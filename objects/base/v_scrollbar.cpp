@@ -147,7 +147,10 @@ V_Scrollbar::V_Scrollbar(qint32 width, qint32 contentWidth)
     {
         if (m_enabled)
         {
-            setSliding(getSliding());
+            if (!m_trackSliding)
+            {
+                setSliding(false);
+            }
             pSlider->addTween(oxygine::Sprite::TweenAddColor(QColor(0, 0, 0, 0)), oxygine::timeMS(300));
         }
     });
