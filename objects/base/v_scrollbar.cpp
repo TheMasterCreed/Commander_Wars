@@ -351,26 +351,23 @@ void V_Scrollbar::setScrollspeed(float Scrollspeed)
 
 void V_Scrollbar::setContentWidth(qint32 width)
 {
+    m_ContentWidth = width;
+    qint32 sliderWidth = 50;
     if (m_ContentWidth > 0)
     {
-        m_ContentWidth = width;
-        qint32 sliderWidth = 50;
-        if (m_ContentWidth > 0)
-        {
-            sliderWidth = ((m_Width - 20 - 20) * m_Width) / m_ContentWidth;
-        }
-        if (sliderWidth < 11)
-        {
-            sliderWidth = 11;
-        }
-        else if (sliderWidth > (m_Width - 20 - 20))
-        {
-            sliderWidth = (m_Width - 20 - 20);
-        }
-        m_Scrollvalue = 0;
-        m_slider->setSize(sliderWidth, 18);
-        setScrollvalue(m_Scrollvalue);
+        sliderWidth = ((m_Width - 20 - 20) * m_Width) / m_ContentWidth;
     }
+    if (sliderWidth < 11)
+    {
+        sliderWidth = 11;
+    }
+    else if (sliderWidth > (m_Width - 20 - 20))
+    {
+        sliderWidth = (m_Width - 20 - 20);
+    }
+    m_Scrollvalue = 0;
+    m_slider->setSize(sliderWidth, 18);
+    setScrollvalue(m_Scrollvalue);
 }
 
 void V_Scrollbar::update(const oxygine::UpdateState& us)
