@@ -370,7 +370,8 @@ void V_Scrollbar::setContentWidth(qint32 width)
     }
     m_Scrollvalue = 0;
     m_slider->setSize(sliderWidth, 18);
-    setScrollvalue(m_Scrollvalue);
+    m_slider->setX(20 + m_Scrollvalue * (m_Width - m_slider->getScaledWidth() - 20 - 20));
+    emit sigScrollValueChanged(m_Scrollvalue);
 }
 
 void V_Scrollbar::update(const oxygine::UpdateState& us)

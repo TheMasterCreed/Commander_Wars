@@ -357,8 +357,8 @@ void H_Scrollbar::setContentHeigth(qint32 heigth)
     }
     m_Scrollvalue = 0;
     m_slider->setSize(18, sliderHeight);
-    changeScrollValue(m_Scrollvalue);
-    
+    m_slider->setY(20 + m_Scrollvalue * (m_Heigth - m_slider->getScaledHeight() - 20 - 20));
+    emit sigScrollValueChanged(m_Scrollvalue);
 }
 
 void H_Scrollbar::update(const oxygine::UpdateState& us)
