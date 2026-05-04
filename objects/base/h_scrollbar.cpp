@@ -361,7 +361,7 @@ void H_Scrollbar::setContentHeigth(qint32 heigth)
     
 }
 
-void H_Scrollbar::update(const oxygine::UpdateState&)
+void H_Scrollbar::update(const oxygine::UpdateState& us)
 {
     // no need to calculate more than we need if we're invisible
     if(m_scroll != 0)
@@ -380,6 +380,7 @@ void H_Scrollbar::update(const oxygine::UpdateState&)
             }
         }
     }
+    oxygine::Actor::update(us);
 }
 
 void H_Scrollbar::changeScrollValue(float value)
