@@ -1176,7 +1176,7 @@ void Multiplayermenu::verifyGameData(QDataStream & stream, quint64 socketID)
         }
         else
         {
-            handleVersionMissmatch(mods, versions, myMods, myVersions, sameMods, differentHash, sameVersion);
+            handleVersionMissmatch(mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, sameMods, differentHash, sameVersion);
         }
     }
 }
@@ -1376,41 +1376,116 @@ void Multiplayermenu::clientMapInfo(QDataStream & stream, quint64 socketID)
         }
         else
         {
-            handleVersionMissmatch(mods, versions, myMods, myVersions, sameMods, differentHash, sameVersion);
+            handleVersionMissmatch(mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, sameMods, differentHash, sameVersion);
         }
     }
 }
 
-void Multiplayermenu::handleVersionMissmatch(const QStringList & mods, const QStringList & versions, const QStringList & myMods, const QStringList & myVersions, bool sameMods, bool differentHash, bool sameVersion)
+void Multiplayermenu::handleVersionMissmatch(const QStringList & mods, const QStringList & versions, const QStringList & myMods, const QStringList & myVersions, const QStringList & mismatchedResourceFolders, const QStringList & mismatchedMods, bool sameMods, bool differentHash, bool sameVersion)
 {
-    // quit game with wrong version
-    spDialogMessageBox pDialogMessageBox;
-    if (differentHash)
+    // Mod/hash fields are stale on version mismatch because readHashInfo early-returns.
+    if (!sameVersion)
     {
-        pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(tr("Host has a different version of a mod or the game resource folder has been modified by one of the games."));
+        spDialogMessageBox pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(tr("Host has a different game version. Leaving the game again."));
+        connect(pDialogMessageBox.get(), &DialogMessageBox::sigOk, this, &Multiplayermenu::buttonBack, Qt::QueuedConnection);
+        addChild(pDialogMessageBox);
+        return;
     }
-    else  if (!sameVersion)
+
+    constexpr qint32 DISPLAY_LIMIT = 5;
+    auto * settings = Settings::getInstance();
+
+    QStringList missingHere;
+    QStringList extraHere;
+    QStringList versionDiffs;
+    if (!sameMods)
     {
-        pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(tr("Host has a different game version. Leaving the game again."));
-    }
-    else if (!sameMods)
-    {
-        QString hostModsInfo;
         for (qint32 i = 0; i < mods.size(); ++i)
         {
-            hostModsInfo += Settings::getInstance()->getModName(mods[i]) + " " + versions[i] + "\n";
+            const QString & mod = mods[i];
+            const qint32 j = myMods.indexOf(mod);
+            if (j < 0)
+            {
+                missingHere.append(settings->getModName(mod) + " " + versions[i]);
+            }
+            else if (versions[i] != myVersions[j])
+            {
+                versionDiffs.append(tr("%1 (host: %2, you: %3)").arg(settings->getModName(mod), versions[i], myVersions[j]));
+            }
         }
-        QString myModsInfo;
         for (qint32 i = 0; i < myMods.size(); ++i)
         {
-            myModsInfo += Settings::getInstance()->getModName(myMods[i]) + " " + myVersions[i]  + "\n";
+            if (!mods.contains(myMods[i]))
+            {
+                extraHere.append(settings->getModName(myMods[i]) + " " + myVersions[i]);
+            }
         }
-        pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(tr("Host has different mods. Leaving the game again.\nHost mods:\n") + hostModsInfo + "\nYour Mods:\n" + myModsInfo);
+    }
+
+    QStringList contentDiffs;
+    for (const auto & mod : std::as_const(mismatchedMods))
+    {
+        contentDiffs.append(settings->getModName(mod));
+    }
+
+    auto logFullList = [](const QString & label, const QStringList & list)
+    {
+        if (!list.isEmpty())
+        {
+            CONSOLE_PRINT(label + ": " + list.join(", "), GameConsole::eINFO);
+        }
+    };
+    logFullList(QStringLiteral("Mods host has that you are missing"), missingHere);
+    logFullList(QStringLiteral("Mods you have that host does not"), extraHere);
+    logFullList(QStringLiteral("Mods with version-string mismatch"), versionDiffs);
+    logFullList(QStringLiteral("Mods with different content"), contentDiffs);
+    logFullList(QStringLiteral("Engine resource folders modified"), mismatchedResourceFolders);
+
+    auto appendSection = [&](QString & dst, const QString & header, const QStringList & lines)
+    {
+        if (lines.isEmpty())
+        {
+            return;
+        }
+        dst += header + "\n";
+        const qint32 shown = std::min(static_cast<qint32>(lines.size()), DISPLAY_LIMIT);
+        for (qint32 i = 0; i < shown; ++i)
+        {
+            dst += "  " + lines[i] + "\n";
+        }
+        if (lines.size() > DISPLAY_LIMIT)
+        {
+            dst += "  " + tr("...and %1 more (see console.log)").arg(lines.size() - DISPLAY_LIMIT) + "\n";
+        }
+        dst += "\n";
+    };
+
+    QString message;
+    appendSection(message, tr("Missing mods (host has, you don't):"), missingHere);
+    appendSection(message, tr("Extra mods (you have, host doesn't):"), extraHere);
+    appendSection(message, tr("Version mismatch (mod.txt):"), versionDiffs);
+    appendSection(message, tr("Content mismatch:"), contentDiffs);
+    appendSection(message, tr("Engine resources differ:"), mismatchedResourceFolders);
+
+    if (message.isEmpty())
+    {
+        // Legacy and fail-closed payloads have no structured detail.
+        if (differentHash)
+        {
+            message = tr("Host has a different version of a mod or the game resource folder has been modified by one of the games.");
+        }
+        else
+        {
+            CONSOLE_PRINT("handleVersionMissmatch reached unreachable branch: !differentHash with no mod-set or hash diff detail. checkMods set !sameMods but our classification found nothing. Investigate.", GameConsole::eERROR);
+            message = tr("Failed to join game due to unknown verification failure.");
+        }
     }
     else
     {
-        pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(tr("Failed to join game due to unknown verification failure."));
+        message = tr("Cannot join, your game data differs from the host:") + "\n\n" + message + tr("Leaving the game again.");
     }
+
+    spDialogMessageBox pDialogMessageBox = MemoryManagement::create<DialogMessageBox>(message);
     connect(pDialogMessageBox.get(), &DialogMessageBox::sigOk, this, &Multiplayermenu::buttonBack, Qt::QueuedConnection);
     addChild(pDialogMessageBox);
 }
