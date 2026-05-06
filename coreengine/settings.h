@@ -527,7 +527,7 @@ public:
     Q_INVOKABLE qint32 getMenuItemCount();
     Q_INVOKABLE void setMenuItemCount(const qint32 MenuItemCount);
     Q_INVOKABLE QString getModString();
-    Q_INVOKABLE void filterCosmeticMods(QStringList mods, QStringList versions, bool filter);
+    void filterCosmeticMods(QStringList & mods, QStringList & versions, bool filter);
     Q_INVOKABLE QString getConfigString(QStringList mods);
     Q_INVOKABLE quint32 getMultiTurnCounter();
     Q_INVOKABLE void setMultiTurnCounter(const quint32 value);

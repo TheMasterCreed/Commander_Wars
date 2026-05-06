@@ -1494,7 +1494,7 @@ QString Settings::getModString()
     return getConfigString(m_activeMods);
 }
 
-void Settings::filterCosmeticMods(QStringList mods, QStringList versions, bool filter)
+void Settings::filterCosmeticMods(QStringList & mods, QStringList & versions, bool filter)
 {
     if (filter)
     {

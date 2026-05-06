@@ -189,12 +189,6 @@ protected:
     bool checkMods(const QStringList & mods, const QStringList & versions, QStringList & myMods, QStringList & myVersions, bool filter);
     void verifyGameData(QDataStream & stream, quint64 socketID);
     /**
-     * @brief filterCosmeticMods
-     * @param mods
-     * @param versions
-     */
-    void filterCosmeticMods(QStringList & mods, QStringList & versions, bool filter);
-    /**
      * @brief requestRule
      * @param socketID
      */
