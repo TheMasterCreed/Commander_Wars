@@ -16,6 +16,9 @@ public:
         QStringList items;
     };
     static const char* const LIST_FILENAME_ENDING;
+    static constexpr qint32 LegacyRuntimeHashSize = 64;
+    // Old clients read this field as a QByteArray length, so versions must stay small and never collide with 64.
+    static constexpr qint32 CurrentHashPayloadVersion = 1;
     Filesupport() = delete;
     ~Filesupport() = delete;
     static QByteArray getLegacyRuntimeHash(const QStringList & mods);
