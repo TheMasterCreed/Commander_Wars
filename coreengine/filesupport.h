@@ -5,6 +5,7 @@
 #include <QObject>
 #include <QDataStream>
 #include <QCryptographicHash>
+#include <QMap>
 
 class Filesupport final
 {
@@ -17,24 +18,11 @@ public:
     static const char* const LIST_FILENAME_ENDING;
     Filesupport() = delete;
     ~Filesupport() = delete;
-    /**
-     * @brief getRuntimeHash
-     * @return
-     */
-    static QByteArray getRuntimeHash(const QStringList & mods);
-    /**
-     * @brief getHash
-     * @param filter
-     * @param folders
-     * @return
-     */
+    static QByteArray getLegacyRuntimeHash(const QStringList & mods);
+    static QMap<QString, QByteArray> getPerModHashes(const QStringList & mods);
+    static QMap<QString, QByteArray> getResourceFolderHashes();
+    static QByteArray hashSingleFolder(const QString & folder, const QStringList & filter);
     static QByteArray getHash(const QStringList & filter, const QStringList & folders);
-    /**
-     * @brief addHash
-     * @param hash
-     * @param folder
-     * @param filter
-     */
     static void addHash(QCryptographicHash & hash, const QString & folder, const QStringList & filter);
     /**
      * @brief writeByteArray

@@ -705,7 +705,7 @@ void GameMenue::sendVerifyGameData(quint64 socketID)
         stream << mods[i];
         stream << versions[i];
     }
-    auto hostHash = Filesupport::getRuntimeHash(mods);
+    auto hostHash = Filesupport::getLegacyRuntimeHash(mods);
     if (GameConsole::eDEBUG >= GameConsole::getLogLevel())
     {
         QString hostString = GlobalUtils::getByteArrayString(hostHash);

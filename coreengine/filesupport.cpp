@@ -54,13 +54,38 @@ void Filesupport::addHash(QCryptographicHash & hash, const QString & folder, con
     }
 }
 
-QByteArray Filesupport::getRuntimeHash(const QStringList & mods)
+QByteArray Filesupport::getLegacyRuntimeHash(const QStringList & mods)
 {
     QStringList folders = mods;
     folders.append("resources/scripts");
     folders.append("resources/aidata");
     QStringList filter = {"*.js", "*.csv"};
     return getHash(filter, folders);
+}
+
+QByteArray Filesupport::hashSingleFolder(const QString & folder, const QStringList & filter)
+{
+    return getHash(filter, QStringList{folder});
+}
+
+QMap<QString, QByteArray> Filesupport::getPerModHashes(const QStringList & mods)
+{
+    const QStringList filter = {"*.js", "*.csv"};
+    QMap<QString, QByteArray> result;
+    for (const auto & mod : std::as_const(mods))
+    {
+        result.insert(mod, hashSingleFolder(mod, filter));
+    }
+    return result;
+}
+
+QMap<QString, QByteArray> Filesupport::getResourceFolderHashes()
+{
+    const QStringList filter = {"*.js", "*.csv"};
+    QMap<QString, QByteArray> result;
+    result.insert(QStringLiteral("resources/scripts"), hashSingleFolder(QStringLiteral("resources/scripts"), filter));
+    result.insert(QStringLiteral("resources/aidata"), hashSingleFolder(QStringLiteral("resources/aidata"), filter));
+    return result;
 }
 
 void Filesupport::writeByteArray(QDataStream& stream, const QByteArray& array)

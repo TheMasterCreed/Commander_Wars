@@ -743,7 +743,7 @@ void Multiplayermenu::sendMapInfoUpdate(quint64 socketID)
         stream << mods[i];
         stream << versions[i];
     }
-    auto hostHash = Filesupport::getRuntimeHash(mods);
+    auto hostHash = Filesupport::getLegacyRuntimeHash(mods);
     if (GameConsole::eDEBUG >= GameConsole::getLogLevel())
     {
         QString hostString = GlobalUtils::getByteArrayString(hostHash);
@@ -1249,7 +1249,7 @@ void Multiplayermenu::readHashInfo(QDataStream & stream, quint64 socketID, QStri
     }
     sameMods = checkMods(mods, versions, myMods, myVersions, filter);
     QByteArray hostRuntime = Filesupport::readByteArray(stream);
-    QByteArray ownRuntime = Filesupport::getRuntimeHash(mods);
+    QByteArray ownRuntime = Filesupport::getLegacyRuntimeHash(mods);
     if (GameConsole::eDEBUG >= GameConsole::getLogLevel())
     {
         QString hostString = GlobalUtils::getByteArrayString(hostRuntime);
