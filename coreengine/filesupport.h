@@ -6,6 +6,7 @@
 #include <QDataStream>
 #include <QCryptographicHash>
 #include <QMap>
+#include <QPair>
 
 class Filesupport final
 {
@@ -14,6 +15,21 @@ public:
     {
         QString name;
         QStringList items;
+    };
+    struct ModSyncCaps
+    {
+        qint32 perModBytes{64 * 1024 * 1024};
+        qint32 fileCountMax{5000};
+        qint32 relPathMaxLen{260};
+    };
+    // rejectReason values match NetworkCommands::ModSyncRejectReason; kept as qint32 to avoid
+    // pulling networkcommands.h into coreengine.
+    struct ModSyncPackage
+    {
+        QByteArray compressedBlob;
+        qint32 declaredUncompressedSize{0};
+        qint32 fileCount{0};
+        qint32 rejectReason{0};
     };
     static const char* const LIST_FILENAME_ENDING;
     static constexpr qint32 LegacyRuntimeHashSize = 64;
@@ -37,6 +53,14 @@ public:
     static QByteArray getHash(const QStringList & filter, const QStringList & folders);
     static void addHash(QCryptographicHash & hash, const QString & folder, const QStringList & filter);
     static bool validateModPath(const QString & modPath, qint32 maxLen = ModPathDefaultMaxLen);
+    static bool validateRelativeFilePath(const QString & relPath, qint32 maxLen);
+    static ModSyncPackage buildModSyncPackage(const QString & installRoot, const QString & modPath, const ModSyncCaps & caps);
+    static QMap<QString, QByteArray> extractModSyncPackage(const QByteArray & compressedBlob, qint32 declaredUncompressedSize, const ModSyncCaps & caps, qint32 & rejectReason);
+    static QString stageModSync(const QString & installRoot, const QString & modPath, const QMap<QString, QByteArray> & files, qint32 & rejectReason);
+    static void reapModSyncFolders(const QString & installRoot, qint32 backupKeep = 3);
+    static QString pendingModSyncManifestPath(const QString & userDataPath);
+    static bool writePendingModSyncManifest(const QString & userDataPath, const QList<QPair<QString, QString>> & swaps);
+    static void executePendingModSyncManifest(const QString & installRoot, const QString & userDataPath);
     /**
      * @brief writeByteArray
      * @param stream
