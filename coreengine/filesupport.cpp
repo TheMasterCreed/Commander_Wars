@@ -4,6 +4,7 @@
 
 #include <QDirIterator>
 #include <QCoreApplication>
+#include <QSet>
 
 const char* const Filesupport::LIST_FILENAME_ENDING = ".bl";
 
@@ -86,6 +87,72 @@ QMap<QString, QByteArray> Filesupport::getResourceFolderHashes()
     result.insert(QStringLiteral("resources/scripts"), hashSingleFolder(QStringLiteral("resources/scripts"), filter));
     result.insert(QStringLiteral("resources/aidata"), hashSingleFolder(QStringLiteral("resources/aidata"), filter));
     return result;
+}
+
+bool Filesupport::validateModPath(const QString & modPath, qint32 maxLen)
+{
+    if (modPath.isEmpty() || modPath.size() > maxLen)
+    {
+        return false;
+    }
+    if (!modPath.startsWith(QStringLiteral("mods/")))
+    {
+        return false;
+    }
+    if (modPath.contains(QChar('\\')))
+    {
+        return false;
+    }
+    const QStringList segments = modPath.split(QChar('/'));
+    if (segments.size() != 2)
+    {
+        return false;
+    }
+    static const QSet<QChar> kInvalidChars = {
+        QChar('<'), QChar('>'), QChar(':'), QChar('"'),
+        QChar('|'), QChar('?'), QChar('*'),
+    };
+    for (const auto & segment : segments)
+    {
+        if (segment.isEmpty() || segment == QStringLiteral(".") || segment == QStringLiteral(".."))
+        {
+            return false;
+        }
+        // Windows strips trailing dots and spaces at create time; rejecting them avoids name collisions.
+        if (segment.endsWith(QChar('.')) || segment.endsWith(QChar(' ')))
+        {
+            return false;
+        }
+        for (const QChar c : segment)
+        {
+            if (c.unicode() < 0x20 || c.unicode() == 0x7F)
+            {
+                return false;
+            }
+            if (kInvalidChars.contains(c))
+            {
+                return false;
+            }
+        }
+    }
+    static const QSet<QString> kReservedNames = {
+        QStringLiteral("CON"), QStringLiteral("PRN"), QStringLiteral("AUX"), QStringLiteral("NUL"),
+        QStringLiteral("CONIN$"), QStringLiteral("CONOUT$"),
+        QStringLiteral("COM0"), QStringLiteral("COM1"), QStringLiteral("COM2"), QStringLiteral("COM3"),
+        QStringLiteral("COM4"), QStringLiteral("COM5"), QStringLiteral("COM6"), QStringLiteral("COM7"),
+        QStringLiteral("COM8"), QStringLiteral("COM9"),
+        QStringLiteral("LPT0"), QStringLiteral("LPT1"), QStringLiteral("LPT2"), QStringLiteral("LPT3"),
+        QStringLiteral("LPT4"), QStringLiteral("LPT5"), QStringLiteral("LPT6"), QStringLiteral("LPT7"),
+        QStringLiteral("LPT8"), QStringLiteral("LPT9"),
+    };
+    const QString & nameSegment = segments[1];
+    const qint32 dotIdx = nameSegment.indexOf(QChar('.'));
+    const QString basename = (dotIdx >= 0) ? nameSegment.left(dotIdx) : nameSegment;
+    if (kReservedNames.contains(basename.toUpper()))
+    {
+        return false;
+    }
+    return true;
 }
 
 void Filesupport::writeByteArray(QDataStream& stream, const QByteArray& array)

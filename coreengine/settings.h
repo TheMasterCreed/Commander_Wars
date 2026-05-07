@@ -353,6 +353,16 @@ public:
     Q_INVOKABLE void setServerPort(const quint16 ServerPort);
     Q_INVOKABLE QString getServerPassword();
     Q_INVOKABLE void setServerPassword(const QString newServerPassword);
+    Q_INVOKABLE bool getModSyncEnabled() const;
+    Q_INVOKABLE void setModSyncEnabled(bool newModSyncEnabled);
+    Q_INVOKABLE qint32 getModSyncMaxPerModBytes() const;
+    Q_INVOKABLE void setModSyncMaxPerModBytes(qint32 newValue);
+    Q_INVOKABLE qint32 getModSyncMaxTotalBytes() const;
+    Q_INVOKABLE void setModSyncMaxTotalBytes(qint32 newValue);
+    Q_INVOKABLE qint32 getModSyncMaxFiles() const;
+    Q_INVOKABLE void setModSyncMaxFiles(qint32 newValue);
+    Q_INVOKABLE qint32 getModSyncMaxRelativePathLength() const;
+    Q_INVOKABLE void setModSyncMaxRelativePathLength(qint32 newValue);
     Q_INVOKABLE QString getMailServerSendAddress();
     Q_INVOKABLE void setMailServerSendAddress(const QString newMailServerSendAddress);
     Q_INVOKABLE qint32 getMailServerAuthMethod();
@@ -933,6 +943,15 @@ private:
     std::chrono::seconds m_slaveDespawnTime{std::chrono::minutes(0)};
     std::chrono::seconds m_suspendedDespawnTime{std::chrono::minutes(0)};
     std::chrono::seconds m_replayDeleteTime{std::chrono::minutes(0)};
+
+    // Default false until slice 4 wires the request receiver; operator opt-in.
+    bool m_modSyncEnabled{false};
+    // TODO slice 2: enforced by the package builder and receive path.
+    qint32 m_modSyncMaxPerModBytes{64 * 1024 * 1024};
+    qint32 m_modSyncMaxTotalBytes{256 * 1024 * 1024};
+    qint32 m_modSyncMaxFiles{5000};
+    // Inside-package relpath cap; the modPath identifier itself uses Filesupport::ModPathDefaultMaxLen.
+    qint32 m_modSyncMaxRelativePathLength{260};
 
     // mailing
     QString m_mailServerAddress;

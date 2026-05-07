@@ -184,7 +184,7 @@ protected:
     spGameMap createMapFromStream(QString mapFile, QString scriptFile, QDataStream &stream);
     QString getNewFileName(QString filename);    
     void clientMapInfo(QDataStream & stream, quint64 socketID);
-    void readHashInfo(QDataStream & stream, quint64 socketID, QStringList & mods, QStringList & versions, QStringList & myMods, QStringList & myVersions, QStringList & mismatchedResourceFolders, QStringList & mismatchedMods, bool & sameMods, bool & differentHash, bool & sameVersion);
+    void readHashInfo(QDataStream & stream, quint64 socketID, QStringList & mods, QStringList & versions, QStringList & myMods, QStringList & myVersions, QStringList & mismatchedResourceFolders, QStringList & mismatchedMods, quint32 & hostCapabilities, bool & sameMods, bool & differentHash, bool & sameVersion);
     void handleVersionMissmatch(const QStringList & mods, const QStringList & versions, const QStringList & myMods, const QStringList & myVersions, const QStringList & mismatchedResourceFolders, const QStringList & mismatchedMods, bool sameMods, bool differentHash, bool sameVersion);
     bool checkMods(const QStringList & mods, const QStringList & versions, QStringList & myMods, QStringList & myVersions, bool filter);
     void verifyGameData(QDataStream & stream, quint64 socketID);

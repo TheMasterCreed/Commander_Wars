@@ -260,6 +260,56 @@ void Settings::setServerPassword(const QString newServerPassword)
     m_serverPassword = newServerPassword;
 }
 
+bool Settings::getModSyncEnabled() const
+{
+    return m_modSyncEnabled;
+}
+
+void Settings::setModSyncEnabled(bool newModSyncEnabled)
+{
+    m_modSyncEnabled = newModSyncEnabled;
+}
+
+qint32 Settings::getModSyncMaxPerModBytes() const
+{
+    return m_modSyncMaxPerModBytes;
+}
+
+void Settings::setModSyncMaxPerModBytes(qint32 newValue)
+{
+    m_modSyncMaxPerModBytes = newValue;
+}
+
+qint32 Settings::getModSyncMaxTotalBytes() const
+{
+    return m_modSyncMaxTotalBytes;
+}
+
+void Settings::setModSyncMaxTotalBytes(qint32 newValue)
+{
+    m_modSyncMaxTotalBytes = newValue;
+}
+
+qint32 Settings::getModSyncMaxFiles() const
+{
+    return m_modSyncMaxFiles;
+}
+
+void Settings::setModSyncMaxFiles(qint32 newValue)
+{
+    m_modSyncMaxFiles = newValue;
+}
+
+qint32 Settings::getModSyncMaxRelativePathLength() const
+{
+    return m_modSyncMaxRelativePathLength;
+}
+
+void Settings::setModSyncMaxRelativePathLength(qint32 newValue)
+{
+    m_modSyncMaxRelativePathLength = newValue;
+}
+
 QString Settings::getMailServerSendAddress()
 {
     return m_mailServerSendAddress;
@@ -1044,6 +1094,8 @@ QStringList Settings::getActiveMods()
 void Settings::setActiveMods(const QStringList activeMods)
 {
     m_activeMods = activeMods;
+    // Rebuild versions so repeated setActiveMods calls stay aligned.
+    m_activeModVersions.clear();
     qint32 i = 0;
     while (i < m_activeMods.size())
     {
@@ -1402,6 +1454,11 @@ void Settings::setup()
             MemoryManagement::create<Value<std::chrono::seconds>>("Network", "SlaveDespawnTime", &m_slaveDespawnTime, std::chrono::seconds(60 * 60 * 24), std::chrono::seconds(1), std::chrono::seconds(60 * 60 * 24 * 96)),
             MemoryManagement::create<Value<std::chrono::seconds>>("Network", "SuspendedDespawnTime", &m_suspendedDespawnTime, std::chrono::seconds(60 * 60 * 24), std::chrono::seconds(1), std::chrono::seconds(60 * 60 * 24 * 96)),
             MemoryManagement::create<Value<std::chrono::seconds>>("Network", "ReplayDeleteTime", &m_replayDeleteTime, std::chrono::seconds(60 * 60 * 24 * 7), std::chrono::seconds(1), std::chrono::seconds(60 * 60 * 24 * 96)),
+            MemoryManagement::create<Value<bool>>("Network", "ModSyncEnabled", &m_modSyncEnabled, false, false, true),
+            MemoryManagement::create<Value<qint32>>("Network", "ModSyncMaxPerModBytes", &m_modSyncMaxPerModBytes, 64 * 1024 * 1024, 0, std::numeric_limits<qint32>::max()),
+            MemoryManagement::create<Value<qint32>>("Network", "ModSyncMaxTotalBytes", &m_modSyncMaxTotalBytes, 256 * 1024 * 1024, 0, std::numeric_limits<qint32>::max()),
+            MemoryManagement::create<Value<qint32>>("Network", "ModSyncMaxFiles", &m_modSyncMaxFiles, 5000, 0, std::numeric_limits<qint32>::max()),
+            MemoryManagement::create<Value<qint32>>("Network", "ModSyncMaxRelativePathLength", &m_modSyncMaxRelativePathLength, 260, 1, std::numeric_limits<qint32>::max()),
             // mailing
             MemoryManagement::create<Value<QString>>("Mailing", "MailServerAddress", &m_mailServerAddress, "", "", ""),
             MemoryManagement::create<Value<quint16>>("Mailing", "MailServerPort", &m_mailServerPort, 0, 0, std::numeric_limits<quint16>::max()),

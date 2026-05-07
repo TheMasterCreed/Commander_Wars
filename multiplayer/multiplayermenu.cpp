@@ -743,7 +743,21 @@ void Multiplayermenu::sendMapInfoUpdate(quint64 socketID)
         stream << mods[i];
         stream << versions[i];
     }
-    stream << static_cast<qint32>(Filesupport::CurrentHashPayloadVersion);
+    quint32 capabilities = 0;
+    if (Settings::getInstance()->getModSyncEnabled())
+    {
+        capabilities |= Filesupport::CapabilityModSync;
+    }
+    // Stay on parent v1 wire format when no caps advertised so v1 clients still join.
+    if (capabilities == 0)
+    {
+        stream << static_cast<qint32>(Filesupport::LegacyHashPayloadVersion);
+    }
+    else
+    {
+        stream << static_cast<qint32>(Filesupport::CurrentHashPayloadVersion);
+        stream << capabilities;
+    }
     Filesupport::writeMap(stream, Filesupport::getResourceFolderHashes());
     Filesupport::writeMap(stream, Filesupport::getPerModHashes(mods));
     stream << m_saveGame;
@@ -1163,7 +1177,9 @@ void Multiplayermenu::verifyGameData(QDataStream & stream, quint64 socketID)
         QStringList myVersions;
         QStringList mismatchedResourceFolders;
         QStringList mismatchedMods;
-        readHashInfo(stream, socketID, mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, sameMods, differentHash, sameVersion);
+        quint32 hostCapabilities = 0;
+        readHashInfo(stream, socketID, mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, hostCapabilities, sameMods, differentHash, sameVersion);
+        Q_UNUSED(hostCapabilities);
         if (sameVersion && sameMods && !differentHash)
         {
             QString command = QString(NetworkCommands::GAMEDATAVERIFIED);
@@ -1228,8 +1244,9 @@ bool Multiplayermenu::checkMods(const QStringList & mods, const QStringList & ve
     return sameMods;
 }
 
-void Multiplayermenu::readHashInfo(QDataStream & stream, quint64 socketID, QStringList & mods, QStringList & versions, QStringList & myMods, QStringList & myVersions, QStringList & mismatchedResourceFolders, QStringList & mismatchedMods, bool & sameMods, bool & differentHash, bool & sameVersion)
+void Multiplayermenu::readHashInfo(QDataStream & stream, quint64 socketID, QStringList & mods, QStringList & versions, QStringList & myMods, QStringList & myVersions, QStringList & mismatchedResourceFolders, QStringList & mismatchedMods, quint32 & hostCapabilities, bool & sameMods, bool & differentHash, bool & sameVersion)
 {
+    hostCapabilities = 0;
     GameVersion version;
     version.deserializeObject(stream);
     sameVersion = (version == GameVersion());
@@ -1253,27 +1270,10 @@ void Multiplayermenu::readHashInfo(QDataStream & stream, quint64 socketID, QStri
     sameMods = checkMods(mods, versions, myMods, myVersions, filter);
     qint32 sentinel = 0;
     stream >> sentinel;
-    if (sentinel == Filesupport::LegacyRuntimeHashSize)
+
+    // Call once per readHashInfo: appends to mismatch lists without clearing.
+    auto compareMaps = [&](const QMap<QString, QByteArray> & hostResources, const QMap<QString, QByteArray> & hostMods)
     {
-        QByteArray hostRuntime;
-        for (qint32 i = 0; i < sentinel; ++i)
-        {
-            qint8 byte = 0;
-            stream >> byte;
-            hostRuntime.append(byte);
-        }
-        QByteArray ownRuntime = Filesupport::getLegacyRuntimeHash(mods);
-        if (GameConsole::eDEBUG >= GameConsole::getLogLevel())
-        {
-            CONSOLE_PRINT("Received legacy host hash: " + GlobalUtils::getByteArrayString(hostRuntime), GameConsole::eDEBUG);
-            CONSOLE_PRINT("Own legacy hash:           " + GlobalUtils::getByteArrayString(ownRuntime), GameConsole::eDEBUG);
-        }
-        differentHash = (hostRuntime != ownRuntime);
-    }
-    else if (sentinel == Filesupport::CurrentHashPayloadVersion)
-    {
-        auto hostResources = Filesupport::readMap<QString, QByteArray, QMap>(stream);
-        auto hostMods = Filesupport::readMap<QString, QByteArray, QMap>(stream);
         auto ownResources = Filesupport::getResourceFolderHashes();
         auto ownMods = Filesupport::getPerModHashes(myMods);
         for (auto iter = hostResources.constBegin(); iter != hostResources.constEnd(); ++iter)
@@ -1296,6 +1296,38 @@ void Multiplayermenu::readHashInfo(QDataStream & stream, quint64 socketID, QStri
             }
         }
         differentHash = !mismatchedResourceFolders.isEmpty() || !mismatchedMods.isEmpty();
+    };
+
+    if (sentinel == Filesupport::LegacyRuntimeHashSize)
+    {
+        QByteArray hostRuntime;
+        for (qint32 i = 0; i < sentinel; ++i)
+        {
+            qint8 byte = 0;
+            stream >> byte;
+            hostRuntime.append(byte);
+        }
+        QByteArray ownRuntime = Filesupport::getLegacyRuntimeHash(mods);
+        if (GameConsole::eDEBUG >= GameConsole::getLogLevel())
+        {
+            CONSOLE_PRINT("Received legacy host hash: " + GlobalUtils::getByteArrayString(hostRuntime), GameConsole::eDEBUG);
+            CONSOLE_PRINT("Own legacy hash:           " + GlobalUtils::getByteArrayString(ownRuntime), GameConsole::eDEBUG);
+        }
+        differentHash = (hostRuntime != ownRuntime);
+    }
+    else if (sentinel == Filesupport::LegacyHashPayloadVersion)
+    {
+        // parent named-mod-mismatch wire format: two maps, no capabilities advertised.
+        auto hostResources = Filesupport::readMap<QString, QByteArray, QMap>(stream);
+        auto hostMods = Filesupport::readMap<QString, QByteArray, QMap>(stream);
+        compareMaps(hostResources, hostMods);
+    }
+    else if (sentinel == Filesupport::CurrentHashPayloadVersion)
+    {
+        stream >> hostCapabilities;
+        auto hostResources = Filesupport::readMap<QString, QByteArray, QMap>(stream);
+        auto hostMods = Filesupport::readMap<QString, QByteArray, QMap>(stream);
+        compareMaps(hostResources, hostMods);
     }
     else
     {
@@ -1318,7 +1350,9 @@ void Multiplayermenu::clientMapInfo(QDataStream & stream, quint64 socketID)
         QStringList myVersions;
         QStringList mismatchedResourceFolders;
         QStringList mismatchedMods;
-        readHashInfo(stream, socketID, mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, sameMods, differentHash, sameVersion);
+        quint32 hostCapabilities = 0;
+        readHashInfo(stream, socketID, mods, versions, myMods, myVersions, mismatchedResourceFolders, mismatchedMods, hostCapabilities, sameMods, differentHash, sameVersion);
+        Q_UNUSED(hostCapabilities);
         if (sameVersion && sameMods && !differentHash)
         {
             stream >> m_saveGame;

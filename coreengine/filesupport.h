@@ -18,7 +18,16 @@ public:
     static const char* const LIST_FILENAME_ENDING;
     static constexpr qint32 LegacyRuntimeHashSize = 64;
     // Old clients read this field as a QByteArray length, so versions must stay small and never collide with 64.
-    static constexpr qint32 CurrentHashPayloadVersion = 1;
+    static constexpr qint32 LegacyHashPayloadVersion = 1;
+    static constexpr qint32 CurrentHashPayloadVersion = 2;
+    static_assert(CurrentHashPayloadVersion != LegacyRuntimeHashSize, "sentinel collision with legacy hash size");
+    static_assert(CurrentHashPayloadVersion != LegacyHashPayloadVersion, "sentinel collision with legacy payload version");
+
+    // Bit 0 = slice-1 mod-sync wire format; future schema breakages claim new bits.
+    static constexpr quint32 CapabilityModSync = 0x00000001u;
+
+    static constexpr qint32 ModPathDefaultMaxLen = 260;
+
     Filesupport() = delete;
     ~Filesupport() = delete;
     static QByteArray getLegacyRuntimeHash(const QStringList & mods);
@@ -27,6 +36,7 @@ public:
     static QByteArray hashSingleFolder(const QString & folder, const QStringList & filter);
     static QByteArray getHash(const QStringList & filter, const QStringList & folders);
     static void addHash(QCryptographicHash & hash, const QString & folder, const QStringList & filter);
+    static bool validateModPath(const QString & modPath, qint32 maxLen = ModPathDefaultMaxLen);
     /**
      * @brief writeByteArray
      * @param stream

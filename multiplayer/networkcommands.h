@@ -158,6 +158,23 @@ namespace NetworkCommands
      * @brief GAMEDATAVERIFIED
      */
     const char* const GAMEDATAVERIFIED = "GAMEDATAVERIFIED";
+    // Mod-sync wire format v1. Gated by capability bit Filesupport::CapabilityModSync.
+    const char* const REQUESTMODSYNC = "REQUESTMODSYNC";
+    const char* const MODSYNCDATA = "MODSYNCDATA";
+    const char* const MODSYNCREJECT = "MODSYNCREJECT";
+    const char* const MODSYNCCOMPLETE = "MODSYNCCOMPLETE";
+
+    // Append-only; serialize as qint32, not the enum's underlying type. 0 reserved so callers can use truthy reads.
+    enum ModSyncRejectReason
+    {
+        ModSyncNoReason = 0,
+        ModSyncDisabled = 1,
+        ModSyncUnknownMod = 2,
+        ModSyncSizeCapExceeded = 3,
+        ModSyncFileCountCapExceeded = 4,
+        ModSyncInvalidPath = 5,
+        ModSyncInternalError = 6,
+    };
     /**
      * @brief JOINASPLAYER
      */
