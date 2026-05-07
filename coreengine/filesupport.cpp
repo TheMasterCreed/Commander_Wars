@@ -639,11 +639,76 @@ void Filesupport::reapModSyncFolders(const QString & installRoot, qint32 backupK
     const auto entries = modsDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
     QMap<QString, QList<QFileInfo>> backupsByMod;
     const QDateTime cutoff = QDateTime::currentDateTime().addSecs(-3600);
+    // Match only exact slice-2-generated shapes; substring matching would catch legitimate mod folder names.
+    auto matchStagingShape = [](const QString & name, QString & outPrefix) -> bool
+    {
+        const qint32 idx = name.lastIndexOf(QStringLiteral(".sync-staging-"));
+        if (idx <= 0)
+        {
+            return false;
+        }
+        const QString prefix = name.left(idx);
+        const QString suffix = name.mid(idx + QStringLiteral(".sync-staging-").size());
+        if (suffix.isEmpty() || !validateModPath(QStringLiteral("mods/") + prefix))
+        {
+            return false;
+        }
+        for (const QChar c : suffix)
+        {
+            if (c < QChar('0') || c > QChar('9'))
+            {
+                return false;
+            }
+        }
+        outPrefix = prefix;
+        return true;
+    };
+    auto matchBackupShape = [](const QString & name, QString & outPrefix) -> bool
+    {
+        const qint32 idx = name.lastIndexOf(QStringLiteral(".bak-"));
+        if (idx <= 0)
+        {
+            return false;
+        }
+        const QString prefix = name.left(idx);
+        const QString suffix = name.mid(idx + QStringLiteral(".bak-").size());
+        if (!validateModPath(QStringLiteral("mods/") + prefix))
+        {
+            return false;
+        }
+        // Generated suffix is exactly yyyyMMdd-HHmmsszzzZ (19 chars) with optional -<digits> collision counter.
+        if (suffix.size() < 19)
+        {
+            return false;
+        }
+        auto isDigit = [](QChar c) { return c >= QChar('0') && c <= QChar('9'); };
+        for (qint32 i = 0; i < 8; ++i)
+        {
+            if (!isDigit(suffix[i])) return false;
+        }
+        if (suffix[8] != QChar('-')) return false;
+        for (qint32 i = 9; i < 18; ++i)
+        {
+            if (!isDigit(suffix[i])) return false;
+        }
+        if (suffix[18] != QChar('Z')) return false;
+        if (suffix.size() > 19)
+        {
+            // Collision-counter form requires `-<digits>` after the timestamp; bare `-` is invalid.
+            if (suffix[19] != QChar('-') || suffix.size() < 21) return false;
+            for (qint32 i = 20; i < suffix.size(); ++i)
+            {
+                if (!isDigit(suffix[i])) return false;
+            }
+        }
+        outPrefix = prefix;
+        return true;
+    };
     for (const auto & entry : entries)
     {
         const QString name = entry.fileName();
-        const qint32 stagingIdx = name.indexOf(QStringLiteral(".sync-staging-"));
-        if (stagingIdx > 0)
+        QString prefix;
+        if (matchStagingShape(name, prefix))
         {
             // Mtime fallback heuristic; cheap, no platform-specific PID liveness check.
             if (entry.lastModified() < cutoff)
@@ -653,10 +718,9 @@ void Filesupport::reapModSyncFolders(const QString & installRoot, qint32 backupK
             }
             continue;
         }
-        const qint32 bakIdx = name.indexOf(QStringLiteral(".bak-"));
-        if (bakIdx > 0)
+        if (matchBackupShape(name, prefix))
         {
-            backupsByMod[name.left(bakIdx)].append(entry);
+            backupsByMod[prefix].append(entry);
         }
     }
     for (auto iter = backupsByMod.begin(); iter != backupsByMod.end(); ++iter)

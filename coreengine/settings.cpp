@@ -19,6 +19,7 @@
 #include <QUuid>
 
 #include "coreengine/settings.h"
+#include "coreengine/filesupport.h"
 #include "coreengine/mainapp.h"
 #include "coreengine/globalutils.h"
 #include "coreengine/userdata.h"
@@ -1506,6 +1507,10 @@ void Settings::loadSettings()
     }
     setUserPath(m_userPath);
     setFramesPerSecond(m_framesPerSecond);
+    // Apply any pending mod-sync swaps before setActiveMods, so just-synced folders are visible to its missing-folder pruning pass.
+    CONSOLE_PRINT("Checking pending mod-sync manifest", GameConsole::eDEBUG);
+    Filesupport::executePendingModSyncManifest(m_userPath, m_userPath);
+    Filesupport::reapModSyncFolders(m_userPath);
     setActiveMods(m_activeMods);
     GameConsole::setLogLevel(m_defaultLogLevel);
     GameConsole::setActiveModules(m_defaultLogModuls);
