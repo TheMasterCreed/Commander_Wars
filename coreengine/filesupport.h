@@ -22,8 +22,7 @@ public:
         qint32 fileCountMax{5000};
         qint32 relPathMaxLen{260};
     };
-    // rejectReason values match NetworkCommands::ModSyncRejectReason; kept as qint32 to avoid
-    // pulling networkcommands.h into coreengine.
+    // rejectReason matches NetworkCommands::ModSyncRejectReason; qint32 keeps coreengine decoupled from multiplayer/.
     struct ModSyncPackage
     {
         QByteArray compressedBlob;
@@ -56,11 +55,14 @@ public:
     static bool validateRelativeFilePath(const QString & relPath, qint32 maxLen);
     static ModSyncPackage buildModSyncPackage(const QString & installRoot, const QString & modPath, const ModSyncCaps & caps);
     static QMap<QString, QByteArray> extractModSyncPackage(const QByteArray & compressedBlob, qint32 declaredUncompressedSize, const ModSyncCaps & caps, qint32 & rejectReason);
-    static QString stageModSync(const QString & installRoot, const QString & modPath, const QMap<QString, QByteArray> & files, qint32 & rejectReason);
+    // Returns staging path RELATIVE to installRoot on success (e.g. "mods/foo.sync-staging-12345"); the caller writes that into the manifest.
+    // `caps` re-validates relpath, file count, per-file and total bytes here as defense in depth; callers should still run extractModSyncPackage first.
+    static QString stageModSync(const QString & installRoot, const QString & modPath, const QMap<QString, QByteArray> & files, const ModSyncCaps & caps, qint32 & rejectReason);
     static void reapModSyncFolders(const QString & installRoot, qint32 backupKeep = 3);
     static QString pendingModSyncManifestPath(const QString & userDataPath);
     static bool writePendingModSyncManifest(const QString & userDataPath, const QList<QPair<QString, QString>> & swaps);
-    static void executePendingModSyncManifest(const QString & installRoot, const QString & userDataPath);
+    // Returns the list of `final` paths that were successfully swapped in; slice 3 uses this to drive settings mutation.
+    static QStringList executePendingModSyncManifest(const QString & installRoot, const QString & userDataPath);
     /**
      * @brief writeByteArray
      * @param stream

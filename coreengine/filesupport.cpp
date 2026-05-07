@@ -11,6 +11,8 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QSet>
+#include <QtEndian>
+#include <limits>
 
 const char* const Filesupport::LIST_FILENAME_ENDING = ".bl";
 
@@ -354,12 +356,30 @@ Filesupport::ModSyncPackage Filesupport::buildModSyncPackage(const QString & ins
     {
         const QString absolute = it.next();
         const QString rel = QDir(modRoot).relativeFilePath(absolute);
-        // Filter VCS metadata, build artefacts, and our own staging/backup dirs.
-        if (rel.startsWith(QStringLiteral(".git/")) ||
-            rel.startsWith(QStringLiteral(".svn/")) ||
-            rel.startsWith(QStringLiteral("__pycache__/")) ||
-            rel.contains(QStringLiteral(".sync-staging-")) ||
-            rel.contains(QStringLiteral(".bak-")))
+        const QStringList relSegs = rel.split(QChar('/'));
+        const QString basename = relSegs.isEmpty() ? rel : relSegs.last();
+        // Segment-based filter; substrings would false-positive legit filenames containing .bak- or .sync-staging-.
+        bool cruft = false;
+        for (qint32 si = 0; si < relSegs.size(); ++si)
+        {
+            const QString & seg = relSegs[si];
+            if (seg == QStringLiteral(".git") || seg == QStringLiteral(".svn") || seg == QStringLiteral("__pycache__"))
+            {
+                cruft = true;
+                break;
+            }
+            const bool isDir = (si + 1 < relSegs.size());
+            if (isDir && (seg.startsWith(QStringLiteral(".sync-staging-")) || seg.startsWith(QStringLiteral(".bak-"))))
+            {
+                cruft = true;
+                break;
+            }
+        }
+        if (cruft)
+        {
+            continue;
+        }
+        if (basename == QStringLiteral(".DS_Store") || basename == QStringLiteral("Thumbs.db") || basename == QStringLiteral("desktop.ini"))
         {
             continue;
         }
@@ -399,7 +419,18 @@ Filesupport::ModSyncPackage Filesupport::buildModSyncPackage(const QString & ins
     {
         QDataStream stream(&serialized, QIODevice::WriteOnly);
         stream.setVersion(QDataStream::Version::Qt_6_5);
-        writeMap(stream, files);
+        // Custom format: keys as UTF-8 QByteArrays so the receiver can run a length-bounded reader.
+        stream << static_cast<qint32>(files.size());
+        for (auto iter = files.constBegin(); iter != files.constEnd(); ++iter)
+        {
+            stream << iter.key().toUtf8();
+            stream << iter.value();
+        }
+    }
+    if (serialized.size() > caps.perModBytes || serialized.size() > std::numeric_limits<qint32>::max())
+    {
+        pkg.rejectReason = kModSyncSizeCapExceeded;
+        return pkg;
     }
     pkg.declaredUncompressedSize = static_cast<qint32>(serialized.size());
     pkg.compressedBlob = qCompress(serialized);
@@ -417,6 +448,11 @@ QMap<QString, QByteArray> Filesupport::extractModSyncPackage(const QByteArray & 
 {
     rejectReason = 0;
     QMap<QString, QByteArray> files;
+    if (caps.perModBytes < 0 || caps.fileCountMax < 0 || caps.relPathMaxLen <= 0)
+    {
+        rejectReason = kModSyncInternalError;
+        return files;
+    }
     if (compressedBlob.size() > caps.perModBytes)
     {
         rejectReason = kModSyncSizeCapExceeded;
@@ -427,57 +463,97 @@ QMap<QString, QByteArray> Filesupport::extractModSyncPackage(const QByteArray & 
         rejectReason = kModSyncSizeCapExceeded;
         return files;
     }
+    // qCompress prefixes a 4-byte big-endian uncompressed size used for pre-allocation; gate it before qUncompress to bound memory.
+    if (compressedBlob.size() < 4)
+    {
+        rejectReason = kModSyncInternalError;
+        return files;
+    }
+    const quint32 framingSize = qFromBigEndian<quint32>(reinterpret_cast<const uchar *>(compressedBlob.constData()));
+    if (framingSize > static_cast<quint32>(caps.perModBytes) || static_cast<qint32>(framingSize) != declaredUncompressedSize)
+    {
+        rejectReason = kModSyncSizeCapExceeded;
+        return files;
+    }
     const QByteArray serialized = qUncompress(compressedBlob);
     if (serialized.isEmpty() || serialized.size() != declaredUncompressedSize)
     {
         rejectReason = kModSyncInternalError;
         return files;
     }
-    QByteArray mut = serialized;
-    QDataStream stream(&mut, QIODevice::ReadOnly);
+    QDataStream stream(serialized);
     stream.setVersion(QDataStream::Version::Qt_6_5);
-    auto map = readMap<QString, QByteArray, QMap>(stream);
-    if (stream.status() != QDataStream::Ok)
+    qint32 mapSize = 0;
+    stream >> mapSize;
+    if (stream.status() != QDataStream::Ok || mapSize < 0 || mapSize > caps.fileCountMax)
     {
-        rejectReason = kModSyncInternalError;
-        return files;
+        rejectReason = kModSyncFileCountCapExceeded;
+        return QMap<QString, QByteArray>();
     }
-    qint32 fileCount = 0;
-    qint64 uncompressedTotal = 0;
-    for (auto iter = map.constBegin(); iter != map.constEnd(); ++iter)
+    // Validate length header before allocation; defends against decompression-bomb pre-allocation in operator>>.
+    auto readBoundedBytes = [&stream](QByteArray & out, qint64 maxBytes) -> bool
     {
-        if (!validateRelativeFilePath(iter.key(), caps.relPathMaxLen))
+        quint32 declared = 0;
+        stream >> declared;
+        if (stream.status() != QDataStream::Ok)
+        {
+            return false;
+        }
+        if (declared == 0xFFFFFFFFu)
+        {
+            out.clear();
+            return true;
+        }
+        if (declared > static_cast<quint32>(maxBytes))
+        {
+            return false;
+        }
+        out.resize(static_cast<qint32>(declared));
+        if (out.size() > 0 && stream.readRawData(out.data(), out.size()) != out.size())
+        {
+            return false;
+        }
+        return true;
+    };
+    qint64 uncompressedTotal = 0;
+    for (qint32 i = 0; i < mapSize; ++i)
+    {
+        QByteArray keyUtf8;
+        QByteArray value;
+        // UTF-8 max 4 bytes per code point; cap key bytes at relPathMaxLen * 4.
+        if (!readBoundedBytes(keyUtf8, static_cast<qint64>(caps.relPathMaxLen) * 4))
         {
             rejectReason = kModSyncInvalidPath;
-            files.clear();
-            return files;
+            return QMap<QString, QByteArray>();
         }
-        if (iter.value().size() > caps.perModBytes)
+        if (!readBoundedBytes(value, caps.perModBytes))
         {
             rejectReason = kModSyncSizeCapExceeded;
-            files.clear();
-            return files;
+            return QMap<QString, QByteArray>();
         }
-        uncompressedTotal += iter.value().size();
+        const QString key = QString::fromUtf8(keyUtf8);
+        if (!validateRelativeFilePath(key, caps.relPathMaxLen))
+        {
+            rejectReason = kModSyncInvalidPath;
+            return QMap<QString, QByteArray>();
+        }
+        uncompressedTotal += value.size();
         if (uncompressedTotal > caps.perModBytes)
         {
             rejectReason = kModSyncSizeCapExceeded;
-            files.clear();
-            return files;
+            return QMap<QString, QByteArray>();
         }
-        ++fileCount;
-        if (fileCount > caps.fileCountMax)
+        if (files.contains(key))
         {
-            rejectReason = kModSyncFileCountCapExceeded;
-            files.clear();
-            return files;
+            rejectReason = kModSyncInvalidPath;
+            return QMap<QString, QByteArray>();
         }
+        files.insert(key, value);
     }
-    files = map;
     return files;
 }
 
-QString Filesupport::stageModSync(const QString & installRoot, const QString & modPath, const QMap<QString, QByteArray> & files, qint32 & rejectReason)
+QString Filesupport::stageModSync(const QString & installRoot, const QString & modPath, const QMap<QString, QByteArray> & files, const ModSyncCaps & caps, qint32 & rejectReason)
 {
     rejectReason = 0;
     if (!validateModPath(modPath))
@@ -485,44 +561,71 @@ QString Filesupport::stageModSync(const QString & installRoot, const QString & m
         rejectReason = kModSyncInvalidPath;
         return QString();
     }
-    const qint64 pid = QCoreApplication::applicationPid();
-    const QString stagingPath = joinPath(installRoot, modPath) + QStringLiteral(".sync-staging-") + QString::number(pid);
-    QDir stagingDir(stagingPath);
-    if (stagingDir.exists())
+    if (files.size() > caps.fileCountMax)
     {
-        stagingDir.removeRecursively();
+        rejectReason = kModSyncFileCountCapExceeded;
+        return QString();
     }
-    if (!QDir().mkpath(stagingPath))
+    qint64 totalBytes = 0;
+    for (auto iter = files.constBegin(); iter != files.constEnd(); ++iter)
+    {
+        if (!validateRelativeFilePath(iter.key(), caps.relPathMaxLen))
+        {
+            rejectReason = kModSyncInvalidPath;
+            return QString();
+        }
+        if (iter.value().size() > caps.perModBytes)
+        {
+            rejectReason = kModSyncSizeCapExceeded;
+            return QString();
+        }
+        totalBytes += iter.value().size();
+        if (totalBytes > caps.perModBytes)
+        {
+            rejectReason = kModSyncSizeCapExceeded;
+            return QString();
+        }
+    }
+    const qint64 pid = QCoreApplication::applicationPid();
+    const QString stagingRel = modPath + QStringLiteral(".sync-staging-") + QString::number(pid);
+    const QString stagingAbs = joinPath(installRoot, stagingRel);
+    QDir stagingDir(stagingAbs);
+    if (stagingDir.exists() && !stagingDir.removeRecursively())
+    {
+        rejectReason = kModSyncInternalError;
+        return QString();
+    }
+    if (!QDir().mkpath(stagingAbs))
     {
         rejectReason = kModSyncInternalError;
         return QString();
     }
     for (auto iter = files.constBegin(); iter != files.constEnd(); ++iter)
     {
-        const QString full = joinPath(stagingPath, iter.key());
+        const QString full = joinPath(stagingAbs, iter.key());
         const QFileInfo fi(full);
         if (!QDir().mkpath(fi.absolutePath()))
         {
-            QDir(stagingPath).removeRecursively();
+            QDir(stagingAbs).removeRecursively();
             rejectReason = kModSyncInternalError;
             return QString();
         }
         QSaveFile f(full);
         if (!f.open(QIODevice::WriteOnly))
         {
-            QDir(stagingPath).removeRecursively();
+            QDir(stagingAbs).removeRecursively();
             rejectReason = kModSyncInternalError;
             return QString();
         }
         f.write(iter.value());
         if (!f.commit())
         {
-            QDir(stagingPath).removeRecursively();
+            QDir(stagingAbs).removeRecursively();
             rejectReason = kModSyncInternalError;
             return QString();
         }
     }
-    return stagingPath;
+    return stagingRel;
 }
 
 void Filesupport::reapModSyncFolders(const QString & installRoot, qint32 backupKeep)
@@ -609,18 +712,27 @@ bool Filesupport::writePendingModSyncManifest(const QString & userDataPath, cons
     return true;
 }
 
-void Filesupport::executePendingModSyncManifest(const QString & installRoot, const QString & userDataPath)
+QStringList Filesupport::executePendingModSyncManifest(const QString & installRoot, const QString & userDataPath)
 {
+    QStringList applied;
     const QString path = pendingModSyncManifestPath(userDataPath);
     QFile f(path);
     if (!f.exists())
     {
-        return;
+        return applied;
+    }
+    // Oversize manifest is treated as corrupt or tampered: discard rather than try to parse partial state.
+    constexpr qint64 kMaxManifestBytes = 1 * 1024 * 1024;
+    if (f.size() > kMaxManifestBytes)
+    {
+        CONSOLE_PRINT("Pending mod-sync manifest oversize, discarding: " + path, GameConsole::eERROR);
+        QFile::remove(path);
+        return applied;
     }
     if (!f.open(QIODevice::ReadOnly))
     {
         CONSOLE_PRINT("Pending mod-sync manifest exists but cannot be read: " + path, GameConsole::eERROR);
-        return;
+        return applied;
     }
     const QByteArray data = f.readAll();
     f.close();
@@ -630,17 +742,18 @@ void Filesupport::executePendingModSyncManifest(const QString & installRoot, con
     {
         CONSOLE_PRINT("Pending mod-sync manifest is invalid JSON: " + parseErr.errorString(), GameConsole::eERROR);
         QFile::remove(path);
-        return;
+        return applied;
     }
     const QJsonObject root = doc.object();
     if (root.value(QStringLiteral("version")).toInt(0) != 1)
     {
         CONSOLE_PRINT("Pending mod-sync manifest has unknown version, discarding", GameConsole::eERROR);
         QFile::remove(path);
-        return;
+        return applied;
     }
     const QJsonArray swaps = root.value(QStringLiteral("swaps")).toArray();
-    const QString isoStamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+    // UTC + ms keeps backup names lexically sorted across DST and avoids same-second collision on rapid retries.
+    const QString isoStamp = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmsszzzZ"));
     for (const auto & v : swaps)
     {
         const QJsonObject entry = v.toObject();
@@ -651,16 +764,59 @@ void Filesupport::executePendingModSyncManifest(const QString & installRoot, con
             CONSOLE_PRINT("Manifest entry has invalid final path, skipping: " + finalRel, GameConsole::eERROR);
             continue;
         }
+        // Pin staging to the exact shape stageModSync writes: <finalRel>.sync-staging-<digits>.
+        const QString stagingPrefix = finalRel + QStringLiteral(".sync-staging-");
+        if (!stagingRel.startsWith(stagingPrefix))
+        {
+            CONSOLE_PRINT("Manifest staging path shape mismatch, skipping: " + stagingRel, GameConsole::eERROR);
+            continue;
+        }
+        const QString suffix = stagingRel.mid(stagingPrefix.size());
+        bool suffixDigits = !suffix.isEmpty();
+        for (const QChar c : suffix)
+        {
+            if (c < QChar('0') || c > QChar('9'))
+            {
+                suffixDigits = false;
+                break;
+            }
+        }
+        if (!suffixDigits)
+        {
+            CONSOLE_PRINT("Manifest staging suffix not numeric pid, skipping: " + stagingRel, GameConsole::eERROR);
+            continue;
+        }
         const QString stagingAbs = joinPath(installRoot, stagingRel);
         const QString finalAbs = joinPath(installRoot, finalRel);
-        if (!QFileInfo::exists(stagingAbs))
+        const QFileInfo stagingInfo(stagingAbs);
+        if (!stagingInfo.exists())
         {
             CONSOLE_PRINT("Manifest staging missing, skipping: " + stagingAbs, GameConsole::eERROR);
             continue;
         }
-        if (QFileInfo::exists(finalAbs))
+        // Defends against a tampered manifest pointing the staging slot at a regular file.
+        if (!stagingInfo.isDir())
         {
-            const QString backupAbs = finalAbs + QStringLiteral(".bak-") + isoStamp;
+            CONSOLE_PRINT("Manifest staging path is not a directory, skipping: " + stagingAbs, GameConsole::eERROR);
+            continue;
+        }
+        QString backupAbs;
+        const QFileInfo finalInfo(finalAbs);
+        const bool finalExisted = finalInfo.exists();
+        if (finalExisted)
+        {
+            // Symmetric guard with stagingInfo.isDir(); skip the swap if a regular file occupies the mod slot.
+            if (!finalInfo.isDir())
+            {
+                CONSOLE_PRINT("Manifest final path is not a directory, skipping: " + finalAbs, GameConsole::eERROR);
+                continue;
+            }
+            // Loop suffix defends against duplicate manifest entries for the same finalRel sharing one isoStamp.
+            backupAbs = finalAbs + QStringLiteral(".bak-") + isoStamp;
+            for (qint32 n = 1; QFileInfo::exists(backupAbs); ++n)
+            {
+                backupAbs = finalAbs + QStringLiteral(".bak-") + isoStamp + QStringLiteral("-") + QString::number(n);
+            }
             if (!QDir().rename(finalAbs, backupAbs))
             {
                 CONSOLE_PRINT("Failed to back up existing mod folder: " + finalAbs + " -> " + backupAbs, GameConsole::eERROR);
@@ -670,9 +826,16 @@ void Filesupport::executePendingModSyncManifest(const QString & installRoot, con
         if (!QDir().rename(stagingAbs, finalAbs))
         {
             CONSOLE_PRINT("Failed to swap staging into place: " + stagingAbs + " -> " + finalAbs, GameConsole::eERROR);
+            // Roll the backup back so the active mod folder is not left missing.
+            if (finalExisted && !QDir().rename(backupAbs, finalAbs))
+            {
+                CONSOLE_PRINT("CRITICAL: rollback also failed; mod folder is at " + backupAbs, GameConsole::eERROR);
+            }
             continue;
         }
         CONSOLE_PRINT("Mod sync applied: " + finalRel, GameConsole::eINFO);
+        applied.append(finalRel);
     }
     QFile::remove(path);
+    return applied;
 }
