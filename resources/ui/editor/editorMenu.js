@@ -154,6 +154,10 @@ EditorMenu =
         {
             currentMenu.toggleMiddleCrossGrid();
         }
+        else if (input === "IGNOREPLACEMENTRULES")
+        {
+            currentMenu.toggleIgnorePlacementRestrictions();
+        }
         else  if (input === "VIEWMAPSTATS")
         {
             currentMenu.viewMapStats();

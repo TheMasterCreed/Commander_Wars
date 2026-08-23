@@ -110,6 +110,8 @@ public slots:
      * @brief toggleGridLayout
      */
     void toggleGridLayout();
+    // lets the editor place any terrain, building or unit anywhere. Resets when a map is created or loaded.
+    void toggleIgnorePlacementRestrictions();
     /**
      * @brief optimizePlayers
      */
