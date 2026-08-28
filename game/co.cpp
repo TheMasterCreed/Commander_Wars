@@ -1036,6 +1036,24 @@ qint32 CO::getCaptureBonus(Unit* pUnit, QPoint position)
     return ergValue;
 }
 
+void CO::consumeCaptureBonus(Unit* pUnit, QPoint position)
+{
+    Interpreter* pInterpreter = Interpreter::getInstance();
+    QString function1 = "consumeCaptureBonus";
+    QJSValueList args({m_jsThis,
+                       JsThis::getJsThis(pUnit),
+                       position.x(),
+                       position.y(),
+                       GameMap::getMapJsThis(m_pMap)});
+    for (const auto & perk : std::as_const(m_perkList))
+    {
+        if (isJsFunctionEnabled(perk))
+        {
+            pInterpreter->doFunction(perk, function1, args);
+        }
+    }
+}
+
 void CO::activatePower()
 {
     ++m_powerUsed;

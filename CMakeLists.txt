@@ -1277,6 +1277,8 @@ if (BUILD_TESTING)
         tests/arena/arenamatchrunner.h
         tests/arena/arenatestsupport.cpp
         tests/arena/arenatestsupport.h
+        tests/arena/capturebonusprobe.cpp
+        tests/arena/capturebonusprobe.h
     )
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
@@ -1340,6 +1342,30 @@ if (BUILD_TESTING)
     )
     set_tests_properties(ArenaSupportSmoke PROPERTIES TIMEOUT 120)
     cow_set_arena_test_path(ArenaSupportSmoke)
+
+    set(ARENA_CAPTURE_BONUS_RUN_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/capture_bonus
+    )
+    file(MAKE_DIRECTORY ${ARENA_CAPTURE_BONUS_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/capture_bonus_init.js
+        ${ARENA_CAPTURE_BONUS_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaCaptureBonusPurity
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_CAPTURE_BONUS_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaCaptureBonusPurity PROPERTIES TIMEOUT 120)
+    cow_set_arena_test_path(ArenaCaptureBonusPurity)
 
     set(ARENA_MATCH_MAP_PATH "maps/2_player/Bean Island.map")
     set(ARENA_MATCH_AI_TYPE_0 "Normal")

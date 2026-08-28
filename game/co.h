@@ -482,6 +482,8 @@ public:
      * @return
      */
     Q_INVOKABLE qint32 getCaptureBonus(Unit* pUnit, QPoint position);
+    // Keep one-shot spending out of speculative capture queries.
+    Q_INVOKABLE void consumeCaptureBonus(Unit* pUnit, QPoint position);
     /**
      * @brief getCostModifier
      * @param baseCost

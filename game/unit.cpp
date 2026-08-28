@@ -3062,6 +3062,16 @@ GameAnimation* Unit::killUnit()
 void Unit::increaseCapturePoints(QPoint position)
 {
     m_capturePoints += getCaptureRate(position);
+    CO* pCO = m_pOwner->getCO(0);
+    if (pCO != nullptr)
+    {
+        pCO->consumeCaptureBonus(this, position);
+    }
+    pCO = m_pOwner->getCO(1);
+    if (pCO != nullptr)
+    {
+        pCO->consumeCaptureBonus(this, position);
+    }
     // update icons
     setCapturePoints(m_capturePoints);
 }

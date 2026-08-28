@@ -289,6 +289,11 @@ var TAGPOWER =
     },
     getCaptureBonus : null,
 
+    consumeCaptureBonus : function(co, unit, posX, posY, map)
+    {
+    },
+    consumeCaptureBonus : null,
+
     getAttackHpBonus : function(co, unit, posX, posY, map)
     {
         return 0;

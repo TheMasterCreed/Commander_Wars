@@ -135,8 +135,8 @@ var Constructor = function()
                 if (building !== null)
                 {
                     // store capture bonus
-                    var xVariable = variables.createVariable("POSXBUILDINGS");
-                    var yVariable = variables.createVariable("POSYBUILDINGS");
+                    var xVariable = variables.createVariable(CO_MARY.captureBonusXVariable);
+                    var yVariable = variables.createVariable(CO_MARY.captureBonusYVariable);
                     var pointsX = xVariable.readDataListInt32();
                     var pointsY = yVariable.readDataListInt32();
                     var found = false;
@@ -230,6 +230,11 @@ var Constructor = function()
 
     this.d2dCaptureBonus = 5;
 
+    // Stored variable IDs are savegame-stable.
+    this.captureBonusXVariable = "POSXBUILDINGS";
+    this.captureBonusYVariable = "POSYBUILDINGS";
+    this.noStoredCaptureBonus = -1;
+
     this.getOffensiveBonus = function(co, attacker, atkPosX, atkPosY,
                                  defender, defPosX, defPosY, isDefender, action, luckmode, map)
     {
@@ -307,52 +312,74 @@ var Constructor = function()
         return "";
     };
 
+    this.findStoredCaptureBonus = function(co, posX, posY)
+    {
+        var variables = co.getVariables();
+        var xVariable = variables.getVariable(CO_MARY.captureBonusXVariable);
+        var yVariable = variables.getVariable(CO_MARY.captureBonusYVariable);
+        if (xVariable === null ||
+            yVariable === null)
+        {
+            return CO_MARY.noStoredCaptureBonus;
+        }
+        var pointsX = xVariable.readDataListInt32();
+        var pointsY = yVariable.readDataListInt32();
+        for (var i = 0; i < pointsX.length; i++)
+        {
+            if (pointsX[i] === posX &&
+                    pointsY[i] === posY)
+            {
+                return i;
+            }
+        }
+        return CO_MARY.noStoredCaptureBonus;
+    };
+
     this.getCaptureBonus = function(co, unit, posX, posY, map)
     {
-        if (CO.isActive(co))
+        if (CO.isActive(co) &&
+            CO_MARY.findStoredCaptureBonus(co, posX, posY) !== CO_MARY.noStoredCaptureBonus)
         {
-            var applyBonus = false;
-            // store capture bonus
-            var variables = co.getVariables();
-            var xVariable = variables.createVariable("POSXBUILDINGS");
-            var yVariable = variables.createVariable("POSYBUILDINGS");
-            var pointsX = xVariable.readDataListInt32();
-            var pointsY = yVariable.readDataListInt32();
-            for (var i = 0; i < pointsX.length; i++)
-            {
-                if (pointsX[i] === posX &&
-                        pointsY[i] === posY)
-                {
-                    // apply capture bonus and remove it from the list
-                    applyBonus = true;
-                    pointsX.splice(i, 1);
-                    pointsY.splice(i, 1);
-                    xVariable.writeDataListInt32(pointsX);
-                    yVariable.writeDataListInt32(pointsY);
-                    break;
-                }
-            }
             var powerMode = co.getPowerMode();
-            if ((powerMode === GameEnums.PowerMode_Superpower ||
-                 powerMode === GameEnums.PowerMode_Tagpower) &&
-                    applyBonus === true)
+            if (powerMode === GameEnums.PowerMode_Superpower ||
+                powerMode === GameEnums.PowerMode_Tagpower)
             {
                 return CO_MARY.superPowerCaptureBonus;
             }
-            else if (applyBonus === true)
+            else if (powerMode === GameEnums.PowerMode_Power)
             {
-                if (powerMode === GameEnums.PowerMode_Power)
-                {
-                    return CO_MARY.d2dCaptureBonus;
-                }
-                else if (map === null ||
-                    (map !== null && map.getGameRules().getCoGlobalD2D()))
-                {
-                    return CO_MARY.d2dCaptureBonus;
-                }
+                return CO_MARY.d2dCaptureBonus;
+            }
+            else if (map === null ||
+                map.getGameRules().getCoGlobalD2D())
+            {
+                return CO_MARY.d2dCaptureBonus;
             }
         }
         return 0;
+    };
+
+    this.consumeCaptureBonus = function(co, unit, posX, posY, map)
+    {
+        if (CO.isActive(co) === false)
+        {
+            return;
+        }
+        // A capture spends the stored entry even when its current bonus is zero.
+        var index = CO_MARY.findStoredCaptureBonus(co, posX, posY);
+        if (index === CO_MARY.noStoredCaptureBonus)
+        {
+            return;
+        }
+        var variables = co.getVariables();
+        var xVariable = variables.getVariable(CO_MARY.captureBonusXVariable);
+        var yVariable = variables.getVariable(CO_MARY.captureBonusYVariable);
+        var pointsX = xVariable.readDataListInt32();
+        var pointsY = yVariable.readDataListInt32();
+        pointsX.splice(index, 1);
+        pointsY.splice(index, 1);
+        xVariable.writeDataListInt32(pointsX);
+        yVariable.writeDataListInt32(pointsY);
     };
     this.getAiCoUnitBonus = function(co, unit, map)
     {
