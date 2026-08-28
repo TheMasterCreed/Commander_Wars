@@ -27,6 +27,11 @@
 namespace
 {
 const QString BUILDING_MENU_RESULT_FUNCTION = QStringLiteral("onBuildingMenuItemResult");
+// Pin seed serialization across Qt upgrades.
+constexpr QDataStream::Version AI_SEED_STREAM_VERSION = QDataStream::Version::Qt_6_5;
+const QString AI_SEED_NAMESPACE = QStringLiteral("coordinated-ai-core");
+constexpr AiRandomAlgorithm AI_RANDOM_ALGORITHM = AiRandomAlgorithm::V2;
+constexpr qint32 AI_RANDOM_FIRST_GENERATION = 0;
 }
 
 const char* const CoreAI::ACTION_WAIT = "ACTION_WAIT";
@@ -69,6 +74,12 @@ const char* const CoreAI::ACTION_PRODUCE_OOZIUM_FREE = "ACTION_PRODUCE_OOZIUM_FR
 
 const char* const CoreAI::UNIT_INFANTRY = "INFANTRY";
 const char* const CoreAI::BUILDING_HQ = "HQ";
+
+const char* const CoreAI::AI_RANDOM_ALGORITHM_VARIABLE = "CORE_AI_RANDOM_ALGORITHM";
+const char* const CoreAI::AI_RANDOM_PLAYER_VARIABLE = "CORE_AI_RANDOM_PLAYER";
+const char* const CoreAI::AI_RANDOM_DAY_VARIABLE = "CORE_AI_RANDOM_DAY";
+const char* const CoreAI::AI_RANDOM_SEED_VARIABLE = "CORE_AI_RANDOM_SEED";
+const char* const CoreAI::AI_RANDOM_DRAW_COUNTER_VARIABLE = "CORE_AI_RANDOM_DRAW_COUNTER";
 
 std::map<QString, float> CoreAI::m_baseDamageTable;
 
@@ -2305,6 +2316,79 @@ void CoreAI::resetToTurnStart()
     m_aiFunctionStep = 0;
     m_IslandMaps.clear();
     resetMoveMap();
+}
+
+qint32 CoreAI::randomInt(qint32 low, qint32 high)
+{
+    ensureAiRandomSeeded();
+    const qint32 value = m_aiRandom.bounded(low, high);
+    storeAiRandomStream();
+    return value;
+}
+
+quint32 CoreAI::deriveAiSeed(AiRandomAlgorithm algorithmVersion, qint32 generation) const
+{
+    if (m_pMap == nullptr || m_pPlayer == nullptr)
+    {
+        CONSOLE_PRINT("Ai seed unavailable, falling back to a shared stream", GameConsole::eERROR);
+        return 0;
+    }
+    return AiRandom::deriveSeed(AI_SEED_NAMESPACE,
+                                AI_SEED_STREAM_VERSION,
+                                static_cast<qint32>(algorithmVersion),
+                                m_pPlayer->getPlayerID(),
+                                m_pMap->getCurrentDay(),
+                                generation,
+                                m_pMap->getMapHash());
+}
+
+void CoreAI::ensureAiRandomSeeded()
+{
+    const qint32 playerId = (m_pPlayer != nullptr) ? m_pPlayer->getPlayerID() : -1;
+    const qint32 currentDay = (m_pMap != nullptr) ? m_pMap->getCurrentDay() : -1;
+    // Stored state is the only copy that survives deserialization.
+    if (restoreAiRandomState(playerId, currentDay))
+    {
+        return;
+    }
+    m_aiRandom.reseed(deriveAiSeed(AI_RANDOM_ALGORITHM, AI_RANDOM_FIRST_GENERATION));
+    storeAiRandomState(playerId, currentDay);
+}
+
+bool CoreAI::restoreAiRandomState(qint32 playerId, qint32 currentDay)
+{
+    ScriptVariable* pAlgorithm = m_Variables.getVariable(AI_RANDOM_ALGORITHM_VARIABLE);
+    ScriptVariable* pPlayerId = m_Variables.getVariable(AI_RANDOM_PLAYER_VARIABLE);
+    ScriptVariable* pDay = m_Variables.getVariable(AI_RANDOM_DAY_VARIABLE);
+    ScriptVariable* pSeed = m_Variables.getVariable(AI_RANDOM_SEED_VARIABLE);
+    ScriptVariable* pDrawCounter = m_Variables.getVariable(AI_RANDOM_DRAW_COUNTER_VARIABLE);
+    if (pAlgorithm == nullptr || pPlayerId == nullptr || pDay == nullptr ||
+        pSeed == nullptr || pDrawCounter == nullptr)
+    {
+        return false;
+    }
+    if (pAlgorithm->readDataInt32() != static_cast<qint32>(AI_RANDOM_ALGORITHM) ||
+        pPlayerId->readDataInt32() != playerId ||
+        pDay->readDataInt32() != currentDay)
+    {
+        return false;
+    }
+    m_aiRandom.restore(pSeed->readDataUint32(), pDrawCounter->readDataUint32());
+    return true;
+}
+
+void CoreAI::storeAiRandomState(qint32 playerId, qint32 currentDay)
+{
+    m_Variables.createVariable(AI_RANDOM_ALGORITHM_VARIABLE)->writeDataInt32(static_cast<qint32>(AI_RANDOM_ALGORITHM));
+    m_Variables.createVariable(AI_RANDOM_PLAYER_VARIABLE)->writeDataInt32(playerId);
+    m_Variables.createVariable(AI_RANDOM_DAY_VARIABLE)->writeDataInt32(currentDay);
+    storeAiRandomStream();
+}
+
+void CoreAI::storeAiRandomStream()
+{
+    m_Variables.createVariable(AI_RANDOM_SEED_VARIABLE)->writeDataUint32(m_aiRandom.getSeed());
+    m_Variables.createVariable(AI_RANDOM_DRAW_COUNTER_VARIABLE)->writeDataUint32(m_aiRandom.getDrawCounter());
 }
 
 void CoreAI::finishTurn()

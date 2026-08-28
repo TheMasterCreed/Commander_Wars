@@ -803,6 +803,7 @@ set(${PROJECT_NAME}_SRCS
     ai/proxyai.cpp ai/proxyai.h
     ai/normalai.cpp ai/normalai.h    
     ai/transporterselector.h ai/transporterselector.cpp
+    ai/airandom.h ai/airandom.cpp
     ai/influencefrontmap.cpp ai/influencefrontmap.h
     ai/heavyai/heavyai.cpp ai/heavyai/heavyai.h
     ai/heavyai/heavyAiSharedData.h
@@ -1269,6 +1270,23 @@ if (BUILD_TESTING)
             )
         endif()
     endfunction()
+
+    add_executable(CoordinatorAiRandomTests
+        tests/coordinator_ai/airandomtests.cpp
+        ai/airandom.cpp
+        ai/airandom.h
+    )
+    target_include_directories(CoordinatorAiRandomTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiRandomTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiRandomTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME CoordinatorAiRandomTests COMMAND CoordinatorAiRandomTests)
+    cow_set_arena_test_path(CoordinatorAiRandomTests)
 
     target_sources(${PROJECT_NAME} PRIVATE
         tests/arena/arenamatchconfig.cpp

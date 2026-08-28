@@ -9,6 +9,7 @@
 #include "game/gameaction.h"
 #include "game/unitpathfindingsystem.h"
 
+#include "ai/airandom.h"
 #include "ai/islandmap.h"
 #include "ai/targetedunitpathfindingsystem.h"
 #include "ai/productionSystem/simpleproductionsystem.h"
@@ -182,6 +183,12 @@ public:
 
     static const char* const BUILDING_HQ;
     static const char* const UNIT_INFANTRY;
+
+    static const char* const AI_RANDOM_ALGORITHM_VARIABLE;
+    static const char* const AI_RANDOM_PLAYER_VARIABLE;
+    static const char* const AI_RANDOM_DAY_VARIABLE;
+    static const char* const AI_RANDOM_SEED_VARIABLE;
+    static const char* const AI_RANDOM_DRAW_COUNTER_VARIABLE;
 
     explicit CoreAI(GameMap* pMap, GameEnums::AiTypes aiType, QString jsName);
     virtual ~CoreAI() = default;
@@ -397,6 +404,7 @@ public:
     {
         return &m_Variables;
     }
+    Q_INVOKABLE qint32 randomInt(qint32 low, qint32 high);
     /**
      * @brief loadIni
      * @param file
@@ -907,6 +915,12 @@ protected:
     static std::map<QString, float> m_baseDamageTable;
 
 private:
+    quint32 deriveAiSeed(AiRandomAlgorithm algorithmVersion, qint32 generation) const;
+    void ensureAiRandomSeeded();
+    bool restoreAiRandomState(qint32 playerId, qint32 currentDay);
+    void storeAiRandomState(qint32 playerId, qint32 currentDay);
+    void storeAiRandomStream();
+
     bool finish{false};
     struct FlareInfo
     {
@@ -922,4 +936,5 @@ private:
     };
     ExplodeInfo m_explodeInfo;
     QStringList m_iniFiles;
+    AiRandom m_aiRandom;
 };
