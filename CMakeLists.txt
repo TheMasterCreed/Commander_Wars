@@ -239,11 +239,19 @@ endif()
 ###################################################################################
 # General version information
 ###################################################################################
+set(COW_VERSION_MAJOR 0)
+set(COW_VERSION_MINOR 39)
+set(COW_VERSION_REVISION 1)
+set(COW_VERSION_SUFFIX "main")
+set(COW_VERSION_NAME
+    "${COW_VERSION_MAJOR}.${COW_VERSION_MINOR}.${COW_VERSION_REVISION}-${COW_VERSION_SUFFIX}"
+)
+
 add_definitions(
-    -DVERSION_MAJOR=0
-    -DVERSION_MINOR=39
-    -DVERSION_REVISION=1
-    -DVERSION_SUFFIX="main"
+    -DVERSION_MAJOR=${COW_VERSION_MAJOR}
+    -DVERSION_MINOR=${COW_VERSION_MINOR}
+    -DVERSION_REVISION=${COW_VERSION_REVISION}
+    -DVERSION_SUFFIX="${COW_VERSION_SUFFIX}"
     -DCOW_BUILD_TAG="${COW_BUILD_TAG}"
     -DCOW_BUILD_NAME="${COW_BUILD_NAME}"
     -DUPDATE_FILE="${UPDATE_FILE}"
@@ -251,6 +259,12 @@ add_definitions(
 
 set(COW_ANDROID_VERSION_NAME "0.39.1-main")
 set(COW_ANDROID_VERSION_CODE "70")
+
+if (NOT "${COW_ANDROID_VERSION_NAME}" STREQUAL "${COW_VERSION_NAME}")
+    message(FATAL_ERROR
+        "Android version ${COW_ANDROID_VERSION_NAME} does not match game version ${COW_VERSION_NAME}"
+    )
+endif()
 
 ###################################################################################
 # Set up some compiler and linking options
@@ -1305,6 +1319,47 @@ if (BUILD_TESTING)
     )
     add_test(NAME CoordinatorAiTypeIdentityTests COMMAND CoordinatorAiTypeIdentityTests)
     cow_set_arena_test_path(CoordinatorAiTypeIdentityTests)
+
+    add_executable(CoordinatorAiTypeCodecTests
+        tests/coordinator_ai/aitypecodectests.cpp
+        game/GameEnums.h
+        resource_management/gamemanager.h
+    )
+    target_include_directories(CoordinatorAiTypeCodecTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiTypeCodecTests PRIVATE ${QT_LIBRARIES})
+    set_target_properties(CoordinatorAiTypeCodecTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME CoordinatorAiTypeCodecTests COMMAND CoordinatorAiTypeCodecTests)
+    cow_set_arena_test_path(CoordinatorAiTypeCodecTests)
+
+    add_executable(CoordinatorAiGameVersionCompatibilityTests
+        tests/coordinator_ai/gameversioncompatibilitytests.cpp
+        coreengine/gameversion.cpp
+        coreengine/gameversion.h
+    )
+    target_include_directories(CoordinatorAiGameVersionCompatibilityTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(CoordinatorAiGameVersionCompatibilityTests PRIVATE
+        COW_ANDROID_VERSION_NAME="${COW_ANDROID_VERSION_NAME}"
+        COW_ANDROID_VERSION_CODE="${COW_ANDROID_VERSION_CODE}"
+    )
+    target_link_libraries(CoordinatorAiGameVersionCompatibilityTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiGameVersionCompatibilityTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiGameVersionCompatibilityTests
+        COMMAND CoordinatorAiGameVersionCompatibilityTests
+    )
+    cow_set_arena_test_path(CoordinatorAiGameVersionCompatibilityTests)
 
     target_sources(${PROJECT_NAME} PRIVATE
         tests/arena/arenamatchconfig.cpp

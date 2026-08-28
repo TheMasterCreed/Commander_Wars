@@ -40,6 +40,7 @@
 
 #include "resource_management/objectmanager.h"
 #include "resource_management/fontmanager.h"
+#include "resource_management/gamemanager.h"
 
 Multiplayermenu::Multiplayermenu(const QString & address, const QString & secondaryAddress, quint16 port, const QString & password, NetworkMode networkMode)
     : MapSelectionMapsMenue(MemoryManagement::create<MapSelectionView>(QStringList({".map", ".jsm"})), Settings::getInstance()->getSmallScreenDevice() ? oxygine::Stage::getStage()->getHeight() - 80 : oxygine::Stage::getStage()->getHeight() - 230),
@@ -1042,10 +1043,22 @@ void Multiplayermenu::receivePlayerControlledInfo(QDataStream & stream, quint64 
         playerAis.append(player);
         qint32 ai;
         stream >> ai;
-        aiTypes.append(static_cast<GameEnums::AiTypes>(ai));
+        const auto aiType = static_cast<GameEnums::AiTypes>(ai);
+        if (stream.status() != QDataStream::Ok ||
+            !GameManager::getInstance()->isKnownAiType(aiType))
+        {
+            stream.setStatus(QDataStream::ReadCorruptData);
+            CONSOLE_PRINT("Rejected invalid controlled AI type " + QString::number(ai), GameConsole::eERROR);
+            return;
+        }
+        aiTypes.append(aiType);
     }
     qint64 syncCounter = 0;
     stream >> syncCounter;
+    if (stream.status() != QDataStream::Ok)
+    {
+        return;
+    }
     spGameMap pMap = m_pMapSelectionView->getCurrentMap();
     for (qint32 i = 0; i < pMap->getPlayerCount(); ++i)
     {
@@ -1199,18 +1212,39 @@ void Multiplayermenu::sendInitUpdate(QDataStream & stream, quint64 socketID)
                 qint32 aiType;
                 stream >> name;
                 stream >> aiType;
+                const auto wireAiType = static_cast<GameEnums::AiTypes>(aiType);
+                if (stream.status() != QDataStream::Ok ||
+                    !GameManager::getInstance()->isKnownAiType(wireAiType))
+                {
+                    stream.setStatus(QDataStream::ReadCorruptData);
+                    CONSOLE_PRINT("Rejected invalid initial AI type " + QString::number(aiType), GameConsole::eERROR);
+                    return;
+                }
                 CONSOLE_PRINT("Read " + name + " with ai type " + QString::number(aiType) + " for player " + QString::number(i), GameConsole::eDEBUG);
-                m_pPlayerSelection->setPlayerAiName(i, name);
                 spGameMap pMap = m_pMapSelectionView->getCurrentMap();
                 Player* pPlayer = pMap->getPlayer(i);
                 pPlayer->deserializeObject(stream);
-                pPlayer->setControlType(static_cast<GameEnums::AiTypes>(aiType));
-                if (aiType != GameEnums::AiTypes::AiTypes_Open &&
-                    aiType != GameEnums::AiTypes::AiTypes_Closed)
+                if (stream.status() != QDataStream::Ok)
                 {
-                    aiType = GameEnums::AiTypes::AiTypes_ProxyAi;
+                    return;
                 }
-                pPlayer->setBaseGameInput(BaseGameInputIF::createAi(pMap.get(), static_cast<GameEnums::AiTypes>(aiType)));
+                const auto serializedAiType = pPlayer->getControlType();
+                auto inputAiType = wireAiType;
+                if (wireAiType == GameEnums::AiTypes_ProxyAi)
+                {
+                    pPlayer->setControlType(serializedAiType);
+                }
+                else
+                {
+                    pPlayer->setControlType(wireAiType);
+                    if (wireAiType != GameEnums::AiTypes_Open &&
+                        wireAiType != GameEnums::AiTypes_Closed)
+                    {
+                        inputAiType = GameEnums::AiTypes_ProxyAi;
+                    }
+                }
+                m_pPlayerSelection->setPlayerAiName(i, name);
+                pPlayer->setBaseGameInput(BaseGameInputIF::createAi(pMap.get(), inputAiType));
                 pPlayer->setPlayerNameId(name);
                 m_pPlayerSelection->updatePlayerData(i);
             }

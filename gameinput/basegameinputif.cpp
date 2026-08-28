@@ -2,6 +2,7 @@
 
 #include "gameinput/humanplayerinput.h"
 #include "gameinput/basegameinputif.h"
+#include "gameinput/moveplannerinput.h"
 
 #include "ai/veryeasyai.h"
 #include "ai/proxyai.h"
@@ -71,26 +72,20 @@ void BaseGameInputIF::serializeInterface(QDataStream& pStream, BaseGameInputIF* 
 spBaseGameInputIF BaseGameInputIF::deserializeInterface(GameMap* pMap, QDataStream& pStream, qint32 version)
 {
     CONSOLE_PRINT("reading ai", GameConsole::eDEBUG);
-    spBaseGameInputIF ret;
-    if (version > 7)
+    qint32 typeInt = 0;
+    pStream >> typeInt;
+    const auto type = static_cast<GameEnums::AiTypes>(typeInt);
+    if (pStream.status() != QDataStream::Ok ||
+        !GameManager::getInstance()->isKnownAiType(type))
     {
-        GameEnums::AiTypes type;
-        qint32 typeInt;
-        pStream >> typeInt;
-        type = static_cast<GameEnums::AiTypes>(typeInt);
-        ret = createAi(pMap, type);
-        if (ret.get() != nullptr)
-        {
-            ret->deserializeObject(pStream);
-        }
+        pStream.setStatus(QDataStream::ReadCorruptData);
+        return {};
     }
-    else
+
+    spBaseGameInputIF ret = createAi(pMap, type);
+    if (version > 7 && ret.get() != nullptr)
     {
-        GameEnums::AiTypes type;
-        qint32 typeInt;
-        pStream >> typeInt;
-        type = static_cast<GameEnums::AiTypes>(typeInt);
-        ret = createAi(pMap, type);
+        ret->deserializeObject(pStream);
     }
     return ret;
 }
@@ -177,6 +172,11 @@ spBaseGameInputIF BaseGameInputIF::createAi(GameMap* pMap, GameEnums::AiTypes ty
         ret = MemoryManagement::create<ProxyAi>(pMap);
         break;
     }
+    case GameEnums::AiTypes_MovePlanner:
+    {
+        ret = MemoryManagement::create<MoveplannerInput>(pMap);
+        break;
+    }
     case GameEnums::AiTypes_DummyAi:
     {
         ret = MemoryManagement::create<DummyAi>(pMap, type);
@@ -190,6 +190,12 @@ spBaseGameInputIF BaseGameInputIF::createAi(GameMap* pMap, GameEnums::AiTypes ty
     }
     default: // heavy ai case
     {
+        GameManager* pGameManager = GameManager::getInstance();
+        if (!pGameManager->isHeavyAiType(type))
+        {
+            CONSOLE_PRINT("Rejected unknown AI type " + QString::number(type), GameConsole::eERROR);
+            break;
+        }
         if (Settings::getInstance()->getSpawnAiProcess() &&
             !Settings::getInstance()->getAiSlave())
         {
@@ -197,8 +203,8 @@ spBaseGameInputIF BaseGameInputIF::createAi(GameMap* pMap, GameEnums::AiTypes ty
         }
         else
         {
-            GameManager* pGameManager = GameManager::getInstance();
-            QString id = pGameManager->getHeavyAiID(static_cast<qint32>(type) - GameEnums::AiTypes_Heavy);
+            const qint32 index = *GameManager::getHeavyAiIndex(type);
+            QString id = pGameManager->getHeavyAiID(index);
             ret = MemoryManagement::create<HeavyAi>(pMap, id, type);
         }
         break;

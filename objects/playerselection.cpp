@@ -1804,7 +1804,14 @@ void PlayerSelection::requestPlayer(quint64 socketID, QDataStream &stream)
         stream >> aiType;
         bool serverRequest = false;
         stream >> serverRequest;
-        GameEnums::AiTypes eAiType = static_cast<GameEnums::AiTypes>(aiType);
+        const auto eAiType = static_cast<GameEnums::AiTypes>(aiType);
+        if (stream.status() != QDataStream::Ok ||
+            !GameManager::getInstance()->isKnownAiType(eAiType))
+        {
+            stream.setStatus(QDataStream::ReadCorruptData);
+            CONSOLE_PRINT("Rejected invalid requested AI type " + QString::number(aiType), GameConsole::eERROR);
+            return;
+        }
         CONSOLE_PRINT("Requesting player " + QString::number(player) + " for username " + username + " as ai " + QString::number(eAiType) + " for socket " + QString::number(socketID), GameConsole::eDEBUG);
         bool rejoin = false;
         if (player < 0)
@@ -1824,9 +1831,7 @@ void PlayerSelection::requestPlayer(quint64 socketID, QDataStream &stream)
                 else if (Mainapp::getSlave() &&
                          pPlayer->getSocketId() == 0 &&
                          pPlayer->getBaseGameInput() != nullptr &&
-                         pPlayer->getControlType() > GameEnums::AiTypes::AiTypes_Human &&
-                         pPlayer->getControlType() != GameEnums::AiTypes::AiTypes_Open &&
-                         pPlayer->getControlType() != GameEnums::AiTypes::AiTypes_Closed)
+                         isComputerAiType(pPlayer->getControlType()))
                 {
                     CONSOLE_PRINT("Slave player " + QString::number(i) + " ai " + pPlayer->getPlayerNameId() + " control type " + QString::number(pPlayer->getControlType()) + " transferred control to socket " + QString::number(socketID), GameConsole::eDEBUG);
                     remoteChangePlayerOwner(socketID, pPlayer->getPlayerNameId(), i, pPlayer->getControlType(), true, true);
@@ -1854,9 +1859,7 @@ void PlayerSelection::requestPlayer(quint64 socketID, QDataStream &stream)
                             CONSOLE_PRINT("Player is " + QString::number(i) + " is currently owned by username " + pPlayer->getPlayerNameId() + " and socket " + QString::number(pPlayer->getSocketId()), GameConsole::eDEBUG);
                             // an ai slot transferred to this socket must not block its own seat request
                             bool ownAiSlot = pPlayer->getSocketId() == socketID &&
-                                             pPlayer->getControlType() > GameEnums::AiTypes::AiTypes_Human &&
-                                             pPlayer->getControlType() != GameEnums::AiTypes::AiTypes_Open &&
-                                             pPlayer->getControlType() != GameEnums::AiTypes::AiTypes_Closed;
+                                             isComputerAiType(pPlayer->getControlType());
                             if (!ownAiSlot &&
                                 (pPlayer->getSocketId() == socketID ||
                                  pPlayer->getPlayerNameId() == username))
@@ -2058,21 +2061,25 @@ void PlayerSelection::changePlayer(quint64 socketId, QDataStream &stream)
         stream >> player;
         stream >> aiType;
         stream >> setup;
+        const auto originalAiType = static_cast<GameEnums::AiTypes>(aiType);
+        if (stream.status() != QDataStream::Ok ||
+            !GameManager::getInstance()->isKnownAiType(originalAiType))
+        {
+            stream.setStatus(QDataStream::ReadCorruptData);
+            CONSOLE_PRINT("Rejected invalid player change AI type " + QString::number(aiType), GameConsole::eERROR);
+            return;
+        }
         CONSOLE_PRINT("Remote change of Player " + QString::number(player) + " with name " + name + " for socket " + QString::number(socket) + " and ai " + QString::number(aiType) + " in setup " + QString::number(setup), GameConsole::eDEBUG);
         if (socket != m_pNetworkInterface->getSocketID() ||
             aiType != GameEnums::AiTypes::AiTypes_ProxyAi)
         {
-            GameEnums::AiTypes originalAiType = static_cast<GameEnums::AiTypes>(aiType);
             if (player >= 0 && player < m_playerSockets.size() && m_pMap != nullptr)
             {
-                if (aiType != GameEnums::AiTypes::AiTypes_Open &&
-                    aiType != GameEnums::AiTypes::AiTypes_Closed)
+                quint64 playerSocket = socket;
+                if (aiType == GameEnums::AiTypes::AiTypes_Open ||
+                    aiType == GameEnums::AiTypes::AiTypes_Closed)
                 {
-                    m_playerSockets[player] = socket;
-                }
-                else
-                {
-                    m_playerSockets[player] = 0;
+                    playerSocket = 0;
                     name = getNameFromAiType(static_cast<GameEnums::AiTypes>(aiType));
                 }
                 if (Mainapp::getSlave())
@@ -2106,8 +2113,13 @@ void PlayerSelection::changePlayer(quint64 socketId, QDataStream &stream)
                     CONSOLE_PRINT("Remapped change of Player " + QString::number(player) + " with name " + name + " for socket " + QString::number(socket) + " and ai " + QString::number(aiType) + " after validation. Orignal ai " + QString::number(originalAiType), GameConsole::eDEBUG);
                 }
                 GameEnums::AiTypes eAiType = static_cast<GameEnums::AiTypes>(aiType);
-                setPlayerAi(player, eAiType, name);
                 m_pMap->getPlayer(player)->deserializeObject(stream);
+                if (stream.status() != QDataStream::Ok)
+                {
+                    return;
+                }
+                m_playerSockets[player] = playerSocket;
+                setPlayerAi(player, eAiType, name);
                 m_pMap->getPlayer(player)->setBaseGameInput(BaseGameInputIF::createAi(m_pMap, eAiType));
                 m_pMap->getPlayer(player)->setPlayerNameId(name);
                 m_pMap->getPlayer(player)->setControlType(originalAiType);
@@ -2635,9 +2647,11 @@ void PlayerSelection::setPlayerReady(bool value)
     const quint64 localSocketID = m_pNetworkInterface->getIsServer() ? 0 : m_pNetworkInterface->getSocketID();
     for (qint32 i = 0; i < m_pMap->getPlayerCount(); i++)
     {
+        const auto controlType = m_pMap->getPlayer(i)->getControlType();
         if (m_playerSockets[i] == localSocketID &&
-            m_pMap->getPlayer(i)->getControlType() >= GameEnums::AiTypes_Human &&
-            m_pMap->getPlayer(i)->getControlType() != GameEnums::AiTypes_Open)
+            (controlType == GameEnums::AiTypes_Human ||
+             controlType == GameEnums::AiTypes_Closed ||
+             isComputerAiType(controlType)))
         {
             m_playerReadyFlags[i] = value;
             Checkbox *pCheckbox = getCastedObject<Checkbox>(OBJECT_READY_PREFIX + QString::number(i));

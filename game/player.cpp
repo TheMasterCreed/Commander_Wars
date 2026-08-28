@@ -18,6 +18,7 @@
 
 #include "menue/gamemenue.h"
 
+#include "resource_management/gamemanager.h"
 #include "resource_management/unitspritemanager.h"
 
 oxygine::spResAnim Player::m_neutralTableAnim;
@@ -2429,7 +2430,13 @@ void Player::deserializer(QDataStream& pStream, bool fast)
         if (version > 4)
         {
             pStream >> m_isDefeated;
-            m_pBaseGameInput = BaseGameInputIF::deserializeInterface(m_pMap, pStream, version);
+            spBaseGameInputIF pBaseGameInput =
+                BaseGameInputIF::deserializeInterface(m_pMap, pStream, version);
+            if (pStream.status() != QDataStream::Ok)
+            {
+                return;
+            }
+            m_pBaseGameInput = pBaseGameInput;
             if (m_pBaseGameInput.get() != nullptr)
             {
                 m_pBaseGameInput->setPlayer(this);
@@ -2588,9 +2595,16 @@ void Player::deserializer(QDataStream& pStream, bool fast)
     }
     if (version > 16)
     {
-        qint32 type;
-        pStream >> type;
-        m_controlType = static_cast<GameEnums::AiTypes>(type);
+        qint32 typeInt = 0;
+        pStream >> typeInt;
+        const auto type = static_cast<GameEnums::AiTypes>(typeInt);
+        if (pStream.status() != QDataStream::Ok ||
+            !GameManager::getInstance()->isKnownAiType(type))
+        {
+            pStream.setStatus(QDataStream::ReadCorruptData);
+            return;
+        }
+        m_controlType = type;
     }
     else
     {
