@@ -13,6 +13,12 @@
 
 const char* const GameAction::INPUTSTEP_FIELD = "FIELD";
 const char* const GameAction::INPUTSTEP_MENU = "MENU";
+static constexpr quint32 ACTION_SEED_BOUND = std::numeric_limits<quint32>::max();
+
+#ifdef COW_ACTION_SEED_TESTING
+QRandomGenerator GameAction::m_pinnedSeedGenerator;
+bool GameAction::m_actionSeedsPinned{false};
+#endif
 
 namespace
 {
@@ -40,11 +46,11 @@ GameAction::GameAction(GameMap* pMap)
     Interpreter::setCppOwnerShip(this);
     setupJsThis(this);
     m_buffer.open(QIODevice::ReadWrite);
-    m_seed = QRandomGenerator::global()->bounded(std::numeric_limits<quint32>::max());
+    m_seed = nextActionSeed();
 }
 
 GameAction::GameAction(const QString & actionID, GameMap* pMap)
-    : GameAction(actionID, pMap, QRandomGenerator::global()->bounded(std::numeric_limits<quint32>::max()))
+    : GameAction(actionID, pMap, nextActionSeed())
 {
 }
 
@@ -61,6 +67,35 @@ GameAction::GameAction(const QString & actionID, GameMap* pMap, quint32 seed)
     Interpreter::setCppOwnerShip(this);
     setupJsThis(this);
     m_buffer.open(QIODevice::ReadWrite);
+}
+
+#ifdef COW_ACTION_SEED_TESTING
+void GameAction::pinActionSeeds(quint32 masterSeed)
+{
+    m_pinnedSeedGenerator.seed(masterSeed);
+    m_actionSeedsPinned = true;
+}
+
+void GameAction::unpinActionSeeds()
+{
+    m_actionSeedsPinned = false;
+}
+
+bool GameAction::getActionSeedsPinned()
+{
+    return m_actionSeedsPinned;
+}
+#endif
+
+quint32 GameAction::nextActionSeed()
+{
+#ifdef COW_ACTION_SEED_TESTING
+    if (m_actionSeedsPinned)
+    {
+        return m_pinnedSeedGenerator.bounded(ACTION_SEED_BOUND);
+    }
+#endif
+    return QRandomGenerator::global()->bounded(ACTION_SEED_BOUND);
 }
 
 void GameAction::setSeed(quint32 seed)

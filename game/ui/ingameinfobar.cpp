@@ -80,6 +80,10 @@ IngameInfoBar::IngameInfoBar(GameMenue *pMenu, GameMap *pMap)
 
 void IngameInfoBar::updatePlayerInfo()
 {
+    if (Mainapp::getInstance()->getNoUi())
+    {
+        return;
+    }
     Mainapp::getInstance()->pauseRendering();
     Interpreter * pInterpreter = Interpreter::getInstance();
     QJSValueList args({m_jsThis,
@@ -107,6 +111,10 @@ void IngameInfoBar::updateCursorInfo(qint32 x, qint32 y)
 
 void IngameInfoBar::updateTerrainInfo(qint32 x, qint32 y, bool update)
 {
+    if (Mainapp::getInstance()->getNoUi())
+    {
+        return;
+    }
     if (m_pMap != nullptr && m_pMap->onMap(x, y))
     {
         if (m_LastX != x || m_LastY != y || update)

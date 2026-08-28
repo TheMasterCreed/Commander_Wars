@@ -1404,9 +1404,12 @@ if (BUILD_TESTING)
         tests/arena/arenamatchrunner.h
         tests/arena/arenatestsupport.cpp
         tests/arena/arenatestsupport.h
+        tests/arena/actionseedprobe.cpp
+        tests/arena/actionseedprobe.h
         tests/arena/capturebonusprobe.cpp
         tests/arena/capturebonusprobe.h
     )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
     )
@@ -1519,6 +1522,30 @@ if (BUILD_TESTING)
     )
     set_tests_properties(ArenaCaptureBonusPurity PROPERTIES TIMEOUT 120)
     cow_set_arena_test_path(ArenaCaptureBonusPurity)
+
+    set(ARENA_ACTION_SEED_RUN_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/action_seed
+    )
+    file(MAKE_DIRECTORY ${ARENA_ACTION_SEED_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/action_seed_init.js
+        ${ARENA_ACTION_SEED_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaActionSeedDeterminism
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_ACTION_SEED_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaActionSeedDeterminism PROPERTIES TIMEOUT 120)
+    cow_set_arena_test_path(ArenaActionSeedDeterminism)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})

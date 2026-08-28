@@ -6,6 +6,7 @@
 #include <QVector>
 #include <QBuffer>
 #include <QDataStream>
+#include <QRandomGenerator>
 
 #include "gameinput/menudata.h"
 #include "gameinput/markedfielddata.h"
@@ -82,6 +83,11 @@ public:
     explicit GameAction(const QString & actionID, GameMap* pMap);
     explicit GameAction(const QString & actionID, GameMap* pMap, quint32 seed);
     virtual ~GameAction() = default;
+#ifdef COW_ACTION_SEED_TESTING
+    static void pinActionSeeds(quint32 masterSeed);
+    static void unpinActionSeeds();
+    static bool getActionSeedsPinned();
+#endif
     /**
      * @brief setTarget sets the target for the current action
      * @param point
@@ -435,6 +441,12 @@ public:
 protected:
     void printAction();
 private:
+    static quint32 nextActionSeed();
+#ifdef COW_ACTION_SEED_TESTING
+    static QRandomGenerator m_pinnedSeedGenerator;
+    static bool m_actionSeedsPinned;
+#endif
+
     QString m_actionID;
     /**
      * @brief m_target unit, building on which we perfom the action
