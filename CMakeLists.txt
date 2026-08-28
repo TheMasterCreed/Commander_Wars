@@ -826,6 +826,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/attackopportunitybuilder.h ai/coordinator/attackopportunitybuilder.cpp
     ai/coordinator/propertyeconomics.h
     ai/coordinator/propertyeconomicsbuilder.h ai/coordinator/propertyeconomicsbuilder.cpp
+    ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1496,6 +1497,7 @@ if (BUILD_TESTING)
         tests/arena/attackfactsprobe.h
         tests/arena/propertyfactsprobe.cpp
         tests/arena/propertyfactsprobe.h
+        tests/coordinator_ai/damageoracletests.cpp
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
@@ -1834,6 +1836,11 @@ if (BUILD_TESTING)
     cow_add_coordinated_shell_test(
         ArenaCoordinatedShellPauseFallback
         coordinatedShellPauseFallback
+    )
+    add_custom_target(CoordinatorAiDamageOracleTests DEPENDS ${PROJECT_NAME})
+    cow_add_coordinated_shell_test(
+        CoordinatorAiDamageOracleTests
+        damageOracle
     )
 
     set(ARENA_AI_CHOICE_RUN_DIR
