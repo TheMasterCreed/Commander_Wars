@@ -822,6 +822,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/economicledger.h
     ai/coordinator/terminalvalue.h
     ai/coordinator/ownershipschedule.h
+    ai/coordinator/bundlevaluation.h
     ai/coordinator/turnplan.h
     ai/coordinator/mobilityfield.h
     ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
@@ -1405,6 +1406,24 @@ if (BUILD_TESTING)
         COMMAND CoordinatorAiTurnPlanTests
     )
     cow_set_arena_test_path(CoordinatorAiTurnPlanTests)
+
+    add_executable(CoordinatorAiBundleValuationTests
+        tests/coordinator_ai/bundlevaluationtests.cpp
+    )
+    target_include_directories(CoordinatorAiBundleValuationTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiBundleValuationTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiBundleValuationTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiBundleValuationTests
+        COMMAND CoordinatorAiBundleValuationTests
+    )
+    cow_set_arena_test_path(CoordinatorAiBundleValuationTests)
 
     add_executable(CoordinatorAiMobilityFieldTests
         tests/coordinator_ai/mobilityfieldtests.cpp
