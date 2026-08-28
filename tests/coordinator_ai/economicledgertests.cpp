@@ -1,14 +1,23 @@
+#include <array>
 #include <cstdint>
 
 #include "ai/coordinator/economicledger.h"
+#include "ai/coordinator/ownershipschedule.h"
 
 namespace
 {
     using Coordinator::CapitalPolicy;
     using Coordinator::divideRoundHalfAwayFromZero;
     using Coordinator::EconomicDelta;
+    using Coordinator::incomeSwing;
     using Coordinator::MilliFunds;
+    using Coordinator::mirroredSign;
+    using Coordinator::OwnershipInterval;
+    using Coordinator::OwnerSign;
+    using Coordinator::PropertyIncome;
     using Coordinator::ReplacementCostPolicy;
+    using Coordinator::scheduleIncome;
+    using Coordinator::scheduleTurns;
     using Coordinator::toMilliFunds;
     using Coordinator::UNIT_HP_STEPS;
 
@@ -146,6 +155,68 @@ namespace
     static_assert(KILL_TRADE.mirrored().friendlyCapital == -KILL_TRADE.enemyCapital);
     static_assert(KILL_TRADE.mirrored().enemyCapital == -KILL_TRADE.friendlyCapital);
     static_assert(KILL_TRADE.mirrored() != -KILL_TRADE);
+
+    constexpr MilliFunds SYMMETRIC_RATE = toMilliFunds(1000);
+    constexpr PropertyIncome SYMMETRIC_INCOME{
+        .oursPerTurn = SYMMETRIC_RATE,
+        .enemyPerTurn = SYMMETRIC_RATE,
+    };
+    constexpr MilliFunds OUR_ASYMMETRIC_RATE = toMilliFunds(1200);
+    constexpr MilliFunds ENEMY_ASYMMETRIC_RATE = toMilliFunds(800);
+    constexpr PropertyIncome ASYMMETRIC_INCOME{
+        .oursPerTurn = OUR_ASYMMETRIC_RATE,
+        .enemyPerTurn = ENEMY_ASYMMETRIC_RATE,
+    };
+    constexpr std::int64_t HORIZON_TURNS = 8;
+    constexpr std::int64_t DELAY_TURNS = 3;
+
+    constexpr MilliFunds NEUTRAL_CAPTURE_SWING =
+        incomeSwing(SYMMETRIC_INCOME, HORIZON_TURNS, OwnerSign::Neutral, OwnerSign::Ours);
+    constexpr MilliFunds ENEMY_CAPTURE_SWING =
+        incomeSwing(SYMMETRIC_INCOME, HORIZON_TURNS, OwnerSign::Enemy, OwnerSign::Ours);
+
+    static_assert(NEUTRAL_CAPTURE_SWING == SYMMETRIC_RATE * HORIZON_TURNS);
+    static_assert(ENEMY_CAPTURE_SWING == 2 * NEUTRAL_CAPTURE_SWING);
+    static_assert(incomeSwing(SYMMETRIC_INCOME, HORIZON_TURNS, OwnerSign::Ours, OwnerSign::Ours) == 0);
+
+    static_assert(incomeSwing(ASYMMETRIC_INCOME, HORIZON_TURNS, OwnerSign::Enemy, OwnerSign::Ours) ==
+                  (OUR_ASYMMETRIC_RATE + ENEMY_ASYMMETRIC_RATE) * HORIZON_TURNS);
+    static_assert(incomeSwing(ASYMMETRIC_INCOME.mirrored(), HORIZON_TURNS,
+                              mirroredSign(OwnerSign::Enemy), mirroredSign(OwnerSign::Ours)) ==
+                  -incomeSwing(ASYMMETRIC_INCOME, HORIZON_TURNS, OwnerSign::Enemy, OwnerSign::Ours));
+
+    constexpr std::array<OwnershipInterval, 2> DELAYED_LOSS_OF_OURS{
+        OwnershipInterval{OwnerSign::Ours, DELAY_TURNS},
+        OwnershipInterval{OwnerSign::Enemy, HORIZON_TURNS - DELAY_TURNS},
+    };
+    constexpr std::array<OwnershipInterval, 2> DELAYED_LOSS_OF_NEUTRAL{
+        OwnershipInterval{OwnerSign::Neutral, DELAY_TURNS},
+        OwnershipInterval{OwnerSign::Enemy, HORIZON_TURNS - DELAY_TURNS},
+    };
+    constexpr std::array<OwnershipInterval, 1> IMMEDIATE_LOSS{
+        OwnershipInterval{OwnerSign::Enemy, HORIZON_TURNS},
+    };
+
+    static_assert(scheduleTurns(DELAYED_LOSS_OF_OURS) == HORIZON_TURNS);
+    static_assert(scheduleTurns(DELAYED_LOSS_OF_NEUTRAL) == HORIZON_TURNS);
+    static_assert(scheduleTurns(IMMEDIATE_LOSS) == HORIZON_TURNS);
+
+    constexpr MilliFunds PRESERVED_BY_DELAYING_OURS =
+        scheduleIncome(SYMMETRIC_INCOME, DELAYED_LOSS_OF_OURS) - scheduleIncome(SYMMETRIC_INCOME, IMMEDIATE_LOSS);
+    constexpr MilliFunds PRESERVED_BY_DELAYING_NEUTRAL =
+        scheduleIncome(SYMMETRIC_INCOME, DELAYED_LOSS_OF_NEUTRAL) - scheduleIncome(SYMMETRIC_INCOME, IMMEDIATE_LOSS);
+
+    static_assert(PRESERVED_BY_DELAYING_OURS == 2 * PRESERVED_BY_DELAYING_NEUTRAL);
+    static_assert(PRESERVED_BY_DELAYING_OURS ==
+                  incomeSwing(SYMMETRIC_INCOME, DELAY_TURNS, OwnerSign::Enemy, OwnerSign::Ours));
+
+    constexpr std::array<OwnershipInterval, 2> MIRRORED_DELAYED_LOSS{
+        OwnershipInterval{mirroredSign(OwnerSign::Ours), DELAY_TURNS},
+        OwnershipInterval{mirroredSign(OwnerSign::Enemy), HORIZON_TURNS - DELAY_TURNS},
+    };
+
+    static_assert(scheduleIncome(ASYMMETRIC_INCOME.mirrored(), MIRRORED_DELAYED_LOSS) ==
+                  -scheduleIncome(ASYMMETRIC_INCOME, DELAYED_LOSS_OF_OURS));
 
     constexpr std::int64_t EVEN_DENOMINATOR = UNIT_HP_STEPS;
     constexpr std::int64_t EVEN_DOWN_NUMERATOR = 24;
