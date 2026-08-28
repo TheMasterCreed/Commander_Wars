@@ -5,6 +5,29 @@
 
 #include "game/gamemap.h"
 
+namespace
+{
+    // The loaded unit index lives in the menu action id, not in the cost list, which feeds transport fuel.
+    qint32 loadedUnitIndex(const QStringList & actions, qint32 menuItem, qint32 loadedUnitCount)
+    {
+        bool ok = false;
+        const qint32 index = actions[menuItem].toInt(&ok);
+        return UnloadSelection::resolveLoadedIndex(ok, index, menuItem, loadedUnitCount);
+    }
+
+    // Marked field data is the raw list minus the tiles this action already took, in raw order, so both stay aligned.
+    void removeUsedFields(QList<QVariant> & fields, const std::vector<QPoint> & usedFields)
+    {
+        for (qint32 i = fields.size() - 1; i >= 0; --i)
+        {
+            if (GlobalUtils::contains(usedFields, fields[i].toPoint()))
+            {
+                fields.removeAt(i);
+            }
+        }
+    }
+}
+
 TransporterSelector::TransporterSelector(CoreAI & owner)
     : m_owner(owner)
 {
@@ -14,21 +37,22 @@ void TransporterSelector::prepareUnloadInformation(spGameAction &pAction, Unit *
 {
     bool unloaded = false;
     std::vector<qint32> unloadedUnits;
+    std::vector<QPoint> usedFields;
     do
     {
         unloaded = false;
         spMenuData pDataMenu = pAction->getMenuStepData();
-        QVector<qint32> unitIDx = pDataMenu->getCostList();
+        QVector<qint32> costs = pDataMenu->getCostList();
         if (pDataMenu->validData())
         {
             QStringList actions = pDataMenu->getActionIDs();
-            std::vector<QList<QVariant>> unloadFields = getUnloadFields(pAction, unitIDx, pDataMenu);
+            std::vector<QList<QVariant>> unloadFields = getUnloadFields(pAction, pUnit, actions, usedFields);
             if (actions.size() > 1)
             {
-                unloaded = fillUnloadFields(pAction, pUnit, unloadedUnits, unloadFields, unitIDx, actions);
+                unloaded = fillUnloadFields(pAction, pUnit, unloadedUnits, unloadFields, costs, actions, usedFields);
                 if (unloaded == false)
                 {
-                    unloaded = fallbackUnload(pAction, pUnit, pEnemyUnits, pDataMenu, actions);
+                    unloaded = fallbackUnload(pAction, pUnit, pEnemyUnits, pDataMenu, actions, usedFields);
                 }
             }
         }
@@ -41,75 +65,104 @@ void TransporterSelector::prepareUnloadInformation(spGameAction &pAction, Unit *
     m_owner.addMenuItemData(pAction, CoreAI::ACTION_WAIT, 0);
 }
 
-std::vector<QList<QVariant>> TransporterSelector::getUnloadFields(spGameAction &pAction, QVector<qint32> & unitIDx, spMenuData & pDataMenu)
+std::vector<QList<QVariant>> TransporterSelector::getUnloadFields(spGameAction &pAction, Unit *pUnit, QStringList & actions,
+                                                                  const std::vector<QPoint> & usedFields)
 {
     Interpreter *pInterpreter = Interpreter::getInstance();
     std::vector<QList<QVariant>> unloadFields;
-    for (qint32 i = 0; i < unitIDx.size() - 1; i++)
+    const qint32 loadedUnitCount = pUnit->getLoadedUnitCount();
+    // the trailing menu entry is the wait item and has no loaded unit behind it
+    for (qint32 i = 0; i < actions.size() - 1; i++)
     {
         QString function1 = "getUnloadFields";
         QJSValueList args({
             JsThis::getJsThis(pAction.get()),
-            unitIDx[i],
+            loadedUnitIndex(actions, i, loadedUnitCount),
             GameMap::getMapJsThis(m_owner.getMap()),
         });
         QJSValue ret = pInterpreter->doFunction(CoreAI::ACTION_UNLOAD, function1, args);
-        unloadFields.push_back(ret.toVariant().toList());
+        QList<QVariant> fields = ret.toVariant().toList();
+        removeUsedFields(fields, usedFields);
+        unloadFields.push_back(fields);
     }
     return unloadFields;
 }
 
-bool TransporterSelector::fillUnloadFields(spGameAction &pAction, Unit *pUnit, std::vector<qint32> & unloadedUnits,
-                                           std::vector<QList<QVariant>> & unloadFields, QVector<qint32> & unitIDx,
-                                           QStringList & actions)
+qint32 TransporterSelector::findEnemyBuildingField(const QList<QVariant> & fields)
 {
-    bool unloaded = false;
-    for (qint32 i = 0; i < unloadFields.size(); i++)
+    for (qint32 i = 0; i < fields.size(); ++i)
     {
-        Unit *pLoadedUnit = pUnit->getLoadedUnit(i);
-        if (!m_owner.needsRefuel(pLoadedUnit))
+        const QPoint unloadField = fields[i].toPoint();
+        Terrain* pTerrain = m_owner.getMap()->getTerrain(unloadField.x(), unloadField.y());
+        Building *pBuilding = pTerrain->getBuilding();
+        if (pBuilding != nullptr && m_owner.getPlayer()->isEnemy(pBuilding->getOwner()))
         {
-            if (!GlobalUtils::contains(unloadedUnits, unitIDx[i]))
-            {
-                if (unloadFields[i].size() == 1)
-                {
-                    m_owner.addMenuItemData(pAction, actions[i], unitIDx[i]);
-                    spMarkedFieldData pFields = pAction->getMarkedFieldStepData();
-                    m_owner.addSelectedFieldData(pAction, pFields->getPoints()->at(0));
-                    unloaded = true;
-                    unloadedUnits.push_back(unitIDx[i]);
-                    break;
-                }
-                else if (unloadFields[i].size() > 0 &&
-                           pUnit->getLoadedUnit(i)->getActionList().contains(CoreAI::ACTION_CAPTURE))
-                {
-                    auto &fields = unloadFields[i];
-                    for (auto &field : fields)
-                    {
-                        QPoint unloadField = field.toPoint();
-                        Terrain* pTerrain = m_owner.getMap()->getTerrain(unloadField.x(), unloadField.y());
-                        Building *pBuilding = pTerrain->getBuilding();
-                        if (pBuilding != nullptr && m_owner.getPlayer()->isEnemy(pBuilding->getOwner()))
-                        {
-                            m_owner.addMenuItemData(pAction, actions[i], unitIDx[i]);
-                            m_owner.addSelectedFieldData(pAction, unloadField);
-                            unloaded = true;
-                            unloadedUnits.push_back(unitIDx[i]);
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
+            return i;
         }
     }
-    return unloaded;
+    return UnloadSelection::NO_FIELD;
 }
 
-bool TransporterSelector::fallbackUnload(spGameAction &pAction, Unit *pUnit, spQmlVectorUnit &pEnemyUnits, spMenuData & pDataMenu, QStringList & actions)
+std::vector<UnloadSelection::Candidate> TransporterSelector::buildCandidates(Unit *pUnit, const std::vector<QList<QVariant>> & unloadFields,
+                                                                             const QStringList & actions)
+{
+    std::vector<UnloadSelection::Candidate> candidates;
+    candidates.reserve(unloadFields.size());
+    const qint32 loadedUnitCount = pUnit->getLoadedUnitCount();
+    for (qint32 i = 0; i < static_cast<qint32>(unloadFields.size()); ++i)
+    {
+        UnloadSelection::Candidate candidate;
+        candidate.loadedIndex = loadedUnitIndex(actions, i, loadedUnitCount);
+        Unit *pLoadedUnit = pUnit->getLoadedUnit(candidate.loadedIndex);
+        // an entry without a loaded unit keeps its slot so choices stay menu aligned, and stays unselectable
+        if (pLoadedUnit != nullptr)
+        {
+            candidate.needsRefuel = m_owner.needsRefuel(pLoadedUnit);
+            candidate.canCapture = pLoadedUnit->getActionList().contains(CoreAI::ACTION_CAPTURE);
+            candidate.fieldCount = static_cast<qint32>(unloadFields[i].size());
+            if (candidate.canCapture && candidate.fieldCount > 0)
+            {
+                candidate.enemyBuildingField = findEnemyBuildingField(unloadFields[i]);
+            }
+        }
+        candidates.push_back(candidate);
+    }
+    return candidates;
+}
+
+bool TransporterSelector::fillUnloadFields(spGameAction &pAction, Unit *pUnit, std::vector<qint32> & unloadedUnits,
+                                           std::vector<QList<QVariant>> & unloadFields, QVector<qint32> & costs,
+                                           QStringList & actions, std::vector<QPoint> & usedFields)
+{
+    const std::vector<UnloadSelection::Candidate> candidates = buildCandidates(pUnit, unloadFields, actions);
+    const UnloadSelection::Choice choice = UnloadSelection::select(candidates, unloadedUnits);
+    if (choice.source == UnloadSelection::FieldSource::None)
+    {
+        return false;
+    }
+    m_owner.addMenuItemData(pAction, actions[choice.candidate], costs[choice.candidate]);
+    QPoint unloadField;
+    if (choice.source == UnloadSelection::FieldSource::MarkedFieldData)
+    {
+        spMarkedFieldData pFields = pAction->getMarkedFieldStepData();
+        unloadField = pFields->getPoints()->at(choice.field);
+    }
+    else
+    {
+        unloadField = unloadFields[choice.candidate][choice.field].toPoint();
+    }
+    m_owner.addSelectedFieldData(pAction, unloadField);
+    usedFields.push_back(unloadField);
+    unloadedUnits.push_back(candidates[choice.candidate].loadedIndex);
+    return true;
+}
+
+bool TransporterSelector::fallbackUnload(spGameAction &pAction, Unit *pUnit, spQmlVectorUnit &pEnemyUnits, spMenuData & pDataMenu,
+                                         QStringList & actions, std::vector<QPoint> & usedFields)
 {
     bool unloaded = false;
-    if (!m_owner.needsRefuel(pUnit->getLoadedUnit(0)))
+    const qint32 loadedIndex = loadedUnitIndex(actions, 0, pUnit->getLoadedUnitCount());
+    if (!m_owner.needsRefuel(pUnit->getLoadedUnit(loadedIndex)))
     {
         qint32 costs = pDataMenu->getCostList()[0];
         m_owner.addMenuItemData(pAction, actions[0], costs);
@@ -136,7 +189,9 @@ bool TransporterSelector::fallbackUnload(spGameAction &pAction, Unit *pUnit, spQ
                 field = i;
             }
         }
-        m_owner.addSelectedFieldData(pAction, pFields->getPoints()->at(field));
+        const QPoint unloadField = pFields->getPoints()->at(field);
+        m_owner.addSelectedFieldData(pAction, unloadField);
+        usedFields.push_back(unloadField);
     }
     return unloaded;
 }
