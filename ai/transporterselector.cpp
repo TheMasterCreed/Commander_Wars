@@ -130,7 +130,7 @@ bool TransporterSelector::fallbackUnload(spGameAction &pAction, Unit *pUnit, spQ
                 }
             }
             if (currentBestDistance < bestDistance ||
-                (currentBestDistance == bestDistance && GlobalUtils::randInt(0, 1) == 1))
+                (currentBestDistance == bestDistance && m_owner.randomInt(0, 1) == 1))
             {
                 bestDistance = currentBestDistance;
                 field = i;

@@ -247,7 +247,11 @@ spGameAction CaptureBuildingSelector::getPerformingAction(TargetBuildings & capt
         else
         {
             qint32 cost = 0;
-            QPoint rocketTarget = m_owner.getPlayer()->getSiloRockettarget(2, 3, cost);
+            CoreAI::AiRandomScope randomScope(m_owner);
+            QPoint rocketTarget = m_owner.getPlayer()->getSiloRockettarget(Player::DEFAULT_SILO_TARGET_RADIUS,
+                                                                          Player::DEFAULT_SILO_TARGET_DAMAGE,
+                                                                          cost,
+                                                                          randomScope.stream());
             m_owner.addSelectedFieldData(pAction, rocketTarget);
             pAction->setActionID(CoreAI::ACTION_MISSILE);
             if (pAction->canBePerformed())

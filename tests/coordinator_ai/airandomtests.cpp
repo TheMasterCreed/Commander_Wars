@@ -1,5 +1,8 @@
 #include "ai/airandom.h"
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QRandomGenerator>
 
 #include <array>
@@ -228,6 +231,36 @@ void testQtGlobalGeneratorIsolation()
 
     check(globalSnapshot == *QRandomGenerator::global(), "AiRandom leaves Qt global generator untouched");
 }
+
+QByteArray readSource(const QString & relativePath)
+{
+    QDir sourceRoot = QFileInfo(QString::fromUtf8(__FILE__)).absoluteDir();
+    sourceRoot.cdUp();
+    sourceRoot.cdUp();
+    QFile sourceFile(sourceRoot.filePath(relativePath));
+    check(sourceFile.open(QIODevice::ReadOnly),
+          relativePath.toStdString());
+    return sourceFile.readAll();
+}
+
+void testSelectorRouting()
+{
+    const QByteArray transporter = readSource(QStringLiteral("ai/transporterselector.cpp"));
+    check(transporter.contains("m_owner.randomInt(0, 1)"),
+          "transporter tie break uses the ai stream");
+    check(!transporter.contains("GlobalUtils::randInt(0, 1)"),
+          "transporter tie break bypasses the global stream");
+
+    const QByteArray capture = readSource(QStringLiteral("ai/capturebuildingselector.cpp"));
+    check(capture.contains("CoreAI::AiRandomScope randomScope(m_owner)"),
+          "capture selector borrows the ai stream");
+    check(capture.contains("randomScope.stream()"),
+          "capture selector forwards the ai stream");
+    check(capture.contains("Player::DEFAULT_SILO_TARGET_RADIUS"),
+          "capture selector preserves the silo radius");
+    check(capture.contains("Player::DEFAULT_SILO_TARGET_DAMAGE"),
+          "capture selector preserves the silo damage");
+}
 }
 
 int main()
@@ -237,5 +270,6 @@ int main()
     testBoundsAndCounterWrap();
     testSeedDerivation();
     testQtGlobalGeneratorIsolation();
+    testSelectorRouting();
     return failureCount == 0 ? 0 : 1;
 }
