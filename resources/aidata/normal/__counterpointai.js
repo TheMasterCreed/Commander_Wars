@@ -1,7 +1,7 @@
 ;var COUNTERPOINTAI =
 {
     // Reject persisted state from earlier strategy revisions.
-    STRATEGY_VERSION : 13,
+    STRATEGY_VERSION : 14,
     DOMAIN_GROUND : "ground",
     DOMAIN_AIR : "air",
     DOMAIN_NAVAL : "naval",
@@ -13,7 +13,7 @@
     ORDER_MODE_DAMAGE : "damage",
     ORDER_MODE_INVERSE : "inverse",
     PLANNER_STATE_VARIABLE_ID : "COUNTERPOINT_STATE",
-    PLANNER_STATE_SCHEMA_VERSION : 1,
+    PLANNER_STATE_SCHEMA_VERSION : 2,
     // Rejection sampling changes every seeded sequence.
     RNG_ALGORITHM_VERSION : 2,
     // Fallbacks paired with the tunable of the same name by _tunable, so an install carrying an
@@ -2250,6 +2250,7 @@
             typeof plan.allowCapperBorrow !== "boolean" ||
             typeof plan.forcedBuild !== "boolean" ||
             typeof plan.randomSurplusFunded !== "boolean" ||
+            typeof plan.executed !== "boolean" ||
             typeof plan.complete !== "boolean" ||
             !Array.isArray(plan.candidates) ||
             plan.candidates.length === 0 || plan.candidates.length > candidateLimit ||
@@ -2259,6 +2260,11 @@
             return false;
         }
         if (plan.strategicHold && (!plan.strategicHoldEligible || plan.skipped))
+        {
+            return false;
+        }
+        if (plan.executed &&
+            (!plan.complete || plan.selected < 0 || plan.skipped))
         {
             return false;
         }
@@ -2574,7 +2580,7 @@
     {
         return COUNTERPOINTAI._plannerStateFitsAfter(state, planIndex, function(plans)
             {
-                COUNTERPOINTAI._completePlan(plans, planIndex, spent);
+                COUNTERPOINTAI._recordSuccessfulBuild(plans, planIndex, spent);
             }) &&
             COUNTERPOINTAI._plannerStateFitsAfter(state, planIndex, function(plans)
             {
@@ -2851,6 +2857,7 @@
             order : [],
             rejected : rejected,
             selected : -1,
+            executed : false,
             complete : false
         };
         COUNTERPOINTAI._refreshPlanCostKinds(plan);
@@ -5651,6 +5658,7 @@
                 (cheapest < 0 || cheapest > plan.reservedBudget);
             if (plan.skipped !== true && (outsideSubset || fundedButUnaffordable))
             {
+                plan.executed = false;
                 plan.complete = true;
             }
         }
@@ -5823,6 +5831,7 @@
                 }
                 reclaimed += freed;
                 paidPlans[paidIndex].reservedBudget = 0;
+                paidPlans[paidIndex].executed = false;
                 paidPlans[paidIndex].complete = true;
             }
             else if (!paidPlans[paidIndex].complete &&
@@ -5938,6 +5947,12 @@
         COUNTERPOINTAI._releasePlanBudget(plans, planIndex, spent);
     },
 
+    _recordSuccessfulBuild : function(plans, planIndex, spent)
+    {
+        plans[planIndex].executed = true;
+        COUNTERPOINTAI._completePlan(plans, planIndex, spent);
+    },
+
     _abandonPlan : function(plans, planIndex)
     {
         var plan = plans[planIndex];
@@ -5948,6 +5963,7 @@
         plan.randomSurplusFunded = false;
         plan.available = false;
         plan.selected = -1;
+        plan.executed = false;
         COUNTERPOINTAI._completePlan(plans, planIndex, 0);
     },
 
@@ -6086,7 +6102,7 @@
         for (var index = 0; index < plans.length; ++index)
         {
             var plan = plans[index];
-            if (plan.complete === true && plan.selected >= 0 &&
+            if (plan.executed === true && plan.selected >= 0 &&
                 plan.candidates && plan.candidates[plan.selected] &&
                 plan.candidates[plan.selected][flag] === true)
             {
@@ -7366,7 +7382,7 @@
         var candidateIndex = plan.selected;
         if (succeeded === true)
         {
-            COUNTERPOINTAI._completePlan(
+            COUNTERPOINTAI._recordSuccessfulBuild(
                 state.plans,
                 planIndex,
                 plan.candidates[candidateIndex].transactionCost
@@ -7518,7 +7534,7 @@
                                     resolved.cost
                                 ))
                             {
-                                COUNTERPOINTAI._completePlan(
+                                COUNTERPOINTAI._recordSuccessfulBuild(
                                     state.plans,
                                     planIndex,
                                     resolved.cost
