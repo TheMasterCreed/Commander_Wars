@@ -32,6 +32,8 @@
     COUNTER_SAVE_MIN_DAY_DEFAULT : 3,
     COUNTER_GAP_RATIO_DEFAULT : 0.5,
     COUNTER_WORTH_RATIO_DEFAULT : 1.5,
+    COUNTER_UTILITY_WORTH_RATIO_DEFAULT : 1.25,
+    SAVE_DELAY_UTILITY_TAX_DEFAULT : 0.25,
     ADJACENCY_DAMAGE_NORM_DEFAULT : 100,
     COVERAGE_QUALITY_DAMAGE_DEFAULT : 55,
     INDIRECT_SATURATION_FREE_COUNT_DEFAULT : 2,
@@ -2293,13 +2295,23 @@
         for (var scoreIndex = 0; scoreIndex < length; ++scoreIndex)
         {
             var candidate = COUNTERPOINTAI._collectionAt(candidates, scoreIndex);
-            scores.push(typeof candidate.orderScore === "number" ?
-                candidate.orderScore :
-                COUNTERPOINTAI._scoreUnitAgainstEnemies(
-                    candidate,
-                    enemies,
-                    scoreContext
-                ));
+            var utility = COUNTERPOINTAI._finiteNumber(
+                candidate.purchaseUtility,
+                NaN
+            );
+            if (!isFinite(utility))
+            {
+                utility = COUNTERPOINTAI._purchaseUtility(
+                    COUNTERPOINTAI._scoreUnitAgainstEnemies(
+                        candidate,
+                        enemies,
+                        scoreContext
+                    ),
+                    COUNTERPOINTAI._strategicValue(candidate),
+                    candidate
+                );
+            }
+            scores.push(utility);
         }
 
         var ranks = [];
@@ -2340,17 +2352,8 @@
             var rawWeight = 1;
             if (scores[weightIndex] > 0)
             {
-                var valueUnits = Math.max(
-                    1,
-                    COUNTERPOINTAI._strategicValue(
-                        COUNTERPOINTAI._collectionAt(candidates, weightIndex)
-                    ) / COUNTERPOINTAI.COST_SCALE
-                );
-                var efficiency = scores[weightIndex] / valueUnits;
-                rawWeight = Math.max(1, Math.floor(
-                    Math.pow(efficiency, COUNTERPOINTAI.SCORE_EFFICIENCY_EXPONENT) *
-                    Math.pow(valueUnits, COUNTERPOINTAI.SCORE_VALUE_EXPONENT)
-                )) * rankCeiling;
+                rawWeight = Math.max(1, Math.floor(scores[weightIndex])) *
+                    rankCeiling;
             }
             else
             {
@@ -2543,6 +2546,8 @@
             typeof candidate.isDirectCombat !== "boolean" ||
             typeof candidate.canTransportTank !== "boolean" ||
             typeof candidate.indirectStacked !== "boolean" ||
+            typeof candidate.turnOnePriority !== "boolean" ||
+            typeof candidate.urgentFerry !== "boolean" ||
             !COUNTERPOINTAI._validPlannerNumber(
                 candidate.movement,
                 0,
@@ -2620,6 +2625,11 @@
              plan.actionId === COUNTERPOINTAI.ACTION_BUILD_UNITS) ||
             !COUNTERPOINTAI._validPlannerInteger(
                 plan.reservedBudget,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validPlannerInteger(
+                plan.valueReach,
                 0,
                 COUNTERPOINTAI.PLANNER_VALUE_MAX
             ) ||
@@ -3276,6 +3286,8 @@
                 isDirectCombat : false,
                 canTransportTank : false,
                 indirectStacked : false,
+                turnOnePriority : false,
+                urgentFerry : false,
                 movement : 0,
                 intrinsicMobilityFactor : 1,
                 baseCombatScore : 0,
@@ -3347,6 +3359,7 @@
             actionId : actionId,
             phase : phase,
             reservedBudget : 0,
+            valueReach : 0,
             freeOnly : false,
             hasPaid : false,
             hasFree : false,
@@ -4827,8 +4840,10 @@
                 Math.pow(COUNTERPOINTAI.UNIT_DIVERSITY_FACTOR, fieldedCopies)
             );
         }
-        var duplicateExempt = plan !== null && plan !== undefined &&
-            plan.forcedBuild === true && candidate.canCapture === true;
+        var duplicateExempt = candidate.turnOnePriority === true ||
+            candidate.urgentFerry === true ||
+            (plan !== null && plan !== undefined &&
+             plan.forcedBuild === true && candidate.canCapture === true);
         if (!duplicateExempt && builtCopies > 0)
         {
             adjusted = COUNTERPOINTAI._flipFactor(
@@ -5427,11 +5442,14 @@
             {
                 continue;
             }
-            var score = typeof candidate.orderScore === "number" ? candidate.orderScore : 0;
-            if (score > 0 && (score > valuedScore ||
-                (score === valuedScore && candidate.transactionCost < valuedCost)))
+            var utility = COUNTERPOINTAI._finiteNumber(
+                candidate.purchaseUtility,
+                0
+            );
+            if (utility > 0 && (utility > valuedScore ||
+                (utility === valuedScore && candidate.transactionCost < valuedCost)))
             {
-                valuedScore = score;
+                valuedScore = utility;
                 valuedCost = candidate.transactionCost;
             }
         }
@@ -6034,11 +6052,165 @@
         );
     },
 
-    // Future counters are enabled purchases above the surplus left after production floors.
-    _futureCounterAnswers : function(context, enemyId, surplus, reach)
+    _candidateCoverageDelta : function(candidate, threatIndex)
+    {
+        for (var index = 0; index < candidate.coverageProfile.length; ++index)
+        {
+            if (candidate.coverageProfile[index].threatIndex === threatIndex)
+            {
+                return Math.max(
+                    0,
+                    COUNTERPOINTAI._finiteNumber(
+                        candidate.coverageProfile[index].coverageDelta,
+                        0
+                    )
+                );
+            }
+        }
+        return 0;
+    },
+
+    _counterCandidateAllowed : function(context, plan, candidateIndex, budget)
+    {
+        var candidate = plan.candidates[candidateIndex];
+        return candidate.enabled === true &&
+            candidate.transactionCost >= 0 &&
+            candidate.transactionCost <= budget &&
+            !COUNTERPOINTAI._candidateRejected(plan, candidateIndex) &&
+            (COUNTERPOINTAI._capperBuildsAllowed() ||
+             candidate.canCapture !== true) &&
+            (context.banIndirects !== true ||
+             candidate.isIndirect !== true);
+    },
+
+    _counterPaidPlanIndexes : function(context)
+    {
+        var indexes = [];
+        var plans = context.plans || [];
+        for (var planIndex = 0; planIndex < plans.length; ++planIndex)
+        {
+            var plan = plans[planIndex];
+            if (plan.actionId === COUNTERPOINTAI.ACTION_BUILD_UNITS &&
+                plan.hasPaid && !plan.complete && !plan.skipped)
+            {
+                indexes.push(planIndex);
+            }
+        }
+        return indexes;
+    },
+
+    _counterBestPlanCandidate : function(context, plan, budget, projected)
+    {
+        var best = {
+            candidateIndex : -1,
+            utility : 0,
+            cost : COUNTERPOINTAI.PLANNER_VALUE_MAX
+        };
+        for (var candidateIndex = 0;
+             candidateIndex < plan.candidates.length;
+             ++candidateIndex)
+        {
+            if (!COUNTERPOINTAI._counterCandidateAllowed(
+                    context,
+                    plan,
+                    candidateIndex,
+                    budget
+                ))
+            {
+                continue;
+            }
+            var candidate = plan.candidates[candidateIndex];
+            var utility = COUNTERPOINTAI._candidateUtility(
+                candidate,
+                plan,
+                projected,
+                candidate.transactionCost
+            );
+            if (utility > best.utility ||
+                (utility === best.utility &&
+                 candidate.transactionCost < best.cost))
+            {
+                best.candidateIndex = candidateIndex;
+                best.utility = utility;
+                best.cost = candidate.transactionCost;
+            }
+        }
+        return best;
+    },
+
+    _counterLineupOpportunity : function(context, surplus, projected,
+                                          threatIndex, forcedAnswer)
+    {
+        var plans = context.plans || [];
+        var paidIndexes = COUNTERPOINTAI._counterPaidPlanIndexes(context);
+        var opportunity = { totalUtility : 0, coverageGain : 0 };
+        if (paidIndexes.length === 0)
+        {
+            return opportunity;
+        }
+        var fairSurplus = Math.ceil(
+            Math.max(0, surplus) / paidIndexes.length
+        );
+        var hypothetical = projected;
+        for (var paidIndex = 0; paidIndex < paidIndexes.length; ++paidIndex)
+        {
+            var planIndex = paidIndexes[paidIndex];
+            var plan = plans[planIndex];
+            var selected = null;
+            if (forcedAnswer !== null && forcedAnswer !== undefined &&
+                forcedAnswer.planIndex === planIndex)
+            {
+                selected = {
+                    candidateIndex : forcedAnswer.candidateIndex,
+                    utility : COUNTERPOINTAI._candidateUtility(
+                        plan.candidates[forcedAnswer.candidateIndex],
+                        plan,
+                        hypothetical,
+                        forcedAnswer.cost
+                    )
+                };
+            }
+            else
+            {
+                selected = COUNTERPOINTAI._counterBestPlanCandidate(
+                    context,
+                    plan,
+                    COUNTERPOINTAI._planFloor(plan) + fairSurplus,
+                    hypothetical
+                );
+            }
+            if (selected.candidateIndex < 0 || selected.utility <= 0)
+            {
+                continue;
+            }
+            var candidate = plan.candidates[selected.candidateIndex];
+            opportunity.totalUtility += selected.utility;
+            opportunity.coverageGain +=
+                COUNTERPOINTAI._candidateCoverageDelta(
+                    candidate,
+                    threatIndex
+                );
+            hypothetical = COUNTERPOINTAI._projectedWithCandidate(
+                hypothetical,
+                candidate
+            );
+        }
+        return opportunity;
+    },
+
+    // Future counters must add meaningful coverage and positive canonical utility.
+    _futureCounterAnswers : function(context, threatIndex, surplus, reach,
+                                     projected, perTurn, turns, remainingNeed)
     {
         var answers = [];
         var plans = context.plans || [];
+        var meaningfulCoverage = Math.min(
+            remainingNeed,
+            Math.max(
+                1,
+                COUNTERPOINTAI._tunable("COVERAGE_QUALITY_DAMAGE")
+            )
+        );
         for (var planIndex = 0; planIndex < plans.length; ++planIndex)
         {
             var plan = plans[planIndex];
@@ -6053,169 +6225,143 @@
             {
                 var candidate = plan.candidates[candidateIndex];
                 var cost = candidate.transactionCost;
-                if (candidate.scoreData === undefined || !candidate.enabled ||
-                    cost <= surplus || cost > reach || cost < 0 ||
-                    COUNTERPOINTAI._candidateRejected(plan, candidateIndex) ||
-                    (!COUNTERPOINTAI._capperBuildsAllowed() && candidate.canCapture) ||
-                    (context.banIndirects &&
-                     COUNTERPOINTAI._isPureIndirect(candidate.scoreData)))
+                if (!COUNTERPOINTAI._counterCandidateAllowed(
+                        context,
+                        plan,
+                        candidateIndex,
+                        reach
+                    ) ||
+                    cost <= surplus)
                 {
                     continue;
                 }
-                var damage = COUNTERPOINTAI._usableDamageAgainst(
-                    candidate.scoreData,
-                    enemyId,
-                    context.banIndirects
+                var coverageGain = COUNTERPOINTAI._candidateCoverageDelta(
+                    candidate,
+                    threatIndex
                 );
-                if (damage > 0)
+                var turnsNeeded = Math.max(
+                    1,
+                    Math.ceil((cost - surplus) / Math.max(1, perTurn))
+                );
+                var utility = COUNTERPOINTAI._candidateUtility(
+                    candidate,
+                    plan,
+                    projected,
+                    cost
+                );
+                if (coverageGain >= meaningfulCoverage &&
+                    turnsNeeded <= turns && utility > 0)
                 {
-                    answers.push({ damage : damage, cost : cost });
+                    answers.push({
+                        planIndex : planIndex,
+                        candidateIndex : candidateIndex,
+                        cost : cost,
+                        coverageGain : coverageGain,
+                        turnsNeeded : turnsNeeded,
+                        utility : utility
+                    });
                 }
             }
         }
         return answers;
     },
 
-    _currentCounterOpportunity : function(context, enemyId, surplus)
+    _currentCounterOpportunity : function(context, threatIndex, surplus,
+                                           projected)
     {
-        var plans = context.plans || [];
-        var paidPlans = [];
-        for (var planIndex = 0; planIndex < plans.length; ++planIndex)
-        {
-            if (plans[planIndex].hasPaid && !plans[planIndex].complete &&
-                !plans[planIndex].skipped &&
-                plans[planIndex].actionId === COUNTERPOINTAI.ACTION_BUILD_UNITS)
-            {
-                paidPlans.push(plans[planIndex]);
-            }
-        }
-        var opportunity = { best : 0, total : 0 };
-        if (paidPlans.length === 0)
-        {
-            return opportunity;
-        }
-        var fairSurplus = Math.ceil(Math.max(0, surplus) / paidPlans.length);
-        for (var paidIndex = 0; paidIndex < paidPlans.length; ++paidIndex)
-        {
-            var plan = paidPlans[paidIndex];
-            var budget = COUNTERPOINTAI._planFloor(plan) + fairSurplus;
-            var bestDamage = 0;
-            for (var candidateIndex = 0;
-                 candidateIndex < plan.candidates.length;
-                 ++candidateIndex)
-            {
-                var candidate = plan.candidates[candidateIndex];
-                if (candidate.scoreData === undefined || !candidate.enabled ||
-                    candidate.transactionCost < 0 ||
-                    candidate.transactionCost > budget ||
-                    COUNTERPOINTAI._candidateRejected(plan, candidateIndex) ||
-                    (!COUNTERPOINTAI._capperBuildsAllowed() && candidate.canCapture) ||
-                    (context.banIndirects &&
-                     COUNTERPOINTAI._isPureIndirect(candidate.scoreData)))
-                {
-                    continue;
-                }
-                bestDamage = Math.max(
-                    bestDamage,
-                    COUNTERPOINTAI._usableDamageAgainst(
-                        candidate.scoreData,
-                        enemyId,
-                        context.banIndirects
-                    )
-                );
-            }
-            opportunity.best = Math.max(opportunity.best, bestDamage);
-            opportunity.total += bestDamage;
-        }
-        return opportunity;
+        return COUNTERPOINTAI._counterLineupOpportunity(
+            context,
+            surplus,
+            projected,
+            threatIndex,
+            null
+        );
     },
 
-    _counterRequiredDamage : function(bestDamage, totalDamage, baseRatio, held, surplus)
+    _counterUtilityWorthRatio : function()
     {
-        var base = bestDamage * Math.max(1, COUNTERPOINTAI._finiteNumber(baseRatio, 1));
-        var full = Math.max(base, totalDamage);
-        var share = surplus > 0 ? COUNTERPOINTAI._clamp(held / surplus, 0, 1) : 0;
-        return base + (full - base) * share;
+        if (typeof COUNTERPOINTAI.COUNTER_UTILITY_WORTH_RATIO === "number" &&
+            isFinite(COUNTERPOINTAI.COUNTER_UTILITY_WORTH_RATIO))
+        {
+            return COUNTERPOINTAI.COUNTER_UTILITY_WORTH_RATIO;
+        }
+        return COUNTERPOINTAI._tunable("COUNTER_WORTH_RATIO");
     },
 
-    // Pick the cheapest future answer that clears its own production opportunity cost.
-    _counterTarget : function(system, context, surplus, perTurn, turns)
+    _counterTarget : function(context, projected, surplus, perTurn, turns)
     {
-        var enemies = context.enemyComposition;
-        var length = COUNTERPOINTAI._collectionLength(enemies);
+        var baseline = projected.baseline;
         var reach = surplus + perTurn * Math.max(1, Math.floor(turns));
         var gapRatio = COUNTERPOINTAI._tunable("COUNTER_GAP_RATIO");
-        var worthRatio = COUNTERPOINTAI._tunable("COUNTER_WORTH_RATIO");
-        var best = 0;
-        for (var index = 0; index < length; ++index)
+        var worthRatio = Math.max(
+            1,
+            COUNTERPOINTAI._counterUtilityWorthRatio()
+        );
+        var delayTax = Math.max(
+            0,
+            COUNTERPOINTAI._tunable("SAVE_DELAY_UTILITY_TAX")
+        );
+        var bestCost = 0;
+        var bestGain = 0;
+        for (var threatIndex = 0;
+             threatIndex < baseline.threats.length;
+             ++threatIndex)
         {
-            var enemy = COUNTERPOINTAI._collectionAt(enemies, index);
-            var enemyId = COUNTERPOINTAI._unitId(enemy);
-            if (enemyId === "")
-            {
-                continue;
-            }
-            var enemyHp = Math.max(0, COUNTERPOINTAI._readNumber(enemy, "hpSum", 0));
-            if (enemy.canCapture === true)
-            {
-                enemyHp = COUNTERPOINTAI._softcapCapperHP(enemyHp);
-            }
-            // Same ratio the scoring uses for its gap factor, so "under covered" means one thing.
-            var threatNeed = enemyHp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE;
+            var threatNeed = baseline.threats[threatIndex].need;
             if (threatNeed <= 0)
             {
                 continue;
             }
-            var coverage = COUNTERPOINTAI._contextNumber(
-                context,
-                "ownCoverage",
-                COUNTERPOINTAI._unitKey(enemy),
-                0
-            );
+            var coverage = projected.coverageByThreat[threatIndex];
             if (coverage / threatNeed >= gapRatio)
+            {
+                continue;
+            }
+            var remainingNeed = Math.max(0, threatNeed - coverage);
+            var current = COUNTERPOINTAI._currentCounterOpportunity(
+                context,
+                threatIndex,
+                surplus,
+                projected
+            );
+            if (current.coverageGain >= remainingNeed)
             {
                 continue;
             }
             var answers = COUNTERPOINTAI._futureCounterAnswers(
                 context,
-                enemyId,
+                threatIndex,
                 surplus,
-                reach
+                reach,
+                projected,
+                perTurn,
+                turns,
+                remainingNeed
             );
-            var current = COUNTERPOINTAI._currentCounterOpportunity(
-                context,
-                enemyId,
-                surplus
-            );
-            var remainingNeed = Math.max(0, threatNeed - coverage);
-            if (current.total >= remainingNeed)
-            {
-                continue;
-            }
             for (var answerIndex = 0; answerIndex < answers.length; ++answerIndex)
             {
                 var answer = answers[answerIndex];
-                var held = COUNTERPOINTAI._savingHold(
+                var future = COUNTERPOINTAI._counterLineupOpportunity(
+                    context,
                     surplus,
-                    perTurn,
-                    answer.cost,
-                    turns
+                    projected,
+                    threatIndex,
+                    answer
                 );
-                var requiredDamage = COUNTERPOINTAI._counterRequiredDamage(
-                    current.best,
-                    current.total,
-                    worthRatio,
-                    held,
-                    surplus
-                );
-                if (held > 0 && answer.damage >= requiredDamage &&
-                    (best <= 0 || answer.cost < best))
+                var delayedUtility = future.totalUtility /
+                    (1 + delayTax * answer.turnsNeeded);
+                var requiredUtility = current.totalUtility * worthRatio;
+                var gain = delayedUtility - requiredUtility;
+                if (future.coverageGain > 0 && gain > 0 &&
+                    (bestCost <= 0 || gain > bestGain ||
+                     (gain === bestGain && answer.cost < bestCost)))
                 {
-                    best = answer.cost;
+                    bestCost = answer.cost;
+                    bestGain = gain;
                 }
             }
         }
-        return best;
+        return bestCost;
     },
 
     // Bank for a counter the way a player does: a threat we are not equipped for, and a unit that
@@ -6226,7 +6372,8 @@
     // there is no ferry, though: it also means the hull is affordable right now. Reading the two
     // the same let a counter bank exactly the money the hull was about to be bought with, and the
     // port passed the turn with nothing built.
-    _savingDecision : function(system, ai, context, funds, day, blockedCount)
+    _savingDecision : function(system, ai, context, projected, funds, day,
+                                blockedCount)
     {
         var ferry = context.ferry;
         var held = COUNTERPOINTAI._ferrySaving(ai, context.roster, ferry, funds);
@@ -6243,10 +6390,17 @@
         {
             return 0;
         }
-        return COUNTERPOINTAI._counterSaving(system, ai, context, funds, day);
+        return COUNTERPOINTAI._counterSaving(
+            system,
+            ai,
+            context,
+            projected,
+            funds,
+            day
+        );
     },
 
-    _counterSaving : function(system, ai, context, funds, day)
+    _counterSaving : function(system, ai, context, projected, funds, day)
     {
         // Early on the enemy army is barely on the board, so the coverage ratio is mostly noise and
         // a hold costs a unit of opening presence to answer a threat that is not there yet.
@@ -6265,8 +6419,8 @@
             spare.surplus,
             spare.perTurn,
             COUNTERPOINTAI._counterTarget(
-                system,
                 context,
+                projected,
                 spare.surplus,
                 spare.perTurn,
                 turns
@@ -6664,10 +6818,15 @@
         var maySkip = state.day >= COUNTERPOINTAI.RANDOM_BASE_SKIP_MIN_DAY &&
             safeFunds >= COUNTERPOINTAI.RANDOM_BASE_SKIP_MIN_FUNDS;
         var dynamicCap = COUNTERPOINTAI.FACTORY_BUDGET_CAP_FLOOR;
+        var valueReach = Math.min(
+            COUNTERPOINTAI.PLANNER_VALUE_MAX,
+            COUNTERPOINTAI._wholeCount(reach)
+        );
         for (var planIndex = 0; planIndex < plans.length; ++planIndex)
         {
             var plan = plans[planIndex];
             plan.reservedBudget = 0;
+            plan.valueReach = valueReach;
             if (!plan.hasPaid)
             {
                 continue;
@@ -7049,6 +7208,19 @@
                     COUNTERPOINTAI._hasAttackCapability(data);
                 candidate.canTransportTank = data !== undefined && data !== null &&
                     COUNTERPOINTAI._isTankCapableTransport(data);
+                candidate.turnOnePriority = turn <= 1 &&
+                    COUNTERPOINTAI.TURN1_FORCE_CAPPERS !== false &&
+                    candidate.canCapture === true;
+                candidate.urgentFerry = context.ferry !== null &&
+                    context.ferry !== undefined &&
+                    context.ferry.urgent === true &&
+                    context.ferry.plans[plan.key] === true &&
+                    candidate.isTransporter === true &&
+                    context.ferry.needed[candidate.domain] === true &&
+                    COUNTERPOINTAI._readFlag(
+                        context.groundCarriers,
+                        candidate.id
+                    );
                 candidate.movement = data === undefined || data === null ? 0 :
                     Math.max(0, COUNTERPOINTAI._readNumber(data, "movement", 0));
                 candidate.indirectStacked = candidate.isIndirect &&
@@ -7475,7 +7647,7 @@
     {
         return candidate.canCapture !== true &&
                candidate.isTransporter !== true &&
-               typeof candidate.orderScore === "number";
+               typeof candidate.purchaseUtility === "number";
     },
 
     _negativeScorerSkipped : function(candidate, affordableAlternative)
@@ -7486,7 +7658,7 @@
         }
         return affordableAlternative === true &&
                COUNTERPOINTAI._scoredCombatCandidate(candidate) &&
-               candidate.orderScore < 0;
+               candidate.purchaseUtility < 0;
     },
 
     // Only scored fallback transports are eligible for rejection.
@@ -7498,25 +7670,57 @@
         }
         return affordableAlternative === true &&
                candidate.isTransporter === true &&
-               typeof candidate.orderScore === "number" &&
-               candidate.orderScore < 0;
+               typeof candidate.purchaseUtility === "number" &&
+               candidate.purchaseUtility < 0;
     },
 
-    // Never defer an economic capper for a higher combat score.
-    _holdForBetterCandidate : function(candidate, bestMissedScore)
+    // Never defer an economic capper for a higher combat utility.
+    _holdForBetterCandidate : function(candidate, bestMissedUtility)
     {
         var ratio = COUNTERPOINTAI._tunable("HOLD_FOR_BETTER_RATIO");
-        if (!(ratio > 0) || bestMissedScore <= 0 ||
+        if (!(ratio > 0) || bestMissedUtility <= 0 ||
             !COUNTERPOINTAI._scoredCombatCandidate(candidate))
         {
             return false;
         }
-        return candidate.orderScore < bestMissedScore * ratio;
+        return candidate.purchaseUtility < bestMissedUtility * ratio;
     },
 
-    _bestPlanOpportunityScore : function(plan, budget)
+    _planOrderPosition : function(plan, candidateIndex)
     {
-        var best = 0;
+        var position = plan.order.indexOf(candidateIndex);
+        return position < 0 ? COUNTERPOINTAI.PLANNER_VALUE_MAX : position;
+    },
+
+    _candidateUtility : function(candidate, plan, projected, liveCost)
+    {
+        var evaluated = COUNTERPOINTAI._evaluateMarginalPurchase(
+            candidate,
+            plan,
+            projected,
+            liveCost
+        );
+        return COUNTERPOINTAI._clamp(
+            COUNTERPOINTAI._finiteNumber(evaluated.purchaseUtility, 0),
+            -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+            COUNTERPOINTAI.PLANNER_VALUE_MAX
+        );
+    },
+
+    _updateCandidateUtility : function(candidate, plan, projected, liveCost)
+    {
+        candidate.purchaseUtility = COUNTERPOINTAI._candidateUtility(
+            candidate,
+            plan,
+            projected,
+            liveCost
+        );
+        return candidate.purchaseUtility;
+    },
+
+    _bestPlanOpportunity : function(plan, budget, projected, plans, turnTargets)
+    {
+        var best = { utility : 0, candidateIndex : -1 };
         for (var orderIndex = 0; orderIndex < plan.order.length; ++orderIndex)
         {
             var candidateIndex = plan.order[orderIndex];
@@ -7527,82 +7731,159 @@
             var candidate = plan.candidates[candidateIndex];
             if (candidate.enabled === true && candidate.transactionCost >= 0 &&
                 candidate.transactionCost <= budget &&
-                typeof candidate.orderScore === "number")
+                !COUNTERPOINTAI._turnSaturatedSkipped(
+                    candidate,
+                    plans,
+                    turnTargets
+                ))
             {
-                best = Math.max(best, candidate.orderScore);
+                var utility = COUNTERPOINTAI._candidateUtility(
+                    candidate,
+                    plan,
+                    projected,
+                    candidate.transactionCost
+                );
+                if (candidate.urgentFerry === true ||
+                    candidate.turnOnePriority === true ||
+                    (plan.allowCapperBorrow === true &&
+                     candidate.canCapture === true))
+                {
+                    return {
+                        utility : Math.max(0, utility),
+                        candidateIndex : candidateIndex
+                    };
+                }
+                if (utility > best.utility)
+                {
+                    best.utility = utility;
+                    best.candidateIndex = candidateIndex;
+                }
             }
         }
-        return Math.max(0, best);
+        return best;
     },
 
-    _productionLineupScore : function(plans, planIndex, candidateIndex)
+    _bestPlanOpportunityScore : function(plan, budget, projected, plans, turnTargets)
     {
+        if (projected === undefined)
+        {
+            var best = 0;
+            for (var index = 0; index < plan.candidates.length; ++index)
+            {
+                var candidate = plan.candidates[index];
+                if (!COUNTERPOINTAI._candidateRejected(plan, index) &&
+                    candidate.enabled === true &&
+                    candidate.transactionCost >= 0 &&
+                    candidate.transactionCost <= budget)
+                {
+                    best = Math.max(
+                        best,
+                        COUNTERPOINTAI._finiteNumber(
+                            candidate.purchaseUtility,
+                            0
+                        )
+                    );
+                }
+            }
+            return Math.max(0, best);
+        }
+        return COUNTERPOINTAI._bestPlanOpportunity(
+            plan,
+            budget,
+            projected,
+            plans,
+            turnTargets
+        ).utility;
+    },
+
+    _productionLineupScore : function(state, planIndex, candidateIndex,
+                                       liveCost, projected, turnTargets)
+    {
+        var plans = state.plans;
         var plan = plans[planIndex];
         var candidate = plan.candidates[candidateIndex];
-        var score = Math.max(0, candidate.orderScore);
+        var score = Math.max(
+            0,
+            COUNTERPOINTAI._candidateUtility(
+                candidate,
+                plan,
+                projected,
+                liveCost
+            )
+        );
         var targets = COUNTERPOINTAI._remainingBudgetPlans(plans, planIndex);
         if (targets.length === 0)
         {
             return score;
         }
-        var remainder = Math.max(0, plan.reservedBudget - candidate.transactionCost);
+        var hypothetical = COUNTERPOINTAI._projectedWithCandidate(
+            projected,
+            candidate
+        );
+        var remainder = Math.max(0, plan.reservedBudget - liveCost);
         var perPlan = Math.floor(remainder / targets.length);
         var extra = remainder - perPlan * targets.length;
         for (var targetIndex = 0; targetIndex < targets.length; ++targetIndex)
         {
             var addition = perPlan + (targetIndex < extra ? 1 : 0);
-            score += COUNTERPOINTAI._bestPlanOpportunityScore(
+            var opportunity = COUNTERPOINTAI._bestPlanOpportunity(
                 targets[targetIndex],
-                targets[targetIndex].reservedBudget + addition
+                targets[targetIndex].reservedBudget + addition,
+                hypothetical,
+                plans,
+                turnTargets
             );
+            score += opportunity.utility;
+            if (opportunity.candidateIndex >= 0)
+            {
+                hypothetical = COUNTERPOINTAI._projectedWithCandidate(
+                    hypothetical,
+                    targets[targetIndex].candidates[
+                        opportunity.candidateIndex
+                    ]
+                );
+            }
         }
         return score;
     },
 
-    _opportunityAwareCandidate : function(plans, planIndex, candidateIndex, turnTargets)
+    _opportunityAwareCandidate : function(state, planIndex, candidateIndexes,
+                                           projected, turnTargets)
     {
+        var plans = state.plans;
         var plan = plans[planIndex];
-        var candidate = plan.candidates[candidateIndex];
-        if (plan.phase !== COUNTERPOINTAI.PHASE_ORDINARY ||
-            plan.strategicHoldEligible === true || plan.strategicHold === true ||
-            plan.allowCapperBorrow === true ||
-            COUNTERPOINTAI.RECYCLE_UNUSED_BUDGET === false ||
-            typeof candidate.orderScore !== "number" || candidate.orderScore <= 0)
+        var compareLineups = plan.phase === COUNTERPOINTAI.PHASE_ORDINARY &&
+            plan.strategicHold !== true &&
+            plan.allowCapperBorrow !== true &&
+            COUNTERPOINTAI.RECYCLE_UNUSED_BUDGET !== false;
+        var bestIndex = -1;
+        var bestScore = -COUNTERPOINTAI.PLANNER_VALUE_MAX;
+        for (var index = 0; index < candidateIndexes.length; ++index)
         {
-            return candidateIndex;
-        }
-        var bestIndex = candidateIndex;
-        var bestLineupScore = COUNTERPOINTAI._productionLineupScore(
-            plans,
-            planIndex,
-            candidateIndex
-        );
-        for (var orderIndex = 0; orderIndex < plan.order.length; ++orderIndex)
-        {
-            var alternativeIndex = plan.order[orderIndex];
-            if (alternativeIndex === candidateIndex ||
-                COUNTERPOINTAI._candidateRejected(plan, alternativeIndex))
+            var candidateIndex = candidateIndexes[index];
+            var candidate = plan.candidates[candidateIndex];
+            var score = compareLineups ?
+                COUNTERPOINTAI._productionLineupScore(
+                    state,
+                    planIndex,
+                    candidateIndex,
+                    candidate.transactionCost,
+                    projected,
+                    turnTargets
+                ) :
+                COUNTERPOINTAI._finiteNumber(candidate.purchaseUtility, 0);
+            var betterTie = score === bestScore &&
+                (bestIndex < 0 ||
+                 COUNTERPOINTAI._planOrderPosition(plan, candidateIndex) <
+                    COUNTERPOINTAI._planOrderPosition(plan, bestIndex) ||
+                 (COUNTERPOINTAI._planOrderPosition(plan, candidateIndex) ===
+                    COUNTERPOINTAI._planOrderPosition(plan, bestIndex) &&
+                  candidate.transactionCost <
+                    plan.candidates[bestIndex].transactionCost));
+            if (bestIndex < 0 || score > bestScore || betterTie)
             {
-                continue;
-            }
-            var alternative = plan.candidates[alternativeIndex];
-            if (alternative.enabled !== true || alternative.transactionCost < 0 ||
-                alternative.transactionCost >= candidate.transactionCost ||
-                alternative.transactionCost > plan.reservedBudget ||
-                typeof alternative.orderScore !== "number" || alternative.orderScore <= 0 ||
-                COUNTERPOINTAI._turnSaturatedSkipped(alternative, plans, turnTargets))
-            {
-                continue;
-            }
-            var lineupScore = COUNTERPOINTAI._productionLineupScore(
-                plans,
-                planIndex,
-                alternativeIndex
-            );
-            if (lineupScore > bestLineupScore)
-            {
-                bestIndex = alternativeIndex;
-                bestLineupScore = lineupScore;
+                bestIndex = candidateIndex;
+                bestScore = score;
             }
         }
         return bestIndex;
@@ -7695,20 +7976,22 @@
         return held < limit;
     },
 
-    _selectPlanCandidate : function(plans, planIndex, funds, turnTargets)
+    _selectPlanCandidate : function(state, planIndex, funds, turnTargets)
     {
+        var plans = state.plans;
         var plan = plans[planIndex];
         plan.selected = -1;
-        // Reset forcedBuild so its reserve bypass cannot leak across retries.
         plan.forcedBuild = false;
         var retryable = false;
-        var fallbackCandidateIndexes = [];
-        var bestMissedScore = 0;
+        var projected = COUNTERPOINTAI._projectedTurnContext(state);
+        var bestMissedUtility = 0;
         var heldAffordable = false;
         var heldCandidateIndex = -1;
         var canStartStrategicHold = COUNTERPOINTAI._canStartStrategicHold(plans, planIndex);
         var safeFunds = COUNTERPOINTAI._wholeCount(funds);
         var affordableAlternative = false;
+        var priorityCandidateIndexes = [];
+        var candidateIndexes = [];
         for (var missedIndex = 0; missedIndex < plan.order.length; ++missedIndex)
         {
             var missedCandidateIndex = plan.order[missedIndex];
@@ -7717,6 +8000,15 @@
                 continue;
             }
             var missedCandidate = plan.candidates[missedCandidateIndex];
+            if (missedCandidate.transactionCost >= 0)
+            {
+                COUNTERPOINTAI._updateCandidateUtility(
+                    missedCandidate,
+                    plan,
+                    projected,
+                    missedCandidate.transactionCost
+                );
+            }
             if (missedCandidate.enabled === true &&
                 missedCandidate.transactionCost >= 0 &&
                 (missedCandidate.transactionCost <= plan.reservedBudget ||
@@ -7731,22 +8023,24 @@
                     turnTargets
                 ) &&
                 ((COUNTERPOINTAI._scoredCombatCandidate(missedCandidate) &&
-                  missedCandidate.orderScore >= 0) ||
-                 missedCandidate.canCapture === true))
+                  missedCandidate.purchaseUtility >= 0) ||
+                 missedCandidate.canCapture === true ||
+                 missedCandidate.urgentFerry === true))
             {
                 affordableAlternative = true;
             }
             if (missedCandidate.transactionCost < 0 ||
-                typeof missedCandidate.orderScore !== "number" ||
-                missedCandidate.orderScore <= 0)
+                missedCandidate.purchaseUtility <= 0)
             {
                 continue;
             }
             var missedByBudget = missedCandidate.enabled === true &&
-                missedCandidate.transactionCost > plan.reservedBudget;
-            if (missedByBudget && missedCandidate.orderScore > bestMissedScore)
+                missedCandidate.transactionCost > plan.reservedBudget &&
+                missedCandidate.transactionCost <= plan.valueReach;
+            if (missedByBudget &&
+                missedCandidate.purchaseUtility > bestMissedUtility)
             {
-                bestMissedScore = missedCandidate.orderScore;
+                bestMissedUtility = missedCandidate.purchaseUtility;
             }
         }
         for (var orderIndex = 0; orderIndex < plan.order.length; ++orderIndex)
@@ -7762,88 +8056,124 @@
                 retryable = true;
                 continue;
             }
-            if (COUNTERPOINTAI._negativeScorerSkipped(candidate, affordableAlternative) ||
-                COUNTERPOINTAI._unwantedTransporterSkipped(candidate, affordableAlternative) ||
-                COUNTERPOINTAI._turnSaturatedSkipped(candidate, plans, turnTargets))
+            var policyPriority = candidate.urgentFerry === true ||
+                candidate.turnOnePriority === true ||
+                (plan.allowCapperBorrow === true &&
+                 candidate.canCapture === true);
+            if (COUNTERPOINTAI._turnSaturatedSkipped(
+                    candidate,
+                    plans,
+                    turnTargets
+                ) ||
+                (!policyPriority &&
+                 (COUNTERPOINTAI._negativeScorerSkipped(
+                      candidate,
+                      affordableAlternative
+                  ) ||
+                  COUNTERPOINTAI._unwantedTransporterSkipped(
+                      candidate,
+                      affordableAlternative
+                  ))))
             {
                 continue;
             }
-            if (candidate.transactionCost === 0)
+            var withinReserve = candidate.transactionCost <=
+                plan.reservedBudget;
+            var unreserved = COUNTERPOINTAI._canUseUnreservedFunds(
+                plan,
+                candidate.transactionCost,
+                safeFunds
+            );
+            var borrowable = candidate.canCapture === true &&
+                plan.allowCapperBorrow === true;
+            if (!withinReserve && !unreserved && !borrowable)
             {
-                COUNTERPOINTAI._restoreBorrowedBudget(plans, plan);
-                if (canStartStrategicHold &&
-                    COUNTERPOINTAI._holdForBetterCandidate(candidate, bestMissedScore))
-                {
-                    plan.strategicHold = true;
-                }
-                plan.selected = candidateIndex;
-                return true;
+                retryable = true;
+                continue;
             }
-            if (candidate.transactionCost <= plan.reservedBudget)
-            {
-                // Keep walking after a hold so a stronger affordable candidate can still win.
-                if ((canStartStrategicHold &&
-                     COUNTERPOINTAI._holdForBetterCandidate(candidate, bestMissedScore)) ||
-                    (heldAffordable && typeof candidate.orderScore !== "number"))
-                {
-                    heldAffordable = true;
-                    if (heldCandidateIndex < 0 || candidate.transactionCost <
-                        plan.candidates[heldCandidateIndex].transactionCost)
-                    {
-                        heldCandidateIndex = candidateIndex;
-                    }
-                    continue;
-                }
-                plan.selected = COUNTERPOINTAI._opportunityAwareCandidate(
-                    plans,
-                    planIndex,
-                    candidateIndex,
-                    turnTargets
-                );
-                return true;
-            }
-            if (candidate.canCapture && plan.allowCapperBorrow &&
-                COUNTERPOINTAI._borrowForCandidate(
-                    plans,
-                    planIndex,
-                    candidate.transactionCost
+            if (canStartStrategicHold &&
+                COUNTERPOINTAI._holdForBetterCandidate(
+                    candidate,
+                    bestMissedUtility
                 ))
-            {
-                plan.selected = candidateIndex;
-                return true;
-            }
-            if (COUNTERPOINTAI._canUseUnreservedFunds(
-                    plan,
-                    candidate.transactionCost,
-                    funds
-                ))
-            {
-                fallbackCandidateIndexes.push(candidateIndex);
-            }
-            retryable = true;
-        }
-        // A fallback may buy the high scorer that established the hold threshold.
-        for (var fallbackIndex = 0;
-             fallbackIndex < fallbackCandidateIndexes.length;
-             ++fallbackIndex)
-        {
-            var fallbackCandidate = plan.candidates[fallbackCandidateIndexes[fallbackIndex]];
-            if ((canStartStrategicHold &&
-                 COUNTERPOINTAI._holdForBetterCandidate(fallbackCandidate, bestMissedScore)) ||
-                (heldAffordable && typeof fallbackCandidate.orderScore !== "number"))
             {
                 heldAffordable = true;
-                if (heldCandidateIndex < 0 || fallbackCandidate.transactionCost <
+                if (heldCandidateIndex < 0 || candidate.transactionCost <
                     plan.candidates[heldCandidateIndex].transactionCost)
                 {
-                    heldCandidateIndex = fallbackCandidateIndexes[fallbackIndex];
+                    heldCandidateIndex = candidateIndex;
                 }
                 continue;
             }
-            plan.selected = fallbackCandidateIndexes[fallbackIndex];
+            if (policyPriority)
+            {
+                priorityCandidateIndexes.push(candidateIndex);
+            }
+            else
+            {
+                candidateIndexes.push(candidateIndex);
+            }
+        }
+        for (var priorityIndex = 0;
+             priorityIndex < priorityCandidateIndexes.length;
+             ++priorityIndex)
+        {
+            var priorityCandidateIndex =
+                priorityCandidateIndexes[priorityIndex];
+            var priorityCandidate =
+                plan.candidates[priorityCandidateIndex];
+            if (priorityCandidate.transactionCost > plan.reservedBudget &&
+                !COUNTERPOINTAI._canUseUnreservedFunds(
+                    plan,
+                    priorityCandidate.transactionCost,
+                    safeFunds
+                ) &&
+                !COUNTERPOINTAI._borrowForCandidate(
+                    plans,
+                    planIndex,
+                    priorityCandidate.transactionCost
+                ))
+            {
+                retryable = true;
+                continue;
+            }
+            if (priorityCandidate.transactionCost === 0)
+            {
+                COUNTERPOINTAI._restoreBorrowedBudget(plans, plan);
+            }
+            plan.selected = priorityCandidateIndex;
             return true;
         }
-        // Build cheaply while keeping the holder's surplus committed for the stronger unit.
+        var positiveCandidateIndexes = [];
+        for (var positiveIndex = 0;
+             positiveIndex < candidateIndexes.length;
+             ++positiveIndex)
+        {
+            if (plan.candidates[candidateIndexes[positiveIndex]]
+                    .purchaseUtility > 0)
+            {
+                positiveCandidateIndexes.push(
+                    candidateIndexes[positiveIndex]
+                );
+            }
+        }
+        var selectionPool = positiveCandidateIndexes.length > 0 ?
+            positiveCandidateIndexes : candidateIndexes;
+        if (selectionPool.length > 0)
+        {
+            plan.selected = COUNTERPOINTAI._opportunityAwareCandidate(
+                state,
+                planIndex,
+                selectionPool,
+                projected,
+                turnTargets
+            );
+            if (plan.candidates[plan.selected].transactionCost === 0)
+            {
+                COUNTERPOINTAI._restoreBorrowedBudget(plans, plan);
+            }
+            return true;
+        }
         if (heldAffordable)
         {
             plan.strategicHold = true;
@@ -7862,6 +8192,12 @@
             if (rescueIndex >= 0)
             {
                 plan.forcedBuild = true;
+                COUNTERPOINTAI._updateCandidateUtility(
+                    plan.candidates[rescueIndex],
+                    plan,
+                    projected,
+                    plan.candidates[rescueIndex].transactionCost
+                );
                 plan.selected = rescueIndex;
                 return true;
             }
@@ -8033,6 +8369,18 @@
         var available = Math.max(0, ai.getPlayer().getFunds() -
             blocked.capperReserve -
             COUNTERPOINTAI._strategicHeldFunds(state.plans));
+        COUNTERPOINTAI._designateStrategicHolders(
+            plans,
+            enemyUnits,
+            ordinaryPhase ? blocked.count : 0
+        );
+        var projected = COUNTERPOINTAI._projectedTurnContext(state);
+        COUNTERPOINTAI._scorePlanCandidates(
+            plans,
+            context,
+            map.getCurrentDay(),
+            projected
+        );
         // Preserve the first hold decision after spending changes the treasury.
         if (ordinaryPhase && state.ordinaryPrepared !== true)
         {
@@ -8042,22 +8390,12 @@
                 system,
                 ai,
                 context,
+                projected,
                 ai.getPlayer().getFunds(),
                 state.day,
                 blocked.count
             );
         }
-        COUNTERPOINTAI._designateStrategicHolders(
-            plans,
-            enemyUnits,
-            ordinaryPhase ? blocked.count : 0
-        );
-        COUNTERPOINTAI._scorePlanCandidates(
-            plans,
-            context,
-            map.getCurrentDay(),
-            COUNTERPOINTAI._projectedTurnContext(state)
-        );
         if (state.specialPrepared !== true && state.ordinaryPrepared !== true)
         {
             state.turnTargets = COUNTERPOINTAI._computeTurnTargets(context);
@@ -8269,18 +8607,50 @@
         return { index : liveIndex, cost : cost };
     },
 
+    _updatePlanFromLiveLists : function(plan, ids, costs, enabled)
+    {
+        for (var candidateIndex = 0;
+             candidateIndex < plan.candidates.length;
+             ++candidateIndex)
+        {
+            var candidate = plan.candidates[candidateIndex];
+            var live = COUNTERPOINTAI._validateLiveCandidate(
+                candidate,
+                ids,
+                costs,
+                enabled
+            );
+            candidate.enabled = live.index >= 0;
+            candidate.transactionCost = live.cost;
+        }
+        COUNTERPOINTAI._refreshPlanCostKinds(plan);
+    },
+
     _planIndex : function(plans, plan)
     {
         return COUNTERPOINTAI._planIndexByKey(plans, plan.key);
     },
 
-    _resolveLivePlanCandidate : function(plans, planIndex, ids, costs, enabled, funds, turnTargets)
+    _resolveLivePlanCandidate : function(state, planIndex, ids, costs, enabled,
+                                          funds, turnTargets)
     {
+        var plans = state.plans;
         var plan = plans[planIndex];
+        COUNTERPOINTAI._updatePlanFromLiveLists(
+            plan,
+            ids,
+            costs,
+            enabled
+        );
         while (!plan.complete)
         {
             if (plan.selected < 0 &&
-                !COUNTERPOINTAI._selectPlanCandidate(plans, planIndex, funds, turnTargets))
+                !COUNTERPOINTAI._selectPlanCandidate(
+                    state,
+                    planIndex,
+                    funds,
+                    turnTargets
+                ))
             {
                 return null;
             }
@@ -8384,7 +8754,7 @@
             );
         }
         var resolved = COUNTERPOINTAI._resolveLivePlanCandidate(
-            state.plans,
+            state,
             planIndex,
             ids,
             costs,
@@ -8468,7 +8838,7 @@
             return false;
         }
         var retry = COUNTERPOINTAI._selectPlanCandidate(
-            state.plans,
+            state,
             planIndex,
             COUNTERPOINTAI._spendableFunds(state, ai),
             state.turnTargets
@@ -8559,7 +8929,7 @@
                         while (!plan.complete)
                         {
                             var resolved = COUNTERPOINTAI._resolveLivePlanCandidate(
-                                state.plans,
+                                state,
                                 planIndex,
                                 ids,
                                 costs,

@@ -212,6 +212,10 @@
     // buys, as a damage multiple. 1.5 means it must hit half again as hard, which stops the AI
     // waiting a turn for a marginal upgrade over something it could build right now.
     strategy.COUNTER_WORTH_RATIO = 1.5;
+    // Delayed future lineups must beat the current lineup by this ratio.
+    strategy.COUNTER_UTILITY_WORTH_RATIO = 1.25;
+    // Utility lost per turn spent waiting for a future counter.
+    strategy.SAVE_DELAY_UTILITY_TAX = 0.25;
     // Turns of income the counter saving may plan across, same meaning as the ferry setting above.
     // 1 keeps it to answers that are one turn away, which is what a player usually does.
     strategy.COUNTER_SAVE_MAX_TURNS = 1;
