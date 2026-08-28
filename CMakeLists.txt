@@ -818,6 +818,7 @@ set(${PROJECT_NAME}_SRCS
     ai/proxyai.cpp ai/proxyai.h
     ai/normalai.cpp ai/normalai.h    
     ai/coordinatedai.cpp ai/coordinatedai.h
+    ai/coordinator/coordinatorcommon.h
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1309,6 +1310,20 @@ if (BUILD_TESTING)
     )
     add_test(NAME CoordinatorAiRandomTests COMMAND CoordinatorAiRandomTests)
     cow_set_arena_test_path(CoordinatorAiRandomTests)
+
+    add_executable(CoordinatorAiCommonTests
+        tests/coordinator_ai/coordinatorcommontests.cpp
+    )
+    target_include_directories(CoordinatorAiCommonTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(CoordinatorAiCommonTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME CoordinatorAiCommonTests COMMAND CoordinatorAiCommonTests)
+    cow_set_arena_test_path(CoordinatorAiCommonTests)
 
     add_executable(CoordinatorAiTypeIdentityTests
         tests/coordinator_ai/aitypeidentitytests.cpp
