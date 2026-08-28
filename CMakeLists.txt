@@ -824,6 +824,7 @@ set(${PROJECT_NAME}_SRCS
     ai/unloadselection.h
     ai/fastbattleestimate.h
     ai/buildingthreat.h
+    ai/farawaycapturereservations.h
     ai/influencefrontmap.cpp ai/influencefrontmap.h
     ai/heavyai/heavyai.cpp ai/heavyai/heavyai.h
     ai/heavyai/heavyAiSharedData.h
@@ -1548,6 +1549,23 @@ if (BUILD_TESTING)
         COMMAND NormalAiBuildingThreatTests
     )
     cow_set_arena_test_path(NormalAiBuildingThreatTests)
+
+    add_executable(NormalAiFarAwayCaptureReservationTests
+        tests/normal_ai/farawaycapturereservationtests.cpp
+    )
+    target_include_directories(NormalAiFarAwayCaptureReservationTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(NormalAiFarAwayCaptureReservationTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME NormalAiFarAwayCaptureReservationTests
+        COMMAND NormalAiFarAwayCaptureReservationTests
+    )
+    cow_set_arena_test_path(NormalAiFarAwayCaptureReservationTests)
 
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})

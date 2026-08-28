@@ -2,6 +2,7 @@
 
 #include <QtGlobal>
 #include "ai/coreai.h"
+#include "ai/farawaycapturereservations.h"
 
 class GameAction;
 using spGameAction = std::shared_ptr<GameAction>;
@@ -45,5 +46,5 @@ private:
     bool findSingleCaptureBuilding(TargetBuildings & captureBuildings, TargetBuildings & captures, qint32 & targetIndex);
 private:
     CoreAI & m_owner;
-    QVector<QPoint> m_usedFarAwayBuildings;
+    FarAwayCapture::Reservations m_usedFarAwayBuildings;
 };

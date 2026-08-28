@@ -270,6 +270,7 @@ CaptureBuildingSelector::TargetBuildings CaptureBuildingSelector::getTargetBuild
 {
     Interpreter *pInterpreter = Interpreter::getInstance();
     bool fireSilos = m_owner.hasMissileTarget();
+    const qint32 currentDay = m_owner.getMap()->getCurrentDay();
     TargetBuildings captureBuildings;
     for (qint32 i = 0; i < rOwnUnits.size(); ++i)
     {
@@ -324,7 +325,7 @@ CaptureBuildingSelector::TargetBuildings CaptureBuildingSelector::getTargetBuild
                         auto *pBuilding = pTerrain->getBuilding();
                         if (pBuilding != nullptr &&
                             pBuilding->getOwner() == nullptr &&
-                            !m_usedFarAwayBuildings.contains(target) &&
+                            !m_usedFarAwayBuildings.isReserved(currentDay, FarAwayCapture::Target{target.x(), target.y()}) &&
                             highPrioBuildings.contains(pBuilding->getBuildingID()) &&
                             pTerrain->getUnit() == nullptr)
                         {
@@ -343,10 +344,11 @@ CaptureBuildingSelector::TargetBuildings CaptureBuildingSelector::getTargetBuild
 
 void CaptureBuildingSelector::addUsedFarAwayBuildings(QPoint farAwayTarget)
 {
-    m_usedFarAwayBuildings.push_back(farAwayTarget);
+    m_usedFarAwayBuildings.reserve(m_owner.getMap()->getCurrentDay(),
+                                   FarAwayCapture::Target{farAwayTarget.x(), farAwayTarget.y()});
 }
 
 void CaptureBuildingSelector::resetUsedFarAwayBuildings()
 {
-    m_usedFarAwayBuildings.clear();
+    m_usedFarAwayBuildings.reset();
 }
