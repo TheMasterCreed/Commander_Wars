@@ -19,11 +19,20 @@
 #include "game/building.h"
 #include "game/player.h"
 #include "game/unit.h"
+#include "game/weaponrangecheck.h"
 #include "game/gameanimation/gameanimation.h"
 
 #include "menue/editormenue.h"
 
 static constexpr qreal FLOAT_PRECISION = 100.0f;
+
+static_assert(static_cast<qint32>(WeaponRangeCheck::WeaponType::Both) == GameEnums::WeaponType_Both);
+static_assert(static_cast<qint32>(WeaponRangeCheck::WeaponType::Direct) == GameEnums::WeaponType_Direct);
+static_assert(static_cast<qint32>(WeaponRangeCheck::WeaponType::Indirect) == GameEnums::WeaponType_Indirect);
+static_assert(static_cast<qint32>(WeaponRangeCheck::RangeCheck::All) == GameEnums::AttackRangeCheck_All);
+static_assert(static_cast<qint32>(WeaponRangeCheck::RangeCheck::None) == GameEnums::AttackRangeCheck_None);
+static_assert(static_cast<qint32>(WeaponRangeCheck::RangeCheck::OnlyMin) == GameEnums::AttackRangeCheck_OnlyMin);
+static_assert(static_cast<qint32>(WeaponRangeCheck::RangeCheck::OnlyMax) == GameEnums::AttackRangeCheck_OnlyMax);
 
 Unit::Unit(GameMap* pMap)
     : m_pMap(pMap)
@@ -1050,13 +1059,16 @@ bool Unit::isAttackable(Unit* pDefender, bool ignoreOutOfVisionRange, QPoint uni
 bool Unit::canAttackWithWeapon(qint32 weaponIndex, qint32 unitX, qint32 unitY, qint32 targetX, qint32 targetY, GameEnums::AttackRangeCheck rangeCheck)
 {
     GameEnums::WeaponType weaponType = GameEnums::WeaponType::WeaponType_Both;
+    WeaponRangeCheck::Slot slot;
     if (weaponIndex == 0)
     {
         weaponType = getTypeOfWeapon1();
+        slot = {!m_weapon1ID.isEmpty(), hasAmmo1()};
     }
     else
     {
         weaponType = getTypeOfWeapon2();
+        slot = {!m_weapon2ID.isEmpty(), hasAmmo2()};
     }
     bool ret = false;
     Interpreter* pInterpreter = Interpreter::getInstance();
@@ -1091,24 +1103,13 @@ bool Unit::canAttackWithWeapon(qint32 weaponIndex, qint32 unitX, qint32 unitY, q
         QJSValue erg = pInterpreter->doFunction(m_UnitID, "canUseWeapon", args);
         if (!erg.isBool() || erg.toBool())
         {
-            qint32 distance = GlobalUtils::getDistance(QPoint(unitX, unitY), QPoint(targetX, targetY));
             QPoint position(unitX, unitY);
-            bool inIndirectRange = (distance >= getMinRange(position) || rangeCheck == GameEnums::AttackRangeCheck_None || rangeCheck == GameEnums::AttackRangeCheck_OnlyMax) &&
-                                   (distance <= getMaxRange(position) || rangeCheck == GameEnums::AttackRangeCheck_None || rangeCheck == GameEnums::AttackRangeCheck_OnlyMin);
-            if (weaponType == GameEnums::WeaponType::WeaponType_Both &&
-                (inIndirectRange || distance == 1))
-            {
-                ret = true;
-            }
-            else
-            {
-                if ((weaponType == GameEnums::WeaponType::WeaponType_Direct && distance == 1) ||
-                    rangeCheck == GameEnums::AttackRangeCheck_None ||
-                    (weaponType == GameEnums::WeaponType::WeaponType_Indirect && inIndirectRange))
-                {
-                    ret = true;
-                }
-            }
+            ret = WeaponRangeCheck::canAttack(slot,
+                                              static_cast<WeaponRangeCheck::WeaponType>(weaponType),
+                                              GlobalUtils::getDistance(position, QPoint(targetX, targetY)),
+                                              getMinRange(position),
+                                              getMaxRange(position),
+                                              static_cast<WeaponRangeCheck::RangeCheck>(rangeCheck));
         }
     }
     return ret;

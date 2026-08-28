@@ -738,6 +738,7 @@ set(${PROJECT_NAME}_SRCS
     game/co.cpp game/co.h
     game/player.cpp game/player.h
     game/unit.cpp game/unit.h
+    game/weaponrangecheck.h
     game/terrainfindingsystem.cpp game/terrainfindingsystem.h
     game/gameaction.cpp game/gameaction.h
     game/unitpathfindingsystem.cpp game/unitpathfindingsystem.h
@@ -1360,6 +1361,23 @@ if (BUILD_TESTING)
         COMMAND CoordinatorAiGameVersionCompatibilityTests
     )
     cow_set_arena_test_path(CoordinatorAiGameVersionCompatibilityTests)
+
+    add_executable(GameWeaponRangeCheckTests
+        tests/game/weaponrangechecktests.cpp
+    )
+    target_include_directories(GameWeaponRangeCheckTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(GameWeaponRangeCheckTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME GameWeaponRangeCheckTests
+        COMMAND GameWeaponRangeCheckTests
+    )
+    cow_set_arena_test_path(GameWeaponRangeCheckTests)
 
     target_sources(${PROJECT_NAME} PRIVATE
         tests/arena/arenamatchconfig.cpp
