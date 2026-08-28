@@ -300,6 +300,14 @@
     strategy.MOBILITY_VALUE_CEIL = 1.5;
     // Credit air movement for ignoring terrain; one disables the bonus.
     strategy.MOBILITY_AIR_REACH_BONUS = 1.25;
+    // Relevant threat profiles sampled for factory deployment time.
+    strategy.DEPLOYMENT_TARGET_SAMPLE = 3;
+    // Penalty added for each deployment turn after the first.
+    strategy.DEPLOYMENT_TURN_WEIGHT = 0.30;
+    // Lowest multiplier for a reachable deployment estimate.
+    strategy.DEPLOYMENT_FACTOR_FLOOR = 0.35;
+    // Multiplier used only for a confidently unreachable deployment.
+    strategy.DEPLOYMENT_UNREACHABLE_FACTOR = 0.05;
     // Per duplicate score multiplier applied to every unit type, keeping armies mixed.
     strategy.UNIT_DIVERSITY_FACTOR = 0.85;
     // Exponent on cost in the cost biased ordering. Raising it favours expensive units harder.
@@ -324,6 +332,10 @@
     strategy.MAX_DYNAMIC_BASELINE_COUNTS = 65536;
     // Most enemy unit ids retained in the daily baseline.
     strategy.MAX_DYNAMIC_BASELINE_THREATS = 65536;
+    // Most engine deployment queries in one planning pass.
+    strategy.MAX_DEPLOYMENT_PATH_QUERIES = 256;
+    // Most map nodes expanded by one deployment query.
+    strategy.MAX_DEPLOYMENT_PATH_NODES = 65536;
     // Most production plans tracked in a turn, one per building or special action.
     strategy.MAX_PLAN_COUNT = 512;
     // Most candidates stored on a single plan.

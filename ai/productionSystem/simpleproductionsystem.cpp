@@ -9,7 +9,9 @@
 
 #include <QCryptographicHash>
 
+#include <algorithm>
 #include <limits>
+#include <queue>
 
 namespace
 {
@@ -26,6 +28,27 @@ const QString PREPARE_PRODUCTION_FUNCTION = QStringLiteral("prepareProduction");
 const QString BASE_PRODUCTION_ACTION_FUNCTION = QStringLiteral("getIsBaseProductionAction");
 // Comfortably above any real roster, including large mods, and a hard ceiling on retained units.
 constexpr std::size_t COUNTERPOINT_UNIT_CACHE_LIMIT = 512;
+constexpr qint32 COUNTERPOINT_DEPLOYMENT_DX[] = {1, -1, 0, 0};
+constexpr qint32 COUNTERPOINT_DEPLOYMENT_DY[] = {0, 0, 1, -1};
+
+struct CounterpointDeploymentNode
+{
+    qint64 cost;
+    qint32 index;
+};
+
+struct CounterpointDeploymentNodeGreater
+{
+    bool operator()(const CounterpointDeploymentNode & left,
+                    const CounterpointDeploymentNode & right) const
+    {
+        if (left.cost != right.cost)
+        {
+            return left.cost > right.cost;
+        }
+        return left.index > right.index;
+    }
+};
 }
 
 SimpleProductionSystem::SimpleProductionSystem(CoreAI * owner)
@@ -301,6 +324,139 @@ qreal SimpleProductionSystem::getCounterpointBaseDamage(const QString & attacker
     spUnit pAttacker = getCounterpointUnit(attackerId);
     spUnit pDefender = getCounterpointUnit(defenderId);
     return pAttacker->getBaseDamage(pDefender.get());
+}
+
+qint32 SimpleProductionSystem::estimateCounterpointDeploymentTurns(
+    qint32 startX, qint32 startY, const QString & unitId,
+    qint32 targetX, qint32 targetY, qint32 effectiveMinRange,
+    qint32 effectiveMaxRange, bool pureIndirect, qint32 maxExpandedNodes)
+{
+    if (m_owner == nullptr || m_owner->getMap() == nullptr ||
+        m_owner->getPlayer() == nullptr || unitId.isEmpty() ||
+        !UnitSpriteManager::getInstance()->exists(unitId) ||
+        maxExpandedNodes <= 0)
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    GameMap* pMap = m_owner->getMap();
+    if (!pMap->onMap(startX, startY) || !pMap->onMap(targetX, targetY) ||
+        effectiveMinRange < 1 || effectiveMaxRange < effectiveMinRange)
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    const auto inFiringBand = [=](qint32 x, qint32 y)
+    {
+        const qint32 distance = qAbs(x - targetX) + qAbs(y - targetY);
+        return distance >= effectiveMinRange && distance <= effectiveMaxRange;
+    };
+    if (inFiringBand(startX, startY))
+    {
+        return 1;
+    }
+    spUnit pUnit = getCounterpointUnit(unitId);
+    if (pUnit == nullptr)
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    const QString movementType = pUnit->getMovementType();
+    if (movementType.isEmpty() ||
+        !Interpreter::getInstance()->exists(
+            movementType,
+            QStringLiteral("getMovementpoints")
+        ))
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    pUnit->setTerrain(pMap->getTerrain(startX, startY));
+    const qint32 movementPoints = pUnit->getMovementpoints(QPoint(startX, startY));
+    const bool canMoveAndFire = pUnit->canMoveAndFire(QPoint(startX, startY));
+    pUnit->setTerrain(nullptr);
+    if (movementPoints <= 0)
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    const qint32 width = pMap->getMapWidth();
+    const qint32 height = pMap->getMapHeight();
+    const qint64 tileCount = static_cast<qint64>(width) * height;
+    if (width <= 0 || height <= 0 ||
+        tileCount > std::numeric_limits<qint32>::max())
+    {
+        return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+    }
+    const qint32 nodeLimit = std::min(
+        maxExpandedNodes,
+        static_cast<qint32>(tileCount)
+    );
+    const qint64 infinity = std::numeric_limits<qint64>::max();
+    std::vector<qint64> distances(static_cast<std::size_t>(tileCount), infinity);
+    std::priority_queue<
+        CounterpointDeploymentNode,
+        std::vector<CounterpointDeploymentNode>,
+        CounterpointDeploymentNodeGreater
+    > pending;
+    const qint32 startIndex = startY * width + startX;
+    distances[static_cast<std::size_t>(startIndex)] = 0;
+    pending.push({0, startIndex});
+    qint32 expanded = 0;
+    while (!pending.empty())
+    {
+        const CounterpointDeploymentNode current = pending.top();
+        pending.pop();
+        if (current.cost != distances[static_cast<std::size_t>(current.index)])
+        {
+            continue;
+        }
+        if (expanded >= nodeLimit)
+        {
+            return COUNTERPOINT_DEPLOYMENT_UNKNOWN;
+        }
+        ++expanded;
+        const qint32 x = current.index % width;
+        const qint32 y = current.index / width;
+        if (inFiringBand(x, y))
+        {
+            qint64 turns = std::max<qint64>(
+                1,
+                (current.cost + movementPoints - 1) / movementPoints
+            );
+            if (pureIndirect && current.cost > 0 && !canMoveAndFire)
+            {
+                ++turns;
+            }
+            return static_cast<qint32>(std::min<qint64>(
+                turns,
+                std::numeric_limits<qint32>::max()
+            ));
+        }
+        for (qint32 direction = 0; direction < 4; ++direction)
+        {
+            const qint32 nextX = x + COUNTERPOINT_DEPLOYMENT_DX[direction];
+            const qint32 nextY = y + COUNTERPOINT_DEPLOYMENT_DY[direction];
+            if (!pMap->onMap(nextX, nextY))
+            {
+                continue;
+            }
+            const qint32 movementCost = pUnit->getMovementCosts(
+                nextX,
+                nextY,
+                x,
+                y
+            );
+            if (movementCost < 0)
+            {
+                continue;
+            }
+            const qint64 nextCost = current.cost + movementCost;
+            const qint32 nextIndex = nextY * width + nextX;
+            auto & previous = distances[static_cast<std::size_t>(nextIndex)];
+            if (nextCost < previous)
+            {
+                previous = nextCost;
+                pending.push({nextCost, nextIndex});
+            }
+        }
+    }
+    return COUNTERPOINT_DEPLOYMENT_UNREACHABLE;
 }
 
 bool SimpleProductionSystem::executeCounterpointBuild(qint32 x, qint32 y, const QString & unitId, qint32 ordinal, qint32 expectedCost)

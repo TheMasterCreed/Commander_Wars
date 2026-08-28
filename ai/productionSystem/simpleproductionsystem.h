@@ -158,11 +158,20 @@ public:
     static constexpr qint32 DEFAULT_ACTION_ORDINAL = 0;
     // Skips the live cost check, so the build proceeds at whatever the menu currently reports.
     static constexpr qint32 NO_EXPECTED_COST = -1;
+    static constexpr qint32 COUNTERPOINT_DEPLOYMENT_UNKNOWN = -1;
+    static constexpr qint32 COUNTERPOINT_DEPLOYMENT_UNREACHABLE = -2;
 
     Q_INVOKABLE ProductionActionData* getProductionActionData(Building* pBuilding, const QString & actionId) const;
     Q_INVOKABLE quint32 deriveCounterpointSeed(qint32 algorithmVersion, qint32 generation) const;
     Q_INVOKABLE quint32 randomCounterpointSeed() const;
     Q_INVOKABLE qreal getCounterpointBaseDamage(const QString & attackerId, const QString & defenderId);
+    Q_INVOKABLE qint32 estimateCounterpointDeploymentTurns(qint32 startX, qint32 startY,
+                                                           const QString & unitId,
+                                                           qint32 targetX, qint32 targetY,
+                                                           qint32 effectiveMinRange,
+                                                           qint32 effectiveMaxRange,
+                                                           bool pureIndirect,
+                                                           qint32 maxExpandedNodes);
     Q_INVOKABLE bool executeCounterpointBuild(qint32 x, qint32 y, const QString & unitId, qint32 ordinal = DEFAULT_ACTION_ORDINAL, qint32 expectedCost = NO_EXPECTED_COST);
 private:
     // Game script first, owning ai second, which is the seam every scripted hook here goes through.

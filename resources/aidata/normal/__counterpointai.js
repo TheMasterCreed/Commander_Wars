@@ -12,6 +12,8 @@
     PHASE_ORDINARY : "ordinary",
     ORDER_MODE_DAMAGE : "damage",
     ORDER_MODE_INVERSE : "inverse",
+    DEPLOYMENT_UNKNOWN : -1,
+    DEPLOYMENT_UNREACHABLE : -2,
     PLANNER_STATE_VARIABLE_ID : "COUNTERPOINT_STATE",
     PLANNER_STATE_SCHEMA_VERSION : 2,
     // Rejection sampling changes every seeded sequence.
@@ -41,6 +43,12 @@
     SAME_TURN_DUPLICATE_FACTOR_DEFAULT : 0.55,
     INDIRECT_ROLE_FREE_COUNT_DEFAULT : 2,
     INDIRECT_ROLE_STACK_FACTOR_DEFAULT : 0.75,
+    DEPLOYMENT_TARGET_SAMPLE_DEFAULT : 3,
+    MAX_DEPLOYMENT_PATH_QUERIES_DEFAULT : 256,
+    MAX_DEPLOYMENT_PATH_NODES_DEFAULT : 65536,
+    DEPLOYMENT_TURN_WEIGHT_DEFAULT : 0.30,
+    DEPLOYMENT_FACTOR_FLOOR_DEFAULT : 0.35,
+    DEPLOYMENT_UNREACHABLE_FACTOR_DEFAULT : 0.05,
     HOLD_FOR_BETTER_RATIO_DEFAULT : 0.25,
     MAX_STRATEGIC_HOLDS_PER_TURN_DEFAULT : 3,
     PHANTOM_RETAL_WEIGHT_DEFAULT : 0.5,
@@ -95,6 +103,9 @@
         MAX_COVERAGE_PROFILE_ENTRIES : 16,
         MAX_DYNAMIC_BASELINE_COUNTS : 65536,
         MAX_DYNAMIC_BASELINE_THREATS : 65536,
+        DEPLOYMENT_TARGET_SAMPLE : 16,
+        MAX_DEPLOYMENT_PATH_QUERIES : 1024,
+        MAX_DEPLOYMENT_PATH_NODES : 1048576,
         // Kept under the signed limit of the engine's bounded random API.
         MAX_RANDOM_WEIGHT_TOTAL : 1000000000
     },
@@ -2580,6 +2591,9 @@
             typeof candidate.deploymentKnown !== "boolean" ||
             typeof candidate.deploymentUnreachable !== "boolean" ||
             (candidate.deploymentUnreachable && !candidate.deploymentKnown) ||
+            (candidate.deploymentKnown &&
+             !candidate.deploymentUnreachable &&
+             candidate.deploymentTurns < 1) ||
             !COUNTERPOINTAI._validPlannerNumber(
                 candidate.purchaseUtility,
                 -COUNTERPOINTAI.PLANNER_VALUE_MAX,
@@ -4450,7 +4464,13 @@
             ),
             banIndirects : banIndirects,
             indirectCo : indirectCo,
-            fieldedIndirects : COUNTERPOINTAI._countPureIndirects(ownSnapshots)
+            fieldedIndirects : COUNTERPOINTAI._countPureIndirects(ownSnapshots),
+            deploymentSystem : system,
+            deploymentMap : map,
+            deploymentEnemies : enemyUnits,
+            deploymentQueries : 0,
+            deploymentCache : Object.create(null),
+            deploymentTargetCache : Object.create(null)
         };
         context.staticThreats = COUNTERPOINTAI._staticThreatRecords(context);
         context.staticThreatIndexes = COUNTERPOINTAI._staticThreatIndexes(
@@ -4920,10 +4940,43 @@
                 );
             }
         }
-        adjusted = COUNTERPOINTAI._flipFactor(
-            adjusted,
-            candidate.intrinsicMobilityFactor
-        );
+        var deploymentFactor = candidate.intrinsicMobilityFactor;
+        if (candidate.deploymentKnown === true)
+        {
+            if (candidate.deploymentUnreachable === true)
+            {
+                deploymentFactor = COUNTERPOINTAI._clamp(
+                    COUNTERPOINTAI._tunable(
+                        "DEPLOYMENT_UNREACHABLE_FACTOR"
+                    ),
+                    0,
+                    1
+                );
+            }
+            else
+            {
+                var deploymentFloor = COUNTERPOINTAI._clamp(
+                    COUNTERPOINTAI._tunable("DEPLOYMENT_FACTOR_FLOOR"),
+                    0,
+                    1
+                );
+                deploymentFactor = COUNTERPOINTAI._clamp(
+                    1 / (
+                        1 +
+                        Math.max(
+                            0,
+                            COUNTERPOINTAI._tunable(
+                                "DEPLOYMENT_TURN_WEIGHT"
+                            )
+                        ) *
+                        Math.max(0, candidate.deploymentTurns - 1)
+                    ),
+                    deploymentFloor,
+                    1
+                );
+            }
+        }
+        adjusted = COUNTERPOINTAI._flipFactor(adjusted, deploymentFactor);
         adjusted = COUNTERPOINTAI._clamp(
             COUNTERPOINTAI._finiteNumber(adjusted, 0),
             -COUNTERPOINTAI.PLANNER_VALUE_MAX,
@@ -7121,6 +7174,252 @@
         COUNTERPOINTAI._rejectCandidate(plan, candidateIndex);
     },
 
+    _deploymentTarget : function(context, plan, unitId)
+    {
+        var key = plan.x + "," + plan.y + "#" + unitId;
+        if (context.deploymentTargetCache[key] !== undefined)
+        {
+            return context.deploymentTargetCache[key];
+        }
+        var best = null;
+        var bestDistance = COUNTERPOINTAI.PLANNER_VALUE_MAX;
+        var length = COUNTERPOINTAI._collectionLength(
+            context.deploymentEnemies
+        );
+        for (var index = 0; index < length; ++index)
+        {
+            var enemy = COUNTERPOINTAI._collectionAt(
+                context.deploymentEnemies,
+                index
+            );
+            if (enemy === null || enemy === undefined ||
+                String(enemy.getUnitID()) !== unitId)
+            {
+                continue;
+            }
+            var x = enemy.getX();
+            var y = enemy.getY();
+            var distance = Math.abs(plan.x - x) + Math.abs(plan.y - y);
+            if (best === null || distance < bestDistance ||
+                (distance === bestDistance &&
+                 (x < best.x || (x === best.x && y < best.y))))
+            {
+                best = { x : x, y : y };
+                bestDistance = distance;
+            }
+        }
+        context.deploymentTargetCache[key] = best;
+        return best;
+    },
+
+    _deploymentNodeLimit : function(context)
+    {
+        var map = context.deploymentMap;
+        if (map === null || map === undefined ||
+            typeof map.getMapWidth !== "function" ||
+            typeof map.getMapHeight !== "function")
+        {
+            return 0;
+        }
+        var tiles = Math.max(
+            0,
+            Math.floor(
+                COUNTERPOINTAI._finiteNumber(map.getMapWidth(), 0) *
+                COUNTERPOINTAI._finiteNumber(map.getMapHeight(), 0)
+            )
+        );
+        return Math.min(
+            tiles,
+            COUNTERPOINTAI._plannerLimit("MAX_DEPLOYMENT_PATH_NODES", 1)
+        );
+    },
+
+    _deploymentQuery : function(candidate, plan, context, target,
+                                 minRange, maxRange)
+    {
+        var system = context.deploymentSystem;
+        if (system === null || system === undefined ||
+            typeof system.estimateCounterpointDeploymentTurns !== "function" ||
+            typeof system.getDummyUnit !== "function")
+        {
+            return COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        var dummy = system.getDummyUnit(candidate.id);
+        if (dummy === null || dummy === undefined)
+        {
+            return COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        var nodeLimit = COUNTERPOINTAI._deploymentNodeLimit(context);
+        if (nodeLimit <= 0)
+        {
+            return COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        var key = String(dummy.getMovementType()) + "#" + candidate.id +
+            "@" + plan.x + "," + plan.y +
+            ">" + target.x + "," + target.y +
+            ":" + minRange + "-" + maxRange +
+            ":" + (candidate.isIndirect ? "1" : "0") +
+            ":" + nodeLimit;
+        if (context.deploymentCache[key] !== undefined)
+        {
+            return context.deploymentCache[key];
+        }
+        if (context.deploymentQueries >=
+            COUNTERPOINTAI._plannerLimit("MAX_DEPLOYMENT_PATH_QUERIES", 1))
+        {
+            return COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        context.deploymentQueries += 1;
+        var result = COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        try
+        {
+            result = Math.floor(COUNTERPOINTAI._finiteNumber(
+                system.estimateCounterpointDeploymentTurns(
+                    plan.x,
+                    plan.y,
+                    candidate.id,
+                    target.x,
+                    target.y,
+                    minRange,
+                    maxRange,
+                    candidate.isIndirect,
+                    nodeLimit
+                ),
+                COUNTERPOINTAI.DEPLOYMENT_UNKNOWN
+            ));
+        }
+        catch (error)
+        {
+            result = COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        if (result <= 0 &&
+            result !== COUNTERPOINTAI.DEPLOYMENT_UNREACHABLE)
+        {
+            result = COUNTERPOINTAI.DEPLOYMENT_UNKNOWN;
+        }
+        context.deploymentCache[key] = result;
+        return result;
+    },
+
+    _estimateCandidateDeployment : function(candidate, plan, context)
+    {
+        candidate.deploymentTurns = 0;
+        candidate.deploymentKnown = false;
+        candidate.deploymentUnreachable = false;
+        if (!Array.isArray(candidate.coverageProfile) ||
+            candidate.coverageProfile.length === 0 ||
+            !Array.isArray(context.staticThreats) ||
+            context.staticThreats.length === 0 ||
+            candidate.scoreData === null ||
+            candidate.scoreData === undefined)
+        {
+            return;
+        }
+        if (context.deploymentCache === null ||
+            context.deploymentCache === undefined)
+        {
+            context.deploymentCache = Object.create(null);
+        }
+        if (context.deploymentTargetCache === null ||
+            context.deploymentTargetCache === undefined)
+        {
+            context.deploymentTargetCache = Object.create(null);
+        }
+        context.deploymentQueries = COUNTERPOINTAI._wholeCount(
+            context.deploymentQueries
+        );
+        if (context.deploymentQueries >=
+            COUNTERPOINTAI._plannerLimit("MAX_DEPLOYMENT_PATH_QUERIES", 1))
+        {
+            return;
+        }
+        var data = candidate.scoreData;
+        var minRange = Math.max(
+            1,
+            Math.floor(COUNTERPOINTAI._readNumber(data, "minRange", 1))
+        );
+        var rangeDelta = COUNTERPOINTAI._hasIndirectChannel(data) ?
+            COUNTERPOINTAI._contextNumber(
+                context,
+                "indirectRangeDeltas",
+                candidate.id,
+                0
+            ) : 0;
+        var maxRange = Math.max(
+            minRange,
+            Math.floor(
+                COUNTERPOINTAI._readNumber(data, "maxRange", minRange) +
+                rangeDelta
+            )
+        );
+        var sampleLimit = COUNTERPOINTAI._plannerLimit(
+            "DEPLOYMENT_TARGET_SAMPLE",
+            1
+        );
+        var sampled = 0;
+        var unreachable = 0;
+        var totalWeight = 0;
+        var weightedTurns = 0;
+        for (var profileIndex = 0;
+             profileIndex < candidate.coverageProfile.length &&
+             sampled < sampleLimit;
+             ++profileIndex)
+        {
+            var profile = candidate.coverageProfile[profileIndex];
+            if (profile.threatIndex < 0 ||
+                profile.threatIndex >= context.staticThreats.length)
+            {
+                continue;
+            }
+            var threat = context.staticThreats[profile.threatIndex];
+            var target = COUNTERPOINTAI._deploymentTarget(
+                context,
+                plan,
+                threat.id
+            );
+            if (target === null)
+            {
+                continue;
+            }
+            sampled += 1;
+            var result = COUNTERPOINTAI._deploymentQuery(
+                candidate,
+                plan,
+                context,
+                target,
+                minRange,
+                maxRange
+            );
+            if (result > 0)
+            {
+                var weight = Math.max(
+                    0,
+                    COUNTERPOINTAI._finiteNumber(profile.staticWeight, 0)
+                );
+                weightedTurns += weight * result;
+                totalWeight += weight;
+            }
+            else if (result === COUNTERPOINTAI.DEPLOYMENT_UNREACHABLE)
+            {
+                unreachable += 1;
+            }
+        }
+        if (totalWeight > 0)
+        {
+            candidate.deploymentTurns = COUNTERPOINTAI._clamp(
+                weightedTurns / totalWeight,
+                1,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            );
+            candidate.deploymentKnown = true;
+        }
+        else if (sampled > 0 && unreachable === sampled)
+        {
+            candidate.deploymentKnown = true;
+            candidate.deploymentUnreachable = true;
+        }
+    },
+
     _scoreContext : function(context)
     {
         return {
@@ -7243,6 +7542,11 @@
                 {
                     COUNTERPOINTAI._setCandidateOrderScore(candidate, context);
                 }
+                COUNTERPOINTAI._estimateCandidateDeployment(
+                    candidate,
+                    plan,
+                    context
+                );
                 var marginal = COUNTERPOINTAI._evaluateMarginalPurchase(
                     candidate,
                     plan,
