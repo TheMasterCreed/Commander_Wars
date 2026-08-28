@@ -1,4 +1,5 @@
 #include "ai/coreai.h"
+#include "ai/fastbattleestimate.h"
 #include "ai/targetedunitpathfindingsystem.h"
 #include "ai/aiprocesspipe.h"
 
@@ -23,6 +24,8 @@
 #include <QFile>
 #include <QSettings>
 #include <map>
+
+static_assert(FastBattleEstimate::HP_SCALE == Unit::MAX_UNIT_HP, "the pure estimate must use the engine hp scale");
 
 namespace
 {
@@ -762,9 +765,7 @@ void CoreAI::getAttacksFromField(Unit* pUnit, spGameAction & pAction, std::vecto
                 DamageData data;
                 data.x = target.x();
                 data.y = target.y();
-                data.fundsDamage = dmg.fundsDamage;
-                data.hpDamage = dmg.atkHpDamage;
-                data.hpDamageDifference = dmg.hpDamage;
+                FastBattleEstimate::fillDamageData(dmg, data);
                 ret.push_back(data);
                 QPoint point = pAction->getActionTarget();
                 moveTargetFields.push_back(QVector3D(point.x(), point.y(), 1 + stealthMalus));
@@ -804,27 +805,14 @@ bool CoreAI::isAttackOnTerrainAllowed(Terrain* pTerrain, float damage) const
 
 CoreAI::FundsDamageData CoreAI::calcFundsDamage(const QRectF & damage, Unit* pAtk, Unit* pDef) const
 {
-    float atkDamage = static_cast<float>(damage.x()) / Unit::MAX_UNIT_HP;
-    if (atkDamage > pDef->getHp())
-    {
-        atkDamage = pDef->getHp();
-    }
-    float hpDamage = atkDamage;
-    float fundsDamage = pDef->getUnitCosts() * atkDamage / Unit::MAX_UNIT_HP;
-    if (damage.width() >= 0.0)
-    {
-        hpDamage -= damage.width() / Unit::MAX_UNIT_HP;
-        float counterDamage = static_cast<float>(damage.width()) / Unit::MAX_UNIT_HP;
-        if (counterDamage > pAtk->getHp())
-        {
-            counterDamage = pAtk->getHp();
-        }
-        fundsDamage -= pAtk->getUnitCosts() * counterDamage / Unit::MAX_UNIT_HP * m_ownUnitValue;
-    }
+    const auto estimate = FastBattleEstimate::evaluate(damage.x(), damage.width(),
+                                                       FastBattleEstimate::Combatant{pAtk->getHp(), pAtk->getUnitCosts()},
+                                                       FastBattleEstimate::Combatant{pDef->getHp(), pDef->getUnitCosts()},
+                                                       m_ownUnitValue);
     FundsDamageData dmg;
-    dmg.atkHpDamage = atkDamage;
-    dmg.fundsDamage = fundsDamage;
-    dmg.hpDamage = hpDamage;
+    dmg.atkHpDamage = estimate.attackerHpDamage;
+    dmg.fundsDamage = estimate.fundsDamage;
+    dmg.hpDamage = estimate.hpDamageDifference;
     return dmg;
 }
 
@@ -3247,24 +3235,26 @@ void CoreAI::getAttacksFromFieldFast(Unit* pUnit, QPoint position, QmlVectorPoin
                 DamageData data;
                 data.x = finalPos.x();
                 data.y = finalPos.y();
-                data.fundsDamage = dmg.fundsDamage;
-                data.hpDamage = dmg.hpDamage;
-                data.hpDamageDifference = dmg.hpDamage;
+                FastBattleEstimate::fillDamageData(dmg, data);
                 ret.push_back(data);
             }
         }
     }
 }
 
+QPointF CoreAI::getBaseDamageAgainst(Unit* pAttacker, Unit* pDefender)
+{
+    return getBaseDamage(pAttacker, pDefender);
+}
+
 QRectF CoreAI::calcUnitDamageFast(Unit* pAttacker, Unit* pDefender)
 {
+    const auto damage = FastBattleEstimate::exchangeBaseDamage(&CoreAI::getBaseDamageAgainst, pAttacker, pDefender);
     QRectF ret;
-    QPointF atkDmg = getBaseDamage(pAttacker, pDefender);
-    QPointF defDmg = getBaseDamage(pAttacker, pDefender);
-    ret.setX(atkDmg.x());
-    ret.setY(atkDmg.y());
-    ret.setWidth(defDmg.x());
-    ret.setHeight(defDmg.y());
+    ret.setX(damage.attack.x());
+    ret.setY(damage.attack.y());
+    ret.setWidth(damage.counter.x());
+    ret.setHeight(damage.counter.y());
     return ret;
 }
 

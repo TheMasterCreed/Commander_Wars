@@ -822,6 +822,7 @@ set(${PROJECT_NAME}_SRCS
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
     ai/unloadselection.h
+    ai/fastbattleestimate.h
     ai/influencefrontmap.cpp ai/influencefrontmap.h
     ai/heavyai/heavyai.cpp ai/heavyai/heavyai.h
     ai/heavyai/heavyAiSharedData.h
@@ -1512,6 +1513,23 @@ if (BUILD_TESTING)
         COMMAND NormalAiUnloadSelectionTests
     )
     cow_set_arena_test_path(NormalAiUnloadSelectionTests)
+
+    add_executable(NormalAiFastBattleEstimateTests
+        tests/normal_ai/fastbattleestimatetests.cpp
+    )
+    target_include_directories(NormalAiFastBattleEstimateTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(NormalAiFastBattleEstimateTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME NormalAiFastBattleEstimateTests
+        COMMAND NormalAiFastBattleEstimateTests
+    )
+    cow_set_arena_test_path(NormalAiFastBattleEstimateTests)
 
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})

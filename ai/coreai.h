@@ -899,6 +899,8 @@ protected:
      * @return
      */
     static float getBaseDamage(const QString & weaponID, Unit* pDefender);
+    // Named so the overloaded getBaseDamage collapses to one oracle for exchangeBaseDamage.
+    static QPointF getBaseDamageAgainst(Unit* pAttacker, Unit* pDefender);
 protected:
     std::vector<spIslandMap> m_IslandMaps;
     double m_buildingValue{1.0f};
