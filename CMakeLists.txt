@@ -824,6 +824,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/battlefieldknowledge.h ai/coordinator/battlefieldknowledge.cpp
     ai/coordinator/attackopportunityfield.h
     ai/coordinator/attackopportunitybuilder.h ai/coordinator/attackopportunitybuilder.cpp
+    ai/coordinator/propertyeconomics.h
+    ai/coordinator/propertyeconomicsbuilder.h ai/coordinator/propertyeconomicsbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1364,6 +1366,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiAttackOpportunityFieldTests)
 
+    add_executable(CoordinatorAiPropertyEconomicsTests
+        tests/coordinator_ai/propertyeconomicstests.cpp
+    )
+    target_include_directories(CoordinatorAiPropertyEconomicsTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiPropertyEconomicsTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiPropertyEconomicsTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiPropertyEconomicsTests
+        COMMAND CoordinatorAiPropertyEconomicsTests
+    )
+    cow_set_arena_test_path(CoordinatorAiPropertyEconomicsTests)
+
     add_executable(CoordinatorAiTypeIdentityTests
         tests/coordinator_ai/aitypeidentitytests.cpp
         game/GameEnums.h
@@ -1474,6 +1494,8 @@ if (BUILD_TESTING)
         tests/arena/knowledgeprobe.h
         tests/arena/attackfactsprobe.cpp
         tests/arena/attackfactsprobe.h
+        tests/arena/propertyfactsprobe.cpp
+        tests/arena/propertyfactsprobe.h
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
@@ -1781,6 +1803,8 @@ if (BUILD_TESTING)
         ArenaKnowledgeFacts tests/arena/fixtures/knowledge_init.js 120)
     cow_add_arena_probe_test(
         ArenaAttackOpportunityDifferential tests/arena/fixtures/attack_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaPropertyEconomics tests/arena/fixtures/property_init.js 120)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
