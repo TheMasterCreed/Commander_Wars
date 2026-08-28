@@ -819,6 +819,7 @@ set(${PROJECT_NAME}_SRCS
     ai/normalai.cpp ai/normalai.h    
     ai/coordinatedai.cpp ai/coordinatedai.h
     ai/coordinator/coordinatorcommon.h
+    ai/coordinator/mobilityfield.h
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1324,6 +1325,23 @@ if (BUILD_TESTING)
     )
     add_test(NAME CoordinatorAiCommonTests COMMAND CoordinatorAiCommonTests)
     cow_set_arena_test_path(CoordinatorAiCommonTests)
+
+    add_executable(CoordinatorAiMobilityFieldTests
+        tests/coordinator_ai/mobilityfieldtests.cpp
+    )
+    target_include_directories(CoordinatorAiMobilityFieldTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(CoordinatorAiMobilityFieldTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiMobilityFieldTests
+        COMMAND CoordinatorAiMobilityFieldTests
+    )
+    cow_set_arena_test_path(CoordinatorAiMobilityFieldTests)
 
     add_executable(CoordinatorAiTypeIdentityTests
         tests/coordinator_ai/aitypeidentitytests.cpp
