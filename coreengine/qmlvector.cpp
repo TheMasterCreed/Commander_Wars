@@ -3,7 +3,32 @@
 #include "coreengine/interpreter.h"
 #include "game/terrain.h"
 
+#include "ai/airandom.h"
 #include "ai/coreai.h"
+
+namespace
+{
+constexpr qint32 RANDOM_SORT_VALUE_MAX = std::numeric_limits<qint32>::max() - 3;
+
+qint32 drawSortValue(AiRandom * random)
+{
+    return random != nullptr ? random->bounded(0, RANDOM_SORT_VALUE_MAX)
+                             : GlobalUtils::randInt(0, RANDOM_SORT_VALUE_MAX);
+}
+
+template<typename Vector>
+void randomizeSortOrder(Vector & vector, AiRandom * random)
+{
+    for (auto & item : vector)
+    {
+        item->setSortValues({drawSortValue(random)});
+    }
+    std::sort(vector.begin(), vector.end(), [](const auto & lhs, const auto & rhs)
+    {
+        return lhs->getSortValues()[0] > rhs->getSortValues()[0];
+    });
+}
+}
 
 QmlVectorPoint::QmlVectorPoint()
 {
@@ -30,17 +55,26 @@ void QmlVectorUnit::clone(QmlVectorUnit* source)
 
 void QmlVectorUnit::randomize()
 {
-    for (auto & unit : m_Vector)
-    {
-        unit->setSortValues({GlobalUtils::randInt(0, std::numeric_limits<qint32>::max() - 3)});
-    }
-    std::sort(m_Vector.begin(), m_Vector.end(), [](const spUnit& lhs, const spUnit& rhs)
-    {
-        return lhs->getSortValues()[0] > rhs->getSortValues()[0];
-    });
+    randomize(nullptr);
+}
+
+void QmlVectorUnit::randomize(AiRandom * random)
+{
+    randomizeSortOrder(m_Vector, random);
 }
 
 void QmlVectorUnit::sortAiPriority()
+{
+    sortAiPriority(nullptr);
+}
+
+void QmlVectorUnit::sortAiPriority(AiRandom * random)
+{
+    randomize(random);
+    applyAiPrioritySort();
+}
+
+void QmlVectorUnit::applyAiPrioritySort()
 {
     // maps that never set a priority keep the legacy randomized order
     bool hasPriority = false;
@@ -52,7 +86,6 @@ void QmlVectorUnit::sortAiPriority()
             break;
         }
     }
-    randomize();
     if (!hasPriority)
     {
         return;
@@ -191,14 +224,12 @@ void QmlVectorBuilding::clone(QmlVectorBuilding * source)
 
 void QmlVectorBuilding::randomize()
 {
-    for (auto & building : m_Vector)
-    {
-        building->setSortValues({GlobalUtils::randInt(0, std::numeric_limits<qint32>::max() - 3)});
-    }
-    std::sort(m_Vector.begin(), m_Vector.end(), [](const spBuilding& lhs, const spBuilding& rhs)
-    {
-        return lhs->getSortValues()[0] > rhs->getSortValues()[0];
-    });
+    randomize(nullptr);
+}
+
+void QmlVectorBuilding::randomize(AiRandom * random)
+{
+    randomizeSortOrder(m_Vector, random);
 }
 
 qint32 QmlVectorBuilding::getBuildingCount(const QString & buildingId)

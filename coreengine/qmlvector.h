@@ -12,6 +12,8 @@
 #include "coreengine/refobject.h"
 #include "coreengine/jsthis.h"
 
+class AiRandom;
+
 class QmlVectorPoint;
 using spQmlVectorPoint = std::shared_ptr<QmlVectorPoint>;
 
@@ -93,11 +95,10 @@ public:
         m_Vector.erase(m_Vector.cbegin() + i);
     }
     Q_INVOKABLE void randomize();
-    /**
-     * @brief sortAiPriority higher ai priority first, ties by lowest unique id. Units without a
-     * priority keep a randomized order behind them, so unscripted behavior stays unpredictable.
-     */
+    void randomize(AiRandom * random);
+    // Higher priorities sort first, while zero-priority units keep their randomized order.
     Q_INVOKABLE void sortAiPriority();
+    void sortAiPriority(AiRandom * random);
     /**
      * @brief sortExpensive most expensive units are sorted in first
      */
@@ -113,6 +114,8 @@ public:
      */
     Q_INVOKABLE qint32 getUnitCount(const QString & unitId);
 private:
+    void applyAiPrioritySort();
+
     std::vector<spUnit> m_Vector;
 };
 
@@ -168,6 +171,7 @@ public:
         m_Vector.erase(m_Vector.cbegin() + i);
     }
     Q_INVOKABLE void randomize();
+    void randomize(AiRandom * random);
 private:
     std::vector<spBuilding> m_Vector;
 };

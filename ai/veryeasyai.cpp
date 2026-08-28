@@ -74,7 +74,7 @@ void VeryEasyAI::process()
     pBuildings->sortClosestToEnemy(pEnemyUnits);
 
     qint32 cost = 0;
-    m_pPlayer->getSiloRockettarget(2, 3, cost);
+    m_pPlayer->getSiloRockettarget(Player::DEFAULT_SILO_TARGET_RADIUS, Player::DEFAULT_SILO_TARGET_DAMAGE, cost);
     m_missileTarget = (cost >= m_minSiloDamage);
     // create island maps at the start of turn
     if (m_rebuildIslandMaps)
@@ -168,7 +168,7 @@ bool VeryEasyAI::captureBuildings(spQmlVectorUnit & pUnits)
 {
     AI_CONSOLE_PRINT("VeryEasyAI::captureBuildings()", GameConsole::eDEBUG);
     qint32 cost = 0;
-    QPoint rocketTarget = m_pPlayer->getSiloRockettarget(2, 3, cost);
+    QPoint rocketTarget = m_pPlayer->getSiloRockettarget(Player::DEFAULT_SILO_TARGET_RADIUS, Player::DEFAULT_SILO_TARGET_DAMAGE, cost);
     bool fireSilos = (cost >= m_minSiloDamage);
 
     Interpreter* pInterpreter = Interpreter::getInstance();

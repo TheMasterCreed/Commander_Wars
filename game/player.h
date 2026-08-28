@@ -16,6 +16,7 @@
 
 #include "gameinput/basegameinputif.h"
 
+class AiRandom;
 class QmlVectorPoint;
 using spQmlVectorPoint = std::shared_ptr<QmlVectorPoint>;
 class QmlVectorUnit;
@@ -32,6 +33,9 @@ class Player : public QObject, public oxygine::Actor, public FileSerializable, p
     Q_OBJECT
 public:
     static const char *const CO_ARMY;
+    static constexpr qreal DEFAULT_ROCKET_OWN_UNIT_VALUE = 1.2;
+    static constexpr qint32 DEFAULT_SILO_TARGET_RADIUS = 2;
+    static constexpr qint32 DEFAULT_SILO_TARGET_DAMAGE = 3;
     /**
      * @brief Player
      */
@@ -523,7 +527,7 @@ public:
      * @param ownUnitValue value of own or allied units compared to enemy ones.
      * @return -1, -1 for no target found
      */
-    Q_INVOKABLE QPoint getRockettarget(qint32 radius, qint32 damage, qreal ownUnitValue = 1.2, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
+    Q_INVOKABLE QPoint getRockettarget(qint32 radius, qint32 damage, qreal ownUnitValue = DEFAULT_ROCKET_OWN_UNIT_VALUE, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
     /**
      * @brief getSiloRockettarget
      * @param radius
@@ -533,7 +537,9 @@ public:
      * @param targetType
      * @return
      */
-    Q_INVOKABLE QPoint getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highestDamage, qreal ownUnitValue = 1.2, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
+    Q_INVOKABLE QPoint getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highestDamage, qreal ownUnitValue = DEFAULT_ROCKET_OWN_UNIT_VALUE, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
+    QPoint getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highestDamage, AiRandom * random, qreal ownUnitValue = DEFAULT_ROCKET_OWN_UNIT_VALUE, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
+    qint32 getSiloRockettargetDamage(qint32 radius, qint32 damage, qreal ownUnitValue = DEFAULT_ROCKET_OWN_UNIT_VALUE, GameEnums::RocketTarget targetType = GameEnums::RocketTarget_Money, QmlVectorPoint* pSearchArea = nullptr);
     /**
      * @brief getRocketTargetDamage
      * @param x
@@ -735,6 +741,8 @@ public:
     Q_INVOKABLE qreal getRepairCostModifier(Unit* pUnit);
 
 private:
+    QVector<QPoint> collectSiloRockettargets(qint32 radius, qint32 damage, qint32 & highestDamage, qreal ownUnitValue, GameEnums::RocketTarget targetType, QmlVectorPoint* pSearchArea);
+
     /**
      * @brief loadTable
      * @param table

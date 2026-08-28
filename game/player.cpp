@@ -3,6 +3,8 @@
 #include "coreengine/audiomanager.h"
 #include "coreengine/virtualpaths.h"
 
+#include "ai/airandom.h"
+
 #include "gameinput/basegameinputif.h"
 #include "gameinput/humanplayerinput.h"
 
@@ -1936,6 +1938,31 @@ QPoint Player::getRockettarget(qint32 radius, qint32 damage, qreal ownUnitValue,
 
 QPoint Player::getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highestDamage, qreal ownUnitValue, GameEnums::RocketTarget targetType, QmlVectorPoint* pSearchArea)
 {    
+    return getSiloRockettarget(radius, damage, highestDamage, nullptr, ownUnitValue, targetType, pSearchArea);
+}
+
+QPoint Player::getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highestDamage, AiRandom * random, qreal ownUnitValue, GameEnums::RocketTarget targetType, QmlVectorPoint* pSearchArea)
+{
+    const QVector<QPoint> targets = collectSiloRockettargets(radius, damage, highestDamage, ownUnitValue, targetType, pSearchArea);
+    if (!targets.isEmpty())
+    {
+        const qint32 lastIndex = static_cast<qint32>(targets.size() - 1);
+        const qint32 index = random != nullptr ? random->bounded(0, lastIndex)
+                                               : GlobalUtils::randInt(0, lastIndex);
+        return targets[index];
+    }
+    return QPoint(-1, -1);
+}
+
+qint32 Player::getSiloRockettargetDamage(qint32 radius, qint32 damage, qreal ownUnitValue, GameEnums::RocketTarget targetType, QmlVectorPoint* pSearchArea)
+{
+    qint32 highestDamage = -1;
+    collectSiloRockettargets(radius, damage, highestDamage, ownUnitValue, targetType, pSearchArea);
+    return highestDamage;
+}
+
+QVector<QPoint> Player::collectSiloRockettargets(qint32 radius, qint32 damage, qint32 & highestDamage, qreal ownUnitValue, GameEnums::RocketTarget targetType, QmlVectorPoint* pSearchArea)
+{
     spQmlVectorPoint pPoints = GlobalUtils::getSpCircle(0, radius);
     highestDamage = -1;
     QVector<QPoint> targets;
@@ -1979,14 +2006,7 @@ QPoint Player::getSiloRockettarget(qint32 radius, qint32 damage, qint32 & highes
             }
         }
     }
-    if (targets.size() > 0)
-    {
-        return targets[GlobalUtils::randInt(0, targets.size() - 1)];
-    }
-    else
-    {
-        return QPoint(-1, -1);
-    }
+    return targets;
 }
 
 qint32 Player::getAverageCost()

@@ -25,6 +25,10 @@ public slots:
      */
     virtual void process() override;
 protected:
+    virtual bool usesLegacyAiRandom() const
+    {
+        return true;
+    }
     /**
      * @brief performActionSteps
      * @param pUnits

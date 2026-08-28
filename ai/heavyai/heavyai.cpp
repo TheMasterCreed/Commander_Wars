@@ -70,7 +70,7 @@ void HeavyAi::process()
     spQmlVectorUnit pEnemyUnits = m_pPlayer->getSpEnemyUnits();
     pEnemyUnits->pruneEnemies(pUnits.get(), pBuildings.get(), m_ownBuildingPruneRange, m_enemyPruneRange);
     qint32 cost = 0;
-    m_pPlayer->getSiloRockettarget(2, 3, cost);
+    m_pPlayer->getSiloRockettarget(Player::DEFAULT_SILO_TARGET_RADIUS, Player::DEFAULT_SILO_TARGET_DAMAGE, cost);
     m_missileTarget = (cost >= m_minSiloDamage);
     if (useBuilding(pBuildings, pUnits))
     {
