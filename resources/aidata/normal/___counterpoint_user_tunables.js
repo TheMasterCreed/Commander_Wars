@@ -90,6 +90,12 @@
     strategy.INDIRECT_TAX = 0.70;
     // Extra multiplier per indirect of that type already owned, compounding with each one.
     strategy.INDIRECT_STACK_PENALTY = 0.5;
+    // Multiplier for each additional same-turn copy.
+    strategy.SAME_TURN_DUPLICATE_FACTOR = 0.55;
+    // Pure indirects above this projected count receive role-wide damping.
+    strategy.INDIRECT_ROLE_FREE_COUNT = 2;
+    // Multiplier for each pure indirect above the free count.
+    strategy.INDIRECT_ROLE_STACK_FACTOR = 0.75;
     strategy.INDIRECT_SATURATION_FREE_COUNT = 2;
     // Let saturated indirect scores cross below competing negative scores.
     strategy.INDIRECT_SATURATION_COST_WEIGHT = 60;
@@ -308,6 +314,12 @@
     strategy.MAX_RANDOM_WEIGHT_TOTAL = 1000000000;
     // Most buildable units weighed in one pass. Past this the pass gives up rather than crawl.
     strategy.MAX_CANDIDATE_COUNT = 65536;
+    // Most compact threat entries retained per candidate.
+    strategy.MAX_COVERAGE_PROFILE_ENTRIES = 16;
+    // Most fielded unit ids retained in the daily baseline.
+    strategy.MAX_DYNAMIC_BASELINE_COUNTS = 65536;
+    // Most enemy unit ids retained in the daily baseline.
+    strategy.MAX_DYNAMIC_BASELINE_THREATS = 65536;
     // Most production plans tracked in a turn, one per building or special action.
     strategy.MAX_PLAN_COUNT = 512;
     // Most candidates stored on a single plan.

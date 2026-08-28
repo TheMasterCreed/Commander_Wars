@@ -36,6 +36,9 @@
     COVERAGE_QUALITY_DAMAGE_DEFAULT : 55,
     INDIRECT_SATURATION_FREE_COUNT_DEFAULT : 2,
     INDIRECT_SATURATION_COST_WEIGHT_DEFAULT : 60,
+    SAME_TURN_DUPLICATE_FACTOR_DEFAULT : 0.55,
+    INDIRECT_ROLE_FREE_COUNT_DEFAULT : 2,
+    INDIRECT_ROLE_STACK_FACTOR_DEFAULT : 0.75,
     HOLD_FOR_BETTER_RATIO_DEFAULT : 0.25,
     MAX_STRATEGIC_HOLDS_PER_TURN_DEFAULT : 3,
     PHANTOM_RETAL_WEIGHT_DEFAULT : 0.5,
@@ -88,6 +91,8 @@
         MAX_PLANNER_STATE_LENGTH : 8388608,
         MAX_CANDIDATE_COUNT : 65536,
         MAX_COVERAGE_PROFILE_ENTRIES : 16,
+        MAX_DYNAMIC_BASELINE_COUNTS : 65536,
+        MAX_DYNAMIC_BASELINE_THREATS : 65536,
         // Kept under the signed limit of the engine's bounded random API.
         MAX_RANDOM_WEIGHT_TOTAL : 1000000000
     },
@@ -761,67 +766,92 @@
 
     _staticThreatRecords : function(context)
     {
-        var records = [];
-        var seen = Object.create(null);
+        var byId = Object.create(null);
         var enemies = context.enemyComposition || [];
         for (var enemyIndex = 0; enemyIndex < enemies.length; ++enemyIndex)
         {
             var enemy = enemies[enemyIndex];
             var enemyId = COUNTERPOINTAI._unitId(enemy);
-            var key = "field:" + COUNTERPOINTAI._unitKey(enemy);
-            if (enemyId === "" || seen[key] === true)
+            var key = "#" + enemyId;
+            if (enemyId === "")
             {
                 continue;
             }
-            seen[key] = true;
             var hp = Math.max(0, COUNTERPOINTAI._readNumber(enemy, "hpSum", 0));
             if (enemy.canCapture === true)
             {
                 hp = COUNTERPOINTAI._softcapCapperHP(hp);
             }
-            records.push({
-                key : key,
-                id : enemyId,
-                need : hp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
-                baseCoverage : COUNTERPOINTAI._contextNumber(
+            if (byId[key] === undefined)
+            {
+                byId[key] = {
+                    key : key,
+                    id : enemyId,
+                    need : 0,
+                    baseCoverage : 0,
+                    isAirThreat : false
+                };
+            }
+            byId[key].need += hp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE;
+            byId[key].baseCoverage = Math.max(
+                byId[key].baseCoverage,
+                COUNTERPOINTAI._contextNumber(
                     context,
                     "ownCoverage",
                     COUNTERPOINTAI._unitKey(enemy),
                     0
-                ),
-                isAirThreat : COUNTERPOINTAI._isAirThreat(enemy)
-            });
+                )
+            );
+            byId[key].isAirThreat = byId[key].isAirThreat ||
+                COUNTERPOINTAI._isAirThreat(enemy);
         }
         var phantoms = context.phantomThreats || [];
         for (var phantomIndex = 0; phantomIndex < phantoms.length; ++phantomIndex)
         {
             var phantom = phantoms[phantomIndex];
             var phantomId = COUNTERPOINTAI._unitId(phantom);
-            var phantomKey = "phantom:" + COUNTERPOINTAI._unitKey(phantom);
-            if (phantomId === "" || seen[phantomKey] === true)
+            var phantomKey = "#" + phantomId;
+            if (phantomId === "")
             {
                 continue;
             }
-            seen[phantomKey] = true;
-            records.push({
-                key : phantomKey,
-                id : phantomId,
-                need : COUNTERPOINTAI.PHANTOM_RETAL_HP *
-                    COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
-                baseCoverage : COUNTERPOINTAI._contextNumber(
+            if (byId[phantomKey] === undefined)
+            {
+                byId[phantomKey] = {
+                    key : phantomKey,
+                    id : phantomId,
+                    need : 0,
+                    baseCoverage : 0,
+                    isAirThreat : false
+                };
+            }
+            byId[phantomKey].need += COUNTERPOINTAI.PHANTOM_RETAL_HP *
+                COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE;
+            byId[phantomKey].baseCoverage = Math.max(
+                byId[phantomKey].baseCoverage,
+                COUNTERPOINTAI._contextNumber(
                     context,
                     "phantomCoverage",
                     COUNTERPOINTAI._unitKey(phantom),
                     0
-                ),
-                isAirThreat : COUNTERPOINTAI._isAirThreat(phantom)
-            });
+                )
+            );
+            byId[phantomKey].isAirThreat = byId[phantomKey].isAirThreat ||
+                COUNTERPOINTAI._isAirThreat(phantom);
+        }
+        var records = [];
+        for (var threatKey in byId)
+        {
+            records.push(byId[threatKey]);
         }
         records.sort(function(left, right)
         {
             return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
         });
-        return records;
+        return records.slice(
+            0,
+            COUNTERPOINTAI._plannerLimit("MAX_DYNAMIC_BASELINE_THREATS", 1)
+        );
     },
 
     _staticThreatIndexes : function(records)
@@ -849,8 +879,7 @@
             }
             var key = "#" + threatIndex;
             var previous = byIndex[key];
-            if (previous === undefined ||
-                threat.staticContribution > previous.staticContribution)
+            if (previous === undefined)
             {
                 byIndex[key] = {
                     threatIndex : threatIndex,
@@ -860,6 +889,14 @@
                     ),
                     staticContribution : threat.staticContribution
                 };
+            }
+            else
+            {
+                previous.staticContribution += threat.staticContribution;
+                previous.coverageDelta = Math.max(
+                    previous.coverageDelta,
+                    threat.coverageDelta
+                );
             }
         }
         var compact = [];
@@ -1604,8 +1641,9 @@
             if (offenseContribution > 0)
             {
                 staticThreats.push({
-                    key : "field:" + enemyKey,
+                    key : "#" + enemyId,
                     id : enemyId,
+                    coverageKey : enemyKey,
                     need : threatNeed,
                     coverageDelta : COUNTERPOINTAI._coverageDamage(
                         COUNTERPOINTAI._damageAgainst(candidate, enemyId),
@@ -1764,8 +1802,9 @@
                 if (phantomContribution > 0)
                 {
                     staticThreats.push({
-                        key : "phantom:" + COUNTERPOINTAI._unitKey(phantom),
+                        key : "#" + COUNTERPOINTAI._unitId(phantom),
                         id : COUNTERPOINTAI._unitId(phantom),
+                        coverageKey : COUNTERPOINTAI._unitKey(phantom),
                         need : COUNTERPOINTAI.PHANTOM_RETAL_HP *
                             COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
                         coverageDelta : COUNTERPOINTAI._coverageDamage(
@@ -1877,11 +1916,10 @@
 
     _legacyThreatCoverage : function(context, threat)
     {
-        var prefixLength = threat.phantom === true ? 8 : 6;
         return COUNTERPOINTAI._contextNumber(
             context,
             threat.phantom === true ? "phantomCoverage" : "ownCoverage",
-            threat.key.substring(prefixLength),
+            threat.coverageKey,
             0
         );
     },
@@ -2410,10 +2448,11 @@
         );
     },
 
-    _validCoverageProfile : function(profile)
+    _validCoverageProfile : function(profile, threatCount)
     {
         if (!Array.isArray(profile) ||
-            profile.length > COUNTERPOINTAI._coverageProfileLimit())
+            profile.length > COUNTERPOINTAI._coverageProfileLimit() ||
+            (profile.length > 0 && threatCount <= 0))
         {
             return false;
         }
@@ -2425,7 +2464,7 @@
                 !COUNTERPOINTAI._validPlannerInteger(
                     entry.threatIndex,
                     0,
-                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                    Math.max(0, threatCount - 1)
                 ) ||
                 !COUNTERPOINTAI._validPlannerNumber(
                     entry.coverageDelta,
@@ -2475,7 +2514,7 @@
         return true;
     },
 
-    _validPlannerCandidate : function(candidate, candidateCount)
+    _validPlannerCandidate : function(candidate, candidateCount, threatCount)
     {
         if (candidate === null || typeof candidate !== "object" ||
             typeof candidate.id !== "string" || candidate.id.length === 0 ||
@@ -2503,12 +2542,26 @@
             typeof candidate.isIndirect !== "boolean" ||
             typeof candidate.isDirectCombat !== "boolean" ||
             typeof candidate.canTransportTank !== "boolean" ||
+            typeof candidate.indirectStacked !== "boolean" ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.movement,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.intrinsicMobilityFactor,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
             !COUNTERPOINTAI._validPlannerNumber(
                 candidate.baseCombatScore,
                 -COUNTERPOINTAI.PLANNER_VALUE_MAX,
                 COUNTERPOINTAI.PLANNER_VALUE_MAX
             ) ||
-            !COUNTERPOINTAI._validCoverageProfile(candidate.coverageProfile) ||
+            !COUNTERPOINTAI._validCoverageProfile(
+                candidate.coverageProfile,
+                threatCount
+            ) ||
             !COUNTERPOINTAI._validPlannerNumber(
                 candidate.airCoverageDelta,
                 0,
@@ -2522,6 +2575,11 @@
             typeof candidate.deploymentKnown !== "boolean" ||
             typeof candidate.deploymentUnreachable !== "boolean" ||
             (candidate.deploymentUnreachable && !candidate.deploymentKnown) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.purchaseUtility,
+                -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
             (candidate.orderScore !== undefined &&
              !COUNTERPOINTAI._validPlannerInteger(
                  candidate.orderScore,
@@ -2535,7 +2593,7 @@
             COUNTERPOINTAI._isKnownDomain(candidate.domain);
     },
 
-    _validPlannerPlan : function(plan)
+    _validPlannerPlan : function(plan, threatCount)
     {
         var candidateLimit = COUNTERPOINTAI._plannerLimit("MAX_PLAN_CANDIDATES", 1);
         if (plan === null || typeof plan !== "object" ||
@@ -2599,7 +2657,8 @@
         {
             if (!COUNTERPOINTAI._validPlannerCandidate(
                     plan.candidates[candidateIndex],
-                    plan.candidates.length
+                    plan.candidates.length,
+                    threatCount
                 ))
             {
                 return false;
@@ -2663,6 +2722,109 @@
             );
     },
 
+    _validRoleCounts : function(roles)
+    {
+        if (roles === null || typeof roles !== "object")
+        {
+            return false;
+        }
+        var names = ["indirect", "antiAir", "directCombat", "capture", "transport"];
+        for (var index = 0; index < names.length; ++index)
+        {
+            if (!COUNTERPOINTAI._validPlannerInteger(
+                    roles[names[index]],
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ))
+            {
+                return false;
+            }
+        }
+        return true;
+    },
+
+    _validDynamicBaseline : function(baseline)
+    {
+        if (baseline === null || typeof baseline !== "object" ||
+            !Array.isArray(baseline.fieldedCounts) ||
+            baseline.fieldedCounts.length >
+                COUNTERPOINTAI._plannerLimit("MAX_DYNAMIC_BASELINE_COUNTS", 1) ||
+            !Array.isArray(baseline.threats) ||
+            baseline.threats.length >
+                COUNTERPOINTAI._plannerLimit("MAX_DYNAMIC_BASELINE_THREATS", 1) ||
+            !COUNTERPOINTAI._validRoleCounts(baseline.fieldedRoles) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                baseline.baseAirCoverage,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                baseline.airNeed,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                baseline.attackAirShare,
+                0,
+                1
+            ))
+        {
+            return false;
+        }
+        var unitIds = Object.create(null);
+        for (var countIndex = 0;
+             countIndex < baseline.fieldedCounts.length;
+             ++countIndex)
+        {
+            var countRecord = baseline.fieldedCounts[countIndex];
+            if (countRecord === null || typeof countRecord !== "object" ||
+                typeof countRecord.id !== "string" || countRecord.id.length === 0 ||
+                countRecord.id.length > COUNTERPOINTAI.PLANNER_ID_LENGTH_HARD_LIMIT ||
+                !COUNTERPOINTAI._validPlannerInteger(
+                    countRecord.count,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                unitIds["#" + countRecord.id] === true)
+            {
+                return false;
+            }
+            unitIds["#" + countRecord.id] = true;
+        }
+        var threatKeys = Object.create(null);
+        var threatIds = Object.create(null);
+        for (var threatIndex = 0;
+             threatIndex < baseline.threats.length;
+             ++threatIndex)
+        {
+            var threat = baseline.threats[threatIndex];
+            if (threat === null || typeof threat !== "object" ||
+                typeof threat.key !== "string" || threat.key.length === 0 ||
+                threat.key.length > COUNTERPOINTAI.PLANNER_KEY_LENGTH_HARD_LIMIT ||
+                typeof threat.id !== "string" || threat.id.length === 0 ||
+                threat.id.length > COUNTERPOINTAI.PLANNER_ID_LENGTH_HARD_LIMIT ||
+                !COUNTERPOINTAI._validPlannerNumber(
+                    threat.need,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                !COUNTERPOINTAI._validPlannerNumber(
+                    threat.baseCoverage,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                typeof threat.isAirThreat !== "boolean" ||
+                threatKeys[threat.key] === true ||
+                threatIds["#" + threat.id] === true)
+            {
+                return false;
+            }
+            threatKeys[threat.key] = true;
+            threatIds["#" + threat.id] = true;
+        }
+        return true;
+    },
+
     _validPlannerState : function(state)
     {
         if (state === null || state === undefined ||
@@ -2675,6 +2837,7 @@
             typeof state.ordinaryPrepared !== "boolean" ||
             !COUNTERPOINTAI._validPlannerJitter(state.specialRandomFundingJitter) ||
             !COUNTERPOINTAI._validPlannerJitter(state.ordinaryRandomFundingJitter) ||
+            !COUNTERPOINTAI._validDynamicBaseline(state.dynamicBaseline) ||
             !COUNTERPOINTAI._validTurnTargets(state.turnTargets))
         {
             return false;
@@ -2722,7 +2885,11 @@
         for (var planIndex = 0; planIndex < state.plans.length; ++planIndex)
         {
             var plan = state.plans[planIndex];
-            if (!COUNTERPOINTAI._validPlannerPlan(plan) || keys[plan.key] === true)
+            if (!COUNTERPOINTAI._validPlannerPlan(
+                    plan,
+                    state.dynamicBaseline.threats.length
+                ) ||
+                keys[plan.key] === true)
             {
                 return false;
             }
@@ -2945,6 +3112,7 @@
             ordinaryPrepared : false,
             specialRandomFundingJitter : null,
             ordinaryRandomFundingJitter : null,
+            dynamicBaseline : null,
             turnTargets : { aaPerTurn : -1, indirectRemaining : -1 },
             plans : []
         };
@@ -3107,12 +3275,16 @@
                 isIndirect : false,
                 isDirectCombat : false,
                 canTransportTank : false,
+                indirectStacked : false,
+                movement : 0,
+                intrinsicMobilityFactor : 1,
                 baseCombatScore : 0,
                 coverageProfile : [],
                 airCoverageDelta : 0,
                 deploymentTurns : 0,
                 deploymentKnown : false,
-                deploymentUnreachable : false
+                deploymentUnreachable : false,
+                purchaseUtility : 0
             });
         }
         return candidates;
@@ -4272,6 +4444,484 @@
             context.staticThreats
         );
         return context;
+    },
+
+    _roleCounts : function(composition)
+    {
+        var roles = {
+            indirect : 0,
+            antiAir : 0,
+            directCombat : 0,
+            capture : 0,
+            transport : 0
+        };
+        for (var index = 0; index < composition.length; ++index)
+        {
+            var unit = composition[index];
+            var count = COUNTERPOINTAI._wholeCount(
+                COUNTERPOINTAI._readNumber(unit, "count", 0)
+            );
+            if (COUNTERPOINTAI._isPureIndirect(unit))
+            {
+                roles.indirect += count;
+            }
+            if (COUNTERPOINTAI._countsAsAntiAir(unit))
+            {
+                roles.antiAir += count;
+            }
+            if (COUNTERPOINTAI._hasDirectChannel(unit) &&
+                COUNTERPOINTAI._hasAttackCapability(unit))
+            {
+                roles.directCombat += count;
+            }
+            if (unit.canCapture === true)
+            {
+                roles.capture += count;
+            }
+            if (unit.isTransporter === true)
+            {
+                roles.transport += count;
+            }
+        }
+        for (var role in roles)
+        {
+            roles[role] = Math.min(COUNTERPOINTAI.PLANNER_VALUE_MAX, roles[role]);
+        }
+        return roles;
+    },
+
+    _fieldedCountRecords : function(composition)
+    {
+        var counts = Object.create(null);
+        for (var index = 0; index < composition.length; ++index)
+        {
+            var unitId = COUNTERPOINTAI._unitId(composition[index]);
+            if (unitId !== "")
+            {
+                var key = "#" + unitId;
+                counts[key] = (counts[key] || 0) + COUNTERPOINTAI._wholeCount(
+                    COUNTERPOINTAI._readNumber(
+                        composition[index],
+                        "count",
+                        0
+                    )
+                );
+            }
+        }
+        var records = [];
+        for (var countKey in counts)
+        {
+            records.push({
+                id : countKey.substring(1),
+                count : Math.min(
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX,
+                    counts[countKey]
+                )
+            });
+        }
+        records.sort(function(left, right)
+        {
+            return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+        });
+        return records.slice(
+            0,
+            COUNTERPOINTAI._plannerLimit("MAX_DYNAMIC_BASELINE_COUNTS", 1)
+        );
+    },
+
+    _airThreatNeed : function(enemyComposition)
+    {
+        var need = 0;
+        for (var index = 0; index < enemyComposition.length; ++index)
+        {
+            var enemy = enemyComposition[index];
+            if (!COUNTERPOINTAI._isAirThreat(enemy))
+            {
+                continue;
+            }
+            var hp = Math.max(0, COUNTERPOINTAI._readNumber(enemy, "hpSum", 0));
+            if (enemy.canCapture === true)
+            {
+                hp = COUNTERPOINTAI._softcapCapperHP(hp);
+            }
+            need += hp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE;
+        }
+        return need;
+    },
+
+    _ensureDynamicBaseline : function(state, context)
+    {
+        if (state.dynamicBaseline !== null)
+        {
+            return;
+        }
+        var threats = [];
+        for (var index = 0; index < context.staticThreats.length; ++index)
+        {
+            var threat = context.staticThreats[index];
+            threats.push({
+                key : threat.key,
+                id : threat.id,
+                need : COUNTERPOINTAI._clamp(
+                    COUNTERPOINTAI._finiteNumber(threat.need, 0),
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ),
+                baseCoverage : COUNTERPOINTAI._clamp(
+                    COUNTERPOINTAI._finiteNumber(threat.baseCoverage, 0),
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ),
+                isAirThreat : threat.isAirThreat === true
+            });
+        }
+        state.dynamicBaseline = {
+            fieldedCounts : COUNTERPOINTAI._fieldedCountRecords(
+                context.ownComposition
+            ),
+            fieldedRoles : COUNTERPOINTAI._roleCounts(context.ownComposition),
+            threats : threats,
+            baseAirCoverage : COUNTERPOINTAI._clamp(
+                COUNTERPOINTAI._finiteNumber(context.ownAirCoverage, 0),
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ),
+            airNeed : COUNTERPOINTAI._clamp(
+                COUNTERPOINTAI._airThreatNeed(context.enemyComposition),
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ),
+            attackAirShare : COUNTERPOINTAI._clamp(
+                COUNTERPOINTAI._readNumber(
+                    context.threatProfile,
+                    "attackAirShare",
+                    0
+                ),
+                0,
+                1
+            )
+        };
+    },
+
+    _copyRoleCounts : function(roles)
+    {
+        return {
+            indirect : roles.indirect,
+            antiAir : roles.antiAir,
+            directCombat : roles.directCombat,
+            capture : roles.capture,
+            transport : roles.transport
+        };
+    },
+
+    _copyCountMap : function(source)
+    {
+        var copy = Object.create(null);
+        for (var key in source)
+        {
+            copy[key] = source[key];
+        }
+        return copy;
+    },
+
+    _applyCandidateProjection : function(projected, candidate)
+    {
+        var key = "#" + candidate.id;
+        projected.countsById[key] = (projected.countsById[key] || 0) + 1;
+        projected.builtThisTurnById[key] =
+            (projected.builtThisTurnById[key] || 0) + 1;
+        if (candidate.isIndirect)
+        {
+            projected.roleCounts.indirect += 1;
+            projected.builtRolesThisTurn.indirect += 1;
+        }
+        if (candidate.isAA)
+        {
+            projected.roleCounts.antiAir += 1;
+            projected.builtRolesThisTurn.antiAir += 1;
+        }
+        if (candidate.isDirectCombat)
+        {
+            projected.roleCounts.directCombat += 1;
+            projected.builtRolesThisTurn.directCombat += 1;
+        }
+        if (candidate.canCapture)
+        {
+            projected.roleCounts.capture += 1;
+            projected.builtRolesThisTurn.capture += 1;
+        }
+        if (candidate.isTransporter)
+        {
+            projected.roleCounts.transport += 1;
+            projected.builtRolesThisTurn.transport += 1;
+        }
+        for (var index = 0; index < candidate.coverageProfile.length; ++index)
+        {
+            var coverage = candidate.coverageProfile[index];
+            if (coverage.threatIndex >= 0 &&
+                coverage.threatIndex < projected.coverageByThreat.length)
+            {
+                projected.coverageByThreat[coverage.threatIndex] +=
+                    coverage.coverageDelta;
+            }
+        }
+        projected.airCoverage += candidate.airCoverageDelta;
+        return projected;
+    },
+
+    _projectedTurnContext : function(state)
+    {
+        var baseline = state.dynamicBaseline;
+        var countsById = Object.create(null);
+        for (var countIndex = 0;
+             countIndex < baseline.fieldedCounts.length;
+             ++countIndex)
+        {
+            var count = baseline.fieldedCounts[countIndex];
+            countsById["#" + count.id] = count.count;
+        }
+        var coverage = [];
+        for (var threatIndex = 0;
+             threatIndex < baseline.threats.length;
+             ++threatIndex)
+        {
+            coverage.push(baseline.threats[threatIndex].baseCoverage);
+        }
+        var projected = {
+            baseline : baseline,
+            countsById : countsById,
+            builtThisTurnById : Object.create(null),
+            roleCounts : COUNTERPOINTAI._copyRoleCounts(baseline.fieldedRoles),
+            builtRolesThisTurn : {
+                indirect : 0,
+                antiAir : 0,
+                directCombat : 0,
+                capture : 0,
+                transport : 0
+            },
+            coverageByThreat : coverage,
+            airCoverage : baseline.baseAirCoverage
+        };
+        for (var planIndex = 0; planIndex < state.plans.length; ++planIndex)
+        {
+            var plan = state.plans[planIndex];
+            if (plan.executed !== true || plan.selected < 0 ||
+                plan.selected >= plan.candidates.length)
+            {
+                continue;
+            }
+            COUNTERPOINTAI._applyCandidateProjection(
+                projected,
+                plan.candidates[plan.selected]
+            );
+        }
+        return projected;
+    },
+
+    _projectedWithCandidate : function(projected, candidate)
+    {
+        var copy = {
+            baseline : projected.baseline,
+            countsById : COUNTERPOINTAI._copyCountMap(projected.countsById),
+            builtThisTurnById : COUNTERPOINTAI._copyCountMap(
+                projected.builtThisTurnById
+            ),
+            roleCounts : COUNTERPOINTAI._copyRoleCounts(projected.roleCounts),
+            builtRolesThisTurn : COUNTERPOINTAI._copyRoleCounts(
+                projected.builtRolesThisTurn
+            ),
+            coverageByThreat : projected.coverageByThreat.slice(),
+            airCoverage : projected.airCoverage
+        };
+        return COUNTERPOINTAI._applyCandidateProjection(copy, candidate);
+    },
+
+    _baselineUnitCount : function(baseline, unitId)
+    {
+        for (var index = 0; index < baseline.fieldedCounts.length; ++index)
+        {
+            if (baseline.fieldedCounts[index].id === unitId)
+            {
+                return baseline.fieldedCounts[index].count;
+            }
+        }
+        return 0;
+    },
+
+    _projectedCoverageFactor : function(candidate, projected)
+    {
+        var baseline = projected.baseline;
+        var weighted = 0;
+        var totalWeight = 0;
+        for (var index = 0; index < candidate.coverageProfile.length; ++index)
+        {
+            var profile = candidate.coverageProfile[index];
+            if (profile.threatIndex < 0 ||
+                profile.threatIndex >= baseline.threats.length)
+            {
+                continue;
+            }
+            var weight = Math.max(0, profile.staticWeight);
+            weighted += weight * COUNTERPOINTAI._coverageGapFactor(
+                projected.coverageByThreat[profile.threatIndex],
+                baseline.threats[profile.threatIndex].need,
+                candidate.strategicValue
+            );
+            totalWeight += weight;
+        }
+        return totalWeight > 0 ? weighted / totalWeight : 1;
+    },
+
+    _purchaseUtility : function(adjustedCombatScore, liveCost, candidate)
+    {
+        var score = COUNTERPOINTAI._finiteNumber(adjustedCombatScore, 0);
+        if (score === 0)
+        {
+            return 0;
+        }
+        var transactionCost = COUNTERPOINTAI._finiteNumber(liveCost, -1);
+        if (transactionCost < 0)
+        {
+            transactionCost = COUNTERPOINTAI._finiteNumber(
+                candidate.transactionCost,
+                -1
+            );
+        }
+        if (transactionCost < 0)
+        {
+            transactionCost = COUNTERPOINTAI._strategicValue(candidate);
+        }
+        var valueUnits = Math.max(1, transactionCost / COUNTERPOINTAI.COST_SCALE);
+        var magnitude = Math.pow(
+            Math.abs(score) / valueUnits,
+            COUNTERPOINTAI.SCORE_EFFICIENCY_EXPONENT
+        ) * Math.pow(valueUnits, COUNTERPOINTAI.SCORE_VALUE_EXPONENT);
+        return COUNTERPOINTAI._clamp(
+            score > 0 ? magnitude : -magnitude,
+            -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+            COUNTERPOINTAI.PLANNER_VALUE_MAX
+        );
+    },
+
+    _evaluateMarginalPurchase : function(candidate, plan, projectedContext, liveCost)
+    {
+        var projected = projectedContext;
+        var baseline = projected.baseline;
+        var fieldedCopies = COUNTERPOINTAI._baselineUnitCount(
+            baseline,
+            candidate.id
+        );
+        var builtCopies = COUNTERPOINTAI._readUnitNumber(
+            projected.builtThisTurnById,
+            candidate.id,
+            0
+        );
+        var adjusted = COUNTERPOINTAI._finiteNumber(
+            candidate.baseCombatScore,
+            0
+        );
+        if (fieldedCopies > 0)
+        {
+            adjusted = COUNTERPOINTAI._flipFactor(
+                adjusted,
+                Math.pow(COUNTERPOINTAI.UNIT_DIVERSITY_FACTOR, fieldedCopies)
+            );
+        }
+        var duplicateExempt = plan !== null && plan !== undefined &&
+            plan.forcedBuild === true && candidate.canCapture === true;
+        if (!duplicateExempt && builtCopies > 0)
+        {
+            adjusted = COUNTERPOINTAI._flipFactor(
+                adjusted,
+                Math.pow(
+                    COUNTERPOINTAI._tunable("SAME_TURN_DUPLICATE_FACTOR"),
+                    builtCopies
+                )
+            );
+        }
+        adjusted = COUNTERPOINTAI._flipFactor(
+            adjusted,
+            COUNTERPOINTAI._projectedCoverageFactor(candidate, projected)
+        );
+        if (candidate.isAA && baseline.airNeed > 0)
+        {
+            var airShortfall = COUNTERPOINTAI._clamp(
+                1 - projected.airCoverage / baseline.airNeed,
+                0,
+                1
+            );
+            if (airShortfall > 0)
+            {
+                adjusted = COUNTERPOINTAI._flipFactor(
+                    adjusted,
+                    Math.min(
+                        COUNTERPOINTAI._tunable("AA_COVERAGE_BOOST_MAX"),
+                        1 + COUNTERPOINTAI._tunable("AA_COVERAGE_URGENCY") *
+                            airShortfall / Math.max(
+                                COUNTERPOINTAI.AA_SHARE_FLOOR,
+                                baseline.attackAirShare
+                            )
+                    )
+                );
+            }
+        }
+        var totalCopies = fieldedCopies + builtCopies;
+        if (candidate.indirectStacked && totalCopies > 0)
+        {
+            adjusted = COUNTERPOINTAI._flipFactor(
+                adjusted,
+                Math.pow(
+                    COUNTERPOINTAI.INDIRECT_STACK_PENALTY,
+                    totalCopies
+                )
+            );
+            var surplusCopies = totalCopies -
+                COUNTERPOINTAI._tunable("INDIRECT_SATURATION_FREE_COUNT");
+            if (surplusCopies > 0)
+            {
+                adjusted -= COUNTERPOINTAI._tunable(
+                    "INDIRECT_SATURATION_COST_WEIGHT"
+                ) * surplusCopies * Math.max(
+                    1,
+                    candidate.strategicValue / COUNTERPOINTAI.COST_SCALE
+                );
+            }
+        }
+        if (candidate.isIndirect)
+        {
+            var excessIndirects = Math.max(
+                0,
+                projected.roleCounts.indirect -
+                    COUNTERPOINTAI._tunable("INDIRECT_ROLE_FREE_COUNT")
+            );
+            if (excessIndirects > 0)
+            {
+                adjusted = COUNTERPOINTAI._flipFactor(
+                    adjusted,
+                    Math.pow(
+                        COUNTERPOINTAI._tunable("INDIRECT_ROLE_STACK_FACTOR"),
+                        excessIndirects
+                    )
+                );
+            }
+        }
+        adjusted = COUNTERPOINTAI._flipFactor(
+            adjusted,
+            candidate.intrinsicMobilityFactor
+        );
+        adjusted = COUNTERPOINTAI._clamp(
+            COUNTERPOINTAI._finiteNumber(adjusted, 0),
+            -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+            COUNTERPOINTAI.PLANNER_VALUE_MAX
+        );
+        return {
+            adjustedCombatScore : adjusted,
+            purchaseUtility : COUNTERPOINTAI._purchaseUtility(
+                adjusted,
+                liveCost,
+                candidate
+            )
+        };
     },
 
     // Which transports can actually deliver a ground capturer to somewhere we cannot already walk.
@@ -6326,7 +6976,8 @@
             banIndirects : context.banIndirects,
             tankFerryStats : context.tankFerryStats,
             groundCarriers : context.groundCarriers,
-            islandMode : context.islandMode
+            islandMode : context.islandMode,
+            mobilityReference : context.mobilityReference
         };
     },
 
@@ -6369,8 +7020,17 @@
         );
     },
 
-    _scorePlanCandidates : function(plans, context, turn)
+    _scorePlanCandidates : function(plans, context, turn, projected)
     {
+        var scoringCandidates = [];
+        COUNTERPOINTAI._visitPlanCandidates(plans, function(candidate)
+        {
+            if (candidate.scoreData !== undefined && candidate.scoreData !== null)
+            {
+                scoringCandidates.push(candidate.scoreData);
+            }
+        });
+        context.mobilityReference = COUNTERPOINTAI._medianMovement(scoringCandidates);
         for (var planIndex = 0; planIndex < plans.length; ++planIndex)
         {
             var plan = plans[planIndex];
@@ -6389,10 +7049,42 @@
                     COUNTERPOINTAI._hasAttackCapability(data);
                 candidate.canTransportTank = data !== undefined && data !== null &&
                     COUNTERPOINTAI._isTankCapableTransport(data);
+                candidate.movement = data === undefined || data === null ? 0 :
+                    Math.max(0, COUNTERPOINTAI._readNumber(data, "movement", 0));
+                candidate.indirectStacked = candidate.isIndirect &&
+                    COUNTERPOINTAI._contextNumber(
+                        context,
+                        "indirectRangeDeltas",
+                        candidate.id,
+                        0
+                    ) < 1;
+                var mobilityMovement = candidate.domain === COUNTERPOINTAI.DOMAIN_AIR ?
+                    candidate.movement *
+                        COUNTERPOINTAI._tunable("MOBILITY_AIR_REACH_BONUS") :
+                    candidate.movement;
+                candidate.intrinsicMobilityFactor =
+                    COUNTERPOINTAI._intrinsicMobilityFactor(
+                        mobilityMovement,
+                        context.mobilityReference
+                    );
                 if (!(turn <= 1 && candidate.canCapture === true))
                 {
                     COUNTERPOINTAI._setCandidateOrderScore(candidate, context);
                 }
+                var marginal = COUNTERPOINTAI._evaluateMarginalPurchase(
+                    candidate,
+                    plan,
+                    projected,
+                    candidate.transactionCost
+                );
+                candidate.purchaseUtility = COUNTERPOINTAI._clamp(
+                    COUNTERPOINTAI._finiteNumber(
+                        marginal.purchaseUtility,
+                        0
+                    ),
+                    -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                );
             }
         }
     },
@@ -7325,6 +8017,11 @@
             enemyBuildings,
             map
         );
+        COUNTERPOINTAI._ensureDynamicBaseline(state, context);
+        context.staticThreats = state.dynamicBaseline.threats;
+        context.staticThreatIndexes = COUNTERPOINTAI._staticThreatIndexes(
+            context.staticThreats
+        );
         var blocked = COUNTERPOINTAI._blockedProductionStatus(
             system,
             ai,
@@ -7355,7 +8052,12 @@
             enemyUnits,
             ordinaryPhase ? blocked.count : 0
         );
-        COUNTERPOINTAI._scorePlanCandidates(plans, context, map.getCurrentDay());
+        COUNTERPOINTAI._scorePlanCandidates(
+            plans,
+            context,
+            map.getCurrentDay(),
+            COUNTERPOINTAI._projectedTurnContext(state)
+        );
         if (state.specialPrepared !== true && state.ordinaryPrepared !== true)
         {
             state.turnTargets = COUNTERPOINTAI._computeTurnTargets(context);
