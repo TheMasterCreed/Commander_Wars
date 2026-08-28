@@ -802,6 +802,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coreai_predefinedai.cpp
     ai/proxyai.cpp ai/proxyai.h
     ai/normalai.cpp ai/normalai.h    
+    ai/coordinatedai.cpp ai/coordinatedai.h
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencefrontmap.cpp ai/influencefrontmap.h
@@ -1401,6 +1402,36 @@ if (BUILD_TESTING)
     )
     set_tests_properties(ArenaCaptureBonusPurity PROPERTIES TIMEOUT 120)
     cow_set_arena_test_path(ArenaCaptureBonusPurity)
+
+    function(cow_add_coordinated_shell_test testName operationName)
+        set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
+        file(MAKE_DIRECTORY ${runDir})
+        set(ARENA_COORDINATED_SHELL_OPERATION ${operationName})
+        configure_file(
+            tests/arena/fixtures/coordinated_shell_init.js
+            ${runDir}/init.js
+            @ONLY
+        )
+        add_test(
+            NAME ${testName}
+            COMMAND ${CMAKE_COMMAND} -E env
+                "COW_AI_ARENA_TEST=1"
+                $<TARGET_FILE:${PROJECT_NAME}>
+                --noUi
+                --noAudio
+                --spawnAiProcess 0
+                --mods=
+                --userPath ${runDir}/
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_tests_properties(${testName} PROPERTIES TIMEOUT 120)
+        cow_set_arena_test_path(${testName})
+    endfunction()
+    cow_add_coordinated_shell_test(ArenaCoordinatedShell coordinatedShell)
+    cow_add_coordinated_shell_test(
+        ArenaCoordinatedShellPauseFallback
+        coordinatedShellPauseFallback
+    )
 
     set(ARENA_MATCH_MAP_PATH "maps/2_player/Bean Island.map")
     set(ARENA_MATCH_AI_TYPE_0 "Normal")

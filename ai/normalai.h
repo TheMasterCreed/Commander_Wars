@@ -17,7 +17,7 @@ class Building;
 class NormalAi;
 using spNormalAi = std::shared_ptr<NormalAi>;
 
-class NormalAi final : public CoreAI
+class NormalAi : public CoreAI
 {
     Q_OBJECT
     enum FundsMode
@@ -114,6 +114,9 @@ public:
         Max,
     };
 
+    static const QString DEFAULT_INI_FILE;
+    static const QString DEFAULT_JS_NAME;
+
     explicit NormalAi(GameMap* pMap, const QString & configurationFile, GameEnums::AiTypes aiType, const QString & jsName);
     virtual ~NormalAi() = default;
 
@@ -152,6 +155,7 @@ public:
      */
     Q_INVOKABLE void hideFrontMap();
 protected:
+    bool holdForPause();
     bool performActionSteps(spQmlVectorUnit & pUnits, spQmlVectorUnit & pEnemyUnits,
                             spQmlVectorBuilding & pBuildings, spQmlVectorBuilding & pEnemyBuildings);
     /**

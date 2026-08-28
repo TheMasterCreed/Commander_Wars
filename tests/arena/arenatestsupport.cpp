@@ -8,8 +8,18 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QStringList>
 
+#include <memory>
+
+#include "ai/coordinatedai.h"
+#include "ai/normalai.h"
+#include "coreengine/memorymanagement.h"
 #include "coreengine/settings.h"
+#include "game/gameaction.h"
+#include "game/gamemap.h"
+#include "game/player.h"
+#include "gameinput/basegameinputif.h"
 
 namespace
 {
@@ -17,6 +27,9 @@ const QString ARENA_TEST_PASS = QStringLiteral("ARENA_TEST_PASS");
 const QString ARENA_TEST_FAIL_PREFIX = QStringLiteral("ARENA_TEST_FAIL:");
 const QString ARENA_REASON_PREFIX = QStringLiteral("ARENA_REASON:");
 constexpr qint32 MAX_WATCHDOG_MS = 3600000;
+constexpr qint32 COORDINATED_SHELL_MAP_SIZE = 8;
+constexpr qint32 COORDINATED_SHELL_PLAYER_COUNT = 2;
+constexpr qint32 COORDINATED_SHELL_PLAYER = 0;
 
 QHash<QString, AiArenaTestSupport::Operation> & operations()
 {
@@ -35,6 +48,114 @@ qint32 safeExitCode(qint32 exitCode)
             return exitCode;
     }
     return static_cast<qint32>(ArenaExitCode::AssertFailed);
+}
+
+struct CoordinatedShellFixture
+{
+    spGameMap pMap;
+    spBaseGameInputIF pInput;
+    spCoordinatedAi pAi;
+    Player* pPlayer{nullptr};
+};
+
+void expect(bool condition, const QString & failure, QStringList & failures)
+{
+    if (!condition)
+    {
+        failures.append(failure);
+    }
+}
+
+bool buildCoordinatedShellFixture(CoordinatedShellFixture & fixture,
+                                  QStringList & failures)
+{
+    fixture.pMap = MemoryManagement::create<GameMap>(
+        COORDINATED_SHELL_MAP_SIZE,
+        COORDINATED_SHELL_MAP_SIZE,
+        COORDINATED_SHELL_PLAYER_COUNT);
+    fixture.pPlayer = fixture.pMap->getPlayer(COORDINATED_SHELL_PLAYER);
+    fixture.pInput = BaseGameInputIF::createAi(
+        fixture.pMap.get(), GameEnums::AiTypes_Coordinated);
+    fixture.pAi = std::dynamic_pointer_cast<CoordinatedAi>(fixture.pInput);
+    expect(fixture.pPlayer != nullptr, QStringLiteral("missing player"), failures);
+    expect(fixture.pInput != nullptr, QStringLiteral("factory returned null"), failures);
+    expect(fixture.pAi != nullptr, QStringLiteral("factory returned wrong class"), failures);
+    if (fixture.pPlayer == nullptr || fixture.pAi == nullptr)
+    {
+        return false;
+    }
+    fixture.pMap->setCurrentPlayer(COORDINATED_SHELL_PLAYER);
+    fixture.pPlayer->setControlType(GameEnums::AiTypes_Coordinated);
+    fixture.pPlayer->setBaseGameInput(fixture.pInput);
+    fixture.pAi->resetMoveMap();
+    fixture.pAi->onGameStart();
+    return true;
+}
+
+QStringList runCoordinatedShellProcess(CoordinatedAi & ai)
+{
+    QStringList actionIds;
+    const QMetaObject::Connection connection = QObject::connect(
+        &ai,
+        &CoreAI::sigPerformAction,
+        &ai,
+        [&actionIds](spGameAction pAction, bool)
+        {
+            actionIds.append(pAction != nullptr
+                                 ? pAction->getActionID()
+                                 : QStringLiteral("<null>"));
+        },
+        Qt::DirectConnection);
+    ai.process();
+    QObject::disconnect(connection);
+    return actionIds;
+}
+
+QVariantMap coordinatedShell(QObject*, const QVariantMap &)
+{
+    QStringList failures;
+    CoordinatedShellFixture fixture;
+    if (buildCoordinatedShellFixture(fixture, failures))
+    {
+        expect(dynamic_cast<NormalAi*>(fixture.pInput.get()) != nullptr,
+               QStringLiteral("shell does not inherit NormalAi"), failures);
+        expect(fixture.pInput->getAiType() == GameEnums::AiTypes_Coordinated,
+               QStringLiteral("factory lost Coordinated identity"), failures);
+        expect(fixture.pAi->getAiName() == NormalAi::DEFAULT_JS_NAME,
+               QStringLiteral("shell changed NormalAi script name"), failures);
+        expect(fixture.pAi->getLoadedIniCount(
+                   QStringLiteral("normal/") + NormalAi::DEFAULT_INI_FILE) == 1,
+               QStringLiteral("shell did not load NormalAi defaults"), failures);
+        const QStringList actionIds = runCoordinatedShellProcess(*fixture.pAi);
+        expect(actionIds == QStringList{QString::fromLatin1(CoreAI::ACTION_NEXT_PLAYER)},
+               QStringLiteral("shell did not fall back to NormalAi"), failures);
+    }
+    return {
+        {QStringLiteral("ok"), failures.isEmpty()},
+        {QStringLiteral("failures"), failures},
+    };
+}
+
+QVariantMap coordinatedShellPauseFallback(QObject*, const QVariantMap &)
+{
+    QStringList failures;
+    CoordinatedShellFixture fixture;
+    if (buildCoordinatedShellFixture(fixture, failures))
+    {
+        fixture.pAi->toggleAiPause();
+        const QStringList pausedActions = runCoordinatedShellProcess(*fixture.pAi);
+        expect(pausedActions.isEmpty(),
+               QStringLiteral("paused shell emitted an action"), failures);
+        fixture.pAi->toggleAiPause();
+        const QStringList resumedActions = runCoordinatedShellProcess(*fixture.pAi);
+        expect(resumedActions ==
+                   QStringList{QString::fromLatin1(CoreAI::ACTION_NEXT_PLAYER)},
+               QStringLiteral("resumed shell did not use NormalAi fallback"), failures);
+    }
+    return {
+        {QStringLiteral("ok"), failures.isEmpty()},
+        {QStringLiteral("failures"), failures},
+    };
 }
 }
 
@@ -169,4 +290,15 @@ QString AiArenaTestSupport::getOutputPath(const QString & fileName) const
         return QString();
     }
     return userDirectory.filePath(fileName);
+}
+
+namespace
+{
+[[maybe_unused]] const bool COORDINATED_SHELL_REGISTERED =
+    AiArenaTestSupport::registerOperation(
+        QStringLiteral("coordinatedShell"), coordinatedShell);
+[[maybe_unused]] const bool COORDINATED_SHELL_PAUSE_FALLBACK_REGISTERED =
+    AiArenaTestSupport::registerOperation(
+        QStringLiteral("coordinatedShellPauseFallback"),
+        coordinatedShellPauseFallback);
 }

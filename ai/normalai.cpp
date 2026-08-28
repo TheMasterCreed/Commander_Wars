@@ -26,6 +26,9 @@ const QString COUNTERPOINT_PROFILE_INI = QStringLiteral("normal/counterpoint.ini
 constexpr qint32 FUNDS_MODE_ROLL_HIGH = 100;
 }
 
+const QString NormalAi::DEFAULT_INI_FILE = QStringLiteral("normal.ini");
+const QString NormalAi::DEFAULT_JS_NAME = QStringLiteral("NORMALAI");
+
 NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::AiTypes aiType, const QString &jsName)
     : CoreAI(pMap, aiType, jsName),
     m_InfluenceFrontMap(pMap, m_IslandMaps),
@@ -185,17 +188,23 @@ NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::A
     m_BuildingChanceModifier.insert("MECH", 1.1f);
 }
 
-void NormalAi::process()
+bool NormalAi::holdForPause()
 {
-    AI_CONSOLE_PRINT("NormalAi::process()", GameConsole::eDEBUG);
     if (m_pause)
     {
         m_timer.start(1000);
-        return;
+        return true;
     }
-    else
+    m_timer.stop();
+    return false;
+}
+
+void NormalAi::process()
+{
+    AI_CONSOLE_PRINT("NormalAi::process()", GameConsole::eDEBUG);
+    if (holdForPause())
     {
-        m_timer.stop();
+        return;
     }
     spQmlVectorBuilding pBuildings = m_pPlayer->getSpBuildings();
     {
@@ -320,7 +329,8 @@ void NormalAi::onGameStart()
     if (m_pMap != nullptr &&
         m_pMap->getGameRules() != nullptr &&
         m_pMap->getGameRules()->getAiBehaviorMode() == GameEnums::AiBehavior_Counterpoint &&
-        getAiType() == GameEnums::AiTypes_Normal &&
+        (getAiType() == GameEnums::AiTypes_Normal ||
+         getAiType() == GameEnums::AiTypes_Coordinated) &&
         getLoadedIniCount(COUNTERPOINT_PROFILE_INI) == 0)
     {
         loadIni(COUNTERPOINT_PROFILE_INI);

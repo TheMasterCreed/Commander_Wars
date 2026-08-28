@@ -6,6 +6,7 @@
 #include "ai/veryeasyai.h"
 #include "ai/proxyai.h"
 #include "ai/normalai.h"
+#include "ai/coordinatedai.h"
 #include "ai/heavyai/heavyai.h"
 #include "ai/dummyai.h"
 
@@ -127,7 +128,8 @@ spBaseGameInputIF BaseGameInputIF::createAi(GameMap* pMap, GameEnums::AiTypes ty
         }
         else
         {
-            ret = MemoryManagement::create<NormalAi>(pMap, "normal.ini", type, "NORMALAI");
+            ret = MemoryManagement::create<NormalAi>(
+                pMap, NormalAi::DEFAULT_INI_FILE, type, NormalAi::DEFAULT_JS_NAME);
         }
         break;
     }
@@ -154,6 +156,19 @@ spBaseGameInputIF BaseGameInputIF::createAi(GameMap* pMap, GameEnums::AiTypes ty
         else
         {
             ret = MemoryManagement::create<NormalAi>(pMap, "normalDefensive.ini", type, "NORMALAIDEFENSIVE");
+        }
+        break;
+    }
+    case GameEnums::AiTypes_Coordinated:
+    {
+        if (Settings::getInstance()->getSpawnAiProcess() &&
+            !Settings::getInstance()->getAiSlave())
+        {
+            ret = MemoryManagement::create<DummyAi>(pMap, type);
+        }
+        else
+        {
+            ret = MemoryManagement::create<CoordinatedAi>(pMap);
         }
         break;
     }
