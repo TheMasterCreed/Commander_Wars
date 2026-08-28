@@ -21,6 +21,49 @@ class GameMap;
 class GameAction;
 using spGameAction = std::shared_ptr<GameAction>;
 
+namespace GameActionSeed
+{
+inline void write(QDataStream & stream, quint32 seed) { stream << seed; }
+
+inline bool read(QDataStream & stream, quint32 & seed)
+{
+    quint32 value = 0;
+    stream >> value;
+    if (stream.status() != QDataStream::Ok)
+    {
+        return false;
+    }
+    seed = value;
+    return true;
+}
+template <typename Context>
+class Scope final
+{
+public:
+    Scope(Context & context, quint32 seed)
+        : m_context(context),
+          m_owner(!context.isActive())
+    {
+        if (m_owner)
+        {
+            m_context.activate(seed);
+        }
+    }
+    ~Scope()
+    {
+        if (m_owner)
+        {
+            m_context.deactivate();
+        }
+    }
+    Scope(const Scope &) = delete;
+    Scope & operator=(const Scope &) = delete;
+private:
+    Context & m_context;
+    const bool m_owner;
+};
+}
+
 class GameAction final : public QObject, public FileSerializable, public JsThis
 {
     Q_OBJECT

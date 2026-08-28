@@ -14,6 +14,21 @@
 const char* const GameAction::INPUTSTEP_FIELD = "FIELD";
 const char* const GameAction::INPUTSTEP_MENU = "MENU";
 
+namespace
+{
+class GlobalActionSeedContext final
+{
+public:
+    bool isActive() const { return GlobalUtils::getUseSeed(); }
+    void activate(quint32 seed)
+    {
+        GlobalUtils::seed(seed);
+        GlobalUtils::setUseSeed(true);
+    }
+    void deactivate() { GlobalUtils::setUseSeed(false); }
+};
+}
+
 GameAction::GameAction(GameMap* pMap)
     : m_target(-1, -1),
       m_pMap{pMap}
@@ -305,6 +320,8 @@ bool GameAction::isFinalStep()
 
 bool GameAction::isFinalStep(const QString & actionID)
 {
+    GlobalActionSeedContext seedContext;
+    GameActionSeed::Scope seedScope(seedContext, m_seed);
     Interpreter* pInterpreter = Interpreter::getInstance();
     QString function1 = "isFinalStep";
     QJSValueList args({m_jsThis,
@@ -547,7 +564,7 @@ void GameAction::serializeObject(QDataStream& stream) const
     {
         stream << static_cast<qint8>(data[i]);
     }
-    stream << m_seed;
+    GameActionSeed::write(stream, m_seed);
     qint32 size = m_MultiTurnPath.size();
     stream << size;
     for (qint32 i = 0; i < size; i++)
@@ -587,7 +604,7 @@ void GameAction::deserializeObject(QDataStream& stream)
         // stream into action buffer
         m_actionData << value;
     }
-    stream >> m_seed;
+    GameActionSeed::read(stream, m_seed);
     if (version > 1)
     {
         qint32 size = 0;

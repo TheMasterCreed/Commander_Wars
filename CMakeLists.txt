@@ -1379,6 +1379,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(GameWeaponRangeCheckTests)
 
+    add_executable(GameActionSeedTests
+        tests/game/gameactionseedtests.cpp
+    )
+    target_include_directories(GameActionSeedTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(GameActionSeedTests PRIVATE ${QT_LIBRARIES})
+    set_target_properties(GameActionSeedTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME GameActionSeedTests
+        COMMAND GameActionSeedTests
+    )
+    cow_set_arena_test_path(GameActionSeedTests)
+
     target_sources(${PROJECT_NAME} PRIVATE
         tests/arena/arenamatchconfig.cpp
         tests/arena/arenamatchconfig.h
