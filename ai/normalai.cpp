@@ -14,6 +14,7 @@
 #include "game/building.h"
 #include "game/unitpathfindingsystem.h"
 
+#include "ai/influencecontest.h"
 #include "ai/normalai.h"
 #include "ai/targetedunitpathfindingsystem.h"
 
@@ -2085,18 +2086,8 @@ void NormalAi::calcVirtualDamage()
 float NormalAi::getMapInfluenceModifier(Unit *pUnit, qint32 x, qint32 y) const
 {
     const auto *info = m_InfluenceFrontMap.getInfluenceInfo(x, y);
-    float enemyInfluence = info->getEnemyInfluence();
-    float ownInfluence = info->getOwnInfluence();
-    float influence = 0.0f;
+    const float influence = InfluenceContest::getRatio(info->getOwnInfluence(), info->getEnemyInfluence());
     float influenceDamage = 0.0f;
-    if (enemyInfluence > ownInfluence && ownInfluence > 0)
-    {
-        influence = 1.0f - ownInfluence / enemyInfluence;
-    }
-    else if (enemyInfluence > 0)
-    {
-        influence = - (1.0f - enemyInfluence / ownInfluence);
-    }
     if (qAbs(influence) > m_influenceIgnoreValue)
     {
         influenceDamage = influence * pUnit->getCoUnitValue() * m_influenceMultiplier;

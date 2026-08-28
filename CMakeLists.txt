@@ -820,6 +820,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinatedai.cpp ai/coordinatedai.h
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
+    ai/influencecontest.h
     ai/influencefrontmap.cpp ai/influencefrontmap.h
     ai/heavyai/heavyai.cpp ai/heavyai/heavyai.h
     ai/heavyai/heavyAiSharedData.h
@@ -1476,6 +1477,23 @@ if (BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     cow_set_arena_test_path(CoordinatorAiAiChoiceTests)
+
+    add_executable(NormalAiInfluenceContestTests
+        tests/normal_ai/influencecontesttests.cpp
+    )
+    target_include_directories(NormalAiInfluenceContestTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(NormalAiInfluenceContestTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME NormalAiInfluenceContestTests
+        COMMAND NormalAiInfluenceContestTests
+    )
+    cow_set_arena_test_path(NormalAiInfluenceContestTests)
 
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})
