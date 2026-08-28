@@ -32,6 +32,8 @@ constexpr QDataStream::Version AI_SEED_STREAM_VERSION = QDataStream::Version::Qt
 const QString AI_SEED_NAMESPACE = QStringLiteral("coordinated-ai-core");
 constexpr AiRandomAlgorithm AI_RANDOM_ALGORITHM = AiRandomAlgorithm::V2;
 constexpr qint32 AI_RANDOM_FIRST_GENERATION = 0;
+constexpr qint32 FLARE_TIE_BREAK_HIGH = 10;
+constexpr qint32 FLARE_TIE_BREAK_THRESHOLD = 5;
 }
 
 const char* const CoreAI::ACTION_WAIT = "ACTION_WAIT";
@@ -384,8 +386,9 @@ void CoreAI::prepareEnemieData(spQmlVectorUnit & pUnits, spQmlVectorBuilding &pB
         pEnemyUnits->pruneEnemies(pUnits.get(), pBuildings.get(), m_ownBuildingPruneRange, m_enemyPruneRange);
         pEnemyBuildings->pruneEnemieBuildings(pUnits, m_enemyPruneRange);
     }
-    pEnemyUnits->randomize();
-    pEnemyBuildings->randomize();
+    AiRandomScope randomScope(*this);
+    pEnemyUnits->randomize(randomScope.stream());
+    pEnemyBuildings->randomize(randomScope.stream());
 }
 
 bool CoreAI::contains(std::vector<QVector3D>& points, const QPoint & point)
@@ -1730,7 +1733,8 @@ void CoreAI::getBestFlareTarget(Unit* pUnit, spGameAction & pAction, UnitPathFin
                                 flareTarget  = target;
                                 moveTargetField  = targetPos;
                             }
-                            else if (score == currentScore && GlobalUtils::randInt(0, 10) > 5)
+                            else if (score == currentScore &&
+                                     randomInt(0, FLARE_TIE_BREAK_HIGH) > FLARE_TIE_BREAK_THRESHOLD)
                             {
                                 flareTarget  = target;
                                 moveTargetField  = targetPos;
@@ -2320,10 +2324,57 @@ void CoreAI::resetToTurnStart()
 
 qint32 CoreAI::randomInt(qint32 low, qint32 high)
 {
-    ensureAiRandomSeeded();
-    const qint32 value = m_aiRandom.bounded(low, high);
-    storeAiRandomStream();
-    return value;
+    return drawRandomInt(low, high, LegacyRandomFunction::Seeded);
+}
+
+qint32 CoreAI::randomIntBase(qint32 low, qint32 high)
+{
+    return drawRandomInt(low, high, LegacyRandomFunction::Unseeded);
+}
+
+CoreAI::AiRandomScope::AiRandomScope(CoreAI & ai)
+    : m_ai(ai),
+      m_pStream(ai.usesLegacyAiRandom() ? nullptr : &ai.m_aiRandom)
+{
+    if (m_pStream == nullptr)
+    {
+        return;
+    }
+    if (m_ai.m_aiRandomScopeDepth == 0)
+    {
+        m_ai.ensureAiRandomSeeded();
+    }
+    ++m_ai.m_aiRandomScopeDepth;
+}
+
+CoreAI::AiRandomScope::~AiRandomScope()
+{
+    if (m_pStream == nullptr)
+    {
+        return;
+    }
+    --m_ai.m_aiRandomScopeDepth;
+    if (m_ai.m_aiRandomScopeDepth == 0)
+    {
+        m_ai.storeAiRandomStream();
+    }
+}
+
+AiRandom * CoreAI::AiRandomScope::stream()
+{
+    return m_pStream;
+}
+
+qint32 CoreAI::drawRandomInt(qint32 low, qint32 high, LegacyRandomFunction legacyFunction)
+{
+    AiRandomScope randomScope(*this);
+    AiRandom * random = randomScope.stream();
+    if (random != nullptr)
+    {
+        return random->bounded(low, high);
+    }
+    return legacyFunction == LegacyRandomFunction::Seeded ? GlobalUtils::randInt(low, high)
+                                                          : GlobalUtils::randIntBase(low, high);
 }
 
 quint32 CoreAI::deriveAiSeed(AiRandomAlgorithm algorithmVersion, qint32 generation) const
@@ -2559,7 +2610,7 @@ void CoreAI::addBuildingActionFieldStep(spGameAction & pAction)
     addSelectedFieldData(pAction, target);
 }
 
-QPoint CoreAI::pickFallbackBuildingActionTarget(const spMarkedFieldData & pData) const
+QPoint CoreAI::pickFallbackBuildingActionTarget(const spMarkedFieldData & pData)
 {
     QPoint target(0, 0);
     qint32 maxValue = std::numeric_limits<qint32>::lowest();
@@ -2603,7 +2654,7 @@ QPoint CoreAI::pickFallbackBuildingActionTarget(const spMarkedFieldData & pData)
         }
         if (index < 0)
         {
-            target = points.at(GlobalUtils::randIntBase(0, points.size() -1));
+            target = points.at(randomIntBase(0, points.size() - 1));
         }
         else
         {
@@ -2664,7 +2715,7 @@ bool CoreAI::handleBuildingActionMenuStep(spGameAction & pAction, spQmlVectorUni
         {
             return false;
         }
-        selection = GlobalUtils::randIntBase(0, items.size() - 1);
+        selection = randomIntBase(0, items.size() - 1);
     }
     if (selection == GameEnums::MenuSelection_Restart)
     {

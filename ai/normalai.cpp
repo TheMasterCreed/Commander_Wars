@@ -23,6 +23,7 @@
 namespace
 {
 const QString COUNTERPOINT_PROFILE_INI = QStringLiteral("normal/counterpoint.ini");
+constexpr qint32 FUNDS_MODE_ROLL_HIGH = 100;
 }
 
 NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::AiTypes aiType, const QString &jsName)
@@ -197,12 +198,15 @@ void NormalAi::process()
         m_timer.stop();
     }
     spQmlVectorBuilding pBuildings = m_pPlayer->getSpBuildings();
-    pBuildings->randomize();
+    {
+        AiRandomScope randomScope(*this);
+        pBuildings->randomize(randomScope.stream());
+    }
     spQmlVectorUnit pUnits = m_pPlayer->getSpUnits();
     spQmlVectorUnit pEnemyUnits;
     spQmlVectorBuilding pEnemyBuildings;
-    qint32 cost = 0;
-    m_pPlayer->getSiloRockettarget(2, 3, cost);
+    const qint32 cost = m_pPlayer->getSiloRockettargetDamage(Player::DEFAULT_SILO_TARGET_RADIUS,
+                                                             Player::DEFAULT_SILO_TARGET_DAMAGE);
     m_missileTarget = (cost >= m_minSiloDamage);
     // Special production actions are claimed inside useBuilding, so planning has to be ready first.
     m_productionSystem.prepareProduction(pBuildings.get(), pUnits.get());
@@ -1173,7 +1177,7 @@ bool NormalAi::moveUnit(spGameAction &pAction, MoveUnitData *pUnitData, spQmlVec
                     (ret[0].z() >= -pUnit->getCoUnitValue() * m_minSuicideDamage ||
                      lockedUnit))
                 {
-                    qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+                    qint32 selection = randomIntBase(0, ret.size() - 1);
                     QVector3D target = ret[selection];
                     CoreAI::addSelectedFieldData(pAction, QPoint(static_cast<qint32>(target.x()),
                                                                  static_cast<qint32>(target.y())));
@@ -1245,7 +1249,7 @@ bool NormalAi::moveUnit(spGameAction &pAction, MoveUnitData *pUnitData, spQmlVec
                         if (pAction->canBePerformed())
                         {
                             spMarkedFieldData pData = pAction->getMarkedFieldStepData();
-                            QPoint point = pData->getPoints()->at(GlobalUtils::randIntBase(0, pData->getPoints()->size() - 1));
+                            QPoint point = pData->getPoints()->at(randomIntBase(0, pData->getPoints()->size() - 1));
                             CoreAI::addSelectedFieldData(pAction, point);
                             emit sigPerformAction(pAction);
                             return true;
@@ -1263,7 +1267,7 @@ bool NormalAi::moveUnit(spGameAction &pAction, MoveUnitData *pUnitData, spQmlVec
                     getBestAttacksFromField(pUnit, pAction, ret, moveTargets);
                     if (ret.size() > 0 && ret[0].z() >= -pUnit->getCoUnitValue() * m_minSuicideDamage)
                     {
-                        qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+                        qint32 selection = randomIntBase(0, ret.size() - 1);
                         QVector3D target = ret[selection];
                         CoreAI::addSelectedFieldData(pAction, QPoint(static_cast<qint32>(target.x()),
                                                                      static_cast<qint32>(target.y())));
@@ -1315,7 +1319,7 @@ bool NormalAi::suicide(spGameAction &pAction, Unit *pUnit, UnitPathFindingSystem
     CoreAI::getBestTarget(pUnit, pAction, &turnPfs, ret, moveTargetFields, movepoints + 1);
     if (ret.size() > 0 && ret[0].z() >= -pUnit->getCoUnitValue() * m_minSuicideDamage)
     {
-        qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+        qint32 selection = randomIntBase(0, ret.size() - 1);
         QVector3D target = ret[selection];
         auto path = turnPfs.getPathFast(static_cast<qint32>(moveTargetFields[selection].x()),
                                         static_cast<qint32>(moveTargetFields[selection].y()));
@@ -2163,7 +2167,7 @@ bool NormalAi::buildUnits(spQmlVectorBuilding &pBuildings, spQmlVectorUnit &pUni
     // calc average costs if we would build same cost units on every building
     float fundsPerFactory = funds - m_cappedFunds * (productionBuildings - 1) * m_fundsPerBuildingFactorD;
     AI_CONSOLE_PRINT("NormalAI: Funds: " + QString::number(funds) + " funds for the next factory: " + QString::number(fundsPerFactory), GameConsole::eDEBUG);
-    auto chance = GlobalUtils::randInt(0, 100);
+    auto chance = randomInt(0, FUNDS_MODE_ROLL_HIGH);
     if (funds >= m_spamingFunds && productionBuildings > 1 && chance <= m_spamLightUnitChance)
     {
         fundsPerFactory = m_spamingFunds;
@@ -2365,7 +2369,7 @@ bool NormalAi::buildUnits(spQmlVectorBuilding &pBuildings, spQmlVectorUnit &pUni
 
     if (buildingIdx.size() > 0)
     {
-        qint32 item = GlobalUtils::randIntBase(0, buildingIdx.size() - 1);
+        qint32 item = randomIntBase(0, buildingIdx.size() - 1);
         Building *pBuilding = pBuildings->at(buildingIdx[item]);
         pAction->setTarget(QPoint(pBuilding->Building::getX(), pBuilding->Building::getY()));
         spMenuData pData = pAction->getMenuStepData();

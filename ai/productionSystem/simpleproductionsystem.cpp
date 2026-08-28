@@ -844,7 +844,7 @@ bool SimpleProductionSystem::buildNextUnit(QmlVectorBuilding* pBuildings, QmlVec
                 qint32 count = 0;
                 while (count < 100)
                 {
-                    qint32 index = GlobalUtils::randIntBase(0, size);
+                    qint32 index = m_owner->randomIntBase(0, size);
                     if (unitIds[index].isEmpty())
                     {
                         unitIds[index] = item;
@@ -909,7 +909,7 @@ bool SimpleProductionSystem::buildNextUnit(QmlVectorBuilding* pBuildings, QmlVec
                 {
                     for (qint32 i = 0; i < item.distribution.unitIds.length() * 3; ++i)
                     {
-                        qint32 roll = GlobalUtils::randInt(0, item.distribution.totalChance);
+                        qint32 roll = m_owner->randomInt(0, item.distribution.totalChance);
                         qint32 chance = 0;
                         for (qint32 i2 = 0; i2 < item.distribution.unitIds.length(); ++i2)
                         {
@@ -971,7 +971,7 @@ qint32 SimpleProductionSystem::getProductionFromList(const QStringList & unitIds
             {
                 for (qint32 i = 0; i < item.distribution.unitIds.length() * 3; ++i)
                 {
-                    qint32 roll = GlobalUtils::randInt(0, item.distribution.totalChance);
+                    qint32 roll = m_owner->randomInt(0, item.distribution.totalChance);
                     qint32 chance = 0;
                     for (qint32 i2 = 0; i2 < item.distribution.unitIds.length(); ++i2)
                     {

@@ -150,7 +150,7 @@ bool CoreAI::moveBlackBombs(spQmlVectorUnit & pUnits, spQmlVectorUnit & pEnemyUn
                     }
                     if (bestTargets.size() > 0 && maxDamage > 0)
                     {
-                        QPoint target = bestTargets[GlobalUtils::randIntBase(0, bestTargets.size() - 1)];
+                        QPoint target = bestTargets[randomIntBase(0, bestTargets.size() - 1)];
                         auto path = turnPfs.getPathFast(target.x(), target.y());
                         pAction->setMovepath(path, turnPfs.getCosts(path));
                         addSelectedFieldData(pAction, target);
@@ -284,12 +284,15 @@ bool CoreAI::processPredefinedAi()
     {
         CONSOLE_PRINT("processPredefinedAi()", GameConsole::eDEBUG);
         spQmlVectorUnit pUnits = m_pPlayer->getSpUnits();
-        // deterministic order so map scripts can sequence their units via setAiPriority
-        pUnits->sortAiPriority();
         spQmlVectorUnit pEnemyUnits = m_pPlayer->getSpEnemyUnits();
-        pEnemyUnits->randomize();
         spQmlVectorBuilding pEnemyBuildings = m_pPlayer->getSpEnemyBuildings();
-        pEnemyBuildings->randomize();
+        {
+            AiRandomScope randomScope(*this);
+            // Map scripts can sequence units through AI priority.
+            pUnits->sortAiPriority(randomScope.stream());
+            pEnemyUnits->randomize(randomScope.stream());
+            pEnemyBuildings->randomize(randomScope.stream());
+        }
         Interpreter* pInterpreter = Interpreter::getInstance();
         pInterpreter->threadProcessEvents();
         for (auto & spUnit : pUnits->getVector())
@@ -451,7 +454,7 @@ bool CoreAI::processPredefinedAiHold(Unit* pUnit)
     getBestAttacksFromField(pUnit, pAction, ret, moveTargetFields);
     if (ret.size() > 0)
     {
-        qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+        qint32 selection = randomIntBase(0, ret.size() - 1);
         QVector3D target = ret[selection];
         CoreAI::addSelectedFieldData(pAction, QPoint(static_cast<qint32>(target.x()),
                                                      static_cast<qint32>(target.y())));
@@ -493,7 +496,7 @@ bool CoreAI::processPredefinedAiDefensive(Unit* pUnit)
     }
     if (ret.size() > 0 && ret[0].z() >= minDamage)
     {
-        qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+        qint32 selection = randomIntBase(0, ret.size() - 1);
         QVector3D target = ret[selection];
         QPoint point = pAction->getTarget();
         if (static_cast<qint32>(moveTargetFields[selection].x()) != point.x() ||
@@ -573,7 +576,7 @@ bool CoreAI::processPredefinedAiAttack(Unit* pUnit, spGameAction & pAction, Unit
     bool performed = false;
     if (ret.size() > 0)
     {
-        qint32 selection = GlobalUtils::randIntBase(0, ret.size() - 1);
+        qint32 selection = randomIntBase(0, ret.size() - 1);
         QVector3D target = ret[selection];
         QPoint point = pAction->getTarget();
         if (static_cast<qint32>(moveTargetFields[selection].x()) != point.x() ||
