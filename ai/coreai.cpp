@@ -1,4 +1,5 @@
 #include "ai/coreai.h"
+#include "ai/buildingthreat.h"
 #include "ai/fastbattleestimate.h"
 #include "ai/targetedunitpathfindingsystem.h"
 #include "ai/aiprocesspipe.h"
@@ -26,6 +27,7 @@
 #include <map>
 
 static_assert(FastBattleEstimate::HP_SCALE == Unit::MAX_UNIT_HP, "the pure estimate must use the engine hp scale");
+static_assert(BuildingThreat::HP_SCALE == Unit::MAX_UNIT_HP, "the building threat must use the engine hp scale");
 
 namespace
 {
@@ -540,12 +542,7 @@ float CoreAI::calcBuildingDamage(Unit* pUnit, const QPoint newPosition, Building
                 {
                     if (pTargets->contains(pos))
                     {
-                        float damage = pBuilding->getDamage(pUnit);
-                        if (damage > pUnit->getHp())
-                        {
-                            damage = pBuilding->getHp();
-                        }
-                        counterDamage = damage / Unit::MAX_UNIT_HP * pUnit->getUnitCosts();
+                        counterDamage = BuildingThreat::threatValue(pBuilding->getDamage(pUnit), BuildingThreat::Target{pUnit->getHp(), pUnit->getUnitCosts()});
                     }
                 }
             }

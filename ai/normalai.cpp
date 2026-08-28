@@ -1815,7 +1815,7 @@ float NormalAi::calculateCounterDamage(MoveUnitData &curUnitData, QPoint newPosi
 float NormalAi::calculateCounteBuildingDamage(Unit *pUnit, QPoint newPosition, spQmlVectorBuilding &pBuildings, spQmlVectorBuilding &pEnemyBuildings) const
 {
     float counterDamage = 0.0f;
-    for (auto &pBuilding : pEnemyBuildings->getVector())
+    for (auto &pBuilding : pBuildings->getVector())
     {
         counterDamage += calcBuildingDamage(pUnit, newPosition, pBuilding.get());
     }
