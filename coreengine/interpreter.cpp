@@ -10,6 +10,10 @@
 #include "tests/counterpoint_ai/counterpointtestsupport.h"
 #endif
 
+#ifdef COW_AI_ARENA_TESTING
+#include "tests/arena/arenatestsupport.h"
+#endif
+
 #include "resource_management/fontmanager.h"
 #include "resource_management/cospritemanager.h"
 #include "resource_management/terrainmanager.h"
@@ -137,6 +141,15 @@ void Interpreter::init()
         auto* pTestSupport = new CounterpointTestSupport(this);
         setCppOwnerShip(pTestSupport);
         globalObject().setProperty(QStringLiteral("counterpointTest"), newQObject(pTestSupport));
+    }
+#endif
+
+#ifdef COW_AI_ARENA_TESTING
+    if (qEnvironmentVariable(AiArenaTestSupport::ENVIRONMENT_FLAG) == QStringLiteral("1"))
+    {
+        auto* pTestSupport = new AiArenaTestSupport(this);
+        setCppOwnerShip(pTestSupport);
+        globalObject().setProperty(AiArenaTestSupport::JS_GLOBAL_NAME, newQObject(pTestSupport));
     }
 #endif
 

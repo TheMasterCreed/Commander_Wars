@@ -1258,6 +1258,63 @@ qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION
     ${WIN_ICON}
 )
 
+if (BUILD_TESTING)
+    enable_testing()
+    target_sources(${PROJECT_NAME} PRIVATE
+        tests/arena/arenatestsupport.cpp
+        tests/arena/arenatestsupport.h
+    )
+    set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
+    )
+    if (MINGW)
+        set(ARENA_GGC_MIN_EXPAND 20)
+        set(ARENA_GGC_MIN_HEAP_KB 32768)
+        set_source_files_properties(
+            ai/coreai.cpp
+            ai/productionSystem/simpleproductionsystem.cpp
+            PROPERTIES COMPILE_OPTIONS
+                "-g1;-fno-var-tracking;-fno-var-tracking-assignments;--param=ggc-min-expand=${ARENA_GGC_MIN_EXPAND};--param=ggc-min-heapsize=${ARENA_GGC_MIN_HEAP_KB}"
+        )
+        target_link_options(${PROJECT_NAME} PRIVATE
+            $<$<CONFIG:Debug>:-Wl,--no-keep-memory>
+            $<$<CONFIG:Debug>:-Wl,--reduce-memory-overheads>
+        )
+    endif()
+
+    set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
+    file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/smoke_init.js
+        ${ARENA_SMOKE_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaSupportSmoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_SMOKE_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaSupportSmoke PROPERTIES TIMEOUT 120)
+    if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
+        set(_arena_smoke_test_path
+            "${_qt_bin_dir};${CXX_COMPILER_PATH};$ENV{PATH}"
+        )
+        string(REPLACE ";" "\\;" _arena_smoke_test_path
+            "${_arena_smoke_test_path}"
+        )
+        set_tests_properties(ArenaSupportSmoke PROPERTIES
+            ENVIRONMENT "PATH=${_arena_smoke_test_path}"
+        )
+    endif()
+endif()
+
 if (BUILD_TESTING AND GRAPHICSUPPORT)
     target_sources(${PROJECT_NAME} PRIVATE
         tests/oxygine_lifetime/oxyginelifetimetests.cpp
