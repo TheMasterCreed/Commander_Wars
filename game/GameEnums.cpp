@@ -110,6 +110,7 @@ void GameEnums::registerEnums()
     value.setProperty("AiTurnMode_DuringDay", AiTurnMode_DuringDay);
     value.setProperty("AiTurnMode_EndOfDay", AiTurnMode_EndOfDay);
 
+    value.setProperty("AiTypes_Coordinated", AiTypes_Coordinated);
     value.setProperty("AiTypes_DummyAi", AiTypes_DummyAi);
     value.setProperty("AiTypes_MovePlanner", AiTypes_MovePlanner);
     value.setProperty("AiTypes_ProxyAi", AiTypes_ProxyAi);

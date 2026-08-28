@@ -1288,6 +1288,23 @@ if (BUILD_TESTING)
     add_test(NAME CoordinatorAiRandomTests COMMAND CoordinatorAiRandomTests)
     cow_set_arena_test_path(CoordinatorAiRandomTests)
 
+    add_executable(CoordinatorAiTypeIdentityTests
+        tests/coordinator_ai/aitypeidentitytests.cpp
+        game/GameEnums.h
+        resource_management/gamemanager.h
+    )
+    target_include_directories(CoordinatorAiTypeIdentityTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiTypeIdentityTests PRIVATE ${QT_LIBRARIES})
+    set_target_properties(CoordinatorAiTypeIdentityTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME CoordinatorAiTypeIdentityTests COMMAND CoordinatorAiTypeIdentityTests)
+    cow_set_arena_test_path(CoordinatorAiTypeIdentityTests)
+
     target_sources(${PROJECT_NAME} PRIVATE
         tests/arena/arenamatchconfig.cpp
         tests/arena/arenamatchconfig.h

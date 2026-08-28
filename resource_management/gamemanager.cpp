@@ -36,6 +36,35 @@ void GameManager::loadAll()
     m_raiseErrors = true;
 }
 
+QString GameManager::getHeavyAiID(qint32 position) const
+{
+    if (position >= 0 && position < m_loadedHeavyAis.size())
+    {
+        return m_loadedHeavyAis.at(position);
+    }
+    return "";
+}
+
+qint32 GameManager::getHeavyAiCount() const
+{
+    return static_cast<qint32>(m_loadedHeavyAis.size());
+}
+
+bool GameManager::isHeavyAiType(GameEnums::AiTypes type) const
+{
+    return isHeavyAiType(type, getHeavyAiCount());
+}
+
+bool GameManager::isComputerAiType(GameEnums::AiTypes type) const
+{
+    return isComputerAiType(type, getHeavyAiCount());
+}
+
+bool GameManager::isKnownAiType(GameEnums::AiTypes type) const
+{
+    return isKnownAiType(type, getHeavyAiCount());
+}
+
 QString GameManager::getActionIcon(const QString & actionID)
 {
     Interpreter* pInterpreter = Interpreter::getInstance();

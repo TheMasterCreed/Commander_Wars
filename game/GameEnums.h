@@ -193,21 +193,38 @@ public:
     };
     Q_ENUM(AiTurnMode)
 
-    enum AiTypes
+    enum AiTypes : qint32
     {
+        AiTypes_Coordinated = -4,
         AiTypes_DummyAi = -3,
         AiTypes_MovePlanner = -2,
         AiTypes_ProxyAi = -1,
         AiTypes_Human = 0,
-        AiTypes_VeryEasy,
-        AiTypes_Normal,
-        AiTypes_NormalOffensive,
-        AiTypes_NormalDefensive,
-        AiTypes_Heavy,
+        AiTypes_VeryEasy = 1,
+        AiTypes_Normal = 2,
+        AiTypes_NormalOffensive = 3,
+        AiTypes_NormalDefensive = 4,
+        AiTypes_Heavy = 5,
         AiTypes_Closed = 199,
-        AiTypes_Open,
+        AiTypes_Open = 200,
     };
     Q_ENUM(AiTypes)
+
+    static constexpr bool isInternalAiType(AiTypes type)
+    {
+        return type == AiTypes_DummyAi ||
+               type == AiTypes_MovePlanner ||
+               type == AiTypes_ProxyAi;
+    }
+
+    static constexpr bool isBuiltInComputerAiType(AiTypes type)
+    {
+        return type == AiTypes_Coordinated ||
+               type == AiTypes_VeryEasy ||
+               type == AiTypes_Normal ||
+               type == AiTypes_NormalOffensive ||
+               type == AiTypes_NormalDefensive;
+    }
 
     enum AiBehavior : qint32
     {
