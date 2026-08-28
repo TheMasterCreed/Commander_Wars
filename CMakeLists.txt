@@ -1260,11 +1260,28 @@ qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION
 
 if (BUILD_TESTING)
     enable_testing()
+    function(cow_set_arena_test_path testName)
+        if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
+            set(testRuntimePath "${_qt_bin_dir};${CXX_COMPILER_PATH};$ENV{PATH}")
+            string(REPLACE ";" "\\;" testRuntimePath "${testRuntimePath}")
+            set_tests_properties(${testName} PROPERTIES
+                ENVIRONMENT "PATH=${testRuntimePath}"
+            )
+        endif()
+    endfunction()
+
     target_sources(${PROJECT_NAME} PRIVATE
+        tests/arena/arenamatchconfig.cpp
+        tests/arena/arenamatchconfig.h
+        tests/arena/arenamatchrunner.cpp
+        tests/arena/arenamatchrunner.h
         tests/arena/arenatestsupport.cpp
         tests/arena/arenatestsupport.h
     )
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
+    )
+    set_property(SOURCE coreengine/workerthread.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
     )
     if (MINGW)
@@ -1281,6 +1298,26 @@ if (BUILD_TESTING)
             $<$<CONFIG:Debug>:-Wl,--reduce-memory-overheads>
         )
     endif()
+
+    add_executable(ArenaMatchConfigTests
+        tests/arena/arenamatchconfigtests.cpp
+        tests/arena/arenamatchconfig.cpp
+        tests/arena/arenamatchconfig.h
+    )
+    target_include_directories(ArenaMatchConfigTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(ArenaMatchConfigTests PRIVATE Qt6::Core)
+    set_target_properties(ArenaMatchConfigTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME ArenaMatchConfigTests COMMAND ArenaMatchConfigTests)
+    set_tests_properties(ArenaMatchConfigTests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    cow_set_arena_test_path(ArenaMatchConfigTests)
 
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})
@@ -1302,17 +1339,44 @@ if (BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     set_tests_properties(ArenaSupportSmoke PROPERTIES TIMEOUT 120)
-    if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
-        set(_arena_smoke_test_path
-            "${_qt_bin_dir};${CXX_COMPILER_PATH};$ENV{PATH}"
+    cow_set_arena_test_path(ArenaSupportSmoke)
+
+    set(ARENA_MATCH_MAP_PATH "maps/2_player/Bean Island.map")
+    set(ARENA_MATCH_AI_TYPE_0 "Normal")
+    set(ARENA_MATCH_AI_TYPE_1 "Normal")
+    set(ARENA_MATCH_CO_0 "CO_ANDY")
+    set(ARENA_MATCH_CO_1 "CO_JESS")
+    set(ARENA_MATCH_MASTER_SEED 20260828)
+    set(ARENA_MATCH_WATCHDOG_MS 180000)
+    set(ARENA_MATCH_RESULT_FILE_NAME "arena_match_result.json")
+    function(cow_add_configured_match_test testName turnLimit stopDay stopPlayer)
+        set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
+        file(MAKE_DIRECTORY ${runDir})
+        set(ARENA_MATCH_TURN_LIMIT ${turnLimit})
+        set(ARENA_MATCH_STOP_DAY ${stopDay})
+        set(ARENA_MATCH_STOP_PLAYER ${stopPlayer})
+        configure_file(
+            tests/arena/fixtures/arena_match.json.in
+            ${runDir}/arena_match.json
+            @ONLY
         )
-        string(REPLACE ";" "\\;" _arena_smoke_test_path
-            "${_arena_smoke_test_path}"
+        add_test(
+            NAME ${testName}
+            COMMAND ${CMAKE_COMMAND}
+                -DARENA_EXE=$<TARGET_FILE:${PROJECT_NAME}>
+                -DARENA_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
+                -DARENA_RUN_DIR=${runDir}
+                -DARENA_RESULT_FILE_NAME=${ARENA_MATCH_RESULT_FILE_NAME}
+                -DARENA_EXPECTED_STOP_DAY=${stopDay}
+                -DARENA_EXPECTED_STOP_PLAYER=${stopPlayer}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/arena/arenarun.cmake
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         )
-        set_tests_properties(ArenaSupportSmoke PROPERTIES
-            ENVIRONMENT "PATH=${_arena_smoke_test_path}"
-        )
-    endif()
+        set_tests_properties(${testName} PROPERTIES TIMEOUT 240)
+        cow_set_arena_test_path(${testName})
+    endfunction()
+    cow_add_configured_match_test(ArenaConfiguredMatchSmoke 1 null null)
+    cow_add_configured_match_test(ArenaConfiguredMatchStopBoundary 3 1 0)
 endif()
 
 if (BUILD_TESTING AND GRAPHICSUPPORT)

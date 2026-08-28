@@ -1,0 +1,16 @@
+{
+    "version": 2,
+    "mapPath": "@ARENA_MATCH_MAP_PATH@",
+    "players": [
+        {"aiType": "@ARENA_MATCH_AI_TYPE_0@", "co": "@ARENA_MATCH_CO_0@"},
+        {"aiType": "@ARENA_MATCH_AI_TYPE_1@", "co": "@ARENA_MATCH_CO_1@"}
+    ],
+    "aiBehaviorMode": "Standard",
+    "masterSeed": @ARENA_MATCH_MASTER_SEED@,
+    "turnLimit": @ARENA_MATCH_TURN_LIMIT@,
+    "watchdogMs": @ARENA_MATCH_WATCHDOG_MS@,
+    "resultFileName": "@ARENA_MATCH_RESULT_FILE_NAME@",
+    "stopAfterDay": @ARENA_MATCH_STOP_DAY@,
+    "stopAfterPlayer": @ARENA_MATCH_STOP_PLAYER@,
+    "deterministicCounterpointSeed": false
+}

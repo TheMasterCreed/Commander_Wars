@@ -47,6 +47,9 @@
 #ifdef COW_BUILD_TESTING
 #include "tests/oxygine_lifetime/oxyginelifetimetests.h"
 #endif
+#ifdef COW_AI_ARENA_TESTING
+#include "tests/arena/arenamatchrunner.h"
+#endif
 
 WorkerThread::WorkerThread()
 {
@@ -242,6 +245,14 @@ void WorkerThread::showMainwindow()
         {
             QCoreApplication::exit(failures == 0 ? 0 : 1);
         }, Qt::QueuedConnection);
+        return;
+    }
+#endif
+#ifdef COW_AI_ARENA_TESTING
+    if (ArenaMatchRunner::shouldRun())
+    {
+        auto* pRunner = new ArenaMatchRunner(this);
+        pRunner->run();
         return;
     }
 #endif
