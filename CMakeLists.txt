@@ -819,6 +819,7 @@ set(${PROJECT_NAME}_SRCS
     ai/normalai.cpp ai/normalai.h    
     ai/coordinatedai.cpp ai/coordinatedai.h
     ai/coordinator/coordinatorcommon.h
+    ai/coordinator/economicledger.h
     ai/coordinator/mobilityfield.h
     ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
     ai/coordinator/battlefieldknowledge.h ai/coordinator/battlefieldknowledge.cpp
@@ -1332,6 +1333,23 @@ if (BUILD_TESTING)
     )
     add_test(NAME CoordinatorAiCommonTests COMMAND CoordinatorAiCommonTests)
     cow_set_arena_test_path(CoordinatorAiCommonTests)
+
+    add_executable(CoordinatorAiEconomicLedgerTests
+        tests/coordinator_ai/economicledgertests.cpp
+    )
+    target_include_directories(CoordinatorAiEconomicLedgerTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(CoordinatorAiEconomicLedgerTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiEconomicLedgerTests
+        COMMAND CoordinatorAiEconomicLedgerTests
+    )
+    cow_set_arena_test_path(CoordinatorAiEconomicLedgerTests)
 
     add_executable(CoordinatorAiMobilityFieldTests
         tests/coordinator_ai/mobilityfieldtests.cpp
