@@ -825,6 +825,7 @@ set(${PROJECT_NAME}_SRCS
     ai/fastbattleestimate.h
     ai/buildingthreat.h
     ai/farawaycapturereservations.h
+    ai/counterdamagememo.h
     ai/influencefrontmap.cpp ai/influencefrontmap.h
     ai/heavyai/heavyai.cpp ai/heavyai/heavyai.h
     ai/heavyai/heavyAiSharedData.h
@@ -1567,6 +1568,23 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(NormalAiFarAwayCaptureReservationTests)
 
+    add_executable(NormalAiCounterDamageMemoTests
+        tests/normal_ai/counterdamagememotests.cpp
+    )
+    target_include_directories(NormalAiCounterDamageMemoTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(NormalAiCounterDamageMemoTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME NormalAiCounterDamageMemoTests
+        COMMAND NormalAiCounterDamageMemoTests
+    )
+    cow_set_arena_test_path(NormalAiCounterDamageMemoTests)
+
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})
     configure_file(
@@ -1636,6 +1654,30 @@ if (BUILD_TESTING)
     )
     set_tests_properties(ArenaActionSeedDeterminism PROPERTIES TIMEOUT 120)
     cow_set_arena_test_path(ArenaActionSeedDeterminism)
+
+    set(ARENA_ACTION_FIRE_RUN_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/action_fire_taken_damage
+    )
+    file(MAKE_DIRECTORY ${ARENA_ACTION_FIRE_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/action_fire_taken_damage_init.js
+        ${ARENA_ACTION_FIRE_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaActionFireTakenDamageForwarding
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_ACTION_FIRE_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaActionFireTakenDamageForwarding PROPERTIES TIMEOUT 120)
+    cow_set_arena_test_path(ArenaActionFireTakenDamageForwarding)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})

@@ -14,6 +14,7 @@
 #include "game/building.h"
 #include "game/unitpathfindingsystem.h"
 
+#include "ai/counterdamagememo.h"
 #include "ai/influencecontest.h"
 #include "ai/normalai.h"
 #include "ai/targetedunitpathfindingsystem.h"
@@ -1641,7 +1642,7 @@ float NormalAi::calculateCounterDamage(MoveUnitData &curUnitData, QPoint newPosi
     Interpreter *pInterpreter = Interpreter::getInstance();
     pInterpreter->threadProcessEvents();
     Unit *pUnit = curUnitData.pUnit.get();
-    std::map<QString, qint32> unitDamageData;
+    CounterDamage::Memo<QString> unitDamageData;
     float counterDamage = 0;
     for (auto &enemyData : m_EnemyUnits)
     {
@@ -1652,11 +1653,7 @@ float NormalAi::calculateCounterDamage(MoveUnitData &curUnitData, QPoint newPosi
             qint32 distance = GlobalUtils::getDistance(newPosition, enemyPos);
             qint32 maxFireRange = enemyData.maxFireRange;
             bool hasDamage = unitDamageData.contains(pNextEnemy->getUnitID());
-            float unitDamage = -1;
-            if (hasDamage)
-            {
-                unitDamage = unitDamageData[pNextEnemy->getUnitID()];
-            }
+            float unitDamage = unitDamageData.value(pNextEnemy->getUnitID());
             qint32 moveRange = 0;
             bool canMoveAndFire = false;
             if (distance <= enemyData.movementPoints + maxFireRange)
@@ -1695,7 +1692,7 @@ float NormalAi::calculateCounterDamage(MoveUnitData &curUnitData, QPoint newPosi
                                                                        ignoreOutOfVisionRange);
                             if (damageData.x() >= 0)
                             {
-                                unitDamageData.insert_or_assign(pNextEnemy->getUnitID(), damageData.x() * Unit::MAX_UNIT_HP / pNextEnemy->getHp());
+                                unitDamageData.store(pNextEnemy->getUnitID(), damageData.x() * Unit::MAX_UNIT_HP / pNextEnemy->getHp(), enemyDamage);
                             }
                         }
                         if (damageData.x() >= m_notAttackableDamage)
@@ -1745,7 +1742,7 @@ float NormalAi::calculateCounterDamage(MoveUnitData &curUnitData, QPoint newPosi
                                                                                ignoreOutOfVisionRange);
                                     if (damageData.x() >= 0)
                                     {
-                                        unitDamageData.insert_or_assign(pNextEnemy->getUnitID(), damageData.x() * Unit::MAX_UNIT_HP / pNextEnemy->getHp());
+                                        unitDamageData.store(pNextEnemy->getUnitID(), damageData.x() * Unit::MAX_UNIT_HP / pNextEnemy->getHp(), enemyDamage);
                                     }
                                 }
                                 found = true;

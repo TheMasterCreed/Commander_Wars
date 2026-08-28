@@ -373,7 +373,7 @@ var Constructor = function()
 
     this.calcBattleDamage3 = function(map, action, attacker, attackerTakenDamage, atkPosX, atkPosY, defender, x, y, defenderTakenDamage, luckModeAtk, luckModeDef, ignoreOutOfVisionRange = false, fastInaccurate = false)
     {
-        return ACTION_FIRE.calcBattleDamage4(map, action, attacker, 0, atkPosX, atkPosY, defender, x, y, 0, luckModeAtk, luckModeDef, ignoreOutOfVisionRange, false, fastInaccurate);
+        return ACTION_FIRE.calcBattleDamage4(map, action, attacker, attackerTakenDamage, atkPosX, atkPosY, defender, x, y, defenderTakenDamage, luckModeAtk, luckModeDef, ignoreOutOfVisionRange, false, fastInaccurate);
     }
 
     this.calcBattleDamage4 = function(map, action, attacker, attackerTakenDamage, atkPosX, atkPosY, defender, x, y, defenderTakenDamage, luckMode, luckModeDefender, ignoreOutOfVisionRange = false, fast = false, fastInaccurate = false)
