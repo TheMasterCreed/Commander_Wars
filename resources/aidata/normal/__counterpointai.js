@@ -87,6 +87,7 @@
         MAX_PLANNER_DRAW_COUNT : 1000000000,
         MAX_PLANNER_STATE_LENGTH : 8388608,
         MAX_CANDIDATE_COUNT : 65536,
+        MAX_COVERAGE_PROFILE_ENTRIES : 16,
         // Kept under the signed limit of the engine's bounded random API.
         MAX_RANDOM_WEIGHT_TOTAL : 1000000000
     },
@@ -758,6 +759,141 @@
         return coverage;
     },
 
+    _staticThreatRecords : function(context)
+    {
+        var records = [];
+        var seen = Object.create(null);
+        var enemies = context.enemyComposition || [];
+        for (var enemyIndex = 0; enemyIndex < enemies.length; ++enemyIndex)
+        {
+            var enemy = enemies[enemyIndex];
+            var enemyId = COUNTERPOINTAI._unitId(enemy);
+            var key = "field:" + COUNTERPOINTAI._unitKey(enemy);
+            if (enemyId === "" || seen[key] === true)
+            {
+                continue;
+            }
+            seen[key] = true;
+            var hp = Math.max(0, COUNTERPOINTAI._readNumber(enemy, "hpSum", 0));
+            if (enemy.canCapture === true)
+            {
+                hp = COUNTERPOINTAI._softcapCapperHP(hp);
+            }
+            records.push({
+                key : key,
+                id : enemyId,
+                need : hp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
+                baseCoverage : COUNTERPOINTAI._contextNumber(
+                    context,
+                    "ownCoverage",
+                    COUNTERPOINTAI._unitKey(enemy),
+                    0
+                ),
+                isAirThreat : COUNTERPOINTAI._isAirThreat(enemy)
+            });
+        }
+        var phantoms = context.phantomThreats || [];
+        for (var phantomIndex = 0; phantomIndex < phantoms.length; ++phantomIndex)
+        {
+            var phantom = phantoms[phantomIndex];
+            var phantomId = COUNTERPOINTAI._unitId(phantom);
+            var phantomKey = "phantom:" + COUNTERPOINTAI._unitKey(phantom);
+            if (phantomId === "" || seen[phantomKey] === true)
+            {
+                continue;
+            }
+            seen[phantomKey] = true;
+            records.push({
+                key : phantomKey,
+                id : phantomId,
+                need : COUNTERPOINTAI.PHANTOM_RETAL_HP *
+                    COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
+                baseCoverage : COUNTERPOINTAI._contextNumber(
+                    context,
+                    "phantomCoverage",
+                    COUNTERPOINTAI._unitKey(phantom),
+                    0
+                ),
+                isAirThreat : COUNTERPOINTAI._isAirThreat(phantom)
+            });
+        }
+        records.sort(function(left, right)
+        {
+            return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
+        });
+        return records;
+    },
+
+    _staticThreatIndexes : function(records)
+    {
+        var indexes = Object.create(null);
+        for (var index = 0; index < records.length; ++index)
+        {
+            indexes[records[index].key] = index;
+        }
+        return indexes;
+    },
+
+    _compactCoverageProfile : function(evaluation, threatIndexes)
+    {
+        var byIndex = Object.create(null);
+        var threats = evaluation.threatProfile || [];
+        for (var index = 0; index < threats.length; ++index)
+        {
+            var threat = threats[index];
+            var threatIndex = threatIndexes[threat.key];
+            if (threatIndex === undefined || !(threat.staticContribution > 0) ||
+                !(threat.coverageDelta > 0))
+            {
+                continue;
+            }
+            var key = "#" + threatIndex;
+            var previous = byIndex[key];
+            if (previous === undefined ||
+                threat.staticContribution > previous.staticContribution)
+            {
+                byIndex[key] = {
+                    threatIndex : threatIndex,
+                    coverageDelta : Math.min(
+                        COUNTERPOINTAI.PLANNER_VALUE_MAX,
+                        threat.coverageDelta
+                    ),
+                    staticContribution : threat.staticContribution
+                };
+            }
+        }
+        var compact = [];
+        for (var profileKey in byIndex)
+        {
+            compact.push(byIndex[profileKey]);
+        }
+        compact.sort(function(left, right)
+        {
+            if (left.staticContribution !== right.staticContribution)
+            {
+                return right.staticContribution - left.staticContribution;
+            }
+            return left.threatIndex - right.threatIndex;
+        });
+        compact = compact.slice(0, COUNTERPOINTAI._coverageProfileLimit());
+        var total = 0;
+        for (var totalIndex = 0; totalIndex < compact.length; ++totalIndex)
+        {
+            total += compact[totalIndex].staticContribution;
+        }
+        var profile = [];
+        for (var compactIndex = 0; compactIndex < compact.length; ++compactIndex)
+        {
+            profile.push({
+                threatIndex : compact[compactIndex].threatIndex,
+                coverageDelta : compact[compactIndex].coverageDelta,
+                staticWeight : total > 0 ?
+                    compact[compactIndex].staticContribution / total : 0
+            });
+        }
+        return profile;
+    },
+
     // Share one coverage curve between real and phantom threats.
     _coverageGapFactor : function(coverage, threatNeed, candidateValue)
     {
@@ -1076,7 +1212,7 @@
         return 1;
     },
 
-    _indirectChannelFactor : function(candidateId, ownCount, scoreContext)
+    _staticIndirectChannelFactor : function(candidateId, scoreContext)
     {
         var rangeDelta = COUNTERPOINTAI._contextNumber(
             scoreContext,
@@ -1090,10 +1226,6 @@
         }
         var factor = rangeDelta < 1 ? COUNTERPOINTAI.INDIRECT_TAX :
             COUNTERPOINTAI.INDIRECT_SPECIALIST_BONUS;
-        if (rangeDelta < 1 && ownCount >= 1)
-        {
-            factor *= Math.pow(COUNTERPOINTAI.INDIRECT_STACK_PENALTY, ownCount);
-        }
         return COUNTERPOINTAI._safeFactor(factor);
     },
 
@@ -1164,7 +1296,7 @@
     },
 
     _hybridChannelOffense : function(candidate, candidateId, enemy, damage, indirectChannel,
-                                      valueRatio, ownCount, scoreContext)
+                                      valueRatio, scoreContext)
     {
         if (damage <= 0)
         {
@@ -1249,18 +1381,23 @@
         return moves.length % 2 === 0 ? (moves[mid - 1] + moves[mid]) / 2 : moves[mid];
     },
 
-    _scoreUnitAgainstEnemies : function(candidate, enemyComposition, context)
+    _evaluateStaticCombat : function(candidate, enemyComposition, staticContext)
     {
         var enemies = enemyComposition || [];
         var enemyLength = COUNTERPOINTAI._collectionLength(enemies);
-        var scoreContext = context || {};
+        var scoreContext = staticContext || {};
         var phantomLength = COUNTERPOINTAI._collectionLength(
             scoreContext.phantomThreats
         );
         if (candidate === null || candidate === undefined ||
             (enemyLength === 0 && phantomLength === 0))
         {
-            return 0;
+            return {
+                baseCombatScore : 0,
+                threatProfile : [],
+                airCoverageDelta : 0,
+                airNeed : 0
+            };
         }
         var candidateId = COUNTERPOINTAI._unitId(candidate);
         var candidateValue = COUNTERPOINTAI._strategicValue(candidate);
@@ -1270,17 +1407,10 @@
         var isHybrid = hasDirectChannel && hasIndirectChannel;
         var isIndirect = hasIndirectChannel && !hasDirectChannel;
         var isTank = COUNTERPOINTAI._isTankClass(candidate);
-        var ownCount = COUNTERPOINTAI._ownCount(scoreContext, candidateId);
 
-        // A transporter that cannot take a ground unit is no ferry, whatever its cargo bay says, so
-        // it falls through and is scored on its guns like any other warship.
         if (scoreContext.islandMode === true && candidate.isTransporter === true &&
             COUNTERPOINTAI._readFlag(scoreContext.groundCarriers, candidateId))
         {
-            // Scored from a fixed reference rather than the hull's own price. A cost proportional
-            // score cancels against the division by cost in _netDamageWeights, leaving every hull
-            // with identical efficiency and the pick decided by the cost term alone, which rises.
-            // That preferred a transport purely for being expensive.
             var transportScore = COUNTERPOINTAI.COST_SCALE *
                 COUNTERPOINTAI.TRANSPORT_BASE_SCORE_FACTOR;
             if (candidate.domain === COUNTERPOINTAI.DOMAIN_NAVAL ||
@@ -1291,23 +1421,12 @@
                     COUNTERPOINTAI.ISLAND_NAVAL_TRANSPORT_BONUS
                 );
             }
-            var ferryStats = scoreContext.tankFerryStats || {};
-            if (COUNTERPOINTAI._isTankCapableTransport(candidate) &&
-                COUNTERPOINTAI._readNumber(ferryStats, "tanks", 0) >
-                COUNTERPOINTAI._readNumber(ferryStats, "capacity", 0))
-            {
-                transportScore *= COUNTERPOINTAI._safeFactor(
-                    COUNTERPOINTAI.ISLAND_TANK_FERRY_DEMAND_BOOST
-                );
-            }
-            if (ownCount >= 1)
-            {
-                transportScore *= Math.pow(
-                    COUNTERPOINTAI._safeFactor(COUNTERPOINTAI.ISLAND_TRANSPORT_DIVERSITY),
-                    ownCount
-                );
-            }
-            return transportScore;
+            return {
+                baseCombatScore : COUNTERPOINTAI._finiteNumber(transportScore, 0),
+                threatProfile : [],
+                airCoverageDelta : 0,
+                airNeed : 0
+            };
         }
 
         // Weak attackers must not dilute hard-counter retaliation.
@@ -1341,13 +1460,11 @@
         var offenseContributions = [];
         var defenseContributions = [];
         var rawDefenseContributions = [];
-        var threatProfile = scoreContext.threatProfile ||
+        var staticThreats = [];
+        var enemyRoles = scoreContext.threatProfile ||
             COUNTERPOINTAI._analyzeEnemyComp(enemies);
         var airNeedTotal = 0;
-        var airCovTotal = Math.max(
-            0,
-            COUNTERPOINTAI._readNumber(scoreContext, "ownAirCoverage", 0)
-        );
+        var bestAirDamage = 0;
 
         for (var enemyIndex = 0; enemyIndex < enemyLength; ++enemyIndex)
         {
@@ -1400,7 +1517,6 @@
                     COUNTERPOINTAI._directDamageAgainst(candidate, enemyId),
                     false,
                     valueRatio,
-                    ownCount,
                     scoreContext
                 );
                 hybridIndirectOffense = COUNTERPOINTAI._hybridChannelOffense(
@@ -1410,7 +1526,6 @@
                     COUNTERPOINTAI._indirectDamageAgainst(candidate, enemyId),
                     true,
                     valueRatio,
-                    ownCount,
                     scoreContext
                 );
                 offense = Math.max(hybridDirectOffense, hybridIndirectOffense);
@@ -1436,35 +1551,28 @@
             if (enemy.domain === COUNTERPOINTAI.DOMAIN_AIR)
             {
                 roleFactor += roleCoefficient *
-                    COUNTERPOINTAI._readNumber(threatProfile, "airShare", 0);
+                    COUNTERPOINTAI._readNumber(enemyRoles, "airShare", 0);
             }
             if (enemy.domain === COUNTERPOINTAI.DOMAIN_NAVAL)
             {
                 roleFactor += roleCoefficient *
-                    COUNTERPOINTAI._readNumber(threatProfile, "navalShare", 0);
+                    COUNTERPOINTAI._readNumber(enemyRoles, "navalShare", 0);
             }
             var enemyIsIndirect = COUNTERPOINTAI._isPureIndirect(enemy);
             if (enemyIsIndirect)
             {
                 roleFactor += COUNTERPOINTAI.INDIRECT_ROLE_SHARE_FACTOR *
-                    COUNTERPOINTAI._readNumber(threatProfile, "indirectShare", 0);
+                    COUNTERPOINTAI._readNumber(enemyRoles, "indirectShare", 0);
             }
 
-            var coverage = COUNTERPOINTAI._contextNumber(
-                scoreContext,
-                "ownCoverage",
-                enemyKey,
-                0
-            );
             var threatNeed = enemyHp * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE;
-            var gapFactor = COUNTERPOINTAI._coverageGapFactor(
-                coverage,
-                threatNeed,
-                candidateValue
-            );
             if (COUNTERPOINTAI._isAirThreat(enemy))
             {
                 airNeedTotal += threatNeed;
+                bestAirDamage = Math.max(
+                    bestAirDamage,
+                    COUNTERPOINTAI._damageAgainst(candidate, enemyId)
+                );
             }
 
             var offenseContribution = 0;
@@ -1472,15 +1580,14 @@
             var rawDefenseContribution = 0;
             if (isHybrid)
             {
-                var indirectChannelFactor = COUNTERPOINTAI._indirectChannelFactor(
+                var indirectChannelFactor = COUNTERPOINTAI._staticIndirectChannelFactor(
                     candidateId,
-                    ownCount,
                     scoreContext
                 );
                 var hybridChoice = COUNTERPOINTAI._hybridMatchupChoice(
                     hybridDirectOffense,
                     hybridIndirectOffense,
-                    enemyHp * threatFactor * roleFactor * gapFactor,
+                    enemyHp * threatFactor * roleFactor,
                     baseDefense,
                     indirectChannelFactor
                 );
@@ -1491,9 +1598,23 @@
             else if (offense > 0)
             {
                 offenseContribution = enemyHp * offense * threatFactor *
-                    offenseCounterFactor * roleFactor * gapFactor * mobilityFactor;
+                    offenseCounterFactor * roleFactor * mobilityFactor;
             }
             offenseContributions.push(offenseContribution);
+            if (offenseContribution > 0)
+            {
+                staticThreats.push({
+                    key : "field:" + enemyKey,
+                    id : enemyId,
+                    need : threatNeed,
+                    coverageDelta : COUNTERPOINTAI._coverageDamage(
+                        COUNTERPOINTAI._damageAgainst(candidate, enemyId),
+                        COUNTERPOINTAI._tunable("COVERAGE_QUALITY_DAMAGE")
+                    ),
+                    staticContribution : offenseContribution,
+                    phantom : false
+                });
+            }
 
             if (!isHybrid && baseDefense > 0)
             {
@@ -1527,17 +1648,6 @@
                 {
                     phantomThreat *= COUNTERPOINTAI.CAP_THREAT_MULTIPLIER;
                 }
-                // Credit only phantom threats not already covered by the roster.
-                var phantomGapFactor = COUNTERPOINTAI._coverageGapFactor(
-                    COUNTERPOINTAI._contextNumber(
-                        scoreContext,
-                        "phantomCoverage",
-                        COUNTERPOINTAI._unitKey(phantom),
-                        0
-                    ),
-                    COUNTERPOINTAI.PHANTOM_RETAL_HP * COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
-                    candidateValue
-                );
                 var phantomDefense = COUNTERPOINTAI._enemyChannelDefense(
                     phantom,
                     candidateId,
@@ -1576,7 +1686,6 @@
                             phantomDirectOffense,
                             false,
                             candidateValue / phantomValue,
-                            ownCount,
                             scoreContext
                         );
                         var phantomIndirectValue = COUNTERPOINTAI._hybridChannelOffense(
@@ -1586,7 +1695,6 @@
                             phantomIndirectOffense,
                             true,
                             candidateValue / phantomValue,
-                            ownCount,
                             scoreContext
                         );
                         phantomChoice = COUNTERPOINTAI._hybridMatchupChoice(
@@ -1601,9 +1709,8 @@
                                 1,
                                 isTank
                             ),
-                            COUNTERPOINTAI._indirectChannelFactor(
+                            COUNTERPOINTAI._staticIndirectChannelFactor(
                                 candidateId,
-                                ownCount,
                                 scoreContext
                             )
                         );
@@ -1632,6 +1739,7 @@
                             );
                     }
                 }
+                var phantomContribution;
                 if (isHybrid)
                 {
                     phantomWorst = Math.max(phantomWorst, phantomChoice.rawDefense);
@@ -1639,10 +1747,7 @@
                         phantomDiscountedWorst,
                         phantomChoice.defense
                     );
-                    phantomBest = Math.max(
-                        phantomBest,
-                        phantomOffenseValue * phantomGapFactor
-                    );
+                    phantomContribution = phantomOffenseValue;
                 }
                 else
                 {
@@ -1652,11 +1757,30 @@
                         phantomDefense * (isIndirect ?
                             COUNTERPOINTAI.INDIRECT_DEFENSE_FACTOR : 1)
                     );
-                    phantomBest = Math.max(
-                        phantomBest,
-                        COUNTERPOINTAI.PHANTOM_RETAL_HP * phantomThreat *
-                            phantomOffenseValue * phantomGapFactor
-                    );
+                    phantomContribution = COUNTERPOINTAI.PHANTOM_RETAL_HP *
+                        phantomThreat * phantomOffenseValue;
+                }
+                phantomBest = Math.max(phantomBest, phantomContribution);
+                if (phantomContribution > 0)
+                {
+                    staticThreats.push({
+                        key : "phantom:" + COUNTERPOINTAI._unitKey(phantom),
+                        id : COUNTERPOINTAI._unitId(phantom),
+                        need : COUNTERPOINTAI.PHANTOM_RETAL_HP *
+                            COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
+                        coverageDelta : COUNTERPOINTAI._coverageDamage(
+                            COUNTERPOINTAI._phantomDamageTaken(
+                                phantom,
+                                candidate,
+                                "damageTakenById",
+                                false
+                            ),
+                            COUNTERPOINTAI._tunable("COVERAGE_QUALITY_DAMAGE")
+                        ),
+                        staticContribution : phantomContribution *
+                            phantomOffenseWeight,
+                        phantom : true
+                    });
                 }
             }
             if (phantomWeight > 0 && phantomWorst > 0)
@@ -1706,44 +1830,14 @@
         {
             score = COUNTERPOINTAI._flipFactor(score, COUNTERPOINTAI.TANK_BONUS);
         }
-        // Apply absolute reach once here; per-enemy mobility already handles being outrun.
-        var mobilityMovement = candidate.domain === COUNTERPOINTAI.DOMAIN_AIR ?
-            candidateMovement * COUNTERPOINTAI._tunable("MOBILITY_AIR_REACH_BONUS") :
-            candidateMovement;
-        score = COUNTERPOINTAI._flipFactor(
-            score,
-            COUNTERPOINTAI._intrinsicMobilityFactor(
-                mobilityMovement,
-                COUNTERPOINTAI._readNumber(scoreContext, "mobilityReference", 0)
-            )
-        );
-        // Demote AA when no fielded or buildable attack-air exists.
         if (COUNTERPOINTAI._isAASpecialist(candidate) &&
-            COUNTERPOINTAI._readNumber(threatProfile, "attackAirShare", 0) <= 0 &&
+            COUNTERPOINTAI._readNumber(enemyRoles, "attackAirShare", 0) <= 0 &&
             scoreContext.phantomAirPresent !== true)
         {
             score = COUNTERPOINTAI._flipFactor(
                 score,
                 COUNTERPOINTAI._tunable("AA_NO_AIR_DISCOUNT")
             );
-        }
-        if (COUNTERPOINTAI._isAASpecialist(candidate) && airNeedTotal > 0)
-        {
-            var airShortfall = COUNTERPOINTAI._clamp(1 - airCovTotal / airNeedTotal, 0, 1);
-            if (airShortfall > 0)
-            {
-                var airShare = Math.max(
-                    COUNTERPOINTAI.AA_SHARE_FLOOR,
-                    COUNTERPOINTAI._readNumber(threatProfile, "attackAirShare", 0)
-                );
-                score = COUNTERPOINTAI._flipFactor(
-                    score,
-                    Math.min(
-                        COUNTERPOINTAI._tunable("AA_COVERAGE_BOOST_MAX"),
-                        1 + COUNTERPOINTAI._tunable("AA_COVERAGE_URGENCY") * airShortfall / airShare
-                    )
-                );
-            }
         }
         if (scoreContext.islandMode === true)
         {
@@ -1767,20 +1861,163 @@
                 score = COUNTERPOINTAI._flipFactor(score, COUNTERPOINTAI.ISLAND_AIR_BONUS);
             }
         }
-        if (ownCount >= 1)
+        return {
+            baseCombatScore : COUNTERPOINTAI._finiteNumber(score, 0),
+            threatProfile : staticThreats,
+            airCoverageDelta : Math.min(
+                COUNTERPOINTAI.COVERAGE_DAMAGE_SCALE,
+                COUNTERPOINTAI._coverageDamage(
+                    bestAirDamage,
+                    COUNTERPOINTAI._tunable("COVERAGE_QUALITY_DAMAGE")
+                )
+            ),
+            airNeed : airNeedTotal
+        };
+    },
+
+    _legacyThreatCoverage : function(context, threat)
+    {
+        var prefixLength = threat.phantom === true ? 8 : 6;
+        return COUNTERPOINTAI._contextNumber(
+            context,
+            threat.phantom === true ? "phantomCoverage" : "ownCoverage",
+            threat.key.substring(prefixLength),
+            0
+        );
+    },
+
+    _legacyCoverageFactor : function(evaluation, candidateValue, context)
+    {
+        var threats = evaluation.threatProfile.slice();
+        threats.sort(function(left, right)
+        {
+            if (left.staticContribution !== right.staticContribution)
+            {
+                return right.staticContribution - left.staticContribution;
+            }
+            return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
+        });
+        var totalWeight = 0;
+        var weightedFactor = 0;
+        var length = Math.min(
+            threats.length,
+            COUNTERPOINTAI._collectionLength(COUNTERPOINTAI.TOP_N_WEIGHTS)
+        );
+        for (var index = 0; index < length; ++index)
+        {
+            var threat = threats[index];
+            var weight = Math.max(0, threat.staticContribution);
+            totalWeight += weight;
+            weightedFactor += weight * COUNTERPOINTAI._coverageGapFactor(
+                COUNTERPOINTAI._legacyThreatCoverage(context, threat),
+                threat.need,
+                candidateValue
+            );
+        }
+        return totalWeight > 0 ? weightedFactor / totalWeight : 1;
+    },
+
+    _legacyDynamicCombatScore : function(candidate, evaluation, context)
+    {
+        var scoreContext = context || {};
+        var candidateId = COUNTERPOINTAI._unitId(candidate);
+        var candidateValue = COUNTERPOINTAI._strategicValue(candidate);
+        var ownCount = COUNTERPOINTAI._ownCount(scoreContext, candidateId);
+        var score = COUNTERPOINTAI._flipFactor(
+            evaluation.baseCombatScore,
+            COUNTERPOINTAI._legacyCoverageFactor(
+                evaluation,
+                candidateValue,
+                scoreContext
+            )
+        );
+        var movement = Math.max(
+            0,
+            COUNTERPOINTAI._readNumber(candidate, "movement", 0)
+        );
+        if (candidate.domain === COUNTERPOINTAI.DOMAIN_AIR)
+        {
+            movement *= COUNTERPOINTAI._tunable("MOBILITY_AIR_REACH_BONUS");
+        }
+        score = COUNTERPOINTAI._flipFactor(
+            score,
+            COUNTERPOINTAI._intrinsicMobilityFactor(
+                movement,
+                COUNTERPOINTAI._readNumber(scoreContext, "mobilityReference", 0)
+            )
+        );
+        if (COUNTERPOINTAI._isAASpecialist(candidate) && evaluation.airNeed > 0)
+        {
+            var shortfall = COUNTERPOINTAI._clamp(
+                1 - Math.max(
+                    0,
+                    COUNTERPOINTAI._readNumber(scoreContext, "ownAirCoverage", 0)
+                ) / evaluation.airNeed,
+                0,
+                1
+            );
+            if (shortfall > 0)
+            {
+                var airShare = Math.max(
+                    COUNTERPOINTAI.AA_SHARE_FLOOR,
+                    COUNTERPOINTAI._readNumber(
+                        scoreContext.threatProfile,
+                        "attackAirShare",
+                        0
+                    )
+                );
+                score = COUNTERPOINTAI._flipFactor(
+                    score,
+                    Math.min(
+                        COUNTERPOINTAI._tunable("AA_COVERAGE_BOOST_MAX"),
+                        1 + COUNTERPOINTAI._tunable("AA_COVERAGE_URGENCY") *
+                            shortfall / airShare
+                    )
+                );
+            }
+        }
+        if (scoreContext.islandMode === true && candidate.isTransporter === true &&
+            COUNTERPOINTAI._readFlag(scoreContext.groundCarriers, candidateId))
+        {
+            var ferryStats = scoreContext.tankFerryStats || {};
+            if (COUNTERPOINTAI._isTankCapableTransport(candidate) &&
+                COUNTERPOINTAI._readNumber(ferryStats, "tanks", 0) >
+                COUNTERPOINTAI._readNumber(ferryStats, "capacity", 0))
+            {
+                score = COUNTERPOINTAI._flipFactor(
+                    score,
+                    COUNTERPOINTAI.ISLAND_TANK_FERRY_DEMAND_BOOST
+                );
+            }
+            if (ownCount > 0)
+            {
+                score = COUNTERPOINTAI._flipFactor(
+                    score,
+                    Math.pow(COUNTERPOINTAI.ISLAND_TRANSPORT_DIVERSITY, ownCount)
+                );
+            }
+            return COUNTERPOINTAI._finiteNumber(score, 0);
+        }
+        if (ownCount > 0)
         {
             score = COUNTERPOINTAI._flipFactor(
                 score,
                 Math.pow(COUNTERPOINTAI.UNIT_DIVERSITY_FACTOR, ownCount)
             );
         }
-        if (isIndirect && indirectRangeDelta < 1 && ownCount >= 1)
+        var rangeDelta = COUNTERPOINTAI._contextNumber(
+            scoreContext,
+            "indirectRangeDeltas",
+            candidateId,
+            0
+        );
+        if (COUNTERPOINTAI._isPureIndirect(candidate) && rangeDelta < 1 &&
+            ownCount > 0)
         {
             score = COUNTERPOINTAI._flipFactor(
                 score,
                 Math.pow(COUNTERPOINTAI.INDIRECT_STACK_PENALTY, ownCount)
             );
-            // Deduct saturation so indirect scores can fall below negative alternatives.
             var surplusCopies = ownCount -
                 COUNTERPOINTAI._tunable("INDIRECT_SATURATION_FREE_COUNT");
             if (surplusCopies > 0)
@@ -1791,6 +2028,20 @@
             }
         }
         return COUNTERPOINTAI._finiteNumber(score, 0);
+    },
+
+    _scoreUnitAgainstEnemies : function(candidate, enemyComposition, context)
+    {
+        var evaluation = COUNTERPOINTAI._evaluateStaticCombat(
+            candidate,
+            enemyComposition,
+            context
+        );
+        return COUNTERPOINTAI._legacyDynamicCombatScore(
+            candidate,
+            evaluation,
+            context
+        );
     },
 
     _normalizeWeights : function(rawWeights)
@@ -2003,11 +2254,14 @@
         var scores = [];
         for (var scoreIndex = 0; scoreIndex < length; ++scoreIndex)
         {
-            scores.push(COUNTERPOINTAI._scoreUnitAgainstEnemies(
-                COUNTERPOINTAI._collectionAt(candidates, scoreIndex),
-                enemies,
-                scoreContext
-            ));
+            var candidate = COUNTERPOINTAI._collectionAt(candidates, scoreIndex);
+            scores.push(typeof candidate.orderScore === "number" ?
+                candidate.orderScore :
+                COUNTERPOINTAI._scoreUnitAgainstEnemies(
+                    candidate,
+                    enemies,
+                    scoreContext
+                ));
         }
 
         var ranks = [];
@@ -2142,6 +2396,56 @@
             Math.floor(value) === value && value >= minimum && value <= maximum;
     },
 
+    _validPlannerNumber : function(value, minimum, maximum)
+    {
+        return typeof value === "number" && isFinite(value) &&
+            value >= minimum && value <= maximum;
+    },
+
+    _coverageProfileLimit : function()
+    {
+        return Math.min(
+            COUNTERPOINTAI._plannerLimit("MAX_COVERAGE_PROFILE_ENTRIES", 1),
+            COUNTERPOINTAI._collectionLength(COUNTERPOINTAI.TOP_N_WEIGHTS)
+        );
+    },
+
+    _validCoverageProfile : function(profile)
+    {
+        if (!Array.isArray(profile) ||
+            profile.length > COUNTERPOINTAI._coverageProfileLimit())
+        {
+            return false;
+        }
+        var indexes = Object.create(null);
+        for (var index = 0; index < profile.length; ++index)
+        {
+            var entry = profile[index];
+            if (entry === null || typeof entry !== "object" ||
+                !COUNTERPOINTAI._validPlannerInteger(
+                    entry.threatIndex,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                !COUNTERPOINTAI._validPlannerNumber(
+                    entry.coverageDelta,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                !COUNTERPOINTAI._validPlannerNumber(
+                    entry.staticWeight,
+                    0,
+                    COUNTERPOINTAI.PLANNER_VALUE_MAX
+                ) ||
+                indexes["#" + entry.threatIndex] === true)
+            {
+                return false;
+            }
+            indexes["#" + entry.threatIndex] = true;
+        }
+        return true;
+    },
+
     _validPlannerJitter : function(value)
     {
         return value === null || COUNTERPOINTAI._validPlannerInteger(
@@ -2197,6 +2501,27 @@
             typeof candidate.isTransporter !== "boolean" ||
             typeof candidate.isAA !== "boolean" ||
             typeof candidate.isIndirect !== "boolean" ||
+            typeof candidate.isDirectCombat !== "boolean" ||
+            typeof candidate.canTransportTank !== "boolean" ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.baseCombatScore,
+                -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validCoverageProfile(candidate.coverageProfile) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.airCoverageDelta,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            !COUNTERPOINTAI._validPlannerNumber(
+                candidate.deploymentTurns,
+                0,
+                COUNTERPOINTAI.PLANNER_VALUE_MAX
+            ) ||
+            typeof candidate.deploymentKnown !== "boolean" ||
+            typeof candidate.deploymentUnreachable !== "boolean" ||
+            (candidate.deploymentUnreachable && !candidate.deploymentKnown) ||
             (candidate.orderScore !== undefined &&
              !COUNTERPOINTAI._validPlannerInteger(
                  candidate.orderScore,
@@ -2779,7 +3104,15 @@
                 canCapture : false,
                 isTransporter : false,
                 isAA : false,
-                isIndirect : false
+                isIndirect : false,
+                isDirectCombat : false,
+                canTransportTank : false,
+                baseCombatScore : 0,
+                coverageProfile : [],
+                airCoverageDelta : 0,
+                deploymentTurns : 0,
+                deploymentKnown : false,
+                deploymentUnreachable : false
             });
         }
         return candidates;
@@ -3886,7 +4219,7 @@
             COUNTERPOINTAI._fieldedHpById(enemySnapshots),
             damageCache
         );
-        return {
+        var context = {
             plans : plans,
             roster : roster,
             groundCarriers : roster.carriers,
@@ -3934,6 +4267,11 @@
             indirectCo : indirectCo,
             fieldedIndirects : COUNTERPOINTAI._countPureIndirects(ownSnapshots)
         };
+        context.staticThreats = COUNTERPOINTAI._staticThreatRecords(context);
+        context.staticThreatIndexes = COUNTERPOINTAI._staticThreatIndexes(
+            context.staticThreats
+        );
+        return context;
     },
 
     // Which transports can actually deliver a ground capturer to somewhere we cannot already walk.
@@ -5994,15 +6332,30 @@
 
     _setCandidateOrderScore : function(candidate, context)
     {
-        if (context.islandMode === true && candidate.isTransporter === true &&
-            COUNTERPOINTAI._readFlag(context.groundCarriers, candidate.id))
-        {
-            return;
-        }
-        var rawScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        var scoreContext = COUNTERPOINTAI._scoreContext(context);
+        var evaluation = COUNTERPOINTAI._evaluateStaticCombat(
             candidate.scoreData,
             context.enemyComposition,
-            COUNTERPOINTAI._scoreContext(context)
+            scoreContext
+        );
+        candidate.baseCombatScore = COUNTERPOINTAI._clamp(
+            COUNTERPOINTAI._finiteNumber(evaluation.baseCombatScore, 0),
+            -COUNTERPOINTAI.PLANNER_VALUE_MAX,
+            COUNTERPOINTAI.PLANNER_VALUE_MAX
+        );
+        candidate.coverageProfile = COUNTERPOINTAI._compactCoverageProfile(
+            evaluation,
+            context.staticThreatIndexes
+        );
+        candidate.airCoverageDelta = COUNTERPOINTAI._clamp(
+            COUNTERPOINTAI._finiteNumber(evaluation.airCoverageDelta, 0),
+            0,
+            COUNTERPOINTAI.PLANNER_VALUE_MAX
+        );
+        var rawScore = COUNTERPOINTAI._legacyDynamicCombatScore(
+            candidate.scoreData,
+            evaluation,
+            scoreContext
         );
         var roundedScore = Math.round(rawScore);
         if (rawScore < 0 && roundedScore === 0)
@@ -6018,7 +6371,6 @@
 
     _scorePlanCandidates : function(plans, context, turn)
     {
-        var dynamic = COUNTERPOINTAI.DYNAMIC_FLOOR !== false;
         for (var planIndex = 0; planIndex < plans.length; ++planIndex)
         {
             var plan = plans[planIndex];
@@ -6032,7 +6384,12 @@
                 var data = candidate.scoreData;
                 candidate.isAA = data !== undefined && data !== null && COUNTERPOINTAI._countsAsAntiAir(data);
                 candidate.isIndirect = data !== undefined && data !== null && COUNTERPOINTAI._isPureIndirect(data);
-                if (dynamic && !(turn <= 1 && candidate.canCapture === true))
+                candidate.isDirectCombat = data !== undefined && data !== null &&
+                    COUNTERPOINTAI._hasDirectChannel(data) &&
+                    COUNTERPOINTAI._hasAttackCapability(data);
+                candidate.canTransportTank = data !== undefined && data !== null &&
+                    COUNTERPOINTAI._isTankCapableTransport(data);
+                if (!(turn <= 1 && candidate.canCapture === true))
                 {
                     COUNTERPOINTAI._setCandidateOrderScore(candidate, context);
                 }
@@ -6150,7 +6507,7 @@
             else if (mode === COUNTERPOINTAI.ORDER_MODE_DAMAGE)
             {
                 normalized = COUNTERPOINTAI._netDamageWeights(
-                    scoreCandidates,
+                    remaining,
                     context.enemyComposition,
                     COUNTERPOINTAI._scoreContext(context)
                 );
@@ -6299,10 +6656,6 @@
         for (var availableIndex = 0; availableIndex < available.length; ++availableIndex)
         {
             var entry = available[availableIndex];
-            if (turn > 1 || !entry.canCapture)
-            {
-                COUNTERPOINTAI._setCandidateOrderScore(entry, context);
-            }
             if (entry.canCapture)
             {
                 cappers.push(entry);
