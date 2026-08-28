@@ -820,6 +820,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinatedai.cpp ai/coordinatedai.h
     ai/coordinator/coordinatorcommon.h
     ai/coordinator/mobilityfield.h
+    ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1447,6 +1448,8 @@ if (BUILD_TESTING)
         tests/arena/actionseedprobe.h
         tests/arena/capturebonusprobe.cpp
         tests/arena/capturebonusprobe.h
+        tests/arena/mobilityprobe.cpp
+        tests/arena/mobilityprobe.h
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
@@ -1711,6 +1714,30 @@ if (BUILD_TESTING)
     )
     set_tests_properties(ArenaActionFireTakenDamageForwarding PROPERTIES TIMEOUT 120)
     cow_set_arena_test_path(ArenaActionFireTakenDamageForwarding)
+
+    set(ARENA_MOBILITY_RUN_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/mobility
+    )
+    file(MAKE_DIRECTORY ${ARENA_MOBILITY_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/mobility_init.js
+        ${ARENA_MOBILITY_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaMobilityFieldDifferential
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_MOBILITY_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaMobilityFieldDifferential PROPERTIES TIMEOUT 300)
+    cow_set_arena_test_path(ArenaMobilityFieldDifferential)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})

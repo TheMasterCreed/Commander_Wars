@@ -16,6 +16,17 @@
 #include "game/player.h"
 #include "game/co.h"
 
+namespace
+{
+    void bumpMapTerrainGeneration(GameMap* pMap)
+    {
+        if (pMap != nullptr)
+        {
+            pMap->bumpTerrainGeneration();
+        }
+    }
+}
+
 spTerrain Terrain::createTerrain(const QString & terrainID, qint32 x, qint32 y, const QString & currentTerrainID, GameMap* pMap, const QString & currentTerrainPalette)
 {
     spTerrain pTerrain = MemoryManagement::create<Terrain>(terrainID, x, y, pMap);
@@ -1186,6 +1197,7 @@ void Terrain::setBuilding(spBuilding pBuilding)
         {
             createBuildingDownStream();
         }
+        bumpMapTerrainGeneration(m_pMap);
     }
 }
 
@@ -1243,6 +1255,7 @@ void Terrain::removeBuilding()
             }
         }
         m_Building.reset();
+        bumpMapTerrainGeneration(m_pMap);
     }
 }
 
@@ -1260,6 +1273,7 @@ void Terrain::setSpBuilding(spBuilding pBuilding, bool OnlyDownStream)
             m_Building->setTerrain(m_pMap->getTerrain(Terrain::m_x, Terrain::m_y));
             addBuildingSprite(m_Building);
         }
+        bumpMapTerrainGeneration(m_pMap);
     }
 }
 
@@ -1279,6 +1293,7 @@ void Terrain::loadBuilding(const QString & buildingID)
     m_Building->setTerrain(m_pMap->getTerrain(Terrain::m_x, Terrain::m_y));
     addBuildingSprite(m_Building);
     createBuildingDownStream();
+    bumpMapTerrainGeneration(m_pMap);
 }
 
 void Terrain::setUnit(spUnit pUnit)

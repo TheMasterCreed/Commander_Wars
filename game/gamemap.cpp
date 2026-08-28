@@ -1334,6 +1334,16 @@ void GameMap::zoomChanged()
     Interpreter::getInstance()->doFunction("onZoomLevelChanged");
 }
 
+qint32 GameMap::getTerrainGeneration() const
+{
+    return m_terrainGeneration;
+}
+
+void GameMap::bumpTerrainGeneration()
+{
+    ++m_terrainGeneration;
+}
+
 void GameMap::replaceTerrainOnly(const QString terrainID, qint32 x, qint32 y, bool useTerrainAsBaseTerrain, bool removeUnit, const QString palette, bool changePalette, bool includeBaseTerrain, bool force)
 {
     if (onMap(x, y))
@@ -1389,6 +1399,7 @@ void GameMap::replaceTerrainOnly(const QString terrainID, qint32 x, qint32 y, bo
                     m_rowSprites[y]->addChild(pTerrain);
                 }
             }
+            bumpTerrainGeneration();
         }
         else
         {

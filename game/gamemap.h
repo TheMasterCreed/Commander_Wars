@@ -651,6 +651,9 @@ public:
      * @return height of the map
      */
     Q_INVOKABLE qint32 getMapHeight() const;
+    // Bumped when terrain or buildings change; ownership changes do not bump it.
+    qint32 getTerrainGeneration() const;
+    void bumpTerrainGeneration();
     /**
      * @brief spawnUnit
      * @param x coordinates starting at 0
@@ -1040,6 +1043,7 @@ private:
     spGameScript m_GameScript{MemoryManagement::create<GameScript>(this)};
     TrainingDataGenerator m_trainingDataGenerator{this};
     ScriptVariables m_Variables;
+    qint32 m_terrainGeneration{0};
     static const char* const m_GameAnimationFactory;
     bool m_loaded{false};
     QString m_mapMusic;
