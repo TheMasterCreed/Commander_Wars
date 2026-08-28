@@ -822,6 +822,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/mobilityfield.h
     ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
     ai/coordinator/battlefieldknowledge.h ai/coordinator/battlefieldknowledge.cpp
+    ai/coordinator/attackopportunityfield.h
+    ai/coordinator/attackopportunitybuilder.h ai/coordinator/attackopportunitybuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1345,6 +1347,23 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiMobilityFieldTests)
 
+    add_executable(CoordinatorAiAttackOpportunityFieldTests
+        tests/coordinator_ai/attackopportunityfieldtests.cpp
+    )
+    target_include_directories(CoordinatorAiAttackOpportunityFieldTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(CoordinatorAiAttackOpportunityFieldTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiAttackOpportunityFieldTests
+        COMMAND CoordinatorAiAttackOpportunityFieldTests
+    )
+    cow_set_arena_test_path(CoordinatorAiAttackOpportunityFieldTests)
+
     add_executable(CoordinatorAiTypeIdentityTests
         tests/coordinator_ai/aitypeidentitytests.cpp
         game/GameEnums.h
@@ -1453,6 +1472,8 @@ if (BUILD_TESTING)
         tests/arena/mobilityprobe.h
         tests/arena/knowledgeprobe.cpp
         tests/arena/knowledgeprobe.h
+        tests/arena/attackfactsprobe.cpp
+        tests/arena/attackfactsprobe.h
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
@@ -1758,6 +1779,8 @@ if (BUILD_TESTING)
     endfunction()
     cow_add_arena_probe_test(
         ArenaKnowledgeFacts tests/arena/fixtures/knowledge_init.js 120)
+    cow_add_arena_probe_test(
+        ArenaAttackOpportunityDifferential tests/arena/fixtures/attack_init.js 300)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
