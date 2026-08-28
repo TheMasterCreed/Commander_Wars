@@ -41,6 +41,20 @@ constexpr const char *const OBJECT_READY_PREFIX = "Ready_";
 constexpr const char *const OBJECT_CO1_PREFIX = "CO1_";
 constexpr const char *const OBJECT_CO2_PREFIX = "CO2_";
 
+namespace
+{
+QStringList choiceNames(const QVector<AiChoice> & choices)
+{
+    QStringList names;
+    names.reserve(choices.size());
+    for (const AiChoice & choice : choices)
+    {
+        names.append(choice.displayName);
+    }
+    return names;
+}
+}
+
 PlayerSelection::PlayerSelection(qint32 width, qint32 heigth)
 {
 #ifdef GRAPHICSUPPORT
@@ -79,7 +93,8 @@ bool PlayerSelection::isOpenPlayer(qint32 player)
         DropDownmenu *pDropDownmenu = getCastedObject<DropDownmenu>(OBJECT_AI_PREFIX + QString::number(player));
         if (pDropDownmenu != nullptr)
         {
-            if (pDropDownmenu->getCurrentItem() == pDropDownmenu->getItemCount() - 1)
+            const auto type = aiTypeForRow(pDropDownmenu->getCurrentItem());
+            if (type.has_value() && *type == GameEnums::AiTypes_Open)
             {
                 ret = true;
             }
@@ -106,7 +121,8 @@ bool PlayerSelection::isClosedPlayer(qint32 player)
             {
                 if (m_pNetworkInterface->getIsServer())
                 {
-                    if (pDropDownmenu->getCurrentItem() == pDropDownmenu->getItemCount() - 2)
+                    const auto type = aiTypeForRow(pDropDownmenu->getCurrentItem());
+                    if (type.has_value() && *type == GameEnums::AiTypes_Closed)
                     {
                         ret = true;
                     }
@@ -118,10 +134,15 @@ bool PlayerSelection::isClosedPlayer(qint32 player)
                     ret = true;
                 }
             }
-            else if (pDropDownmenu->getCurrentItem() == pDropDownmenu->getItemCount() - 1 &&
-                     pDropDownmenu->getItemCount() > 1)
+            else
             {
-                ret = true;
+                const auto type = aiTypeForRow(pDropDownmenu->getCurrentItem());
+                if (type.has_value() &&
+                    *type == GameEnums::AiTypes_Closed &&
+                    pDropDownmenu->getItemCount() > 1)
+                {
+                    ret = true;
+                }
             }
         }
         else if (player >= 0 &&
@@ -386,7 +407,7 @@ void PlayerSelection::initializeMap(bool relaunchedLobby)
                 if (pPlayer->getBaseGameInput() != nullptr)
                 {
                     auto ai = pPlayer->getBaseGameInput()->getAiType();
-                    if (ai > GameEnums::AiTypes_Human)
+                    if (isComputerAiType(ai))
                     {
                         allHuman = false;
                     }
@@ -468,7 +489,7 @@ void PlayerSelection::initializeMap(bool relaunchedLobby)
                         m_pMap->getPlayer(i)->setPlayerNameId(Settings::getInstance()->getUsername());
                     }
                 }
-                else if (controType <= GameEnums::AiTypes::AiTypes_ProxyAi)
+                else if (GameEnums::isInternalAiType(controType))
                 {
                     // skip other ai types
                 }
@@ -496,9 +517,6 @@ void PlayerSelection::showPlayerSelection(bool relaunchedLobby)
 void PlayerSelection::updateInitialState(bool relaunchedLobby)
 {
     CONSOLE_PRINT("PlayerSelection::updateInitialState", GameConsole::eDEBUG);
-    // add player selection information
-    QStringList aiList = getAiNames();
-    QStringList defaultAiList = getDefaultAiNames();
     if (m_saveGame && m_pNetworkInterface.get() != nullptr && !Mainapp::getSlave())
     {
         if (getIsServerNetworkInterface())
@@ -530,20 +548,21 @@ void PlayerSelection::updateInitialState(bool relaunchedLobby)
         {
             Player *pPlayer = m_pMap->getPlayer(i);
             DropDownmenu *pPlayerAi = getCastedObject<DropDownmenu>(OBJECT_AI_PREFIX + QString::number(i));
-            auto aiType = pPlayer->getControlType();
-            qint32 ai = static_cast<qint32>(aiType);
+            GameEnums::AiTypes ai = pPlayer->getControlType();
             // update co view
             selectInitialCos(i);
             // update ai view
-            selectInitialAi(relaunchedLobby, i, pPlayerAi, ai, aiList, defaultAiList);
+            selectInitialAi(relaunchedLobby, i, pPlayerAi, ai);
             createInitialAi(pPlayerAi, ai, i);
         }
     }
 }
 
-void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropDownmenu *pPlayerAi, qint32 &ai, const QStringList &aiList, const QStringList &defaultAiList)
+void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player,
+                                      DropDownmenu *pPlayerAi,
+                                      GameEnums::AiTypes & ai)
 {
-    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " ai=" + QString::number(ai) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
+    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " ai=" + QString::number(static_cast<qint32>(ai)) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
     Player *pPlayer = m_pMap->getPlayer(player);
     const bool isCampaign = getIsCampaign();
     if (relaunchedLobby)
@@ -555,19 +574,23 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
     }
     else if (isCampaign)
     {
-        if (ai == 0)
+        if (ai == GameEnums::AiTypes_Human)
         {
-            ai = 0;
+            ai = GameEnums::AiTypes_Human;
             if (pPlayerAi != nullptr)
             {
-                pPlayerAi->setCurrentItem(0);
+                pPlayerAi->setCurrentItem(rowForAiType(ai));
             }
         }
         else
         {
             if (pPlayerAi != nullptr)
             {
-                pPlayerAi->setCurrentItemText(defaultAiList[ai]);
+                const auto choice = choiceForAiType(ai);
+                if (choice.has_value())
+                {
+                    pPlayerAi->setCurrentItemText(choice->displayName);
+                }
                 pPlayerAi->setEnabled(false);
             }
         }
@@ -589,14 +612,26 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
                     ai = GameEnums::AiTypes_Open;
                     if (pPlayerAi != nullptr)
                     {
-                        pPlayerAi->setCurrentItem(aiList.size() - 1);
+                        pPlayerAi->setCurrentItem(rowForAiType(ai));
                     }
                 }
                 else
                 {
                     if (pPlayerAi != nullptr)
                     {
-                        pPlayerAi->setCurrentItem(ai);
+                        const qint32 row = rowForAiType(ai);
+                        if (row >= 0)
+                        {
+                            pPlayerAi->setCurrentItem(row);
+                        }
+                        else
+                        {
+                            const auto choice = choiceForAiType(ai);
+                            if (choice.has_value())
+                            {
+                                pPlayerAi->setCurrentItemText(choice->displayName);
+                            }
+                        }
                     }
                 }
             }
@@ -605,8 +640,8 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
                 ai = GameEnums::AiTypes_Open;
                 if (pPlayerAi != nullptr)
                 {
-                    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " new ai=" + QString::number(ai) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
-                    pPlayerAi->setCurrentItem(aiList.size() - 1);
+                    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " new ai=" + QString::number(static_cast<qint32>(ai)) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
+                    pPlayerAi->setCurrentItem(rowForAiType(ai));
                 }
             }
             else
@@ -614,8 +649,8 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
                 ai = GameEnums::AiTypes_Human;
                 if (pPlayerAi != nullptr)
                 {
-                    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " new ai=" + QString::number(ai) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
-                    pPlayerAi->setCurrentItem(0);
+                    CONSOLE_PRINT("PlayerSelection::selectInitialAi player=" + QString::number(player) + " new ai=" + QString::number(static_cast<qint32>(ai)) + " relaunchedLobby=" + QString::number(relaunchedLobby), GameConsole::eDEBUG);
+                    pPlayerAi->setCurrentItem(rowForAiType(ai));
                 }
             }
         }
@@ -624,7 +659,7 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
             ai = GameEnums::AiTypes_Normal;
             if (pPlayerAi != nullptr)
             {
-                pPlayerAi->setCurrentItem(ai);
+                pPlayerAi->setCurrentItemText(getNameFromAiType(ai));
                 pPlayerAi->setEnabled(false);
             }
         }
@@ -637,15 +672,15 @@ void PlayerSelection::selectInitialAi(bool relaunchedLobby, qint32 player, DropD
             ai = GameEnums::AiTypes_Closed;
             if (pPlayerAi != nullptr)
             {
-                pPlayerAi->setCurrentItem(ai);
+                pPlayerAi->setCurrentItem(rowForAiType(ai));
             }
         }
         else
         {
-            ai = static_cast<qint32>(input->getAiType());
+            ai = input->getAiType();
             if (pPlayerAi != nullptr)
             {
-                pPlayerAi->setCurrentItem(ai);
+                pPlayerAi->setCurrentItem(rowForAiType(ai));
             }
         }
     }
@@ -655,6 +690,7 @@ void PlayerSelection::createInitialAi(DropDownmenu *pPlayerAi, qint32 ai, qint32
 {
     CONSOLE_PRINT("PlayerSelection::createInitialAi for player " + QString::number(player) + " with control type " + QString::number(ai), GameConsole::eDEBUG);
     Player *pPlayer = m_pMap->getPlayer(player);
+    const auto aiType = static_cast<GameEnums::AiTypes>(ai);
     // create initial selected ai's
     QString displayName = pPlayer->getPlayerNameId();
     if (pPlayerAi != nullptr && ai != GameEnums::AiTypes_Human)
@@ -662,19 +698,19 @@ void PlayerSelection::createInitialAi(DropDownmenu *pPlayerAi, qint32 ai, qint32
         displayName = pPlayerAi->getCurrentItemText();
         pPlayer->setPlayerNameId(displayName);
     }
-    if (getIsCampaign() && ai > 0)
+    if (getIsCampaign() && isComputerAiType(aiType))
     {
-        createAi(player, static_cast<GameEnums::AiTypes>(ai), displayName);
+        createAi(player, aiType, displayName);
     }
     else if ((m_pNetworkInterface.get() == nullptr ||
               m_pNetworkInterface->getIsServer() ||
               m_isServerGame))
     {
-        selectPlayerAi(player, static_cast<GameEnums::AiTypes>(ai));
+        selectPlayerAi(player, aiType);
     }
     else
     {
-        createAi(player, static_cast<GameEnums::AiTypes>(ai), displayName);
+        createAi(player, aiType, displayName);
     }
 }
 
@@ -1151,22 +1187,22 @@ void PlayerSelection::selectPlayerAi(qint32 player, GameEnums::AiTypes eAiType)
         {
             if (eAiType == GameEnums::AiTypes_Open)
             {
-                pDropDownmenu->setCurrentItem(pDropDownmenu->getItemCount() - 1);
+                pDropDownmenu->setCurrentItem(rowForAiType(eAiType));
             }
             else if (eAiType == GameEnums::AiTypes_Closed)
             {
                 if (m_pNetworkInterface.get() != nullptr)
                 {
-                    pDropDownmenu->setCurrentItem(pDropDownmenu->getItemCount() - 2);
+                    pDropDownmenu->setCurrentItem(rowForAiType(eAiType));
                 }
                 else
                 {
-                    pDropDownmenu->setCurrentItem(pDropDownmenu->getItemCount() - 1);
+                    pDropDownmenu->setCurrentItem(rowForAiType(eAiType));
                 }
             }
             else
             {
-                pDropDownmenu->setCurrentItem(static_cast<qint32>(eAiType));
+                pDropDownmenu->setCurrentItem(rowForAiType(eAiType));
             }
         }
         selectAI(player, true);
@@ -1190,7 +1226,11 @@ void PlayerSelection::selectAI(qint32 player, bool forced)
         DropDownmenu *pDropDownmenu = getCastedObject<DropDownmenu>(OBJECT_AI_PREFIX + QString::number(player));
         if (pDropDownmenu != nullptr)
         {
-            type = static_cast<GameEnums::AiTypes>(pDropDownmenu->getCurrentItem());
+            const auto selectedType = aiTypeForRow(pDropDownmenu->getCurrentItem());
+            if (selectedType.has_value())
+            {
+                type = *selectedType;
+            }
         }
         if (isOpenPlayer(player))
         {
@@ -1211,10 +1251,10 @@ void PlayerSelection::selectAI(qint32 player, bool forced)
         }
         else
         {
-            QStringList aiTypes = getDefaultAiNames();
-            if (type >= 0 && type < aiTypes.size())
+            const auto choice = choiceForAiType(type);
+            if (choice.has_value())
             {
-                name = aiTypes[type];
+                name = choice->displayName;
             }
         }
     }
@@ -1297,45 +1337,113 @@ void PlayerSelection::createAi(qint32 player, GameEnums::AiTypes type, QString d
 
 QStringList PlayerSelection::getDefaultAiNames() const
 {
-    QStringList defaultAiList = {tr("Human"), tr("Very Easy"), tr("Normal"), tr("Normal Off."), tr("Normal Def.")}; // heavy ai disabled cause it's not finished
-#if HEAVY_AI
-    Interpreter *pInterpreter = Interpreter::getInstance();
-    GameManager *pGameManager = GameManager::getInstance();
-    // heavy ai enable code
-    for (qint32 i = 0; i < pGameManager->getHeavyAiCount(); ++i)
-    {
-        QString id = pGameManager->getHeavyAiID(i);
-        QJSValue aiName = pInterpreter->doFunction(id, "getName");
-        defaultAiList.append(aiName.toString());
-    }
-#endif
-    defaultAiList.append(tr("Closed"));
-    return defaultAiList;
+    return choiceNames(getDefaultAiChoices());
 }
 
 QStringList PlayerSelection::getAiNames() const
 {
-    QStringList aiList = getDefaultAiNames();
+    return choiceNames(getAiChoices());
+}
+
+QVector<AiChoice> PlayerSelection::getDefaultAiChoices() const
+{
+    QVector<AiChoice> choices = {
+        {GameEnums::AiTypes_Human, tr("Human")},
+        {GameEnums::AiTypes_VeryEasy, tr("Very Easy")},
+        {GameEnums::AiTypes_Normal, tr("Normal")},
+        {GameEnums::AiTypes_NormalOffensive, tr("Normal Off.")},
+        {GameEnums::AiTypes_NormalDefensive, tr("Normal Def.")},
+    };
+#if HEAVY_AI
+    Interpreter *pInterpreter = Interpreter::getInstance();
+    GameManager *pGameManager = GameManager::getInstance();
+    for (qint32 i = 0; i < pGameManager->getHeavyAiCount(); ++i)
+    {
+        const auto type = GameManager::getHeavyAiType(i);
+        if (type.has_value())
+        {
+            const QString id = pGameManager->getHeavyAiID(i);
+            const QJSValue aiName = pInterpreter->doFunction(id, "getName");
+            choices.append({*type, aiName.toString()});
+        }
+    }
+#endif
+    choices.append({GameEnums::AiTypes_Coordinated, tr("Coordinated")});
+    choices.append({GameEnums::AiTypes_Closed, tr("Closed")});
+    return choices;
+}
+
+QVector<AiChoice> PlayerSelection::getAiChoices() const
+{
+    QVector<AiChoice> choices = getDefaultAiChoices();
     if (getIsCampaign())
     {
-        aiList = {tr("Human")};
+        choices = {{GameEnums::AiTypes_Human, tr("Human")}};
         if (m_pNetworkInterface.get() != nullptr)
         {
-            aiList.append(tr("Open"));
+            choices.append({GameEnums::AiTypes_Open, tr("Open")});
         }
     }
     else if (m_pNetworkInterface.get() != nullptr)
     {
         if (m_pNetworkInterface->getIsServer())
         {
-            aiList.append(tr("Open"));
+            choices.append({GameEnums::AiTypes_Open, tr("Open")});
         }
         else
         {
-            aiList = {tr("Human"), tr("Open")};
+            choices = {
+                {GameEnums::AiTypes_Human, tr("Human")},
+                {GameEnums::AiTypes_Open, tr("Open")},
+            };
         }
     }
-    return aiList;
+    return choices;
+}
+
+std::optional<GameEnums::AiTypes> PlayerSelection::aiTypeForRow(qint32 row) const
+{
+    const QVector<AiChoice> choices = getAiChoices();
+    if (row < 0 || row >= choices.size())
+    {
+        return std::nullopt;
+    }
+    return choices.at(row).type;
+}
+
+qint32 PlayerSelection::rowForAiType(GameEnums::AiTypes type) const
+{
+    const QVector<AiChoice> choices = getAiChoices();
+    for (qint32 row = 0; row < choices.size(); ++row)
+    {
+        if (choices.at(row).type == type)
+        {
+            return row;
+        }
+    }
+    return -1;
+}
+
+std::optional<AiChoice> PlayerSelection::choiceForAiType(GameEnums::AiTypes type) const
+{
+    const QVector<AiChoice> choices = getDefaultAiChoices();
+    for (const AiChoice & choice : choices)
+    {
+        if (choice.type == type)
+        {
+            return choice;
+        }
+    }
+    if (type == GameEnums::AiTypes_Open)
+    {
+        return AiChoice{type, tr("Open")};
+    }
+    return std::nullopt;
+}
+
+bool PlayerSelection::isComputerAiType(GameEnums::AiTypes type) const
+{
+    return GameManager::getInstance()->isComputerAiType(type);
 }
 
 QStringList PlayerSelection::getTeamNames() const
@@ -1896,12 +2004,12 @@ bool PlayerSelection::joinAllowed(quint64 socketId, QString username, GameEnums:
 QString PlayerSelection::getNameFromAiType(GameEnums::AiTypes aiType) const
 {
     QString name;
-    QStringList aiList = getAiNames();
+    const auto choice = choiceForAiType(aiType);
     if (aiType == GameEnums::AiTypes::AiTypes_Open)
     {
-        if (aiList.size() > 0)
+        if (choice.has_value())
         {
-            name = aiList[aiList.size() - 1];
+            name = choice->displayName;
         }
         else
         {
@@ -1910,9 +2018,9 @@ QString PlayerSelection::getNameFromAiType(GameEnums::AiTypes aiType) const
     }
     else if (aiType == GameEnums::AiTypes::AiTypes_Closed)
     {
-        if (aiList.size() > 2)
+        if (choice.has_value())
         {
-            name = aiList[aiList.size() - 2];
+            name = choice->displayName;
         }
         else
         {
@@ -1921,9 +2029,9 @@ QString PlayerSelection::getNameFromAiType(GameEnums::AiTypes aiType) const
     }
     else
     {
-        if (aiType < aiList.size() - 2)
+        if (choice.has_value())
         {
-            name = aiList[aiType];
+            name = choice->displayName;
         }
         else
         {

@@ -1345,7 +1345,10 @@ if (BUILD_TESTING)
     target_include_directories(ArenaMatchConfigTests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    target_link_libraries(ArenaMatchConfigTests PRIVATE Qt6::Core)
+    target_compile_definitions(ArenaMatchConfigTests PRIVATE
+        COW_ARENA_MATCH_CONFIG_STANDALONE
+    )
+    target_link_libraries(ArenaMatchConfigTests PRIVATE ${QT_LIBRARIES})
     set_target_properties(ArenaMatchConfigTests PROPERTIES
         AUTOMOC OFF
         AUTOUIC OFF
@@ -1356,6 +1359,29 @@ if (BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     cow_set_arena_test_path(ArenaMatchConfigTests)
+
+    add_executable(CoordinatorAiAiChoiceTests
+        tests/arena/arenamatchconfigtests.cpp
+        tests/arena/arenamatchconfig.cpp
+        tests/arena/arenamatchconfig.h
+    )
+    target_include_directories(CoordinatorAiAiChoiceTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(CoordinatorAiAiChoiceTests PRIVATE
+        COW_ARENA_MATCH_CONFIG_STANDALONE
+    )
+    target_link_libraries(CoordinatorAiAiChoiceTests PRIVATE ${QT_LIBRARIES})
+    set_target_properties(CoordinatorAiAiChoiceTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(NAME CoordinatorAiAiChoiceTests COMMAND CoordinatorAiAiChoiceTests)
+    set_tests_properties(CoordinatorAiAiChoiceTests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    cow_set_arena_test_path(CoordinatorAiAiChoiceTests)
 
     set(ARENA_SMOKE_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/smoke)
     file(MAKE_DIRECTORY ${ARENA_SMOKE_RUN_DIR})
@@ -1432,6 +1458,30 @@ if (BUILD_TESTING)
         ArenaCoordinatedShellPauseFallback
         coordinatedShellPauseFallback
     )
+
+    set(ARENA_AI_CHOICE_RUN_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/ai_choice
+    )
+    file(MAKE_DIRECTORY ${ARENA_AI_CHOICE_RUN_DIR})
+    configure_file(
+        tests/arena/fixtures/ai_choice_init.js
+        ${ARENA_AI_CHOICE_RUN_DIR}/init.js
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaAiChoice
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COW_AI_ARENA_TEST=1"
+            $<TARGET_FILE:${PROJECT_NAME}>
+            --noUi
+            --noAudio
+            --spawnAiProcess 0
+            --mods=
+            --userPath ${ARENA_AI_CHOICE_RUN_DIR}/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(ArenaAiChoice PROPERTIES TIMEOUT 120)
+    cow_set_arena_test_path(ArenaAiChoice)
 
     set(ARENA_MATCH_MAP_PATH "maps/2_player/Bean Island.map")
     set(ARENA_MATCH_AI_TYPE_0 "Normal")

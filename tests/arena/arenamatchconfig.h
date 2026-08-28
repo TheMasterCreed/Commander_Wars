@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include "game/GameEnums.h"
@@ -17,6 +18,8 @@ struct ArenaMatchConfig
     static const QString FILE_NAME;
 
     static bool load(const QString & path, ArenaMatchConfig & config, QString & error);
+    static bool load(const QString & path, ArenaMatchConfig & config, QString & error,
+                     const QStringList & loadedHeavyAiIds);
 
     bool validatePlayerCount(qint32 playerCount, QString & error) const;
     bool hasStopBoundary() const;

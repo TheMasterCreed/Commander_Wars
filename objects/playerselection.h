@@ -1,7 +1,10 @@
 #ifndef PLAYERSELECTION_H
 #define PLAYERSELECTION_H
 
+#include <optional>
+
 #include <QObject>
+#include <QVector>
 
 #include "ui_reader/createdgui.h"
 
@@ -15,6 +18,17 @@
 class DropDownmenu;
 class PlayerSelection;
 using spPlayerSelection = std::shared_ptr<PlayerSelection>;
+
+struct AiChoice
+{
+    GameEnums::AiTypes type{GameEnums::AiTypes_Human};
+    QString displayName;
+
+    bool operator==(const AiChoice & other) const
+    {
+        return type == other.type && displayName == other.displayName;
+    }
+};
 
 class PlayerSelection final : public CreatedGui, public FileSerializable
 {
@@ -138,6 +152,12 @@ public:
     Q_INVOKABLE QStringList getDefaultAiNames() const;
     Q_INVOKABLE QStringList getAiNames() const;
     Q_INVOKABLE QString getNameFromAiType(GameEnums::AiTypes aiType) const;
+    QVector<AiChoice> getDefaultAiChoices() const;
+    QVector<AiChoice> getAiChoices() const;
+    std::optional<GameEnums::AiTypes> aiTypeForRow(qint32 row) const;
+    qint32 rowForAiType(GameEnums::AiTypes type) const;
+    std::optional<AiChoice> choiceForAiType(GameEnums::AiTypes type) const;
+    Q_INVOKABLE bool isComputerAiType(GameEnums::AiTypes type) const;
     Q_INVOKABLE QStringList getTeamNames() const;
     Q_INVOKABLE QStringList getDropDownColorNames() const;
     /**
@@ -344,7 +364,7 @@ protected:
      * @param ai
      * @param aiList
      */
-    void selectInitialAi(bool relaunchedLobby, qint32 player, DropDownmenu* pPlayerAi, qint32 & ai, const QStringList & aiList, const QStringList & defaultAiList);
+    void selectInitialAi(bool relaunchedLobby, qint32 player, DropDownmenu* pPlayerAi, GameEnums::AiTypes & ai);
     /**
      * @brief createInitialAi
      * @param pPlayerAi

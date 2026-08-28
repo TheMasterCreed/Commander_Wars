@@ -11,6 +11,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "resource_management/gamemanager.h"
+
 namespace
 {
 constexpr qint32 CONFIG_VERSION = 2;
@@ -46,21 +48,60 @@ bool plainFileName(const QString & name)
            QFileInfo(name).fileName() == name;
 }
 
-bool resolveAiType(const QString & name, GameEnums::AiTypes & type)
+QStringList loadedHeavyAiIds()
+{
+#ifdef COW_ARENA_MATCH_CONFIG_STANDALONE
+    return {};
+#else
+    QStringList ids;
+    GameManager *pGameManager = GameManager::getInstance();
+    ids.reserve(pGameManager->getHeavyAiCount());
+    for (qint32 index = 0; index < pGameManager->getHeavyAiCount(); ++index)
+    {
+        ids.append(pGameManager->getHeavyAiID(index));
+    }
+    return ids;
+#endif
+}
+
+bool resolveAiType(const QString & name, const QStringList & heavyAiIds,
+                   GameEnums::AiTypes & type)
 {
     static const QHash<QString, GameEnums::AiTypes> types = {
         {"VeryEasy", GameEnums::AiTypes_VeryEasy},
         {"Normal", GameEnums::AiTypes_Normal},
         {"NormalOffensive", GameEnums::AiTypes_NormalOffensive},
         {"NormalDefensive", GameEnums::AiTypes_NormalDefensive},
-        {"Heavy", GameEnums::AiTypes_Heavy},
+        {"Coordinated", GameEnums::AiTypes_Coordinated},
     };
     const auto entry = types.constFind(name);
-    if (entry == types.constEnd())
+    if (entry != types.constEnd())
+    {
+        type = entry.value();
+        return true;
+    }
+
+    qint32 heavyIndex = heavyAiIds.indexOf(name);
+    const QString ordinalPrefix = QStringLiteral("Heavy:");
+    if (heavyIndex < 0 && name.startsWith(ordinalPrefix))
+    {
+        bool ok = false;
+        heavyIndex = name.mid(ordinalPrefix.size()).toInt(&ok);
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    if (heavyIndex < 0 || heavyIndex >= heavyAiIds.size())
     {
         return false;
     }
-    type = entry.value();
+    const auto heavyType = GameManager::getHeavyAiType(heavyIndex);
+    if (!heavyType.has_value())
+    {
+        return false;
+    }
+    type = *heavyType;
     return true;
 }
 
@@ -83,6 +124,13 @@ bool resolveBehavior(const QString & name, GameEnums::AiBehavior & behavior)
 const QString ArenaMatchConfig::FILE_NAME = QStringLiteral("arena_match.json");
 
 bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config, QString & error)
+{
+    return load(path, config, error, loadedHeavyAiIds());
+}
+
+bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config,
+                            QString & error,
+                            const QStringList & loadedHeavyAiIds)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
@@ -133,7 +181,8 @@ bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config, QSt
         const QJsonObject entry = value.toObject();
         ArenaMatchPlayerConfig player;
         if (!entry.value("aiType").isString() ||
-            !resolveAiType(entry.value("aiType").toString(), player.aiType))
+            !resolveAiType(entry.value("aiType").toString(), loadedHeavyAiIds,
+                           player.aiType))
         {
             return reject(error, "players entry has an unsupported aiType");
         }

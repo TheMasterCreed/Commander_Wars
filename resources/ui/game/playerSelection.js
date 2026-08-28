@@ -32,7 +32,7 @@ var PlayerSelection =
         return !playerSelection.getIsServerNetworkInterface() ||
                 playerSelection.getSaveGame() ||
                 playerSelection.getIsObserverNetworkInterface() ||
-                (playerSelection.getPlayerAiType(playerIdx) > GameEnums.AiTypes_Human && !playerSelection.getIsArmyCustomizationAllowed());
+                (playerSelection.isComputerAiType(playerSelection.getPlayerAiType(playerIdx)) && !playerSelection.getIsArmyCustomizationAllowed());
 
     },
     getIsServerOrSavegameOrCampaignEnabled : function(menu)
@@ -47,7 +47,7 @@ var PlayerSelection =
         return !((!menu.getIsServerNetworkInterface() && menu.hasNetworkInterface()) ||
                    menu.getSaveGame() ||
                    menu.getIsObserverNetworkInterface() ||
-                  (menu.getMap().getPlayer(loopIdx).getControlType() > GameEnums.AiTypes_Human && menu.getIsCampaign()));
+                  (menu.isComputerAiType(menu.getMap().getPlayer(loopIdx).getControlType()) && menu.getIsCampaign()));
     },
     getIsServerOrSavegameOrCampaignAiOrSingleCoEnabled : function(menu)
     {
@@ -56,7 +56,7 @@ var PlayerSelection =
                    menu.getSaveGame() ||
                    menu.getIsObserverNetworkInterface() ||
                   map.getGameRules().getSingleCo() ||
-                 (map.getPlayer(loopIdx).getControlType() > GameEnums.AiTypes_Human && menu.getIsCampaign()));
+                 (menu.isComputerAiType(map.getPlayer(loopIdx).getControlType()) && menu.getIsCampaign()));
     },
     getIsServerOrSavegameOrArmyCustomizationEnabled : function(menu)
     {
@@ -92,7 +92,7 @@ var PlayerSelection =
             var isServer = menu.getIsServerNetworkInterface();
             return !(menu.getSaveGame() ||
                      menu.getIsObserverNetworkInterface() ||
-                     (player.getControlType() > GameEnums.AiTypes_Human && menu.getIsCampaign()) ||
+                     (menu.isComputerAiType(player.getControlType()) && menu.getIsCampaign()) ||
                      (isServer && !menu.isNotServerChangeable(player)) ||
                      (!isServer && aiType !== GameEnums.AiTypes_Human));
         }
