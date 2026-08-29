@@ -256,11 +256,10 @@ namespace Coordinator
         return owned + ourPositionalStock(actor, outcome) - enemyOptimum(outcome);
     }
 
-    MilliFunds PropertyStockField::jointStock(std::span<const PlanRowAction> actions)
+    PropertyStockField::JointActionFacts PropertyStockField::jointActionFacts(
+        std::span<const PlanRowAction> actions) const
     {
-        std::vector<std::int32_t> captured;
-        std::vector<std::int32_t> moverRows;
-        std::vector<PropertyStockActor> movers;
+        JointActionFacts facts;
         for (const PlanRowAction & entry : actions)
         {
             const PropertyStockRow & row = m_ours.rows[static_cast<std::size_t>(entry.row)];
@@ -274,12 +273,12 @@ namespace Coordinator
                     carried += row.captureRate;
                     if (carried >= m_capturePointsToCapture)
                     {
-                        captured.push_back(slot);
+                        facts.capturedColumns.push_back(slot);
                     }
                 }
             }
-            moverRows.push_back(entry.row);
-            movers.push_back(PropertyStockActor{
+            facts.moverRows.push_back(entry.row);
+            facts.movers.push_back(PropertyStockActor{
                 .knowledgeIndex = row.knowledgeIndex,
                 .tile = entry.destination,
                 .movementPoints = row.movementPoints,
@@ -287,17 +286,21 @@ namespace Coordinator
                 .survival = ActorSurvival::Alive,
             });
         }
-        std::sort(captured.begin(), captured.end());
-        captured.erase(std::unique(captured.begin(), captured.end()), captured.end());
-        MilliFunds owned = m_ownedBaseline;
-        for (const std::int32_t column : captured)
-        {
-            owned += ownershipFlipSwing(m_ours.columns[static_cast<std::size_t>(column)], m_horizonTurns);
-        }
+        std::sort(facts.capturedColumns.begin(), facts.capturedColumns.end());
+        facts.capturedColumns.erase(
+            std::unique(facts.capturedColumns.begin(), facts.capturedColumns.end()),
+            facts.capturedColumns.end());
+        return facts;
+    }
+
+    MilliFunds PropertyStockField::ourOpenOptimum(const JointActionFacts & facts)
+    {
         std::vector<std::int32_t> openColumns;
         for (std::int32_t column = 0; column < m_ours.columnCount(); ++column)
         {
-            if (std::find(captured.begin(), captured.end(), column) == captured.end())
+            if (std::find(facts.capturedColumns.begin(),
+                          facts.capturedColumns.end(),
+                          column) == facts.capturedColumns.end())
             {
                 openColumns.push_back(column);
             }
@@ -306,8 +309,9 @@ namespace Coordinator
         weights.reserve(static_cast<std::size_t>(m_ours.rowCount()) * openColumns.size());
         for (std::int32_t row = 0; row < m_ours.rowCount(); ++row)
         {
-            const auto mover = std::find(moverRows.begin(), moverRows.end(), row);
-            if (mover == moverRows.end())
+            const auto mover =
+                std::find(facts.moverRows.begin(), facts.moverRows.end(), row);
+            if (mover == facts.moverRows.end())
             {
                 const std::span<const MilliFunds> source = m_ours.weightRow(row);
                 for (const std::int32_t column : openColumns)
@@ -316,8 +320,10 @@ namespace Coordinator
                 }
                 continue;
             }
-            const std::size_t moverSlot = static_cast<std::size_t>(mover - moverRows.begin());
-            const std::vector<MilliFunds> acting = actingWeights(row, movers[moverSlot]);
+            const std::size_t moverSlot =
+                static_cast<std::size_t>(mover - facts.moverRows.begin());
+            const std::vector<MilliFunds> acting =
+                actingWeights(row, facts.movers[moverSlot]);
             for (const std::int32_t column : openColumns)
             {
                 weights.push_back(acting[static_cast<std::size_t>(column)]);
@@ -325,7 +331,21 @@ namespace Coordinator
         }
         AssignmentSolver solver;
         solver.solve(m_ours.rowCount(), static_cast<std::int32_t>(openColumns.size()), weights);
-        return owned + solver.optimum() - jointEnemyOptimum(captured);
+        return solver.optimum();
+    }
+
+    MilliFunds PropertyStockField::jointStock(std::span<const PlanRowAction> actions)
+    {
+        const JointActionFacts facts = jointActionFacts(actions);
+        MilliFunds owned = m_ownedBaseline;
+        for (const std::int32_t column : facts.capturedColumns)
+        {
+            owned += ownershipFlipSwing(
+                m_ours.columns[static_cast<std::size_t>(column)],
+                m_horizonTurns);
+        }
+        return owned + ourOpenOptimum(facts) -
+               jointEnemyOptimum(facts.capturedColumns);
     }
 
     MilliFunds PropertyStockField::stockCeiling() const
@@ -357,7 +377,8 @@ namespace Coordinator
         return m_field.ourRowOf(known->second);
     }
 
-    MilliFunds JointPlanStockValuer::planStock(const TurnPlan & plan)
+    std::vector<PlanRowAction> JointPlanStockValuer::planActions(
+        const TurnPlan & plan) const
     {
         std::vector<PlanRowAction> actions;
         for (std::int32_t index = 0; index < plan.actionCount(); ++index)
@@ -379,12 +400,366 @@ namespace Coordinator
                             action.kind == PlanBundleKind::MoveAndCapture,
             });
         }
-        return m_field.jointStock(actions);
+        return actions;
+    }
+
+    MilliFunds JointPlanStockValuer::planStock(const TurnPlan & plan)
+    {
+        const std::vector<PlanRowAction> actions = planActions(plan);
+        if (actions.empty())
+        {
+            return originStock();
+        }
+        return sequentialJointStock(actions);
+    }
+
+    MilliFunds JointPlanStockValuer::planStockFloor(const TurnPlan & plan)
+    {
+        return m_field.jointStock(planActions(plan));
     }
 
     MilliFunds JointPlanStockValuer::originStock() const
     {
-        return m_field.originStock();
+        if (!m_originCached)
+        {
+            m_sequentialOrigin =
+                sequentialJointStock(std::span<const PlanRowAction>());
+            m_originCached = true;
+        }
+        return m_sequentialOrigin;
+    }
+
+    void JointPlanStockValuer::ensureOurSequentialState() const
+    {
+        if (m_ourStateBuilt)
+        {
+            return;
+        }
+        const std::vector<PropertyStockColumn> & columns =
+            m_field.m_ours.columns;
+        m_ourNodeOfColumn.assign(columns.size(), NO_SEQUENTIAL_NODE);
+        for (std::size_t slot = 0; slot < columns.size(); ++slot)
+        {
+            if (columns[slot].ownerBefore == STOCK_OWNER_AFTER)
+            {
+                continue;
+            }
+            m_ourNodeOfColumn[slot] =
+                static_cast<std::int32_t>(m_ourNodeSlots.size());
+            m_ourNodeSlots.push_back(static_cast<std::int32_t>(slot));
+            m_ourNodeColumns.push_back(columns[slot]);
+        }
+        m_ourStateBuilt = true;
+    }
+
+    std::vector<std::int32_t> JointPlanStockValuer::nodeArrivalsFor(
+        std::int32_t gridIdentity,
+        std::int32_t movementPoints,
+        const std::vector<std::int32_t> & nodeSlots) const
+    {
+        const std::size_t nodeCount = nodeSlots.size();
+        std::vector<std::int32_t> arrivals(
+            nodeCount * nodeCount,
+            UNREACHABLE);
+        for (std::size_t from = 0; from < nodeCount; ++from)
+        {
+            const PropertyStockField::ArrivalVectors & anchored =
+                m_field.arrivalsFrom(
+                    gridIdentity,
+                    movementPoints,
+                    m_field.m_columnTiles[
+                        static_cast<std::size_t>(nodeSlots[from])]);
+            for (std::size_t to = 0; to < nodeCount; ++to)
+            {
+                arrivals[from * nodeCount + to] =
+                    anchored.activations[
+                        static_cast<std::size_t>(nodeSlots[to])];
+            }
+        }
+        return arrivals;
+    }
+
+    std::int32_t JointPlanStockValuer::ourClassIndexFor(
+        const PropertyStockRow & row) const
+    {
+        const SequentialClassKey key{
+            row.gridIdentity,
+            row.movementPoints,
+            row.captureRate,
+        };
+        for (std::size_t index = 0; index < m_ourClassKeys.size(); ++index)
+        {
+            if (m_ourClassKeys[index] == key)
+            {
+                return static_cast<std::int32_t>(index);
+            }
+        }
+        const std::vector<std::int32_t> arrivals =
+            nodeArrivalsFor(row.gridIdentity,
+                            row.movementPoints,
+                            m_ourNodeSlots);
+        SequentialClassTable table;
+        table.build(
+            std::span<const PropertyStockColumn>(m_ourNodeColumns),
+            std::span<const std::int32_t>(arrivals),
+            captureTurnsFor(0,
+                            row.captureRate,
+                            m_field.m_capturePointsToCapture),
+            m_field.m_horizonTurns);
+        m_ourClassKeys.push_back(key);
+        m_ourClassTables.push_back(std::move(table));
+        return static_cast<std::int32_t>(m_ourClassKeys.size()) - 1;
+    }
+
+    SequentialRow JointPlanStockValuer::sequentialRowFor(
+        const PropertyStockInstance & instance,
+        const PropertyStockRow & row,
+        std::int32_t rowIndex,
+        const PropertyStockActor* pMover,
+        const std::vector<std::int32_t> & nodeSlots,
+        std::int32_t classIndex) const
+    {
+        SequentialRow result;
+        result.classIndex = classIndex;
+        const std::size_t nodeCount = nodeSlots.size();
+        result.weight.assign(nodeCount, 0);
+        result.ownedTurn.assign(nodeCount, NO_CAPTURE_TURNS);
+        const std::int32_t horizon = m_field.m_horizonTurns;
+        const std::int32_t points = m_field.m_capturePointsToCapture;
+        if (pMover == nullptr)
+        {
+            const PropertyStockField::ArrivalVectors & arrivals =
+                m_field.arrivalsFrom(row.gridIdentity,
+                                     row.movementPoints,
+                                     row.tile);
+            const std::span<const MilliFunds> weights =
+                instance.weightRow(rowIndex);
+            for (std::size_t node = 0; node < nodeCount; ++node)
+            {
+                const std::size_t slot =
+                    static_cast<std::size_t>(nodeSlots[node]);
+                result.weight[node] = weights[slot];
+                const std::int32_t owned = ownedTurnsUntil(
+                    arrivals.activations[slot],
+                    m_field.carriedFor(row, nodeSlots[node]),
+                    row.captureRate,
+                    points,
+                    horizon);
+                result.ownedTurn[node] =
+                    sequentialFirstOwnedTurn(owned, horizon);
+            }
+            return result;
+        }
+
+        const std::vector<MilliFunds> acting =
+            m_field.actingWeights(rowIndex, *pMover);
+        const PropertyStockField::ArrivalVectors & arrivals =
+            m_field.arrivalsFrom(row.gridIdentity,
+                                 pMover->movementPoints,
+                                 pMover->tile);
+        for (std::size_t node = 0; node < nodeCount; ++node)
+        {
+            const std::size_t slot =
+                static_cast<std::size_t>(nodeSlots[node]);
+            result.weight[node] = acting[slot];
+            const std::int32_t carried =
+                m_field.m_columnTiles[slot] == pMover->tile
+                    ? pMover->carriedCapturePoints
+                    : 0;
+            const std::int32_t owned = ownedTurnsUntil(
+                arrivals.activations[slot],
+                carried,
+                row.captureRate,
+                points,
+                horizon);
+            result.ownedTurn[node] =
+                sequentialFirstOwnedTurn(owned, horizon);
+        }
+        return result;
+    }
+
+    MilliFunds JointPlanStockValuer::enemySequentialOptimum(
+        const std::vector<std::int32_t> & capturedColumns) const
+    {
+        const auto known =
+            m_enemySequentialOptima.find(capturedColumns);
+        if (known != m_enemySequentialOptima.end())
+        {
+            return known->second;
+        }
+
+        const MilliFunds enemyFloor =
+            m_field.jointEnemyOptimum(capturedColumns);
+        PropertyStockInstance flipped = m_field.m_theirs;
+        for (const std::int32_t column : capturedColumns)
+        {
+            m_field.flipColumnForEnemy(flipped, column);
+        }
+
+        std::vector<std::int32_t> nodeSlots;
+        std::vector<PropertyStockColumn> nodeColumns;
+        for (std::size_t slot = 0; slot < flipped.columns.size(); ++slot)
+        {
+            if (flipped.columns[slot].ownerBefore == STOCK_OWNER_AFTER)
+            {
+                continue;
+            }
+            nodeSlots.push_back(static_cast<std::int32_t>(slot));
+            nodeColumns.push_back(flipped.columns[slot]);
+        }
+
+        std::vector<SequentialClassKey> classKeys;
+        std::vector<SequentialClassTable> classTables;
+        std::vector<std::int32_t> classIndices(
+            flipped.rows.size(),
+            NO_SEQUENTIAL_CLASS);
+        for (std::size_t rowIndex = 0;
+             rowIndex < flipped.rows.size();
+             ++rowIndex)
+        {
+            const PropertyStockRow & row = flipped.rows[rowIndex];
+            const SequentialClassKey key{
+                row.gridIdentity,
+                row.movementPoints,
+                row.captureRate,
+            };
+            for (std::size_t index = 0; index < classKeys.size(); ++index)
+            {
+                if (classKeys[index] == key)
+                {
+                    classIndices[rowIndex] =
+                        static_cast<std::int32_t>(index);
+                    break;
+                }
+            }
+            if (classIndices[rowIndex] != NO_SEQUENTIAL_CLASS)
+            {
+                continue;
+            }
+            const std::vector<std::int32_t> arrivals =
+                nodeArrivalsFor(row.gridIdentity,
+                                row.movementPoints,
+                                nodeSlots);
+            SequentialClassTable table;
+            table.build(
+                std::span<const PropertyStockColumn>(nodeColumns),
+                std::span<const std::int32_t>(arrivals),
+                captureTurnsFor(0,
+                                row.captureRate,
+                                m_field.m_capturePointsToCapture),
+                m_field.m_horizonTurns);
+            classKeys.push_back(key);
+            classTables.push_back(std::move(table));
+            classIndices[rowIndex] =
+                static_cast<std::int32_t>(classKeys.size()) - 1;
+        }
+
+        SequentialInstance instance;
+        instance.horizonTurns = m_field.m_horizonTurns;
+        instance.nodeColumns =
+            std::span<const PropertyStockColumn>(nodeColumns);
+        instance.classes =
+            std::span<const SequentialClassTable>(classTables);
+        instance.capturedNodes.assign(nodeSlots.size(), false);
+        instance.rows.reserve(flipped.rows.size());
+        for (std::size_t rowIndex = 0;
+             rowIndex < flipped.rows.size();
+             ++rowIndex)
+        {
+            instance.rows.push_back(sequentialRowFor(
+                flipped,
+                flipped.rows[rowIndex],
+                static_cast<std::int32_t>(rowIndex),
+                nullptr,
+                nodeSlots,
+                classIndices[rowIndex]));
+        }
+        const SequentialTierResult enemy = solveSequentialPacking(
+            instance,
+            enemyFloor,
+            SEQUENTIAL_SEARCH_STATE_CAP);
+        m_enemySequentialOptima.emplace(capturedColumns,
+                                        enemy.bookedValue);
+        return enemy.bookedValue;
+    }
+
+    MilliFunds JointPlanStockValuer::sequentialJointStock(
+        std::span<const PlanRowAction> actions) const
+    {
+        const PropertyStockField::JointActionFacts facts =
+            m_field.jointActionFacts(actions);
+        MilliFunds owned = m_field.m_ownedBaseline;
+        for (const std::int32_t column : facts.capturedColumns)
+        {
+            owned += ownershipFlipSwing(
+                m_field.m_ours.columns[static_cast<std::size_t>(column)],
+                m_field.m_horizonTurns);
+        }
+        const MilliFunds floorOur = m_field.ourOpenOptimum(facts);
+
+        ensureOurSequentialState();
+        std::vector<std::int32_t> classIndices(
+            m_field.m_ours.rows.size(),
+            NO_SEQUENTIAL_CLASS);
+        for (std::size_t rowIndex = 0;
+             rowIndex < m_field.m_ours.rows.size();
+             ++rowIndex)
+        {
+            classIndices[rowIndex] =
+                ourClassIndexFor(m_field.m_ours.rows[rowIndex]);
+        }
+
+        SequentialInstance instance;
+        instance.horizonTurns = m_field.m_horizonTurns;
+        instance.nodeColumns =
+            std::span<const PropertyStockColumn>(m_ourNodeColumns);
+        instance.classes =
+            std::span<const SequentialClassTable>(m_ourClassTables);
+        instance.capturedNodes.assign(m_ourNodeSlots.size(), false);
+        for (const std::int32_t column : facts.capturedColumns)
+        {
+            const std::int32_t node =
+                m_ourNodeOfColumn[static_cast<std::size_t>(column)];
+            if (node != NO_SEQUENTIAL_NODE)
+            {
+                instance.capturedNodes[static_cast<std::size_t>(node)] =
+                    true;
+            }
+        }
+
+        instance.rows.reserve(m_field.m_ours.rows.size());
+        for (std::size_t rowIndex = 0;
+             rowIndex < m_field.m_ours.rows.size();
+             ++rowIndex)
+        {
+            const PropertyStockActor* pMover = nullptr;
+            for (std::size_t moverSlot = 0;
+                 moverSlot < facts.moverRows.size();
+                 ++moverSlot)
+            {
+                if (facts.moverRows[moverSlot] ==
+                    static_cast<std::int32_t>(rowIndex))
+                {
+                    pMover = &facts.movers[moverSlot];
+                    break;
+                }
+            }
+            instance.rows.push_back(sequentialRowFor(
+                m_field.m_ours,
+                m_field.m_ours.rows[rowIndex],
+                static_cast<std::int32_t>(rowIndex),
+                pMover,
+                m_ourNodeSlots,
+                classIndices[rowIndex]));
+        }
+
+        const SequentialTierResult ours = solveSequentialPacking(
+            instance,
+            floorOur,
+            SEQUENTIAL_SEARCH_STATE_CAP);
+        const MilliFunds enemyBooked =
+            enemySequentialOptimum(facts.capturedColumns);
+        return owned + ours.bookedValue - enemyBooked;
     }
 
     MilliFunds JointPlanStockValuer::stockCeiling() const

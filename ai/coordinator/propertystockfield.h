@@ -70,8 +70,16 @@ namespace Coordinator
         friend PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,
                                                           std::span<const PropertyFacts> properties,
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);
+        friend class JointPlanStockValuer;
 
     private:
+        struct JointActionFacts
+        {
+            std::vector<std::int32_t> capturedColumns;
+            std::vector<std::int32_t> moverRows;
+            std::vector<PropertyStockActor> movers;
+        };
+
         struct ArrivalVectors
         {
             std::vector<std::int32_t> activations;
@@ -105,6 +113,8 @@ namespace Coordinator
 
         const ArrivalVectors & arrivalsFrom(std::int32_t gridIdentity, std::int32_t movementPoints,
                                             const TilePoint & tile);
+        JointActionFacts jointActionFacts(std::span<const PlanRowAction> actions) const;
+        MilliFunds ourOpenOptimum(const JointActionFacts & facts);
         const MarginalTable & marginalFor(std::int32_t row, std::int32_t excludedColumn);
         MilliFunds enemyOptimum(const PropertyStockOutcome & outcome);
         MilliFunds enemyOptimumWith(std::int32_t flippedColumn, std::int32_t removedRow);

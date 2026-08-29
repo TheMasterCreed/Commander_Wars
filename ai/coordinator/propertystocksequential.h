@@ -363,4 +363,437 @@ namespace Coordinator
             return kept;
         }
     }
+
+    struct SequentialTierResult
+    {
+        MilliFunds floorValue{0};
+        MilliFunds relaxedValue{0};
+        MilliFunds repairValue{0};
+        MilliFunds searchValue{0};
+        MilliFunds bookedValue{0};
+        std::int64_t searchStates{0};
+        std::int64_t itinerariesEnumerated{0};
+        std::int64_t itineraryOptionsKept{0};
+        std::int64_t rowsSearched{0};
+        bool continuationSeen{false};
+        bool certificate{false};
+        bool searchCompleted{false};
+    };
+
+    namespace SequentialDetail
+    {
+        inline MilliFunds continuationGain(const SequentialInstance & instance,
+                                           const SequentialRow & row,
+                                           std::int32_t node)
+        {
+            const std::int32_t turn =
+                row.ownedTurn[static_cast<std::size_t>(node)];
+            if (turn == NO_CAPTURE_TURNS)
+            {
+                return 0;
+            }
+            const MilliFunds value =
+                instance.classes[static_cast<std::size_t>(row.classIndex)]
+                    .valueAt(node, turn);
+            return std::max<MilliFunds>(value, 0);
+        }
+
+        struct RelaxedMatch
+        {
+            std::int32_t row{NO_STOCK_ROW};
+            std::int32_t node{NO_SEQUENTIAL_NODE};
+            MilliFunds enrichedWeight{0};
+        };
+
+        inline std::vector<WitnessStep> realizeWitness(
+            const SequentialInstance & instance,
+            const SequentialRow & row,
+            std::int32_t head)
+        {
+            std::vector<WitnessStep> chain;
+            std::int32_t turn =
+                row.ownedTurn[static_cast<std::size_t>(head)];
+            chain.push_back(WitnessStep{head, turn});
+            if (turn == NO_CAPTURE_TURNS)
+            {
+                return chain;
+            }
+            const SequentialClassTable & table =
+                instance.classes[static_cast<std::size_t>(row.classIndex)];
+            std::int32_t node = head;
+            while (table.valueAt(node, turn) > 0)
+            {
+                const std::int32_t next = table.witnessAt(node, turn);
+                if (next == NO_SEQUENTIAL_NODE)
+                {
+                    break;
+                }
+                const std::int32_t nextTurn =
+                    table.continuationOwnedTurn(node, turn, next);
+                if (nextTurn == NO_CAPTURE_TURNS)
+                {
+                    break;
+                }
+                chain.push_back(WitnessStep{next, nextTurn});
+                node = next;
+                turn = nextTurn;
+            }
+            return chain;
+        }
+
+        struct PackedRow
+        {
+            std::int32_t row{NO_STOCK_ROW};
+            std::span<const RowOption> options;
+            MilliFunds bestValue{0};
+        };
+
+        struct PackSearch
+        {
+            std::span<const PackedRow> rows;
+            std::vector<MilliFunds> suffixBound;
+            std::vector<bool> used;
+            EnumerationBudget* pBudget{nullptr};
+            MilliFunds incumbent{0};
+            MilliFunds relaxedValue{0};
+            bool exact{false};
+        };
+
+        inline void packOptionRows(PackSearch & pack,
+                                   std::size_t depth,
+                                   MilliFunds value)
+        {
+            if (pack.exact || pack.pBudget->truncated)
+            {
+                return;
+            }
+            if (depth == pack.rows.size())
+            {
+                if (value > pack.incumbent)
+                {
+                    pack.incumbent = value;
+                    if (pack.incumbent == pack.relaxedValue)
+                    {
+                        pack.exact = true;
+                    }
+                }
+                return;
+            }
+            if (value + pack.suffixBound[depth] <= pack.incumbent)
+            {
+                return;
+            }
+            for (const RowOption & option : pack.rows[depth].options)
+            {
+                if (value + option.value + pack.suffixBound[depth + 1] <=
+                    pack.incumbent)
+                {
+                    break;
+                }
+                bool free = true;
+                for (const std::int32_t node : option.nodes)
+                {
+                    if (pack.used[static_cast<std::size_t>(node)])
+                    {
+                        free = false;
+                        break;
+                    }
+                }
+                if (!free)
+                {
+                    continue;
+                }
+                if (!pack.pBudget->spend())
+                {
+                    return;
+                }
+                for (const std::int32_t node : option.nodes)
+                {
+                    pack.used[static_cast<std::size_t>(node)] = true;
+                }
+                packOptionRows(pack, depth + 1, value + option.value);
+                for (const std::int32_t node : option.nodes)
+                {
+                    pack.used[static_cast<std::size_t>(node)] = false;
+                }
+                if (pack.exact)
+                {
+                    return;
+                }
+            }
+            packOptionRows(pack, depth + 1, value);
+        }
+    }
+
+    inline SequentialTierResult solveSequentialPacking(
+        const SequentialInstance & instance,
+        MilliFunds floorValue,
+        std::int64_t stateCap)
+    {
+        using namespace SequentialDetail;
+
+        SequentialTierResult result;
+        result.floorValue = floorValue;
+        result.relaxedValue = floorValue;
+        result.bookedValue = floorValue;
+        const std::int32_t nodeCount = instance.nodeCount();
+        const std::int32_t rowCount =
+            static_cast<std::int32_t>(instance.rows.size());
+        std::vector<std::int32_t> openNodes;
+        for (std::int32_t node = 0; node < nodeCount; ++node)
+        {
+            if (!instance.capturedNodes[static_cast<std::size_t>(node)])
+            {
+                openNodes.push_back(node);
+            }
+        }
+
+        std::vector<std::vector<MilliFunds>> enriched(
+            static_cast<std::size_t>(rowCount));
+        for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
+        {
+            const SequentialRow & row =
+                instance.rows[static_cast<std::size_t>(rowIndex)];
+            std::vector<MilliFunds> & rowEnriched =
+                enriched[static_cast<std::size_t>(rowIndex)];
+            rowEnriched.assign(static_cast<std::size_t>(nodeCount), 0);
+            for (const std::int32_t node : openNodes)
+            {
+                const std::size_t slot = static_cast<std::size_t>(node);
+                const MilliFunds gain =
+                    continuationGain(instance, row, node);
+                rowEnriched[slot] = row.weight[slot] + gain;
+                if (gain > 0)
+                {
+                    result.continuationSeen = true;
+                }
+            }
+        }
+        if (!result.continuationSeen)
+        {
+            return result;
+        }
+
+        std::vector<MilliFunds> relaxedWeights;
+        relaxedWeights.reserve(static_cast<std::size_t>(rowCount) *
+                               openNodes.size());
+        for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
+        {
+            for (const std::int32_t node : openNodes)
+            {
+                relaxedWeights.push_back(
+                    enriched[static_cast<std::size_t>(rowIndex)]
+                            [static_cast<std::size_t>(node)]);
+            }
+        }
+        AssignmentSolver relaxed;
+        relaxed.solve(rowCount,
+                      static_cast<std::int32_t>(openNodes.size()),
+                      relaxedWeights);
+        result.relaxedValue = relaxed.optimum();
+        if (result.relaxedValue <= floorValue)
+        {
+            result.relaxedValue =
+                std::max(result.relaxedValue, floorValue);
+            return result;
+        }
+
+        std::vector<RelaxedMatch> matches;
+        for (std::int32_t open = 0;
+             open < static_cast<std::int32_t>(openNodes.size());
+             ++open)
+        {
+            const std::int32_t rowIndex = relaxed.matchedRowOf(open);
+            if (rowIndex == NO_STOCK_ROW)
+            {
+                continue;
+            }
+            const std::int32_t node =
+                openNodes[static_cast<std::size_t>(open)];
+            const MilliFunds weight =
+                enriched[static_cast<std::size_t>(rowIndex)]
+                        [static_cast<std::size_t>(node)];
+            if (weight > 0)
+            {
+                matches.push_back(RelaxedMatch{rowIndex, node, weight});
+            }
+        }
+
+        std::vector<bool> touched(static_cast<std::size_t>(nodeCount),
+                                  false);
+        bool certified = true;
+        MilliFunds certifiedTotal = 0;
+        for (const RelaxedMatch & match : matches)
+        {
+            const SequentialRow & row =
+                instance.rows[static_cast<std::size_t>(match.row)];
+            const std::vector<WitnessStep> chain =
+                realizeWitness(instance, row, match.node);
+            MilliFunds replay =
+                row.weight[static_cast<std::size_t>(match.node)];
+            for (std::size_t step = 0; step < chain.size(); ++step)
+            {
+                const std::size_t slot =
+                    static_cast<std::size_t>(chain[step].node);
+                if (touched[slot] || instance.capturedNodes[slot])
+                {
+                    certified = false;
+                    break;
+                }
+                touched[slot] = true;
+                if (step > 0)
+                {
+                    replay += chainPrize(instance,
+                                         chain[step].node,
+                                         chain[step].turn);
+                }
+            }
+            if (!certified || replay != match.enrichedWeight)
+            {
+                certified = false;
+                break;
+            }
+            certifiedTotal += replay;
+        }
+        if (certified && certifiedTotal == result.relaxedValue)
+        {
+            result.certificate = true;
+            result.bookedValue = result.relaxedValue;
+            return result;
+        }
+
+        std::vector<RelaxedMatch> repairOrder = matches;
+        std::stable_sort(repairOrder.begin(),
+                         repairOrder.end(),
+                         [](const RelaxedMatch & lhs,
+                            const RelaxedMatch & rhs)
+        {
+            if (lhs.enrichedWeight != rhs.enrichedWeight)
+            {
+                return lhs.enrichedWeight > rhs.enrichedWeight;
+            }
+            return lhs.row < rhs.row;
+        });
+        std::vector<bool> used(instance.capturedNodes.begin(),
+                               instance.capturedNodes.end());
+        MilliFunds repairTotal = 0;
+        for (const RelaxedMatch & match : repairOrder)
+        {
+            const SequentialRow & row =
+                instance.rows[static_cast<std::size_t>(match.row)];
+            const std::size_t headSlot =
+                static_cast<std::size_t>(match.node);
+            if (!used[headSlot])
+            {
+                const std::vector<WitnessStep> chain =
+                    realizeWitness(instance, row, match.node);
+                for (const WitnessStep & step : chain)
+                {
+                    const std::size_t slot =
+                        static_cast<std::size_t>(step.node);
+                    if (used[slot])
+                    {
+                        break;
+                    }
+                    used[slot] = true;
+                    if (step.node == match.node)
+                    {
+                        repairTotal += row.weight[slot];
+                    }
+                    else
+                    {
+                        repairTotal +=
+                            chainPrize(instance, step.node, step.turn);
+                    }
+                }
+                continue;
+            }
+
+            std::int32_t fallback = NO_SEQUENTIAL_NODE;
+            MilliFunds fallbackWeight = 0;
+            for (std::int32_t node = 0; node < nodeCount; ++node)
+            {
+                const std::size_t slot = static_cast<std::size_t>(node);
+                if (used[slot] || row.weight[slot] <= fallbackWeight)
+                {
+                    continue;
+                }
+                fallback = node;
+                fallbackWeight = row.weight[slot];
+            }
+            if (fallback != NO_SEQUENTIAL_NODE)
+            {
+                used[static_cast<std::size_t>(fallback)] = true;
+                repairTotal += fallbackWeight;
+            }
+        }
+        result.repairValue = repairTotal;
+        if (repairTotal == result.relaxedValue)
+        {
+            result.certificate = true;
+            result.bookedValue = result.relaxedValue;
+            return result;
+        }
+
+        EnumerationBudget budget{
+            .stateCap = stateCap,
+        };
+        std::vector<std::vector<RowOption>> ownedOptions;
+        ownedOptions.reserve(static_cast<std::size_t>(rowCount));
+        std::vector<PackedRow> packedRows;
+        for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
+        {
+            ownedOptions.push_back(enumerateRowOptions(
+                instance,
+                rowIndex,
+                enriched[static_cast<std::size_t>(rowIndex)],
+                budget,
+                result.itinerariesEnumerated));
+            const std::span<const RowOption> options(ownedOptions.back());
+            if (options.empty())
+            {
+                continue;
+            }
+            result.itineraryOptionsKept +=
+                static_cast<std::int64_t>(options.size());
+            packedRows.push_back(PackedRow{
+                .row = rowIndex,
+                .options = options,
+                .bestValue = options.front().value,
+            });
+        }
+        result.rowsSearched =
+            static_cast<std::int64_t>(packedRows.size());
+        std::stable_sort(packedRows.begin(),
+                         packedRows.end(),
+                         [](const PackedRow & lhs, const PackedRow & rhs)
+        {
+            if (lhs.bestValue != rhs.bestValue)
+            {
+                return lhs.bestValue > rhs.bestValue;
+            }
+            return lhs.row < rhs.row;
+        });
+
+        PackSearch pack;
+        pack.rows = std::span<const PackedRow>(packedRows);
+        pack.suffixBound.assign(packedRows.size() + 1, 0);
+        for (std::size_t index = packedRows.size(); index > 0; --index)
+        {
+            pack.suffixBound[index - 1] =
+                pack.suffixBound[index] + packedRows[index - 1].bestValue;
+        }
+        pack.used.assign(static_cast<std::size_t>(nodeCount), false);
+        pack.pBudget = &budget;
+        pack.incumbent = std::max(floorValue, repairTotal);
+        pack.relaxedValue = result.relaxedValue;
+        packOptionRows(pack, 0, 0);
+        result.searchStates = budget.states;
+        result.searchCompleted = pack.exact || !budget.truncated;
+        result.searchValue = pack.incumbent;
+        result.certificate = pack.exact;
+        result.bookedValue =
+            std::max({floorValue, repairTotal, pack.incumbent});
+        return result;
+    }
 }

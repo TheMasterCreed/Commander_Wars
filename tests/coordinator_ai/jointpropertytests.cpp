@@ -1,12 +1,15 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <span>
 #include <utility>
 #include <vector>
 
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/bundlevaluation.h"
+#include "ai/coordinator/propertystocksequential.h"
 
 namespace
 {
@@ -261,6 +264,73 @@ namespace
         expect(valuer.planStock(forward.plan) == valuer.planStock(backward.plan),
                "actor and option order preserve the selected stock state");
     }
+
+    void testSequentialContinuationComposesWithJointStock()
+    {
+        constexpr std::int32_t horizonTurns = 6;
+        const std::vector<Coordinator::PropertyStockColumn> columns{
+            Coordinator::PropertyStockColumn{
+                .slot = 0,
+                .tile = FIRST_COLUMN,
+                .income = Coordinator::PropertyIncome{
+                    .oursPerTurn = 100,
+                    .enemyPerTurn = 100,
+                },
+                .ownerBefore = Coordinator::OwnerSign::Neutral,
+            },
+            Coordinator::PropertyStockColumn{
+                .slot = 1,
+                .tile = SECOND_COLUMN,
+                .income = Coordinator::PropertyIncome{
+                    .oursPerTurn = 80,
+                    .enemyPerTurn = 80,
+                },
+                .ownerBefore = Coordinator::OwnerSign::Neutral,
+            },
+        };
+        const std::array<std::int32_t, 4> arrivals{
+            Coordinator::UNREACHABLE,
+            1,
+            1,
+            Coordinator::UNREACHABLE,
+        };
+        Coordinator::SequentialClassTable table;
+        table.build(columns, arrivals, 1, horizonTurns);
+        const std::array<Coordinator::SequentialClassTable, 1> classes{
+            table
+        };
+        const Coordinator::SequentialInstance instance{
+            .horizonTurns = horizonTurns,
+            .nodeColumns =
+                std::span<const Coordinator::PropertyStockColumn>(columns),
+            .classes =
+                std::span<const Coordinator::SequentialClassTable>(classes),
+            .rows = {
+                Coordinator::SequentialRow{
+                    .classIndex = 0,
+                    .weight = {100, 0},
+                    .ownedTurn = {1, 1},
+                },
+                Coordinator::SequentialRow{
+                    .classIndex = 0,
+                    .weight = {0, 90},
+                    .ownedTurn = {1, 1},
+                },
+            },
+            .capturedNodes = {false, false},
+        };
+        const Coordinator::SequentialTierResult continuation =
+            Coordinator::solveSequentialPacking(instance, 190, 100000);
+        expect(continuation.bookedValue > continuation.floorValue,
+               "the joint stock term retains feasible continuation value");
+
+        DenialStockValuer valuer(LONE_CAPTURE_STOCK,
+                                 continuation.bookedValue);
+        const AssignmentResult result =
+            MaximumValueAssignment::assign(denialInput(valuer, false));
+        expect(achievedValue(result, valuer) == exhaustiveOptimum(valuer),
+               "sequential continuation composes as one joint stock term");
+    }
 }
 
 int main()
@@ -268,5 +338,6 @@ int main()
     testJointCaptureBeatsAdditiveReasoning();
     testHostileJointStockRepelsCaptures();
     testSeatingOrderInvariance();
+    testSequentialContinuationComposesWithJointStock();
     return failures == 0 ? 0 : 1;
 }
