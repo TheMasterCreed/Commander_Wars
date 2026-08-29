@@ -1523,6 +1523,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiJointPropertyTests)
 
+    add_executable(CoordinatorAiSequentialContinuationTests
+        tests/coordinator_ai/sequentialcontinuationtests.cpp
+    )
+    target_include_directories(CoordinatorAiSequentialContinuationTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiSequentialContinuationTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiSequentialContinuationTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiSequentialContinuationTests
+        COMMAND CoordinatorAiSequentialContinuationTests
+    )
+    cow_set_arena_test_path(CoordinatorAiSequentialContinuationTests)
+
     add_executable(CoordinatorAiPlanningTypesTests
         tests/coordinator_ai/planningtypestests.cpp
     )
