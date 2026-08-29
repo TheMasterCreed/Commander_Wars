@@ -121,7 +121,27 @@ var Constructor = function()
             {
                 enabled = true;
             }
-            data.addData(name + " " + unitData[i][0].toString(), unitData[i][1], unitData[i][1], unitData[i][0], enabled);
+            if (typeof data.addDataWithLegality === "function")
+            {
+                data.addDataWithLegality(
+                    name + " " + unitData[i][0].toString(),
+                    unitData[i][1],
+                    unitData[i][1],
+                    unitData[i][0],
+                    enabled,
+                    true
+                );
+            }
+            else
+            {
+                data.addData(
+                    name + " " + unitData[i][0].toString(),
+                    unitData[i][1],
+                    unitData[i][1],
+                    unitData[i][0],
+                    enabled
+                );
+            }
         }
     };
 

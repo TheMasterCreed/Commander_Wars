@@ -15,7 +15,11 @@ class ProductionActionData final : public QObject
     Q_OBJECT
 public:
     explicit ProductionActionData(GameMap* pMap, qint32 x, qint32 y, QString actionId);
-    Q_INVOKABLE void addData(QString text, QString unitId, QString icon, qint32 transactionCost = 0, bool enabled = true);
+    Q_INVOKABLE void addData(QString text, QString unitId, QString icon,
+                             qint32 transactionCost = 0, bool enabled = true);
+    Q_INVOKABLE void addDataWithLegality(QString text, QString unitId, QString icon,
+                                         qint32 transactionCost, bool enabled,
+                                         bool legalIgnoringFunds);
     Q_INVOKABLE qint32 getX() const;
     Q_INVOKABLE qint32 getY() const;
     Q_INVOKABLE QString getActionId() const;
@@ -24,6 +28,7 @@ public:
     Q_INVOKABLE QVector<qint32> getTransactionCosts() const;
     Q_INVOKABLE QVector<qint32> getStrategicValues() const;
     Q_INVOKABLE QVector<bool> getEnabledList() const;
+    Q_INVOKABLE QVector<bool> getLegalIgnoringFundsList() const;
     void setActionAvailable(bool actionAvailable);
     bool validData() const;
 
@@ -37,4 +42,5 @@ private:
     QVector<qint32> m_transactionCosts;
     QVector<qint32> m_strategicValues;
     QVector<bool> m_enabledList;
+    QVector<bool> m_legalIgnoringFundsList;
 };

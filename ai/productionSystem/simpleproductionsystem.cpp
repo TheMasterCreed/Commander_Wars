@@ -387,6 +387,7 @@ qint32 SimpleProductionSystem::estimateCounterpointDeploymentTurns(
         maxExpandedNodes,
         static_cast<qint32>(tileCount)
     );
+    const qint64 movementSpan = static_cast<qint64>(movementPoints) + 1;
     const qint64 infinity = std::numeric_limits<qint64>::max();
     std::vector<qint64> distances(static_cast<std::size_t>(tileCount), infinity);
     std::priority_queue<
@@ -415,11 +416,8 @@ qint32 SimpleProductionSystem::estimateCounterpointDeploymentTurns(
         const qint32 y = current.index / width;
         if (inFiringBand(x, y))
         {
-            qint64 turns = std::max<qint64>(
-                1,
-                (current.cost + movementPoints - 1) / movementPoints
-            );
-            if (pureIndirect && current.cost > 0 && !canMoveAndFire)
+            qint64 turns = current.cost / movementSpan + 1;
+            if (pureIndirect && current.index != startIndex && !canMoveAndFire)
             {
                 ++turns;
             }
@@ -442,11 +440,15 @@ qint32 SimpleProductionSystem::estimateCounterpointDeploymentTurns(
                 x,
                 y
             );
-            if (movementCost < 0)
+            if (movementCost < 0 || movementCost > movementPoints)
             {
                 continue;
             }
-            const qint64 nextCost = current.cost + movementCost;
+            const qint64 currentTurn = current.cost / movementSpan;
+            const qint64 movementSpent = current.cost % movementSpan;
+            const qint64 nextCost = movementSpent + movementCost <= movementPoints
+                ? currentTurn * movementSpan + movementSpent + movementCost
+                : (currentTurn + 1) * movementSpan + movementCost;
             const qint32 nextIndex = nextY * width + nextX;
             auto & previous = distances[static_cast<std::size_t>(nextIndex)];
             if (nextCost < previous)

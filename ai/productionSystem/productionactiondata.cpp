@@ -13,7 +13,15 @@ ProductionActionData::ProductionActionData(GameMap* pMap, qint32 x, qint32 y, QS
 }
 
 // Signature mirrors MenuData::addData so one script getStepData can fill either object.
-void ProductionActionData::addData(QString text, QString unitId, QString icon, qint32 transactionCost, bool enabled)
+void ProductionActionData::addData(QString text, QString unitId, QString icon,
+                                   qint32 transactionCost, bool enabled)
+{
+    addDataWithLegality(text, unitId, icon, transactionCost, enabled, enabled);
+}
+
+void ProductionActionData::addDataWithLegality(QString text, QString unitId, QString icon,
+                                               qint32 transactionCost, bool enabled,
+                                               bool legalIgnoringFunds)
 {
     Q_UNUSED(text);
     Q_UNUSED(icon);
@@ -24,6 +32,7 @@ void ProductionActionData::addData(QString text, QString unitId, QString icon, q
         // A free unit still has a strategic worth, so price it at what it would have cost.
         m_strategicValues.append(transactionCost == 0 ? Unit::getBaseCosts(unitId, m_pMap) : transactionCost);
         m_enabledList.append(enabled);
+        m_legalIgnoringFundsList.append(legalIgnoringFunds);
     }
 }
 
@@ -67,6 +76,11 @@ QVector<bool> ProductionActionData::getEnabledList() const
     return m_enabledList;
 }
 
+QVector<bool> ProductionActionData::getLegalIgnoringFundsList() const
+{
+    return m_legalIgnoringFundsList;
+}
+
 void ProductionActionData::setActionAvailable(bool actionAvailable)
 {
     m_actionAvailable = actionAvailable;
@@ -77,5 +91,6 @@ bool ProductionActionData::validData() const
     return !m_unitIds.isEmpty() &&
            m_unitIds.size() == m_transactionCosts.size() &&
            m_transactionCosts.size() == m_strategicValues.size() &&
-           m_strategicValues.size() == m_enabledList.size();
+           m_strategicValues.size() == m_enabledList.size() &&
+           m_enabledList.size() == m_legalIgnoringFundsList.size();
 }
