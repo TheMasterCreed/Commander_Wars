@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ai/coordinator/continuationinterval.h"
+#include "ai/coordinator/refinementledger.h"
 
 namespace
 {
@@ -18,9 +19,14 @@ namespace
     using Coordinator::ContinuationStore;
     using Coordinator::ContenderRegistry;
     using Coordinator::EnemySetBounds;
+    using Coordinator::GrantId;
     using Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
     using Coordinator::LIVE_PAIR_SLICE_BASE;
     using Coordinator::MilliFunds;
+    using Coordinator::NO_GRANT;
+    using Coordinator::RefinementLedger;
+    using Coordinator::RefinementLedgerStats;
+    using Coordinator::RefinementWork;
     using Coordinator::RowWitness;
     using Coordinator::StockInterval;
 
@@ -31,6 +37,12 @@ namespace
         1,
         65535,
         std::numeric_limits<std::int32_t>::max(),
+    };
+    constexpr std::array<RefinementWork, Coordinator::REFINEMENT_WORK_CLASSES> ALL_WORK = {
+        RefinementWork::MandatoryPrecompute,
+        RefinementWork::OurAdmission,
+        RefinementWork::EnemyEntry,
+        RefinementWork::SearchSlice,
     };
 
     int failures = 0;
@@ -47,6 +59,36 @@ namespace
     ContinuationKey key(std::int32_t row)
     {
         return {CanonicalPlanActionKey::fromAction(row, row + 1, row + 2, row % 2 != 0)};
+    }
+
+    struct LedgerCore
+    {
+        std::int64_t total{0};
+        std::int64_t balance{0};
+        std::int64_t granted{0};
+        std::int64_t refunded{0};
+        std::array<std::int64_t, Coordinator::REFINEMENT_WORK_CLASSES> grantedByWork{};
+
+        friend bool operator==(const LedgerCore &, const LedgerCore &) = default;
+    };
+
+    LedgerCore coreOf(const RefinementLedger & ledger)
+    {
+        const RefinementLedgerStats & stats = ledger.stats();
+        return LedgerCore{
+            stats.total,
+            ledger.balance(),
+            stats.granted,
+            stats.refunded,
+            stats.grantedByWork,
+        };
+    }
+
+    void expectConserved(const RefinementLedger & ledger, std::string_view message)
+    {
+        const RefinementLedgerStats & stats = ledger.stats();
+        expect(ledger.balance() + stats.spent() == stats.total, message);
+        expect(ledger.outstandingGranted() == stats.spent(), message);
     }
 
     void testCanonicalActionKey()
@@ -205,6 +247,86 @@ namespace
         expect(order.size() == 2 && order[0] == key(2) && order[1] == key(1),
                "resolved contender leaves refinement order");
     }
+
+    void testRefinementLedgerConservation()
+    {
+        RefinementLedger ledger;
+        expect(ledger.open(40), "ledger opens with a nonnegative budget");
+        std::array<GrantId, ALL_WORK.size()> grants{};
+        for (std::size_t index = 0; index < ALL_WORK.size(); ++index)
+        {
+            const std::int64_t amount = static_cast<std::int64_t>(index) + 1;
+            grants[index] = ledger.draw(amount, ALL_WORK[index]);
+            expect(grants[index] == static_cast<GrantId>(index), "grant ids are stable");
+            expect(ledger.stats().grantedByWork[index] == amount,
+                   "grants retain their work class");
+            expectConserved(ledger, "draw preserves budget conservation");
+        }
+        for (std::size_t index = 0; index < grants.size(); ++index)
+        {
+            const std::int64_t amount = static_cast<std::int64_t>(index) + 1;
+            expect(ledger.refund(grants[index], amount), "valid refund succeeds");
+            expectConserved(ledger, "refund preserves budget conservation");
+        }
+        expect(ledger.balance() == 40 && ledger.stats().spent() == 0,
+               "full refunds restore the budget");
+
+        const GrantId zero = ledger.draw(0, RefinementWork::SearchSlice);
+        expect(zero == static_cast<GrantId>(grants.size()), "zero-cost work receives a grant");
+        expect(ledger.refund(zero, 0), "zero-cost grant refunds exactly");
+        expectConserved(ledger, "zero-cost grant preserves conservation");
+    }
+
+    void testRefinementLedgerRejectsAtomically()
+    {
+        RefinementLedger ledger;
+        expect(ledger.open(10), "atomic rejection fixture opens");
+        const GrantId grant = ledger.draw(6, RefinementWork::OurAdmission);
+        const LedgerCore before = coreOf(ledger);
+
+        expect(!ledger.open(-1), "negative budget is rejected");
+        expect(coreOf(ledger) == before, "negative open preserves state");
+        expect(ledger.draw(-1, RefinementWork::EnemyEntry) == NO_GRANT,
+               "negative draw is rejected");
+        expect(coreOf(ledger) == before, "negative draw preserves state");
+        expect(ledger.draw(1, static_cast<RefinementWork>(-1)) == NO_GRANT,
+               "invalid work class is rejected");
+        expect(coreOf(ledger) == before, "invalid work preserves state");
+
+        expect(!ledger.refund(grant, 7), "over-refund is rejected");
+        expect(!ledger.refund(NO_GRANT, 1), "invalid grant is rejected");
+        expect(!ledger.refund(grant, -1), "negative refund is rejected");
+        expect(coreOf(ledger) == before, "invalid refunds preserve accounting");
+        expect(ledger.stats().refundClamps == 3, "invalid refunds are counted");
+        expect(ledger.refund(grant, 6), "grant remains refundable after rejection");
+        expectConserved(ledger, "rejected operations preserve conservation");
+    }
+
+    void testRefinementLedgerExhaustionAndOverflow()
+    {
+        RefinementLedger ledger;
+        expect(ledger.open(5), "exhaustion fixture opens");
+        const GrantId grant = ledger.draw(5, RefinementWork::SearchSlice);
+        expect(grant == 0 && ledger.exhausted(), "exact draw exhausts the budget");
+        expect(ledger.draw(1, RefinementWork::SearchSlice) == NO_GRANT,
+               "draw beyond balance is refused");
+        expect(ledger.stats().refusals == 1 &&
+                   ledger.stats().refusalsByWork[
+                       static_cast<std::size_t>(RefinementWork::SearchSlice)] == 1,
+               "refusal retains its work class");
+        expectConserved(ledger, "exhaustion preserves conservation");
+
+        constexpr std::int64_t MAX_TOTAL = std::numeric_limits<std::int64_t>::max();
+        expect(ledger.open(MAX_TOTAL), "maximum budget opens");
+        const GrantId maximum = ledger.draw(MAX_TOTAL, RefinementWork::MandatoryPrecompute);
+        expect(maximum == 0 && ledger.refund(maximum, MAX_TOTAL),
+               "maximum grant and refund succeed");
+        const LedgerCore before = coreOf(ledger);
+        expect(ledger.draw(1, RefinementWork::MandatoryPrecompute) == NO_GRANT,
+               "cumulative grant overflow is refused");
+        expect(coreOf(ledger) == before, "overflow refusal preserves accounting");
+        expectConserved(ledger, "overflow refusal preserves conservation");
+    }
 }
 
 int main()
@@ -215,5 +337,8 @@ int main()
     testStockIntervals();
     testContinuationStore();
     testContenderOrder();
+    testRefinementLedgerConservation();
+    testRefinementLedgerRejectsAtomically();
+    testRefinementLedgerExhaustionAndOverflow();
     return failures == 0 ? 0 : 1;
 }
