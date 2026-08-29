@@ -833,6 +833,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/attackopportunitybuilder.h ai/coordinator/attackopportunitybuilder.cpp
     ai/coordinator/propertyeconomics.h
     ai/coordinator/propertyeconomicsbuilder.h ai/coordinator/propertyeconomicsbuilder.cpp
+    ai/coordinator/propertystock.h
     ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
@@ -1483,6 +1484,24 @@ if (BUILD_TESTING)
         COMMAND CoordinatorAiAssignmentBoundProof
     )
     cow_set_arena_test_path(CoordinatorAiAssignmentBoundProof)
+
+    add_executable(CoordinatorAiPropertyStockTests
+        tests/coordinator_ai/propertystocktests.cpp
+    )
+    target_include_directories(CoordinatorAiPropertyStockTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiPropertyStockTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiPropertyStockTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiPropertyStockTests
+        COMMAND CoordinatorAiPropertyStockTests
+    )
+    cow_set_arena_test_path(CoordinatorAiPropertyStockTests)
 
     add_executable(CoordinatorAiPlanningTypesTests
         tests/coordinator_ai/planningtypestests.cpp
