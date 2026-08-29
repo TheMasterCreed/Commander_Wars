@@ -836,6 +836,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
+    ai/coordinator/engineactionbuilder.h ai/coordinator/engineactionbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
     ai/influencecontest.h
@@ -1649,6 +1650,8 @@ if (BUILD_TESTING)
         tests/arena/propertyfactsprobe.h
         tests/arena/focusfireprobe.cpp
         tests/arena/focusfireprobe.h
+        tests/arena/actionconstructionprobe.cpp
+        tests/arena/actionconstructionprobe.h
         tests/coordinator_ai/damageoracletests.cpp
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
@@ -1961,6 +1964,8 @@ if (BUILD_TESTING)
         ArenaPropertyEconomics tests/arena/fixtures/property_init.js 120)
     cow_add_arena_probe_test(
         ArenaFocusFireExposure tests/arena/fixtures/focus_fire_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaCoordinatedActionConstruction tests/arena/fixtures/action_construction_init.js 120)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
