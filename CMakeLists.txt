@@ -1794,6 +1794,34 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(ArenaMatchConfigTests)
 
+    add_executable(ArenaMatchResultSchemaTests
+        tests/arena/arenamatchresultschematests.cpp
+    )
+    target_link_libraries(
+        ArenaMatchResultSchemaTests PRIVATE Qt6::Core
+    )
+    set_target_properties(ArenaMatchResultSchemaTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    set(ACTION_CONTROL_RESULT
+        ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/action_control.json
+    )
+    configure_file(
+        tests/arena/fixtures/action_control.json.in
+        ${ACTION_CONTROL_RESULT}
+        COPYONLY
+    )
+    add_test(
+        NAME ArenaActionControlSchema
+        COMMAND ${CMAKE_COMMAND}
+            -DSCHEMA_EXE=$<TARGET_FILE:ArenaMatchResultSchemaTests>
+            -DACTION_CONTROL_RESULT=${ACTION_CONTROL_RESULT}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/arena/actioncontrol.cmake
+    )
+    cow_set_arena_test_path(ArenaActionControlSchema)
+
     add_executable(CoordinatorAiAiChoiceTests
         tests/arena/arenamatchconfigtests.cpp
         tests/arena/arenamatchconfig.cpp

@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "mapPath": "maps/2_player/Bean Island.map",
+  "mapSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "masterSeed": 20260826,
+  "turnLimit": 12,
+  "stopAfterDay": 2,
+  "stopAfterPlayer": 0,
+  "players": [
+    {"playerId": 0, "aiType": "Coordinated", "co": "CO_ANDY"},
+    {"playerId": 1, "aiType": "Normal", "co": "CO_JESS"}
+  ],
+  "seedTrace": [1234],
+  "actionIds": ["ACTION_CAPTURE"],
+  "actionTargets": [{"x": 1, "y": 2}],
+  "preActionStateHashes": ["00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"],
+  "actionPayloadSha256": ["6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"],
+  "actionPayloadBase64": ["AA=="],
+  "finalStateHash": "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+  "actionCount": 1,
+  "watchdog": false,
+  "exitCode": 0,
+  "pass": true
+}
