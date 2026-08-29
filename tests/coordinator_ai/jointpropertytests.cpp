@@ -96,7 +96,7 @@ namespace
         MilliFunds stockCeiling() const override
         {
             ++m_ceilingCalls;
-            return std::numeric_limits<MilliFunds>::max();
+            return std::max({MilliFunds{0}, m_loneCaptureStock, m_pairedCaptureStock});
         }
 
         bool affectsStock(std::int32_t engineUnitId) const override
@@ -238,7 +238,7 @@ namespace
                "first capper takes its column");
         expect(pSecond != nullptr && pSecond->kind == PlanBundleKind::Capture,
                "second capper takes its column");
-        expect(valuer.ceilingCalls() == 0, "A5b1 does not consume the conservative stock ceiling");
+        expect(valuer.ceilingCalls() > 0, "cluster search consumes the property-aware stock ceiling");
     }
 
     void testHostileJointStockRepelsCaptures()

@@ -120,6 +120,23 @@ namespace Coordinator
         return incomeSwing(column.income, horizonTurns, column.ownerBefore, STOCK_OWNER_AFTER);
     }
 
+    constexpr std::int32_t COLUMN_CEILING_TERMS = 2;
+
+    constexpr MilliFunds propertyStockCeiling(std::span<const PropertyStockColumn> columns,
+                                              MilliFunds ownedBaseline, std::int32_t horizonTurns)
+    {
+        MilliFunds total = ownedBaseline;
+        for (const PropertyStockColumn & column : columns)
+        {
+            const MilliFunds swing = ownershipFlipSwing(column, horizonTurns);
+            if (swing > 0)
+            {
+                total += COLUMN_CEILING_TERMS * swing;
+            }
+        }
+        return total;
+    }
+
     inline PropertyStockColumn mirroredColumn(const PropertyStockColumn & column)
     {
         PropertyStockColumn mirrored = column;

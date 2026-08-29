@@ -1,7 +1,6 @@
 #include "ai/coordinator/propertystockbuilder.h"
 
 #include <algorithm>
-#include <limits>
 #include <utility>
 
 #include <QString>
@@ -329,6 +328,12 @@ namespace Coordinator
         return owned + solver.optimum() - jointEnemyOptimum(captured);
     }
 
+    MilliFunds PropertyStockField::stockCeiling() const
+    {
+        return propertyStockCeiling(std::span<const PropertyStockColumn>(m_ours.columns),
+                                    m_ownedBaseline, m_horizonTurns);
+    }
+
     JointPlanStockValuer::JointPlanStockValuer(PropertyStockField & field,
                                                std::span<const KnownUnitLink> unitLinks)
         : m_field(field)
@@ -384,7 +389,7 @@ namespace Coordinator
 
     MilliFunds JointPlanStockValuer::stockCeiling() const
     {
-        return std::numeric_limits<MilliFunds>::max();
+        return m_field.stockCeiling();
     }
 
     bool JointPlanStockValuer::affectsStock(std::int32_t engineUnitId) const

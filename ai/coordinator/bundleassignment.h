@@ -371,6 +371,13 @@ namespace Coordinator
         return seatedValue + optionValue + remainingCeiling;
     }
 
+    inline MilliFunds assignmentUpperBound(MilliFunds seatedBase, MilliFunds optionBase,
+                                           MilliFunds remainingBaseCeiling, MilliFunds propertyCeiling,
+                                           MilliFunds propertyAtStart)
+    {
+        return seatedBase + optionBase + remainingBaseCeiling + propertyCeiling - propertyAtStart;
+    }
+
     inline bool isPruneOrderLicensed(std::span<const MilliFunds> orderedValues)
     {
         for (std::size_t slot = 1; slot < orderedValues.size(); ++slot)
@@ -776,6 +783,8 @@ namespace Coordinator
             std::vector<std::int32_t> best;
             MilliFunds bestTotal{0};
             bool stockLive{false};
+            MilliFunds propertyCeiling{0};
+            MilliFunds propertyAtStart{0};
             bool hasBest{false};
             std::int32_t states{0};
             bool aborted{false};
@@ -1217,9 +1226,15 @@ namespace Coordinator
                     return;
                 }
                 ++search.states;
-                if (!search.stockLive && search.hasBest &&
-                    assignmentUpperBound(total, optionValue(state, option),
-                                         search.ceilings[depth + 1]) <= search.bestTotal)
+                MilliFunds upper = assignmentUpperBound(
+                    total, optionValue(state, option), search.ceilings[depth + 1]);
+                if (search.stockLive)
+                {
+                    upper = assignmentUpperBound(
+                        total, optionValue(state, option), search.ceilings[depth + 1],
+                        search.propertyCeiling, search.propertyAtStart);
+                }
+                if (search.hasBest && upper <= search.bestTotal)
                 {
                     return;
                 }
@@ -1286,6 +1301,8 @@ namespace Coordinator
                 if (stockCoupled(input, actors[static_cast<std::size_t>(slot)].pActor->engineUnitId))
                 {
                     search.stockLive = true;
+                    search.propertyCeiling = input.pStockValuer->stockCeiling();
+                    search.propertyAtStart = input.pStockValuer->originStock();
                     break;
                 }
             }
