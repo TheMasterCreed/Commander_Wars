@@ -1,19 +1,29 @@
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <set>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "ai/coordinator/continuationinterval.h"
+#include "ai/coordinator/continuationpricing.h"
 #include "ai/coordinator/refinementledger.h"
 
 namespace
 {
     using Coordinator::CanonicalPlanActionKey;
     using Coordinator::CanonicalPlanActionKeyHash;
+    using Coordinator::CheapActionTerms;
+    using Coordinator::CheapChain;
+    using Coordinator::CheapChainStep;
+    using Coordinator::CheapInitialPrice;
+    using Coordinator::CheapPricingModel;
+    using Coordinator::CheapRowTerms;
+    using Coordinator::CheapUpperState;
     using Coordinator::ContinuationEntry;
     using Coordinator::ContinuationKey;
     using Coordinator::ContinuationStore;
@@ -248,6 +258,364 @@ namespace
                "resolved contender leaves refinement order");
     }
 
+    CheapChain cheapChain(
+        std::initializer_list<std::pair<std::int32_t, MilliFunds>> steps)
+    {
+        CheapChain chain;
+        std::int32_t turn = 1;
+        for (const auto & [column, gain] : steps)
+        {
+            chain.steps.push_back(CheapChainStep{column, turn, gain});
+            chain.value += gain;
+            ++turn;
+        }
+        return chain;
+    }
+
+    CheapRowTerms cheapRow(
+        std::int32_t row,
+        std::initializer_list<CheapChain> chains)
+    {
+        CheapRowTerms terms;
+        terms.row = row;
+        terms.chains.assign(chains.begin(), chains.end());
+        return terms;
+    }
+
+    CheapActionTerms cheapAction(
+        CanonicalPlanActionKey actionKey,
+        std::int32_t row,
+        std::int32_t capturedColumn,
+        CheapRowTerms terms)
+    {
+        return CheapActionTerms{
+            .key = actionKey,
+            .row = row,
+            .capturedColumn = capturedColumn,
+            .rowTerms = std::move(terms),
+        };
+    }
+
+    struct CheapFixture
+    {
+        CheapPricingModel model;
+        CanonicalPlanActionKey rowZeroMove{
+            CanonicalPlanActionKey::fromAction(0, 10, 10, false)
+        };
+        CanonicalPlanActionKey rowZeroCapture{
+            CanonicalPlanActionKey::fromAction(0, 11, 11, true)
+        };
+        CanonicalPlanActionKey rowOneMove{
+            CanonicalPlanActionKey::fromAction(1, 20, 20, false)
+        };
+        CanonicalPlanActionKey rowTwoMove{
+            CanonicalPlanActionKey::fromAction(2, 30, 30, false)
+        };
+        CanonicalPlanActionKey rowTwoCapture{
+            CanonicalPlanActionKey::fromAction(2, 31, 31, true)
+        };
+    };
+
+    CheapFixture makeCheapFixture()
+    {
+        CheapFixture fixture;
+        std::vector<CheapRowTerms> dayRows{
+            cheapRow(0, {
+                cheapChain({{0, 80}, {2, 50}}),
+                cheapChain({{1, 80}}),
+            }),
+            cheapRow(1, {
+                cheapChain({{0, 90}}),
+                cheapChain({{2, 70}}),
+            }),
+            cheapRow(2, {
+                cheapChain({{0, 110}}),
+                cheapChain({{3, 60}, {1, 40}}),
+            }),
+        };
+        std::vector<CheapActionTerms> actions{
+            cheapAction(
+                fixture.rowZeroMove,
+                0,
+                -1,
+                cheapRow(0, {
+                    cheapChain({{1, 140}}),
+                    cheapChain({{2, 50}}),
+                })),
+            cheapAction(
+                fixture.rowZeroCapture,
+                0,
+                0,
+                cheapRow(0, {
+                    cheapChain({{0, 150}}),
+                    cheapChain({{1, 60}}),
+                })),
+            cheapAction(
+                fixture.rowOneMove,
+                1,
+                -1,
+                cheapRow(1, {
+                    cheapChain({{2, 120}}),
+                    cheapChain({{3, 40}}),
+                })),
+            cheapAction(
+                fixture.rowTwoMove,
+                2,
+                -1,
+                cheapRow(2, {
+                    cheapChain({{1, 80}, {3, 50}}),
+                    cheapChain({{2, 60}}),
+                })),
+            cheapAction(
+                fixture.rowTwoCapture,
+                2,
+                0,
+                cheapRow(2, {
+                    cheapChain({{0, 145}}),
+                    cheapChain({{3, 75}}),
+                })),
+        };
+        expect(fixture.model.install(
+                   3,
+                   4,
+                   1000,
+                   {25, 35, 45, 55},
+                   std::move(dayRows),
+                   std::move(actions),
+                   500),
+               "cheap pricing fixture installs");
+        return fixture;
+    }
+
+    bool sameWitness(std::span<const RowWitness> lhs,
+                     std::span<const RowWitness> rhs)
+    {
+        if (lhs.size() != rhs.size())
+        {
+            return false;
+        }
+        for (std::size_t slot = 0; slot < lhs.size(); ++slot)
+        {
+            if (lhs[slot].row != rhs[slot].row ||
+                lhs[slot].nodes != rhs[slot].nodes ||
+                lhs[slot].value != rhs[slot].value)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool samePrice(const CheapInitialPrice & lhs,
+                   const CheapInitialPrice & rhs)
+    {
+        return lhs.key == rhs.key &&
+               lhs.capturedColumns == rhs.capturedColumns &&
+               lhs.owned == rhs.owned &&
+               lhs.ours.lower == rhs.ours.lower &&
+               lhs.ours.upper == rhs.ours.upper &&
+               lhs.enemy.lower == rhs.enemy.lower &&
+               lhs.enemy.upper == rhs.enemy.upper &&
+               lhs.stock.lower == rhs.stock.lower &&
+               lhs.stock.upper == rhs.stock.upper &&
+               sameWitness(lhs.witness, rhs.witness);
+    }
+
+    void feasibleRows(const CheapUpperState & state,
+                      std::int32_t row,
+                      std::vector<bool> & used,
+                      MilliFunds value,
+                      MilliFunds & best)
+    {
+        if (row == static_cast<std::int32_t>(state.termsOfRow.size()))
+        {
+            best = std::max(best, value);
+            return;
+        }
+        feasibleRows(state, row + 1, used, value, best);
+        for (const CheapChain & chain :
+             state.termsOfRow[static_cast<std::size_t>(row)]->chains)
+        {
+            std::vector<std::int32_t> reserved;
+            MilliFunds prefix = 0;
+            for (const CheapChainStep & step : chain.steps)
+            {
+                const std::size_t column =
+                    static_cast<std::size_t>(step.column);
+                if (state.excludedColumns[column] || used[column])
+                {
+                    break;
+                }
+                used[column] = true;
+                reserved.push_back(step.column);
+                prefix += step.gain;
+                feasibleRows(state,
+                             row + 1,
+                             used,
+                             value + prefix,
+                             best);
+            }
+            for (const std::int32_t column : reserved)
+            {
+                used[static_cast<std::size_t>(column)] = false;
+            }
+        }
+    }
+
+    MilliFunds feasibleOptimum(const CheapUpperState & state)
+    {
+        std::vector<bool> used(state.excludedColumns.size(), false);
+        MilliFunds best = 0;
+        feasibleRows(state, 0, used, 0, best);
+        return best;
+    }
+
+    std::vector<ContinuationKey> cheapKeys(const CheapFixture & fixture)
+    {
+        const std::array<ContinuationKey, 3> rowZero{
+            ContinuationKey{},
+            ContinuationKey{fixture.rowZeroMove},
+            ContinuationKey{fixture.rowZeroCapture},
+        };
+        const std::array<ContinuationKey, 2> rowOne{
+            ContinuationKey{},
+            ContinuationKey{fixture.rowOneMove},
+        };
+        const std::array<ContinuationKey, 3> rowTwo{
+            ContinuationKey{},
+            ContinuationKey{fixture.rowTwoMove},
+            ContinuationKey{fixture.rowTwoCapture},
+        };
+        std::vector<ContinuationKey> keys;
+        for (const ContinuationKey & zero : rowZero)
+        {
+            for (const ContinuationKey & one : rowOne)
+            {
+                for (const ContinuationKey & two : rowTwo)
+                {
+                    ContinuationKey combined = zero;
+                    combined.insert(combined.end(),
+                                    one.begin(),
+                                    one.end());
+                    combined.insert(combined.end(),
+                                    two.begin(),
+                                    two.end());
+                    keys.push_back(std::move(combined));
+                }
+            }
+        }
+        return keys;
+    }
+
+    void testCheapPricingBoundsAndReplay()
+    {
+        CheapFixture fixture = makeCheapFixture();
+        CheapUpperState state = fixture.model.initialState();
+        for (const ContinuationKey & requested : cheapKeys(fixture))
+        {
+            CheapInitialPrice price;
+            expect(fixture.model.price(requested, state, price),
+                   "cheap price accepts a canonical action set");
+            const MilliFunds exact = feasibleOptimum(state);
+            expect(price.ours.lower <= exact &&
+                       exact <= price.ours.upper,
+                   "cheap interval contains the exhaustive optimum");
+            expect(fixture.model.replayWitness(
+                       state,
+                       price.witness,
+                       price.ours.lower),
+                   "cheap lower witness replays");
+            const StockInterval composed =
+                Coordinator::composeStockInterval(
+                    price.owned,
+                    price.ours,
+                    price.enemy);
+            expect(composed.lower == price.stock.lower &&
+                       composed.upper == price.stock.upper,
+                   "cheap stock interval preserves signed composition");
+        }
+    }
+
+    void testCheapPricingHistoryAndAtomicity()
+    {
+        CheapFixture fixture = makeCheapFixture();
+        const ContinuationKey target{
+            fixture.rowTwoMove,
+            fixture.rowZeroMove,
+            fixture.rowOneMove,
+        };
+        CheapUpperState coldState = fixture.model.initialState();
+        CheapInitialPrice cold;
+        expect(fixture.model.price(target, coldState, cold),
+               "cold cheap price succeeds");
+
+        CheapUpperState warmState = fixture.model.initialState();
+        CheapInitialPrice unrelated;
+        expect(fixture.model.price(
+                   {fixture.rowZeroCapture},
+                   warmState,
+                   unrelated),
+               "unrelated cheap price succeeds");
+        CheapInitialPrice warm;
+        expect(fixture.model.price(target, warmState, warm) &&
+                   samePrice(cold, warm),
+               "cheap price is history independent");
+
+        const CheapUpperState before = warmState;
+        expect(!fixture.model.apply(
+                   {fixture.rowZeroMove, fixture.rowZeroCapture},
+                   warmState),
+               "two actions for one row are rejected");
+        expect(warmState == before,
+               "invalid row collision preserves upper state");
+        expect(!fixture.model.apply(
+                   {fixture.rowOneMove, fixture.rowOneMove},
+                   warmState),
+               "duplicate action is rejected");
+        expect(warmState == before,
+               "duplicate rejection preserves upper state");
+        expect(!fixture.model.apply(
+                   {CanonicalPlanActionKey::fromAction(
+                       9, 9, 9, false)},
+                   warmState),
+               "unknown action is rejected");
+        expect(warmState == before,
+               "unknown action preserves upper state");
+    }
+
+    void testCheapRepeatedWitnessPrefix()
+    {
+        CheapPricingModel model;
+        std::vector<CheapRowTerms> rows{
+            cheapRow(0, {
+                cheapChain({{0, 5}, {1, 4}, {0, 3}}),
+            }),
+        };
+        expect(model.install(1,
+                             2,
+                             0,
+                             {0, 0},
+                             std::move(rows),
+                             {},
+                             0),
+               "repeated-column model installs");
+        CheapUpperState state = model.initialState();
+        CheapInitialPrice price;
+        expect(model.price({}, state, price),
+               "repeated-column price succeeds");
+        expect(price.ours.lower == 9 &&
+                   price.ours.upper == 12 &&
+                   price.witness.size() == 1 &&
+                   price.witness.front().nodes ==
+                       std::vector<std::int32_t>({0, 1}),
+               "cheap lower stops at the repeated column");
+        expect(model.replayWitness(
+                   state,
+                   price.witness,
+                   price.ours.lower),
+               "feasible prefix replays");
+    }
+
     void testRefinementLedgerConservation()
     {
         RefinementLedger ledger;
@@ -337,6 +705,9 @@ int main()
     testStockIntervals();
     testContinuationStore();
     testContenderOrder();
+    testCheapPricingBoundsAndReplay();
+    testCheapPricingHistoryAndAtomicity();
+    testCheapRepeatedWitnessPrefix();
     testRefinementLedgerConservation();
     testRefinementLedgerRejectsAtomically();
     testRefinementLedgerExhaustionAndOverflow();

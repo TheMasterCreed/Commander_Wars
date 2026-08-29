@@ -18,6 +18,7 @@ namespace
     using Coordinator::OwnerSign;
     using Coordinator::PropertyIncome;
     using Coordinator::PropertyStockColumn;
+    using Coordinator::replaySequentialWitness;
     using Coordinator::SequentialClassTable;
     using Coordinator::SequentialInstance;
     using Coordinator::SequentialRow;
@@ -163,6 +164,25 @@ namespace
                                                      HORIZON_TURNS) ==
                    NO_CAPTURE_TURNS,
                "a first leg outside the horizon has no continuation");
+
+        constexpr std::int32_t PRIZE_HORIZON = 4;
+        const std::array<MilliFunds, 8> prizes{
+            0, 0, 0, 0,
+            0, 0, 77, 0,
+        };
+        const std::array<std::int32_t, 4> arrivals{
+            Coordinator::UNREACHABLE, 1,
+            1, Coordinator::UNREACHABLE,
+        };
+        SequentialClassTable prizeTable;
+        prizeTable.buildFromPrizes(2,
+                                   prizes,
+                                   arrivals,
+                                   1,
+                                   PRIZE_HORIZON);
+        expect(prizeTable.valueAt(0, 1) == 77 &&
+                   prizeTable.witnessAt(0, 1) == 1,
+               "explicit prize tables retain the exact continuation");
     }
 
     void testCanonicalOptionDeduplication()
@@ -371,6 +391,12 @@ namespace
             solveSequentialPacking(fixture.instance,
                                    floorValue,
                                    100000);
+        const SequentialTierResult captured =
+            solveSequentialPacking(fixture.instance,
+                                   floorValue,
+                                   100000,
+                                   nullptr,
+                                   true);
         expect(result.continuationSeen,
                "the fixture exposes a continuation");
         expect(result.searchStates > 0,
@@ -381,6 +407,19 @@ namespace
                "witness recovery books the exact feasible packing");
         expect(result.bookedValue <= result.relaxedValue,
                "the optimistic assignment remains an upper bound");
+        expect(captured.floorValue == result.floorValue &&
+                   captured.relaxedValue == result.relaxedValue &&
+                   captured.repairValue == result.repairValue &&
+                   captured.searchValue == result.searchValue &&
+                   captured.bookedValue == result.bookedValue &&
+                   captured.searchStates == result.searchStates &&
+                   captured.searchCompleted == result.searchCompleted,
+               "witness capture does not change the exact solve");
+        expect(!captured.witness.empty() &&
+                   replaySequentialWitness(fixture.instance,
+                                           captured.witness,
+                                           captured.bookedValue),
+               "captured exact witness replays");
 
         const std::vector<WitnessStep> first =
             realizeWitness(fixture.instance,
@@ -434,10 +473,13 @@ namespace
         const SequentialTierResult floorOnly =
             solveSequentialPacking(fixture.instance,
                                    floorValue,
-                                   100000);
+                                   100000,
+                                   nullptr,
+                                   true);
         expect(!floorOnly.continuationSeen &&
                    floorOnly.bookedValue == floorValue &&
-                   floorOnly.searchStates == 0,
+                   floorOnly.searchStates == 0 &&
+                   floorOnly.witness.empty(),
                "no continuation reproduces the scalar floor exactly");
     }
 

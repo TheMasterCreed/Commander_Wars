@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -33,7 +34,47 @@ namespace Coordinator
                    std::int32_t captureTurnsFromZero,
                    std::int32_t horizonTurns)
         {
-            m_nodeCount = static_cast<std::int32_t>(nodeColumns.size());
+            std::vector<MilliFunds> prizes(
+                nodeColumns.size() *
+                    static_cast<std::size_t>(std::max(horizonTurns, 0)),
+                0);
+            for (std::size_t node = 0; node < nodeColumns.size(); ++node)
+            {
+                for (std::int32_t turn = 0; turn < horizonTurns; ++turn)
+                {
+                    prizes[
+                        node * static_cast<std::size_t>(horizonTurns) +
+                        static_cast<std::size_t>(turn)] =
+                        columnStreamValue(nodeColumns[node],
+                                          turn,
+                                          horizonTurns);
+                }
+            }
+            buildFromPrizes(
+                static_cast<std::int32_t>(nodeColumns.size()),
+                prizes,
+                interArrivals,
+                captureTurnsFromZero,
+                horizonTurns);
+        }
+
+        void buildFromPrizes(std::int32_t nodeCount,
+                             std::span<const MilliFunds> nodeTurnPrizes,
+                             std::span<const std::int32_t> interArrivals,
+                             std::int32_t captureTurnsFromZero,
+                             std::int32_t horizonTurns)
+        {
+            if (nodeCount < 0 || horizonTurns < 0)
+            {
+                m_nodeCount = 0;
+                m_horizonTurns = 0;
+                m_captureTurnsFromZero = captureTurnsFromZero;
+                m_interArrivals.clear();
+                m_values.clear();
+                m_witnesses.clear();
+                return;
+            }
+            m_nodeCount = nodeCount;
             m_horizonTurns = horizonTurns;
             m_captureTurnsFromZero = captureTurnsFromZero;
             m_interArrivals.assign(interArrivals.begin(), interArrivals.end());
@@ -41,7 +82,11 @@ namespace Coordinator
                                       static_cast<std::size_t>(horizonTurns);
             m_values.assign(cells, 0);
             m_witnesses.assign(cells, NO_SEQUENTIAL_NODE);
-            if (captureTurnsFromZero == NO_CAPTURE_TURNS)
+            if (captureTurnsFromZero == NO_CAPTURE_TURNS ||
+                nodeTurnPrizes.size() != cells ||
+                interArrivals.size() !=
+                    static_cast<std::size_t>(nodeCount) *
+                        static_cast<std::size_t>(nodeCount))
             {
                 return;
             }
@@ -60,8 +105,10 @@ namespace Coordinator
                         }
                         const MilliFunds tail = valueAt(next, nextTurn);
                         const MilliFunds candidate =
-                            columnStreamValue(nodeColumns[static_cast<std::size_t>(next)],
-                                              nextTurn, horizonTurns) +
+                            nodeTurnPrizes[
+                                static_cast<std::size_t>(next) *
+                                    static_cast<std::size_t>(horizonTurns) +
+                                static_cast<std::size_t>(nextTurn)] +
                             std::max<MilliFunds>(tail, 0);
                         if (bestSuccessor == NO_SEQUENTIAL_NODE || candidate > best)
                         {
@@ -381,6 +428,27 @@ namespace Coordinator
         }
     }
 
+    struct SequentialWitnessStep
+    {
+        std::int32_t node{NO_SEQUENTIAL_NODE};
+        std::int32_t turn{NO_CAPTURE_TURNS};
+        MilliFunds gain{0};
+
+        friend constexpr bool operator==(
+            const SequentialWitnessStep &,
+            const SequentialWitnessStep &) = default;
+    };
+
+    struct SequentialRowWitness
+    {
+        std::int32_t row{NO_STOCK_ROW};
+        std::vector<SequentialWitnessStep> steps;
+        MilliFunds value{0};
+
+        friend bool operator==(const SequentialRowWitness &,
+                               const SequentialRowWitness &) = default;
+    };
+
     struct SequentialTierResult
     {
         MilliFunds floorValue{0};
@@ -397,6 +465,7 @@ namespace Coordinator
         bool continuationSeen{false};
         bool certificate{false};
         bool searchCompleted{false};
+        std::vector<SequentialRowWitness> witness;
     };
 
     namespace SequentialDetail
@@ -460,6 +529,43 @@ namespace Coordinator
             return chain;
         }
 
+        inline SequentialRowWitness ownedWitness(
+            const SequentialInstance & instance,
+            const SequentialRow & row,
+            std::int32_t rowIndex,
+            std::span<const WitnessStep> steps)
+        {
+            SequentialRowWitness witness;
+            witness.row = rowIndex;
+            witness.steps.reserve(steps.size());
+            for (std::size_t step = 0; step < steps.size(); ++step)
+            {
+                const WitnessStep & source = steps[step];
+                const MilliFunds gain =
+                    step == 0
+                        ? row.weight[static_cast<std::size_t>(source.node)]
+                        : chainPrize(instance, source.node, source.turn);
+                witness.steps.push_back(
+                    SequentialWitnessStep{source.node,
+                                          source.turn,
+                                          gain});
+                witness.value += gain;
+            }
+            return witness;
+        }
+
+        inline void sortOwnedWitness(
+            std::vector<SequentialRowWitness> & witness)
+        {
+            std::sort(witness.begin(),
+                      witness.end(),
+                      [](const SequentialRowWitness & lhs,
+                         const SequentialRowWitness & rhs)
+            {
+                return lhs.row < rhs.row;
+            });
+        }
+
         struct PackedRow
         {
             std::int32_t row{NO_STOCK_ROW};
@@ -475,6 +581,8 @@ namespace Coordinator
             EnumerationBudget* pBudget{nullptr};
             MilliFunds incumbent{0};
             MilliFunds relaxedValue{0};
+            std::vector<const RowOption*>* pCurrentChoices{nullptr};
+            std::vector<const RowOption*>* pBestChoices{nullptr};
             bool exact{false};
         };
 
@@ -491,6 +599,10 @@ namespace Coordinator
                 if (value > pack.incumbent)
                 {
                     pack.incumbent = value;
+                    if (pack.pCurrentChoices != nullptr)
+                    {
+                        *pack.pBestChoices = *pack.pCurrentChoices;
+                    }
                     if (pack.incumbent == pack.relaxedValue)
                     {
                         pack.exact = true;
@@ -530,6 +642,10 @@ namespace Coordinator
                 {
                     pack.used[static_cast<std::size_t>(node)] = true;
                 }
+                if (pack.pCurrentChoices != nullptr)
+                {
+                    (*pack.pCurrentChoices)[depth] = &option;
+                }
                 packOptionRows(pack, depth + 1, value + option.value);
                 for (const std::int32_t node : option.nodes)
                 {
@@ -540,15 +656,114 @@ namespace Coordinator
                     return;
                 }
             }
+            if (pack.pCurrentChoices != nullptr)
+            {
+                (*pack.pCurrentChoices)[depth] = nullptr;
+            }
             packOptionRows(pack, depth + 1, value);
         }
+    }
+
+    inline bool replaySequentialWitness(
+        const SequentialInstance & instance,
+        std::span<const SequentialRowWitness> witness,
+        MilliFunds expectedValue)
+    {
+        std::vector<bool> usedRows(instance.rows.size(), false);
+        std::vector<bool> usedNodes(
+            static_cast<std::size_t>(instance.nodeCount()), false);
+        MilliFunds total = 0;
+        std::int32_t previousRow = NO_STOCK_ROW;
+        for (const SequentialRowWitness & rowWitness : witness)
+        {
+            if (rowWitness.row < 0 ||
+                rowWitness.row >=
+                    static_cast<std::int32_t>(instance.rows.size()) ||
+                rowWitness.row <= previousRow ||
+                rowWitness.steps.empty())
+            {
+                return false;
+            }
+            previousRow = rowWitness.row;
+            const std::size_t rowSlot =
+                static_cast<std::size_t>(rowWitness.row);
+            if (usedRows[rowSlot])
+            {
+                return false;
+            }
+            usedRows[rowSlot] = true;
+            const SequentialRow & row = instance.rows[rowSlot];
+            const SequentialClassTable & table =
+                instance.classes[static_cast<std::size_t>(row.classIndex)];
+            MilliFunds rowTotal = 0;
+            std::int32_t previousNode = NO_SEQUENTIAL_NODE;
+            std::int32_t previousTurn = NO_CAPTURE_TURNS;
+            for (std::size_t index = 0;
+                 index < rowWitness.steps.size();
+                 ++index)
+            {
+                const SequentialWitnessStep & step =
+                    rowWitness.steps[index];
+                if (step.node < 0 ||
+                    step.node >= instance.nodeCount())
+                {
+                    return false;
+                }
+                const std::size_t nodeSlot =
+                    static_cast<std::size_t>(step.node);
+                if (instance.capturedNodes[nodeSlot] ||
+                    usedNodes[nodeSlot])
+                {
+                    return false;
+                }
+                usedNodes[nodeSlot] = true;
+                MilliFunds expectedGain = 0;
+                if (index == 0)
+                {
+                    if (step.turn != row.ownedTurn[nodeSlot])
+                    {
+                        return false;
+                    }
+                    expectedGain = row.weight[nodeSlot];
+                }
+                else
+                {
+                    const std::int32_t expectedTurn =
+                        table.continuationOwnedTurn(previousNode,
+                                                    previousTurn,
+                                                    step.node);
+                    if (expectedTurn == NO_CAPTURE_TURNS ||
+                        step.turn != expectedTurn ||
+                        step.turn <= previousTurn)
+                    {
+                        return false;
+                    }
+                    expectedGain = SequentialDetail::chainPrize(
+                        instance, step.node, step.turn);
+                }
+                if (step.gain != expectedGain)
+                {
+                    return false;
+                }
+                rowTotal += step.gain;
+                previousNode = step.node;
+                previousTurn = step.turn;
+            }
+            if (rowTotal != rowWitness.value)
+            {
+                return false;
+            }
+            total += rowTotal;
+        }
+        return total == expectedValue;
     }
 
     inline SequentialTierResult solveSequentialPacking(
         const SequentialInstance & instance,
         MilliFunds floorValue,
         std::int64_t stateCap,
-        SequentialDetail::SequentialRowOptionSource* pRowSource = nullptr)
+        SequentialDetail::SequentialRowOptionSource* pRowSource = nullptr,
+        bool captureWitness = false)
     {
         using namespace SequentialDetail;
 
@@ -641,6 +856,13 @@ namespace Coordinator
 
         std::vector<bool> touched(static_cast<std::size_t>(nodeCount),
                                   false);
+        std::optional<std::vector<SequentialRowWitness>>
+            relaxedWitness;
+        if (captureWitness)
+        {
+            relaxedWitness.emplace();
+            relaxedWitness->reserve(matches.size());
+        }
         bool certified = true;
         MilliFunds certifiedTotal = 0;
         for (const RelaxedMatch & match : matches)
@@ -674,11 +896,24 @@ namespace Coordinator
                 break;
             }
             certifiedTotal += replay;
+            if (captureWitness)
+            {
+                relaxedWitness->push_back(
+                    ownedWitness(instance,
+                                 row,
+                                 match.row,
+                                 chain));
+            }
         }
         if (certified && certifiedTotal == result.relaxedValue)
         {
             result.certificate = true;
             result.bookedValue = result.relaxedValue;
+            if (captureWitness)
+            {
+                sortOwnedWitness(*relaxedWitness);
+                result.witness = std::move(*relaxedWitness);
+            }
             return result;
         }
 
@@ -696,6 +931,13 @@ namespace Coordinator
         });
         std::vector<bool> used(instance.capturedNodes.begin(),
                                instance.capturedNodes.end());
+        std::optional<std::vector<SequentialRowWitness>>
+            repairWitness;
+        if (captureWitness)
+        {
+            repairWitness.emplace();
+            repairWitness->reserve(repairOrder.size());
+        }
         MilliFunds repairTotal = 0;
         for (const RelaxedMatch & match : repairOrder)
         {
@@ -707,6 +949,12 @@ namespace Coordinator
             {
                 const std::vector<WitnessStep> chain =
                     realizeWitness(instance, row, match.node);
+                std::optional<std::vector<WitnessStep>> acceptedSteps;
+                if (captureWitness)
+                {
+                    acceptedSteps.emplace();
+                    acceptedSteps->reserve(chain.size());
+                }
                 for (const WitnessStep & step : chain)
                 {
                     const std::size_t slot =
@@ -716,6 +964,10 @@ namespace Coordinator
                         break;
                     }
                     used[slot] = true;
+                    if (captureWitness)
+                    {
+                        acceptedSteps->push_back(step);
+                    }
                     if (step.node == match.node)
                     {
                         repairTotal += row.weight[slot];
@@ -725,6 +977,14 @@ namespace Coordinator
                         repairTotal +=
                             chainPrize(instance, step.node, step.turn);
                     }
+                }
+                if (captureWitness && !acceptedSteps->empty())
+                {
+                    repairWitness->push_back(
+                        ownedWitness(instance,
+                                     row,
+                                     match.row,
+                                     *acceptedSteps));
                 }
                 continue;
             }
@@ -745,6 +1005,19 @@ namespace Coordinator
             {
                 used[static_cast<std::size_t>(fallback)] = true;
                 repairTotal += fallbackWeight;
+                if (captureWitness)
+                {
+                    const WitnessStep step{
+                        fallback,
+                        row.ownedTurn[static_cast<std::size_t>(fallback)]
+                    };
+                    repairWitness->push_back(
+                        ownedWitness(
+                            instance,
+                            row,
+                            match.row,
+                            std::span<const WitnessStep>(&step, 1)));
+                }
             }
         }
         result.repairValue = repairTotal;
@@ -752,6 +1025,11 @@ namespace Coordinator
         {
             result.certificate = true;
             result.bookedValue = result.relaxedValue;
+            if (captureWitness)
+            {
+                sortOwnedWitness(*repairWitness);
+                result.witness = std::move(*repairWitness);
+            }
             return result;
         }
 
@@ -831,6 +1109,15 @@ namespace Coordinator
         pack.pBudget = &budget;
         pack.incumbent = std::max(floorValue, repairTotal);
         pack.relaxedValue = result.relaxedValue;
+        std::optional<std::vector<const RowOption*>> currentChoices;
+        std::optional<std::vector<const RowOption*>> bestChoices;
+        if (captureWitness)
+        {
+            currentChoices.emplace(packedRows.size(), nullptr);
+            bestChoices.emplace(packedRows.size(), nullptr);
+            pack.pCurrentChoices = &*currentChoices;
+            pack.pBestChoices = &*bestChoices;
+        }
         packOptionRows(pack, 0, 0);
         result.searchStates = budget.states;
         result.searchCompleted = pack.exact || !budget.truncated;
@@ -838,6 +1125,34 @@ namespace Coordinator
         result.certificate = pack.exact;
         result.bookedValue =
             std::max({floorValue, repairTotal, pack.incumbent});
+        if (captureWitness &&
+            pack.incumbent > std::max(floorValue, repairTotal))
+        {
+            for (std::size_t packed = 0;
+                 packed < packedRows.size();
+                 ++packed)
+            {
+                const RowOption* pOption = (*bestChoices)[packed];
+                if (pOption == nullptr)
+                {
+                    continue;
+                }
+                const std::int32_t rowIndex = packedRows[packed].row;
+                const SequentialRow & row =
+                    instance.rows[static_cast<std::size_t>(rowIndex)];
+                result.witness.push_back(
+                    ownedWitness(instance,
+                                 row,
+                                 rowIndex,
+                                 pOption->steps));
+            }
+            sortOwnedWitness(result.witness);
+        }
+        else if (captureWitness && repairTotal > floorValue)
+        {
+            sortOwnedWitness(*repairWitness);
+            result.witness = std::move(*repairWitness);
+        }
         return result;
     }
 }
