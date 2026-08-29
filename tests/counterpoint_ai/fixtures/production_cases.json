@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "cases": {
+    "fog_distance_prune": {
+      "fog_mode": "Fog_OfShroud",
+      "source_enemy_prune_range": 5,
+      "standard_enemy_prune_range": 3,
+      "expected": {
+        "hidden_enemy_in_full_snapshot": true,
+        "distance_pruning_applies_after_snapshot": true
+      }
+    },
+    "free_black_hole_fallback": {
+      "building_id": "ZBLACKHOLE_FACTORY",
+      "action_ids": [
+        "ACTION_BLACKHOLEFACTORY_DOOR1",
+        "ACTION_BLACKHOLEFACTORY_DOOR2",
+        "ACTION_BLACKHOLEFACTORY_DOOR3"
+      ],
+      "build_list": [
+        "INFANTRY"
+      ],
+      "starting_funds": 0,
+      "expected": {
+        "funds_delta": 0,
+        "strategic_picker_index": -1,
+        "uses_generic_fallback": true
+      }
+    },
+    "free_nest_fallback": {
+      "building_id": "ZNEST_FACTORY",
+      "action_id": "ACTION_NEST_FACTORY_DOOR",
+      "build_list": [
+        "INFANTRY"
+      ],
+      "starting_funds": 0,
+      "expected": {
+        "funds_delta": 0,
+        "strategic_picker_index": -1,
+        "uses_generic_fallback": true
+      }
+    },
+    "modified_cost_boundary": {
+      "building_id": "FACTORY",
+      "build_list": [
+        "INFANTRY"
+      ],
+      "co_id": "CO_KANBEI",
+      "base_cost": 1000,
+      "menu_cost": 1200,
+      "legal_funds": 1200,
+      "rejected_funds": 1100,
+      "expected": {
+        "legal_build_spends_all_funds": true,
+        "rejected_build_leaves_factory_empty": true,
+        "transaction_cost_controls_legality": true
+      }
+    },
+    "ordinary_factory": {
+      "building_id": "FACTORY",
+      "build_list": [
+        "INFANTRY"
+      ],
+      "co_id": "CO_ANDY",
+      "starting_funds": 2000,
+      "expected": {
+        "action_id": "ACTION_BUILD_UNITS",
+        "funds_after": 1000,
+        "unit_id": "INFANTRY"
+      }
+    },
+    "seeded_selection": {
+      "building_id": "FACTORY",
+      "build_list": [
+        "INFANTRY",
+        "MECH",
+        "RECON"
+      ],
+      "co_id": "CO_ANDY",
+      "seed": 12648430,
+      "starting_funds": 10000,
+      "expected": {
+        "same_seed_same_first_build": true
+      }
+    }
+  }
+}

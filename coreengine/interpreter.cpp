@@ -6,6 +6,10 @@
 #include "coreengine/workerthread.h"
 #include "coreengine/gameconsole.h"
 
+#ifdef COW_COUNTERPOINT_TESTING
+#include "tests/counterpoint_ai/counterpointtestsupport.h"
+#endif
+
 #include "resource_management/fontmanager.h"
 #include "resource_management/cospritemanager.h"
 #include "resource_management/terrainmanager.h"
@@ -126,6 +130,15 @@ void Interpreter::init()
     globalObject().setProperty("weaponManager", weaponManager);
     QJSValue movementTableManager = newQObject(MovementTableManager::getInstance());
     globalObject().setProperty("movementTableManager", movementTableManager);
+
+#ifdef COW_COUNTERPOINT_TESTING
+    if (qEnvironmentVariable("COW_COUNTERPOINT_TEST") == QStringLiteral("1"))
+    {
+        auto* pTestSupport = new CounterpointTestSupport(this);
+        setCppOwnerShip(pTestSupport);
+        globalObject().setProperty(QStringLiteral("counterpointTest"), newQObject(pTestSupport));
+    }
+#endif
 
     GameEnums::registerEnums();
 

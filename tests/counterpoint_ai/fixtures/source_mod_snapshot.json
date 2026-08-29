@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "files": {
+    "aidata/normal/___counterpoint_user_tunables.js": "e317c7df35f5c2a56098174fda9a5283dd8cc2b88de68f1dd5f20984cbb0bec1",
+    "aidata/normal/__coreai.js": "6f94ac33d2de08587943e24bf66a30fa38df812161678466b88e06a0cb95a021",
+    "aidata/normal/normal.ini": "e9a282991293d744fcb3c286e67a5ce218cce2ffffe09213bf3838635defb645",
+    "mod.txt": "0f16bda2674d013778b4a9d2e53d9a65dd136244d432483c1ab9999aaa4a3b2e"
+  },
+  "observed": {
+    "candidate_source": "player_build_list",
+    "coordinate_failure_falls_back_to_any_building": true,
+    "enemy_prune_range": 5,
+    "free_menu_items_are_filtered": true,
+    "mutable_turn_state_is_global": true
+  }
+}

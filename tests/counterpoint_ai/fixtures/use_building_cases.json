@@ -1,0 +1,162 @@
+{
+  "comment": "Canonical coordinate-independent sequence. Randomized factory order can omit the final redundant action B skip.",
+  "events": [
+    {
+      "kind": "actionList",
+      "resolved": [
+        "ACTION_BUILD_UNITS",
+        "COUNTERPOINT_TEST_MENU_ACTION_A",
+        "COUNTERPOINT_TEST_MENU_ACTION_B"
+      ]
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "ids": [
+        "ALPHA",
+        "BETA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        true,
+        false
+      ],
+      "response": 0
+    },
+    {
+      "kind": "perform",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A"
+    },
+    {
+      "kind": "menuResult",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "succeeded": true
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "ids": [
+        "ALPHA",
+        "BETA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        true,
+        false
+      ],
+      "response": -2
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_B",
+      "ids": [
+        "ALPHA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        false
+      ],
+      "response": -2
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "ids": [
+        "ALPHA",
+        "BETA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        true,
+        false
+      ],
+      "response": -3
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "ids": [
+        "ALPHA",
+        "BETA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        true,
+        false
+      ],
+      "response": false
+    },
+    {
+      "kind": "perform",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A"
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "ids": [
+        "ALPHA",
+        "BETA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        true,
+        false
+      ],
+      "response": 1
+    },
+    {
+      "kind": "perform",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A"
+    },
+    {
+      "kind": "menuResult",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_A",
+      "succeeded": true
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_B",
+      "ids": [
+        "ALPHA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        false
+      ],
+      "response": -2
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_B",
+      "ids": [
+        "ALPHA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        false
+      ],
+      "response": -2
+    },
+    {
+      "kind": "menuItem",
+      "actionId": "COUNTERPOINT_TEST_MENU_ACTION_B",
+      "ids": [
+        "ALPHA",
+        "GAMMA"
+      ],
+      "enabled": [
+        true,
+        false
+      ],
+      "response": -2
+    }
+  ]
+}

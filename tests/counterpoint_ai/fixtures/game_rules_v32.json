@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "base_revision": "1bff0a282a51781e325683b8fccf952804c8f65d",
+  "version": 32,
+  "size": 10100,
+  "sha256": "45f4b5530fb1121f0c581f2b1d04d7c08d57080e046f4392ebbfa2e058f54de8",
+  "sentinels": {
+    "fog_mode": "Fog_OfShroud",
+    "unit_limit": 37
+  }
+}

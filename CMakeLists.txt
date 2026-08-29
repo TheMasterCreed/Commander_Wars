@@ -1274,6 +1274,40 @@ if (BUILD_TESTING AND GRAPHICSUPPORT)
     )
 endif()
 
+if (BUILD_TESTING)
+    target_sources(${PROJECT_NAME} PRIVATE
+        tests/counterpoint_ai/counterpointtestsupport.cpp
+        tests/counterpoint_ai/counterpointtestsupport.h
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE COW_COUNTERPOINT_TESTING)
+    if (MINGW)
+        set(COUNTERPOINT_GGC_MIN_EXPAND 20)
+        set(COUNTERPOINT_GGC_MIN_HEAP_KB 32768)
+        set_source_files_properties(
+            ai/coreai.cpp
+            ai/productionSystem/simpleproductionsystem.cpp
+            PROPERTIES COMPILE_OPTIONS
+                "-g1;-fno-var-tracking;-fno-var-tracking-assignments;--param=ggc-min-expand=${COUNTERPOINT_GGC_MIN_EXPAND};--param=ggc-min-heapsize=${COUNTERPOINT_GGC_MIN_HEAP_KB}"
+        )
+        target_link_options(${PROJECT_NAME} PRIVATE
+            $<$<CONFIG:Debug>:-Wl,--no-keep-memory>
+            $<$<CONFIG:Debug>:-Wl,--reduce-memory-overheads>
+        )
+    endif()
+    enable_testing()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME CounterpointCharacterization
+        COMMAND ${CMAKE_COMMAND} -E env
+            "COMMANDER_WARS_EXE=$<TARGET_FILE:${PROJECT_NAME}>"
+            "COMMANDER_WARS_QT_BIN=${_qt_bin_dir}"
+            "COMMANDER_WARS_OPENSSL_BIN=${OPENSSL_ROOT_DIR}/bin"
+            ${Python3_EXECUTABLE} -m pytest -q -p no:cacheprovider
+            --basetemp ${CMAKE_CURRENT_BINARY_DIR}/counterpoint-pytest-temp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/counterpoint_ai/test_characterization.py
+    )
+endif()
+
 if (PRECOMPILED_HEADERS)
     target_precompile_headers(${PROJECT_NAME}
         PRIVATE
