@@ -22,6 +22,7 @@ class Player;
 namespace Coordinator
 {
     class MobilityFieldCache;
+    class PropertyStockField;
 
     inline const QString TURN_LIMIT_VICTORY_RULE = QStringLiteral("VICTORYRULE_TURNLIMIT");
     constexpr std::int32_t TURN_LIMIT_RULE_ITEM = 0;
@@ -195,6 +196,7 @@ namespace Coordinator
         const AttackOpportunityField & enemyReach;
         std::span<const PropertyFacts> properties;
         MobilityFieldCache & mobility;
+        const PropertyStockField & propertyStock;
         DamageOracle & oracle;
         ValuationContext valuation;
     };

@@ -7,6 +7,7 @@
 #include <QPoint>
 
 #include "ai/coordinator/mobilityfieldcache.h"
+#include "ai/coordinator/propertystockfield.h"
 #include "ai/coreai.h"
 
 #include "coreengine/gameconsole.h"
@@ -526,14 +527,12 @@ namespace
 
     const Coordinator::PropertyFacts* CandidateBuilder::propertyAt(const TilePoint & tile) const
     {
-        for (const Coordinator::PropertyFacts & facts : m_context.properties)
+        const std::int32_t index = m_context.propertyStock.propertyIndexAt(tile);
+        if (index == Coordinator::NO_PROPERTY_INDEX)
         {
-            if (facts.x == tile.x && facts.y == tile.y)
-            {
-                return &facts;
-            }
+            return nullptr;
         }
-        return nullptr;
+        return &m_context.properties[static_cast<std::size_t>(index)];
     }
 
     void CandidateBuilder::addCaptureCandidates(const ShotSource & actor, const std::vector<MoveOption> & options,

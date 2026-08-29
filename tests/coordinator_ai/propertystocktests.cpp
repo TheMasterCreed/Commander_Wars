@@ -269,6 +269,53 @@ namespace
                    marginal.unmatched,
                "a dominated acting row does not lower the answer");
     }
+
+    Coordinator::MobilityCostGrid straightCorridor(std::int32_t length, std::int32_t stepCost)
+    {
+        Coordinator::MobilityCostGrid grid(length + 1, 1);
+        for (std::int32_t x = 1; x <= length; ++x)
+        {
+            grid.setCost(x, 0, Coordinator::EntryDirection::East, stepCost);
+        }
+        return grid;
+    }
+
+    void testActivationScheduleUsesTurnBoundaries()
+    {
+        constexpr TilePoint origin{0, 0};
+        constexpr TilePoint near{1, 0};
+        constexpr TilePoint target{3, 0};
+        const Coordinator::MobilityCostGrid grid = straightCorridor(3, 3);
+        Coordinator::ActivationField field;
+        field.build(grid, origin, 5, Coordinator::UNBOUNDED_ACTIVATIONS, {origin, near, target});
+        expect(field.activations(origin.x, origin.y) == 1, "origin is reachable on the current activation");
+        expect(field.activations(near.x, near.y) == 1, "one affordable step stays on the current activation");
+        expect(field.activations(target.x, target.y) == 3,
+               "movement allowance resets determine arrival activations");
+
+        const Coordinator::MobilityCostGrid blocked = straightCorridor(1, 6);
+        Coordinator::ActivationField unreachable;
+        unreachable.build(blocked, origin, 5, Coordinator::UNBOUNDED_ACTIVATIONS, {near});
+        expect(unreachable.activations(near.x, near.y) == Coordinator::UNREACHABLE,
+               "a tile costing more than one allowance is unreachable");
+    }
+
+    void testReadSetOnlyBoundsWork()
+    {
+        constexpr TilePoint origin{0, 0};
+        constexpr TilePoint near{1, 0};
+        constexpr TilePoint far{4, 0};
+        const Coordinator::MobilityCostGrid grid = straightCorridor(4, 3);
+        Coordinator::ActivationField narrow;
+        Coordinator::ActivationField wide;
+        narrow.build(grid, origin, 5, Coordinator::UNBOUNDED_ACTIVATIONS, {near});
+        wide.build(grid, origin, 5, Coordinator::UNBOUNDED_ACTIVATIONS, {near, far});
+        expect(narrow.activations(near.x, near.y) == wide.activations(near.x, near.y),
+               "read set size does not change a requested answer");
+        expect(narrow.activations(far.x, far.y) == Coordinator::UNREACHABLE,
+               "an unrequested tile is not exposed as settled");
+        expect(wide.activations(far.x, far.y) == 4, "requested distant arrival remains exact");
+    }
 }
 
 int main()
@@ -279,5 +326,7 @@ int main()
     testCaptureClockAndHorizon();
     testOwnershipAndMirrorIdentities();
     testInjectivityAndPositionalDelta();
+    testActivationScheduleUsesTurnBoundaries();
+    testReadSetOnlyBoundsWork();
     return failures == 0 ? 0 : 1;
 }

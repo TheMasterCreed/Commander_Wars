@@ -14,6 +14,7 @@
 #include "ai/coordinator/damageoracle.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
+#include "ai/coordinator/propertystockbuilder.h"
 #include "coreengine/memorymanagement.h"
 #include "game/gamemap.h"
 #include "game/gamerules.h"
@@ -283,6 +284,9 @@ QString focusFireExposure(const QString & mapPath)
     }
     const std::vector<Coordinator::PropertyFacts> properties =
         Coordinator::buildPropertyEconomics(*pMap, knowledge);
+    const Coordinator::ValuationContext valuation = Coordinator::makeValuationContext(*pMap);
+    Coordinator::PropertyStockField propertyStock =
+        Coordinator::buildPropertyStockField(*pMap, knowledge, properties, cache, valuation.horizonTurns);
     Coordinator::DamageOracle oracle(*pMap);
     const Coordinator::BundleBuildContext context{
         *pMap,
@@ -291,8 +295,9 @@ QString focusFireExposure(const QString & mapPath)
         field,
         properties,
         cache,
+        propertyStock,
         oracle,
-        Coordinator::makeValuationContext(*pMap),
+        valuation,
     };
     Coordinator::BundleBuildStats stats;
     const std::vector<Coordinator::CandidateBundle> candidates = Coordinator::buildCandidateBundles(

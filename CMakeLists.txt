@@ -834,6 +834,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/propertyeconomics.h
     ai/coordinator/propertyeconomicsbuilder.h ai/coordinator/propertyeconomicsbuilder.cpp
     ai/coordinator/propertystock.h
+    ai/coordinator/propertystockfield.h
+    ai/coordinator/propertystockbuilder.h ai/coordinator/propertystockbuilder.cpp
     ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
