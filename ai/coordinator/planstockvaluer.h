@@ -2,11 +2,20 @@
 
 #include <cstdint>
 
+#include "ai/coordinator/continuationinterval.h"
 #include "ai/coordinator/economicledger.h"
 
 namespace Coordinator
 {
     class TurnPlan;
+
+    struct LivePlanStockQuote
+    {
+        ContinuationKey key;
+        StockInterval stockAbsolute;
+        bool valid{false};
+        bool lowerWitnessReplays{false};
+    };
 
     class PlanStockValuer
     {
@@ -16,5 +25,23 @@ namespace Coordinator
         virtual MilliFunds originStock() const = 0;
         virtual MilliFunds stockCeiling() const = 0;
         virtual bool affectsStock(std::int32_t engineUnitId) const = 0;
+
+        virtual bool livePairSwapIntervals() const
+        {
+            return false;
+        }
+
+        virtual LivePlanStockQuote livePlanStock(
+            const TurnPlan &,
+            MilliFunds,
+            bool)
+        {
+            return LivePlanStockQuote{};
+        }
+
+        virtual bool refineLiveAtBoundary(AssignPhase)
+        {
+            return false;
+        }
     };
 }
