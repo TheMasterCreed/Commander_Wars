@@ -1,0 +1,371 @@
+#include <cstdint>
+#include <cstdio>
+#include <utility>
+#include <vector>
+
+#include "ai/coordinator/bundleassignment.h"
+
+namespace
+{
+using Coordinator::ActorProgress;
+using Coordinator::ActorResources;
+using Coordinator::AssignmentActor;
+using Coordinator::AssignmentInput;
+using Coordinator::AssignmentStats;
+using Coordinator::CandidateBundle;
+using Coordinator::captureComponent;
+using Coordinator::CaptureFacts;
+using Coordinator::fireComponent;
+using Coordinator::FireFacts;
+using Coordinator::KnownUnitLink;
+using Coordinator::MilliFunds;
+using Coordinator::NO_ACTION;
+using Coordinator::NO_CANDIDATE;
+using Coordinator::PlanActionIds;
+using Coordinator::PlanActionState;
+using Coordinator::PlanBundleKind;
+using Coordinator::PlannedAction;
+using Coordinator::ReservationResult;
+using Coordinator::TilePoint;
+using Coordinator::TurnPlan;
+
+constexpr std::int32_t ATTACKER_INDEX = 0;
+constexpr std::int32_t SUPPORT_INDEX = 1;
+constexpr std::int32_t TARGET_INDEX = 2;
+constexpr std::int32_t ATTACKER_UNIT = 11;
+constexpr std::int32_t SUPPORT_UNIT = 12;
+constexpr std::int32_t TARGET_UNIT = 13;
+
+constexpr TilePoint ATTACKER_TILE{1, 1};
+constexpr TilePoint SUPPORT_TILE{1, 3};
+constexpr TilePoint TARGET_TILE{4, 1};
+constexpr TilePoint CONTESTED_TILE{2, 1};
+constexpr TilePoint SPARE_TILE{2, 3};
+constexpr TilePoint FAR_TILE{3, 3};
+
+constexpr MilliFunds BEST_VALUE = 1000;
+constexpr MilliFunds GOOD_VALUE = 900;
+constexpr MilliFunds FAIR_VALUE = 800;
+constexpr MilliFunds POOR_VALUE = 100;
+constexpr MilliFunds LOSING_VALUE = -50;
+constexpr std::int32_t TARGET_HP_STEPS = 3;
+constexpr std::int32_t LETHAL_DAMAGE_STEPS = 3;
+
+int failures = 0;
+
+void expect(bool condition, const char* description)
+{
+    if (!condition)
+    {
+        std::printf("FAILED: %s\n", description);
+        ++failures;
+    }
+}
+
+PlanActionIds testActionIds()
+{
+    return PlanActionIds{
+        .wait = QStringLiteral("ACTION_WAIT"),
+        .fire = QStringLiteral("ACTION_FIRE"),
+        .capture = QStringLiteral("ACTION_CAPTURE"),
+    };
+}
+
+std::vector<KnownUnitLink> testUnitLinks()
+{
+    return {
+        KnownUnitLink{ATTACKER_UNIT, ATTACKER_TILE},
+        KnownUnitLink{SUPPORT_UNIT, SUPPORT_TILE},
+        KnownUnitLink{TARGET_UNIT, TARGET_TILE},
+    };
+}
+
+CandidateBundle valuedCandidate(std::int32_t unitIndex, TilePoint origin, TilePoint destination, MilliFunds value)
+{
+    CandidateBundle candidate;
+    candidate.bundle.unitId = unitIndex;
+    candidate.bundle.origin = origin;
+    candidate.bundle.destination = destination;
+    candidate.bundle.path.push_back(origin);
+    if (origin != destination)
+    {
+        candidate.bundle.path.push_back(destination);
+    }
+    candidate.valuation.ledger.enemyCapital = value;
+    candidate.valuation.valid = true;
+    return candidate;
+}
+
+CandidateBundle firingCandidate(std::int32_t unitIndex, TilePoint origin, TilePoint destination,
+                                std::int32_t damageSteps, MilliFunds value)
+{
+    CandidateBundle candidate = valuedCandidate(unitIndex, origin, destination, value);
+    const FireFacts fire{
+        .targetUnitId = TARGET_INDEX,
+        .targetReplacementCost = 0,
+        .targetHpSteps = TARGET_HP_STEPS,
+        .damageSteps = damageSteps,
+        .counterSteps = 0,
+        .targetBestShotBefore = 0,
+        .targetBestShotAfter = 0,
+    };
+    candidate.bundle.components.push_back(fireComponent(fire));
+    return candidate;
+}
+
+CandidateBundle capturingCandidate(std::int32_t unitIndex, TilePoint origin, TilePoint destination,
+                                   MilliFunds value)
+{
+    CandidateBundle candidate = valuedCandidate(unitIndex, origin, destination, value);
+    candidate.bundle.components.push_back(captureComponent(CaptureFacts{}));
+    return candidate;
+}
+
+AssignmentActor actorWith(std::int32_t knowledgeIndex, std::int32_t engineUnitId,
+                          std::vector<CandidateBundle> candidates)
+{
+    AssignmentActor actor;
+    actor.knowledgeUnitIndex = knowledgeIndex;
+    actor.engineUnitId = engineUnitId;
+    actor.candidates = std::move(candidates);
+    return actor;
+}
+
+AssignmentInput inputWith(std::vector<AssignmentActor> actors)
+{
+    AssignmentInput input;
+    input.actionIds = testActionIds();
+    input.unitLinks = testUnitLinks();
+    input.actors = std::move(actors);
+    return input;
+}
+
+std::int32_t addAndClaim(TurnPlan & plan, const AssignmentInput & input, std::int32_t engineUnitId,
+                         const CandidateBundle & candidate)
+{
+    const PlannedAction action =
+        Coordinator::plannedActionFrom(input.actionIds, input.unitLinks, engineUnitId, candidate);
+    const std::int32_t index = plan.addAction(action);
+    if (index != NO_ACTION)
+    {
+        Coordinator::claimOrRollback(plan, index, action, candidate);
+    }
+    return index;
+}
+
+void testConversionMapsEngineActionsAndTargets()
+{
+    const PlanActionIds ids = testActionIds();
+    const std::vector<KnownUnitLink> links = testUnitLinks();
+    const CandidateBundle move = valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, POOR_VALUE);
+    const PlannedAction moved = Coordinator::plannedActionFrom(ids, links, ATTACKER_UNIT, move);
+    expect(moved.kind == PlanBundleKind::Move && moved.actionId == ids.wait, "move maps to wait");
+    expect(moved.path.front() == ATTACKER_TILE && moved.destination == CONTESTED_TILE, "move keeps its endpoints");
+
+    const CandidateBundle fire =
+        firingCandidate(ATTACKER_INDEX, ATTACKER_TILE, ATTACKER_TILE, LETHAL_DAMAGE_STEPS, BEST_VALUE);
+    const PlannedAction fired = Coordinator::plannedActionFrom(ids, links, ATTACKER_UNIT, fire);
+    expect(fired.kind == PlanBundleKind::Fire && fired.actionId == ids.fire, "fire maps to fire");
+    expect(fired.targetUnitId == TARGET_UNIT && fired.target == TARGET_TILE, "fire resolves its target link");
+
+    const CandidateBundle capture = capturingCandidate(SUPPORT_INDEX, SUPPORT_TILE, FAR_TILE, FAIR_VALUE);
+    const PlannedAction captured = Coordinator::plannedActionFrom(ids, links, SUPPORT_UNIT, capture);
+    expect(captured.kind == PlanBundleKind::MoveAndCapture && captured.actionId == ids.capture,
+           "capture maps to capture");
+    expect(captured.target == FAR_TILE, "capture targets its destination");
+
+    CandidateBundle compound = fire;
+    compound.bundle.components.push_back(captureComponent(CaptureFacts{}));
+    expect(!Coordinator::isPlannableCandidate(ids, links, compound), "compound candidates are rejected");
+}
+
+void testDestinationConflictRollsBackTheRefusedAction()
+{
+    const AssignmentInput input = inputWith({});
+    TurnPlan plan;
+    const CandidateBundle first =
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, BEST_VALUE);
+    const CandidateBundle second =
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, GOOD_VALUE);
+    const std::int32_t firstIndex = addAndClaim(plan, input, ATTACKER_UNIT, first);
+    const PlannedAction secondAction =
+        Coordinator::plannedActionFrom(input.actionIds, input.unitLinks, SUPPORT_UNIT, second);
+    const std::int32_t secondIndex = plan.addAction(secondAction);
+    const ReservationResult result =
+        Coordinator::claimOrRollback(plan, secondIndex, secondAction, second);
+    expect(firstIndex != NO_ACTION && secondIndex != NO_ACTION, "both actions are installed");
+    expect(result == ReservationResult::Conflict, "the second destination conflicts");
+    expect(plan.destinationClaimant(CONTESTED_TILE) == firstIndex, "the first claim remains");
+    expect(plan.action(secondIndex).state == PlanActionState::Pending, "the refused action stays pending");
+}
+
+void testAttackAndCaptureClaimsRejectOverbooking()
+{
+    const AssignmentInput input = inputWith({});
+    TurnPlan attackPlan;
+    const CandidateBundle lethal =
+        firingCandidate(ATTACKER_INDEX, ATTACKER_TILE, ATTACKER_TILE, LETHAL_DAMAGE_STEPS, BEST_VALUE);
+    const CandidateBundle overkill =
+        firingCandidate(SUPPORT_INDEX, SUPPORT_TILE, SPARE_TILE, LETHAL_DAMAGE_STEPS, GOOD_VALUE);
+    const std::int32_t lethalIndex = addAndClaim(attackPlan, input, ATTACKER_UNIT, lethal);
+    const PlannedAction overkillAction =
+        Coordinator::plannedActionFrom(input.actionIds, input.unitLinks, SUPPORT_UNIT, overkill);
+    const std::int32_t overkillIndex = attackPlan.addAction(overkillAction);
+    const ReservationResult attackResult =
+        Coordinator::claimOrRollback(attackPlan, overkillIndex, overkillAction, overkill);
+    expect(lethalIndex != NO_ACTION && attackPlan.targetIsLethal(TARGET_UNIT), "the first shot books lethal");
+    expect(attackResult == ReservationResult::Overkill, "the second lethal shot is rejected");
+    expect(attackPlan.destinationClaimant(SPARE_TILE) == NO_ACTION, "overkill releases its destination");
+
+    TurnPlan capturePlan;
+    const CandidateBundle firstCapture =
+        capturingCandidate(ATTACKER_INDEX, ATTACKER_TILE, FAR_TILE, GOOD_VALUE);
+    const CandidateBundle secondCapture =
+        capturingCandidate(SUPPORT_INDEX, SUPPORT_TILE, FAR_TILE, FAIR_VALUE);
+    const std::int32_t captureIndex = addAndClaim(capturePlan, input, ATTACKER_UNIT, firstCapture);
+    const PlannedAction secondCaptureAction =
+        Coordinator::plannedActionFrom(input.actionIds, input.unitLinks, SUPPORT_UNIT, secondCapture);
+    const std::int32_t secondCaptureIndex = capturePlan.addAction(secondCaptureAction);
+    const ReservationResult captureResult =
+        Coordinator::claimOrRollback(capturePlan, secondCaptureIndex, secondCaptureAction, secondCapture);
+    expect(captureResult == ReservationResult::Conflict, "a property has one capture claimant");
+    expect(capturePlan.captureClaimant(FAR_TILE) == captureIndex, "the first capture claim remains");
+}
+
+void testCandidatePreparationIsStableAndIncludesGivingUp()
+{
+    std::vector<CandidateBundle> candidates;
+    candidates.push_back(valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, GOOD_VALUE));
+    candidates.push_back(valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, SPARE_TILE, GOOD_VALUE));
+    candidates.push_back(valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, FAR_TILE, LOSING_VALUE));
+    CandidateBundle unsupported = candidates.front();
+    unsupported.bundle.components.push_back(fireComponent(FireFacts{}));
+    unsupported.bundle.components.push_back(captureComponent(CaptureFacts{}));
+    candidates.push_back(std::move(unsupported));
+
+    AssignmentStats stats;
+    const std::vector<KnownUnitLink> links = testUnitLinks();
+    const std::vector<std::int32_t> order =
+        Coordinator::plannableCandidateOrder(testActionIds(), links, candidates, stats);
+    expect(order == std::vector<std::int32_t>({0, 1, 2}), "candidate order is stable on ties");
+    expect(stats.candidates == 4 && stats.unsupportedCandidates == 1, "preparation counts every candidate");
+
+    AssignmentActor actor = actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(candidates));
+    ActorProgress state;
+    state.pActor = &actor;
+    state.order = order;
+    state.options = Coordinator::buildOptionOrder(state);
+    expect(state.options == std::vector<std::int32_t>({0, 1, NO_CANDIDATE, 2}),
+           "giving up sorts before a losing action");
+    state.chosen = 1;
+    expect(Coordinator::incumbentFirstOptions(state) ==
+               std::vector<std::int32_t>({1, 0, NO_CANDIDATE, 2}),
+           "the incumbent leads its equal value tier");
+}
+
+void testSeatBestClaimableFallsThroughAConflict()
+{
+    std::vector<CandidateBundle> supportCandidates;
+    supportCandidates.push_back(valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, BEST_VALUE));
+    supportCandidates.push_back(valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SPARE_TILE, FAIR_VALUE));
+    AssignmentActor support = actorWith(SUPPORT_INDEX, SUPPORT_UNIT, std::move(supportCandidates));
+    AssignmentInput input = inputWith({support});
+
+    TurnPlan plan;
+    const CandidateBundle blocker =
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, GOOD_VALUE);
+    addAndClaim(plan, input, ATTACKER_UNIT, blocker);
+
+    ActorProgress state;
+    state.pActor = &input.actors.front();
+    AssignmentStats stats;
+    state.order = Coordinator::plannableCandidateOrder(
+        input.actionIds, input.unitLinks, state.pActor->candidates, stats);
+    state.options = Coordinator::buildOptionOrder(state);
+    Coordinator::seatBestClaimable(plan, input, state, state.options);
+    expect(state.chosen == 1 && state.seatedValue == FAIR_VALUE, "seating takes the best claimable option");
+    expect(plan.destinationClaimant(SPARE_TILE) == state.actionIndex, "the fallback destination is claimed");
+}
+
+void testReplanRevivesAndCanAbandonAnAction()
+{
+    const AssignmentInput input = inputWith({});
+    TurnPlan plan;
+    const CandidateBundle initial =
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SUPPORT_TILE, POOR_VALUE);
+    const std::int32_t actionIndex = addAndClaim(plan, input, SUPPORT_UNIT, initial);
+    plan.markFailed(actionIndex);
+    const std::vector<CandidateBundle> fresh{
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SPARE_TILE, FAIR_VALUE),
+    };
+    AssignmentStats stats;
+    const bool revived = Coordinator::replanAction(
+        plan, actionIndex, input.actionIds, input.unitLinks, fresh, stats);
+    expect(revived && plan.action(actionIndex).state == PlanActionState::Pending, "fresh options revive an action");
+    expect(plan.destinationClaimant(SPARE_TILE) == actionIndex, "the revived action claims its destination");
+
+    const CandidateBundle blocker =
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, BEST_VALUE);
+    addAndClaim(plan, input, ATTACKER_UNIT, blocker);
+    const std::vector<CandidateBundle> blocked{
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, GOOD_VALUE),
+    };
+    const bool blockedResult = Coordinator::replanAction(
+        plan, actionIndex, input.actionIds, input.unitLinks, blocked, stats);
+    expect(!blockedResult && plan.action(actionIndex).state == PlanActionState::Abandoned,
+           "an exhausted replan abandons the action");
+    expect(plan.destinationClaimant(SPARE_TILE) == NO_ACTION, "abandoning releases the old claim");
+}
+
+void testActorResourcesExposeTileAndTargetConflicts()
+{
+    std::vector<CandidateBundle> attackerCandidates;
+    attackerCandidates.push_back(valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, GOOD_VALUE));
+    attackerCandidates.push_back(
+        firingCandidate(ATTACKER_INDEX, ATTACKER_TILE, ATTACKER_TILE, 1, FAIR_VALUE));
+    AssignmentActor attacker = actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(attackerCandidates));
+    ActorProgress attackerState;
+    attackerState.pActor = &attacker;
+    attackerState.order = {0, 1};
+    const ActorResources attackerResources = Coordinator::actorResourcesOf(attackerState);
+
+    ActorResources destinationConflict;
+    destinationConflict.destinations.push_back(CONTESTED_TILE);
+    ActorResources targetConflict;
+    targetConflict.targets.push_back(TARGET_INDEX);
+    ActorResources independent;
+    independent.destinations.push_back(FAR_TILE);
+    expect(Coordinator::actorsContest(attackerResources, destinationConflict), "shared destinations conflict");
+    expect(Coordinator::actorsContest(attackerResources, targetConflict), "shared fire targets conflict");
+    expect(!Coordinator::actorsContest(attackerResources, independent), "independent resources do not conflict");
+}
+
+void testTrimmedFireValueUsesOnlyGrantedDamage()
+{
+    constexpr FireFacts fire{
+        .targetUnitId = TARGET_INDEX,
+        .targetReplacementCost = 10000,
+        .targetHpSteps = 3,
+        .damageSteps = 3,
+        .counterSteps = 0,
+        .targetBestShotBefore = 900,
+        .targetBestShotAfter = 0,
+    };
+    constexpr MilliFunds staticValue = 3900;
+    expect(Coordinator::grantedFireValue(fire, staticValue, 2) == 2600,
+           "trimmed fire keeps granted capital and prorated credit");
+}
+}
+
+int main()
+{
+    testConversionMapsEngineActionsAndTargets();
+    testDestinationConflictRollsBackTheRefusedAction();
+    testAttackAndCaptureClaimsRejectOverbooking();
+    testCandidatePreparationIsStableAndIncludesGivingUp();
+    testSeatBestClaimableFallsThroughAConflict();
+    testReplanRevivesAndCanAbandonAnAction();
+    testActorResourcesExposeTileAndTargetConflicts();
+    testTrimmedFireValueUsesOnlyGrantedDamage();
+    return failures == 0 ? 0 : 1;
+}
