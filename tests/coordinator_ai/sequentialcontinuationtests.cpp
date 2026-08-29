@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -23,11 +24,13 @@ namespace
     using Coordinator::SequentialTierResult;
     using Coordinator::TilePoint;
     using Coordinator::solveSequentialPacking;
+    using Coordinator::SequentialDetail::CachedRowEnumeration;
     using Coordinator::SequentialDetail::continuationGain;
     using Coordinator::SequentialDetail::EnumerationBudget;
     using Coordinator::SequentialDetail::realizeWitness;
     using Coordinator::SequentialDetail::RowOption;
     using Coordinator::SequentialDetail::RowOptionMap;
+    using Coordinator::SequentialDetail::SequentialRowOptionSource;
     using Coordinator::SequentialDetail::WitnessStep;
 
     constexpr std::int32_t HORIZON_TURNS = 6;
@@ -99,6 +102,43 @@ namespace
             });
             instance.capturedNodes.assign(columns.size(), false);
         }
+    };
+
+    class MemoryRowSource final : public SequentialRowOptionSource
+    {
+    public:
+        bool lookup(std::int32_t rowIndex,
+                    std::span<const RowOption> & options,
+                    std::int64_t & statesSpent) override
+        {
+            ++lookups;
+            const auto known = entries.find(rowIndex);
+            if (known == entries.end())
+            {
+                return false;
+            }
+            options = std::span<const RowOption>(known->second.options);
+            statesSpent = known->second.statesSpent;
+            return true;
+        }
+
+        void store(std::int32_t rowIndex,
+                   std::span<const RowOption> options,
+                   std::int64_t statesSpent) override
+        {
+            ++stores;
+            entries.emplace(
+                rowIndex,
+                CachedRowEnumeration{
+                    .options =
+                        std::vector<RowOption>(options.begin(), options.end()),
+                    .statesSpent = statesSpent,
+                });
+        }
+
+        std::map<std::int32_t, CachedRowEnumeration> entries;
+        std::int32_t lookups{0};
+        std::int32_t stores{0};
     };
 
     void testClassTableAndFirstLegBounds()
@@ -459,6 +499,60 @@ namespace
                    "every exhaustive sweep case closes its proof");
         }
     }
+
+    void testRowCacheTransparencyAndBudgetFallback()
+    {
+        SequentialFixture fixture;
+        fixture.instance.rows = {
+            SequentialRow{
+                .classIndex = 0,
+                .weight = {100, 0, 0},
+                .ownedTurn = {1, 1, 1},
+            },
+            SequentialRow{
+                .classIndex = 0,
+                .weight = {0, 90, 0},
+                .ownedTurn = {1, 1, 1},
+            },
+        };
+        const MilliFunds floorValue = assignmentFloor(fixture.instance);
+        MemoryRowSource source;
+        const SequentialTierResult cold =
+            solveSequentialPacking(fixture.instance,
+                                   floorValue,
+                                   100000,
+                                   &source);
+        expect(source.stores > 0 && cold.cacheHits == 0,
+               "a cold complete solve stores row options");
+        const std::int32_t storesAfterCold = source.stores;
+        const SequentialTierResult warm =
+            solveSequentialPacking(fixture.instance,
+                                   floorValue,
+                                   100000,
+                                   &source);
+        expect(warm.bookedValue == cold.bookedValue &&
+                   warm.relaxedValue == cold.relaxedValue &&
+                   warm.searchCompleted == cold.searchCompleted,
+               "cached continuation preserves the exact result");
+        expect(warm.cacheHits > 0 &&
+                   source.stores == storesAfterCold,
+               "a warm solve reuses complete row enumerations");
+
+        const SequentialTierResult coldCapped =
+            solveSequentialPacking(fixture.instance, floorValue, 1);
+        const SequentialTierResult warmCapped =
+            solveSequentialPacking(fixture.instance,
+                                   floorValue,
+                                   1,
+                                   &source);
+        expect(warmCapped.cacheFallbacks > 0,
+               "a cached row that cannot fit the cold budget recomputes");
+        expect(warmCapped.bookedValue == coldCapped.bookedValue &&
+                   warmCapped.searchCompleted ==
+                       coldCapped.searchCompleted &&
+                   warmCapped.searchStates == coldCapped.searchStates,
+               "cache budget fallback is replay transparent");
+    }
 }
 
 int main()
@@ -470,5 +564,6 @@ int main()
     testWitnessRecoveryAndExactPacking();
     testCapturedNodeAndFloorCompatibility();
     testExhaustiveCeilingEquivalence();
+    testRowCacheTransparencyAndBudgetFallback();
     return failures == 0 ? 0 : 1;
 }

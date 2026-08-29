@@ -61,6 +61,9 @@ namespace Coordinator
             m_enemySequentialOptima;
         mutable bool m_originCached{false};
         mutable MilliFunds m_sequentialOrigin{0};
+        mutable std::map<std::vector<std::int64_t>,
+                         SequentialDetail::CachedRowEnumeration>
+            m_rowOptionCache;
     };
 
     PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,

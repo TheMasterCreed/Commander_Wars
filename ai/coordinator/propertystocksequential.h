@@ -214,6 +214,23 @@ namespace Coordinator
 
         using RowOptionMap = std::map<std::vector<std::int32_t>, RowOption>;
 
+        struct CachedRowEnumeration
+        {
+            std::vector<RowOption> options;
+            std::int64_t statesSpent{0};
+        };
+
+        struct SequentialRowOptionSource
+        {
+            virtual ~SequentialRowOptionSource() = default;
+            virtual bool lookup(std::int32_t rowIndex,
+                                std::span<const RowOption> & options,
+                                std::int64_t & statesSpent) = 0;
+            virtual void store(std::int32_t rowIndex,
+                               std::span<const RowOption> options,
+                               std::int64_t statesSpent) = 0;
+        };
+
         inline void recordOption(RowOptionMap & options,
                                  const std::vector<WitnessStep> & steps,
                                  MilliFunds value,
@@ -375,6 +392,8 @@ namespace Coordinator
         std::int64_t itinerariesEnumerated{0};
         std::int64_t itineraryOptionsKept{0};
         std::int64_t rowsSearched{0};
+        std::int64_t cacheHits{0};
+        std::int64_t cacheFallbacks{0};
         bool continuationSeen{false};
         bool certificate{false};
         bool searchCompleted{false};
@@ -528,7 +547,8 @@ namespace Coordinator
     inline SequentialTierResult solveSequentialPacking(
         const SequentialInstance & instance,
         MilliFunds floorValue,
-        std::int64_t stateCap)
+        std::int64_t stateCap,
+        SequentialDetail::SequentialRowOptionSource* pRowSource = nullptr)
     {
         using namespace SequentialDetail;
 
@@ -743,13 +763,37 @@ namespace Coordinator
         std::vector<PackedRow> packedRows;
         for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
         {
-            ownedOptions.push_back(enumerateRowOptions(
-                instance,
-                rowIndex,
-                enriched[static_cast<std::size_t>(rowIndex)],
-                budget,
-                result.itinerariesEnumerated));
-            const std::span<const RowOption> options(ownedOptions.back());
+            std::span<const RowOption> options;
+            std::int64_t cachedCost = 0;
+            const bool cached =
+                pRowSource != nullptr &&
+                pRowSource->lookup(rowIndex, options, cachedCost);
+            if (cached && budget.states + cachedCost < budget.stateCap)
+            {
+                budget.states += cachedCost;
+                ++result.cacheHits;
+            }
+            else
+            {
+                if (cached)
+                {
+                    ++result.cacheFallbacks;
+                }
+                const std::int64_t statesBefore = budget.states;
+                ownedOptions.push_back(enumerateRowOptions(
+                    instance,
+                    rowIndex,
+                    enriched[static_cast<std::size_t>(rowIndex)],
+                    budget,
+                    result.itinerariesEnumerated));
+                options = std::span<const RowOption>(ownedOptions.back());
+                if (!cached && pRowSource != nullptr && !budget.truncated)
+                {
+                    pRowSource->store(rowIndex,
+                                      options,
+                                      budget.states - statesBefore);
+                }
+            }
             if (options.empty())
             {
                 continue;

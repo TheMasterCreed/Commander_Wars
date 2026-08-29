@@ -19,6 +19,47 @@
 
 namespace
 {
+    constexpr std::size_t ROW_ENUM_KEY_PREFIX = 5;
+
+    struct ValuerRowOptionSource final
+        : Coordinator::SequentialDetail::SequentialRowOptionSource
+    {
+        std::map<std::vector<std::int64_t>,
+                 Coordinator::SequentialDetail::CachedRowEnumeration>*
+            pCache{nullptr};
+        const std::vector<std::vector<std::int64_t>>* pKeys{nullptr};
+
+        bool lookup(
+            std::int32_t rowIndex,
+            std::span<const Coordinator::SequentialDetail::RowOption> & options,
+            std::int64_t & statesSpent) override
+        {
+            const auto found =
+                pCache->find((*pKeys)[static_cast<std::size_t>(rowIndex)]);
+            if (found == pCache->end())
+            {
+                return false;
+            }
+            options = std::span<const Coordinator::SequentialDetail::RowOption>(
+                found->second.options);
+            statesSpent = found->second.statesSpent;
+            return true;
+        }
+
+        void store(
+            std::int32_t rowIndex,
+            std::span<const Coordinator::SequentialDetail::RowOption> options,
+            std::int64_t statesSpent) override
+        {
+            Coordinator::SequentialDetail::CachedRowEnumeration entry;
+            entry.options.assign(options.begin(), options.end());
+            entry.statesSpent = statesSpent;
+            pCache->emplace(
+                (*pKeys)[static_cast<std::size_t>(rowIndex)],
+                std::move(entry));
+        }
+    };
+
     std::int32_t tileSlot(std::int32_t width, std::int32_t height, std::int32_t x, std::int32_t y)
     {
         if (x < 0 || y < 0 || x >= width || y >= height)
@@ -727,6 +768,12 @@ namespace Coordinator
             }
         }
 
+        std::vector<std::int64_t> sortedCaptured(
+            facts.capturedColumns.begin(),
+            facts.capturedColumns.end());
+        std::sort(sortedCaptured.begin(), sortedCaptured.end());
+        std::vector<std::vector<std::int64_t>> rowKeys;
+        rowKeys.reserve(m_field.m_ours.rows.size());
         instance.rows.reserve(m_field.m_ours.rows.size());
         for (std::size_t rowIndex = 0;
              rowIndex < m_field.m_ours.rows.size();
@@ -744,6 +791,23 @@ namespace Coordinator
                     break;
                 }
             }
+            std::vector<std::int64_t> rowKey;
+            rowKey.reserve(ROW_ENUM_KEY_PREFIX + sortedCaptured.size());
+            rowKey.push_back(static_cast<std::int64_t>(rowIndex));
+            rowKey.push_back(
+                pMover != nullptr ? pMover->tile.x : NO_STOCK_COLUMN);
+            rowKey.push_back(
+                pMover != nullptr ? pMover->tile.y : NO_STOCK_COLUMN);
+            rowKey.push_back(
+                pMover != nullptr ? pMover->carriedCapturePoints : 0);
+            rowKey.push_back(
+                pMover != nullptr
+                    ? static_cast<std::int64_t>(pMover->survival)
+                    : 0);
+            rowKey.insert(rowKey.end(),
+                          sortedCaptured.begin(),
+                          sortedCaptured.end());
+            rowKeys.push_back(std::move(rowKey));
             instance.rows.push_back(sequentialRowFor(
                 m_field.m_ours,
                 m_field.m_ours.rows[rowIndex],
@@ -753,10 +817,14 @@ namespace Coordinator
                 classIndices[rowIndex]));
         }
 
+        ValuerRowOptionSource rowSource;
+        rowSource.pCache = &m_rowOptionCache;
+        rowSource.pKeys = &rowKeys;
         const SequentialTierResult ours = solveSequentialPacking(
             instance,
             floorOur,
-            SEQUENTIAL_SEARCH_STATE_CAP);
+            SEQUENTIAL_SEARCH_STATE_CAP,
+            &rowSource);
         const MilliFunds enemyBooked =
             enemySequentialOptimum(facts.capturedColumns);
         return owned + ours.bookedValue - enemyBooked;
