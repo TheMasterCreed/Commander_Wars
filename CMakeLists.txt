@@ -1745,6 +1745,8 @@ if (BUILD_TESTING)
         tests/arena/focusfireprobe.h
         tests/arena/actionconstructionprobe.cpp
         tests/arena/actionconstructionprobe.h
+        tests/arena/coordinatedintegrationprobe.cpp
+        tests/arena/coordinatedintegrationprobe.h
         tests/coordinator_ai/damageoracletests.cpp
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
@@ -2059,6 +2061,14 @@ if (BUILD_TESTING)
         ArenaFocusFireExposure tests/arena/fixtures/focus_fire_init.js 300)
     cow_add_arena_probe_test(
         ArenaCoordinatedActionConstruction tests/arena/fixtures/action_construction_init.js 120)
+    cow_add_arena_probe_test(
+        ArenaCoordinatedIntegration tests/arena/fixtures/coordinated_integration_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaCoordinatedPauseGate tests/arena/fixtures/pause_gate_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaCoordinatedFirstFailureReplan tests/arena/fixtures/failure_replan_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaCoordinatedSecondFailureFallback tests/arena/fixtures/failure_fallback_init.js 300)
 
     function(cow_add_coordinated_shell_test testName operationName)
         set(runDir ${CMAKE_CURRENT_BINARY_DIR}/tests/arena/${testName})
