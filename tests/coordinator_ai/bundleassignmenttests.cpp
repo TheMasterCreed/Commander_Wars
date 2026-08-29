@@ -11,6 +11,7 @@ using Coordinator::ActorProgress;
 using Coordinator::ActorResources;
 using Coordinator::AssignmentActor;
 using Coordinator::AssignmentInput;
+using Coordinator::AssignmentResult;
 using Coordinator::AssignmentStats;
 using Coordinator::CandidateBundle;
 using Coordinator::captureComponent;
@@ -18,6 +19,7 @@ using Coordinator::CaptureFacts;
 using Coordinator::fireComponent;
 using Coordinator::FireFacts;
 using Coordinator::KnownUnitLink;
+using Coordinator::MaximumValueAssignment;
 using Coordinator::MilliFunds;
 using Coordinator::NO_ACTION;
 using Coordinator::NO_CANDIDATE;
@@ -151,6 +153,32 @@ std::int32_t addAndClaim(TurnPlan & plan, const AssignmentInput & input, std::in
         Coordinator::claimOrRollback(plan, index, action, candidate);
     }
     return index;
+}
+
+const PlannedAction* actionOf(const AssignmentResult & result, std::int32_t engineUnitId)
+{
+    for (std::int32_t index = 0; index < result.plan.actionCount(); ++index)
+    {
+        if (result.plan.action(index).unitId == engineUnitId)
+        {
+            return &result.plan.action(index);
+        }
+    }
+    return nullptr;
+}
+
+MilliFunds plannedTotal(const AssignmentResult & result)
+{
+    MilliFunds total = 0;
+    for (std::int32_t index = 0; index < result.plan.actionCount(); ++index)
+    {
+        const PlannedAction & action = result.plan.action(index);
+        if (Coordinator::isLiveState(action.state))
+        {
+            total += action.marginalValue.economicValue;
+        }
+    }
+    return total;
 }
 
 void testConversionMapsEngineActionsAndTargets()
@@ -340,6 +368,77 @@ void testActorResourcesExposeTileAndTargetConflicts()
     expect(!Coordinator::actorsContest(attackerResources, independent), "independent resources do not conflict");
 }
 
+AssignmentInput losingFallbackInput()
+{
+    std::vector<CandidateBundle> attacker{
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, BEST_VALUE),
+    };
+    std::vector<CandidateBundle> support{
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, GOOD_VALUE),
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SUPPORT_TILE, LOSING_VALUE),
+    };
+    return inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(attacker)),
+        actorWith(SUPPORT_INDEX, SUPPORT_UNIT, std::move(support)),
+    });
+}
+
+void testSettlingDropsALosingFallback()
+{
+    const AssignmentResult result = MaximumValueAssignment::assign(losingFallbackInput());
+    const PlannedAction* pAttacker = actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport = actionOf(result, SUPPORT_UNIT);
+    expect(pAttacker != nullptr && pAttacker->destination == CONTESTED_TILE, "the winner keeps the tile");
+    expect(pSupport != nullptr && pSupport->state == PlanActionState::Abandoned, "the losing fallback is abandoned");
+    expect(plannedTotal(result) == BEST_VALUE, "settling removes the losing value");
+    expect(result.stats.settlingMoves == 1 && result.stats.settlingSweeps == 2,
+           "one moving sweep has one confirming sweep");
+    expect(result.stats.unassignedUnits == 1, "the stranded actor is unassigned");
+}
+
+AssignmentInput destinationSwapInput()
+{
+    std::vector<CandidateBundle> attacker{
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, BEST_VALUE),
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, SPARE_TILE, GOOD_VALUE),
+    };
+    std::vector<CandidateBundle> support{
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, FAIR_VALUE),
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SUPPORT_TILE, 0),
+    };
+    return inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(attacker)),
+        actorWith(SUPPORT_INDEX, SUPPORT_UNIT, std::move(support)),
+    });
+}
+
+void testPairSearchResolvesADestinationConflict()
+{
+    const AssignmentResult result = MaximumValueAssignment::assign(destinationSwapInput());
+    const PlannedAction* pAttacker = actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport = actionOf(result, SUPPORT_UNIT);
+    expect(pAttacker != nullptr && pAttacker->destination == SPARE_TILE, "the first actor steps aside");
+    expect(pSupport != nullptr && pSupport->destination == CONTESTED_TILE, "the second actor takes the tile");
+    expect(plannedTotal(result) == GOOD_VALUE + FAIR_VALUE, "the pair reaches the better total");
+    expect(result.stats.settlingMoves == 0, "settling alone cannot reach the pair improvement");
+    expect(result.stats.swapImprovements == 1 && result.stats.swapStates > 0, "the exact pair search is reported");
+}
+
+void testPairAssignmentReplaysDeterministically()
+{
+    const AssignmentResult first = MaximumValueAssignment::assign(destinationSwapInput());
+    const AssignmentResult second = MaximumValueAssignment::assign(destinationSwapInput());
+    expect(first.executionOrder == second.executionOrder, "execution order replays");
+    bool same = first.plan.actionCount() == second.plan.actionCount();
+    for (std::int32_t index = 0; index < first.plan.actionCount() && same; ++index)
+    {
+        same = first.plan.action(index).unitId == second.plan.action(index).unitId &&
+               first.plan.action(index).destination == second.plan.action(index).destination &&
+               first.plan.action(index).state == second.plan.action(index).state;
+    }
+    expect(same, "pair assignments replay");
+}
+
 void testTrimmedFireValueUsesOnlyGrantedDamage()
 {
     constexpr FireFacts fire{
@@ -366,6 +465,9 @@ int main()
     testSeatBestClaimableFallsThroughAConflict();
     testReplanRevivesAndCanAbandonAnAction();
     testActorResourcesExposeTileAndTargetConflicts();
+    testSettlingDropsALosingFallback();
+    testPairSearchResolvesADestinationConflict();
+    testPairAssignmentReplaysDeterministically();
     testTrimmedFireValueUsesOnlyGrantedDamage();
     return failures == 0 ? 0 : 1;
 }

@@ -78,6 +78,11 @@ namespace Coordinator
         std::int32_t invalidActions{0};
         std::int32_t vacateConflicts{0};
         std::int32_t unorderedActions{0};
+        std::int32_t settlingSweeps{0};
+        std::int32_t settlingMoves{0};
+        std::int32_t swapImprovements{0};
+        std::int32_t swapStates{0};
+        std::int32_t replayFailures{0};
     };
 
     struct AssignmentResult
@@ -626,4 +631,347 @@ namespace Coordinator
     {
         return sharesTile(left.destinations, right.destinations) || sharesId(left.targets, right.targets);
     }
+
+    struct ConflictEdge
+    {
+        std::int32_t left{NO_UNIT};
+        std::int32_t right{NO_UNIT};
+    };
+
+    inline std::size_t pickBestActor(const std::vector<ActorProgress> & progress)
+    {
+        std::size_t best = progress.size();
+        for (std::size_t slot = 0; slot < progress.size(); ++slot)
+        {
+            if (progress[slot].done)
+            {
+                continue;
+            }
+            if (best == progress.size() || progress[slot].economicValue() > progress[best].economicValue() ||
+                (progress[slot].economicValue() == progress[best].economicValue() &&
+                 progress[slot].pActor->engineUnitId < progress[best].pActor->engineUnitId))
+            {
+                best = slot;
+            }
+        }
+        return best;
+    }
+
+    struct MaximumValueAssignment
+    {
+        static constexpr std::int32_t SETTLING_SWEEP_CAP = 8;
+        static constexpr std::int32_t SWAP_SWEEP_CAP = 4;
+
+        static AssignmentResult assign(const AssignmentInput & input)
+        {
+            AssignmentResult result;
+            std::vector<ActorProgress> actors = prepareActors(input, result.stats);
+            greedyInit(result, actors, input);
+            const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
+            settle(result.plan, input, actors, sweepOrder, result.stats);
+            improveBySwaps(result.plan, input, actors, conflictEdges(actors, sweepOrder), result.stats);
+            finishPlan(result);
+            countAssignments(result.plan, actors, result.stats);
+            return result;
+        }
+
+    private:
+        struct ActorSeat
+        {
+            std::int32_t chosen{NO_CANDIDATE};
+            std::int32_t actionIndex{NO_ACTION};
+            MilliFunds seatedValue{0};
+        };
+
+        struct PairSearch
+        {
+            std::vector<std::int32_t> members;
+            std::vector<std::int32_t> leftOptions;
+            std::vector<std::int32_t> rightOptions;
+            std::int32_t bestLeft{NO_CANDIDATE};
+            std::int32_t bestRight{NO_CANDIDATE};
+            MilliFunds bestTotal{0};
+            bool hasBest{false};
+            std::int32_t states{0};
+        };
+
+        static std::vector<ActorProgress> prepareActors(const AssignmentInput & input, AssignmentStats & stats)
+        {
+            std::vector<ActorProgress> actors;
+            actors.reserve(input.actors.size());
+            for (const AssignmentActor & actor : input.actors)
+            {
+                ActorProgress entry;
+                entry.pActor = &actor;
+                entry.order = plannableCandidateOrder(input.actionIds, input.unitLinks, actor.candidates, stats);
+                entry.options = buildOptionOrder(entry);
+                entry.done = entry.order.empty();
+                actors.push_back(std::move(entry));
+            }
+            return actors;
+        }
+
+        static void greedyInit(AssignmentResult & result, std::vector<ActorProgress> & actors,
+                               const AssignmentInput & input)
+        {
+            while (true)
+            {
+                const std::size_t slot = pickBestActor(actors);
+                if (slot >= actors.size())
+                {
+                    return;
+                }
+                takeBestCandidate(result, actors[slot], input);
+            }
+        }
+
+        static void takeBestCandidate(AssignmentResult & result, ActorProgress & entry, const AssignmentInput & input)
+        {
+            const CandidateBundle & candidate = entry.candidate();
+            const PlannedAction action =
+                plannedActionFrom(input.actionIds, input.unitLinks, entry.pActor->engineUnitId, candidate);
+            ReservationResult claim = ReservationResult::Invalid;
+            if (entry.actionIndex == NO_ACTION)
+            {
+                entry.actionIndex = result.plan.addAction(action);
+                if (entry.actionIndex != NO_ACTION)
+                {
+                    claim = claimOrRollback(result.plan, entry.actionIndex, action, candidate);
+                }
+            }
+            else
+            {
+                claim = installCandidate(result.plan, entry.actionIndex, action, candidate);
+            }
+            if (claim == ReservationResult::Granted)
+            {
+                entry.done = true;
+                entry.chosen = entry.order[entry.cursor];
+                entry.seatedValue = seatedOptionValue(result.plan, entry, entry.chosen);
+                return;
+            }
+            countRejection(result.stats, claim);
+            ++entry.cursor;
+            if (entry.cursor < entry.order.size())
+            {
+                return;
+            }
+            entry.done = true;
+            if (entry.actionIndex != NO_ACTION)
+            {
+                result.plan.markFailed(entry.actionIndex);
+            }
+        }
+
+        static std::vector<std::int32_t> actorSweepOrder(const std::vector<ActorProgress> & actors)
+        {
+            std::vector<std::int32_t> order;
+            order.reserve(actors.size());
+            for (std::size_t slot = 0; slot < actors.size(); ++slot)
+            {
+                order.push_back(static_cast<std::int32_t>(slot));
+            }
+            std::sort(order.begin(), order.end(), ActorIdOrder{&actors});
+            return order;
+        }
+
+        static void settle(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+                           const std::vector<std::int32_t> & sweepOrder, AssignmentStats & stats)
+        {
+            for (std::int32_t sweep = 0; sweep < SETTLING_SWEEP_CAP; ++sweep)
+            {
+                ++stats.settlingSweeps;
+                bool moved = false;
+                for (const std::int32_t slot : sweepOrder)
+                {
+                    ActorProgress & state = actors[static_cast<std::size_t>(slot)];
+                    const MilliFunds previousValue = state.seatedValue;
+                    const std::vector<std::int32_t> options = incumbentFirstOptions(state);
+                    unseatActor(plan, state);
+                    seatBestClaimable(plan, input, state, options);
+                    if (state.seatedValue > previousValue)
+                    {
+                        moved = true;
+                        ++stats.settlingMoves;
+                    }
+                }
+                if (!moved)
+                {
+                    return;
+                }
+            }
+        }
+
+        static std::vector<ConflictEdge> conflictEdges(const std::vector<ActorProgress> & actors,
+                                                       const std::vector<std::int32_t> & sweepOrder)
+        {
+            std::vector<ActorResources> resources;
+            resources.reserve(actors.size());
+            for (const ActorProgress & state : actors)
+            {
+                resources.push_back(actorResourcesOf(state));
+            }
+            std::vector<ConflictEdge> edges;
+            for (std::size_t left = 0; left < sweepOrder.size(); ++left)
+            {
+                for (std::size_t right = left + 1; right < sweepOrder.size(); ++right)
+                {
+                    const std::int32_t leftSlot = sweepOrder[left];
+                    const std::int32_t rightSlot = sweepOrder[right];
+                    if (actorsContest(resources[static_cast<std::size_t>(leftSlot)],
+                                      resources[static_cast<std::size_t>(rightSlot)]))
+                    {
+                        edges.push_back(ConflictEdge{leftSlot, rightSlot});
+                    }
+                }
+            }
+            return edges;
+        }
+
+        static std::vector<ActorSeat> recordSeats(const std::vector<ActorProgress> & actors,
+                                                  const std::vector<std::int32_t> & members)
+        {
+            std::vector<ActorSeat> seats;
+            seats.reserve(members.size());
+            for (const std::int32_t slot : members)
+            {
+                const ActorProgress & state = actors[static_cast<std::size_t>(slot)];
+                seats.push_back(ActorSeat{state.chosen, state.actionIndex, state.seatedValue});
+            }
+            return seats;
+        }
+
+        static void restoreSeats(std::vector<ActorProgress> & actors, const std::vector<std::int32_t> & members,
+                                 const std::vector<ActorSeat> & seats)
+        {
+            for (std::size_t depth = 0; depth < members.size(); ++depth)
+            {
+                ActorProgress & state = actors[static_cast<std::size_t>(members[depth])];
+                state.chosen = seats[depth].chosen;
+                state.actionIndex = seats[depth].actionIndex;
+                state.seatedValue = seats[depth].seatedValue;
+            }
+        }
+
+        static void unseatMembers(TurnPlan & plan, std::vector<ActorProgress> & actors,
+                                  const std::vector<std::int32_t> & members)
+        {
+            for (const std::int32_t slot : members)
+            {
+                unseatActor(plan, actors[static_cast<std::size_t>(slot)]);
+            }
+        }
+
+        static bool searchPair(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+                               const ConflictEdge & edge, AssignmentStats & stats)
+        {
+            PairSearch search;
+            search.members = {edge.left, edge.right};
+            ActorProgress & left = actors[static_cast<std::size_t>(edge.left)];
+            ActorProgress & right = actors[static_cast<std::size_t>(edge.right)];
+            search.leftOptions = incumbentFirstOptions(left);
+            search.rightOptions = incumbentFirstOptions(right);
+            const MilliFunds incumbentTotal = left.seatedValue + right.seatedValue;
+            const TurnPlan snapshot = plan;
+            const std::vector<ActorSeat> seats = recordSeats(actors, search.members);
+            unseatMembers(plan, actors, search.members);
+            for (const std::int32_t leftOption : search.leftOptions)
+            {
+                const SeatOutcome leftOutcome = seatOption(plan, input, left, leftOption);
+                ++search.states;
+                if (leftOutcome.claim != ReservationResult::Granted)
+                {
+                    continue;
+                }
+                for (const std::int32_t rightOption : search.rightOptions)
+                {
+                    const SeatOutcome rightOutcome = seatOption(plan, input, right, rightOption);
+                    ++search.states;
+                    if (rightOutcome.claim == ReservationResult::Granted)
+                    {
+                        const MilliFunds total = leftOutcome.value + rightOutcome.value;
+                        if (!search.hasBest || total > search.bestTotal)
+                        {
+                            search.bestLeft = leftOption;
+                            search.bestRight = rightOption;
+                            search.bestTotal = total;
+                            search.hasBest = true;
+                        }
+                    }
+                    unseatActor(plan, right);
+                }
+                unseatActor(plan, left);
+            }
+            stats.swapStates += search.states;
+            plan = snapshot;
+            restoreSeats(actors, search.members, seats);
+            if (!search.hasBest || search.bestTotal <= incumbentTotal)
+            {
+                return false;
+            }
+            unseatMembers(plan, actors, search.members);
+            const MilliFunds replayed =
+                seatOption(plan, input, left, search.bestLeft).value +
+                seatOption(plan, input, right, search.bestRight).value;
+            if (replayed == search.bestTotal)
+            {
+                return true;
+            }
+            ++stats.replayFailures;
+            plan = snapshot;
+            restoreSeats(actors, search.members, seats);
+            return false;
+        }
+
+        static void improveBySwaps(TurnPlan & plan, const AssignmentInput & input,
+                                   std::vector<ActorProgress> & actors,
+                                   const std::vector<ConflictEdge> & edges, AssignmentStats & stats)
+        {
+            for (std::int32_t sweep = 0; sweep < SWAP_SWEEP_CAP; ++sweep)
+            {
+                bool improved = false;
+                for (const ConflictEdge & edge : edges)
+                {
+                    if (searchPair(plan, input, actors, edge, stats))
+                    {
+                        ++stats.swapImprovements;
+                        improved = true;
+                    }
+                }
+                if (!improved)
+                {
+                    return;
+                }
+            }
+        }
+
+        static void countAssignments(const TurnPlan & plan, const std::vector<ActorProgress> & actors,
+                                     AssignmentStats & stats)
+        {
+            for (const ActorProgress & state : actors)
+            {
+                if (state.actionIndex != NO_ACTION && isLiveState(plan.action(state.actionIndex).state))
+                {
+                    ++stats.assignedUnits;
+                }
+                else
+                {
+                    ++stats.unassignedUnits;
+                }
+            }
+        }
+
+        static void finishPlan(AssignmentResult & result)
+        {
+            for (const VacateConflict & conflict : result.plan.addVacateEdges(planOccupancy(result.plan)))
+            {
+                ++result.stats.vacateConflicts;
+                result.plan.markFailed(conflict.moverAction);
+            }
+            const OrderingResult ordering = result.plan.executionOrder();
+            result.executionOrder = ordering.order;
+            result.stats.unorderedActions =
+                static_cast<std::int32_t>(ordering.cycleMembers.size() + ordering.blockedByCycle.size());
+        }
+    };
 }
