@@ -1,10 +1,13 @@
 #include "ai/coordinator/propertystockbuilder.h"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 #include <QString>
 
 #include "ai/coordinator/battlefieldknowledge.h"
+#include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coreai.h"
@@ -156,30 +159,59 @@ namespace Coordinator
         return m_marginals.emplace(key, std::move(table)).first->second;
     }
 
+    void PropertyStockField::flipColumnForEnemy(PropertyStockInstance & instance,
+                                                std::int32_t flippedColumn) const
+    {
+        const std::size_t columnCount = instance.columns.size();
+        const std::size_t column = static_cast<std::size_t>(flippedColumn);
+        instance.columns[column].ownerBefore = mirroredSign(STOCK_OWNER_AFTER);
+        for (std::size_t row = 0; row < instance.rows.size(); ++row)
+        {
+            const std::size_t offset = row * columnCount + column;
+            const ArrivalFacts arrival{
+                .arrivalActivations = m_enemyArrivals[offset],
+                .carriedPoints = carriedFor(instance.rows[row], flippedColumn),
+                .ratePerTurn = instance.rows[row].captureRate,
+            };
+            instance.weights[offset] = columnWeight(instance.columns[column], arrival,
+                                                    m_capturePointsToCapture, m_horizonTurns);
+        }
+    }
+
     MilliFunds PropertyStockField::enemyOptimumWith(std::int32_t flippedColumn, std::int32_t removedRow)
     {
         PropertyStockInstance instance = m_theirs;
-        const std::size_t columnCount = instance.columns.size();
         if (flippedColumn != NO_STOCK_COLUMN)
         {
-            const std::size_t column = static_cast<std::size_t>(flippedColumn);
-            instance.columns[column].ownerBefore = mirroredSign(STOCK_OWNER_AFTER);
-            for (std::size_t row = 0; row < instance.rows.size(); ++row)
-            {
-                const std::size_t offset = row * columnCount + column;
-                const ArrivalFacts arrival{
-                    .arrivalActivations = m_enemyArrivals[offset],
-                    .carriedPoints = carriedFor(instance.rows[row], flippedColumn),
-                    .ratePerTurn = instance.rows[row].captureRate,
-                };
-                instance.weights[offset] = columnWeight(instance.columns[column], arrival,
-                                                        m_capturePointsToCapture, m_horizonTurns);
-            }
+            flipColumnForEnemy(instance, flippedColumn);
         }
         const AssignmentSubInstance sub = subInstanceWithout(instance, removedRow, NO_STOCK_COLUMN);
         AssignmentSolver solver;
         solver.solve(sub.rowCount, sub.columnCount, sub.weights);
         return solver.optimum();
+    }
+
+    MilliFunds PropertyStockField::jointEnemyOptimum(const std::vector<std::int32_t> & capturedColumns)
+    {
+        if (capturedColumns.empty())
+        {
+            return m_enemyOptimum;
+        }
+        const auto known = m_jointEnemyOptima.find(capturedColumns);
+        if (known != m_jointEnemyOptima.end())
+        {
+            return known->second;
+        }
+        PropertyStockInstance instance = m_theirs;
+        for (const std::int32_t flipped : capturedColumns)
+        {
+            flipColumnForEnemy(instance, flipped);
+        }
+        AssignmentSolver solver;
+        solver.solve(instance.rowCount(), instance.columnCount(), instance.weights);
+        const MilliFunds optimum = solver.optimum();
+        m_jointEnemyOptima.emplace(capturedColumns, optimum);
+        return optimum;
     }
 
     MilliFunds PropertyStockField::enemyOptimum(const PropertyStockOutcome & outcome)
@@ -223,6 +255,141 @@ namespace Coordinator
                                         m_horizonTurns);
         }
         return owned + ourPositionalStock(actor, outcome) - enemyOptimum(outcome);
+    }
+
+    MilliFunds PropertyStockField::jointStock(std::span<const PlanRowAction> actions)
+    {
+        std::vector<std::int32_t> captured;
+        std::vector<std::int32_t> moverRows;
+        std::vector<PropertyStockActor> movers;
+        for (const PlanRowAction & entry : actions)
+        {
+            const PropertyStockRow & row = m_ours.rows[static_cast<std::size_t>(entry.row)];
+            std::int32_t carried = 0;
+            const std::int32_t slot = columnSlotAt(entry.destination);
+            if (slot != NO_STOCK_COLUMN)
+            {
+                carried = carriedFor(row, slot);
+                if (entry.captures)
+                {
+                    carried += row.captureRate;
+                    if (carried >= m_capturePointsToCapture)
+                    {
+                        captured.push_back(slot);
+                    }
+                }
+            }
+            moverRows.push_back(entry.row);
+            movers.push_back(PropertyStockActor{
+                .knowledgeIndex = row.knowledgeIndex,
+                .tile = entry.destination,
+                .movementPoints = row.movementPoints,
+                .carriedCapturePoints = carried,
+                .survival = ActorSurvival::Alive,
+            });
+        }
+        std::sort(captured.begin(), captured.end());
+        captured.erase(std::unique(captured.begin(), captured.end()), captured.end());
+        MilliFunds owned = m_ownedBaseline;
+        for (const std::int32_t column : captured)
+        {
+            owned += ownershipFlipSwing(m_ours.columns[static_cast<std::size_t>(column)], m_horizonTurns);
+        }
+        std::vector<std::int32_t> openColumns;
+        for (std::int32_t column = 0; column < m_ours.columnCount(); ++column)
+        {
+            if (std::find(captured.begin(), captured.end(), column) == captured.end())
+            {
+                openColumns.push_back(column);
+            }
+        }
+        std::vector<MilliFunds> weights;
+        weights.reserve(static_cast<std::size_t>(m_ours.rowCount()) * openColumns.size());
+        for (std::int32_t row = 0; row < m_ours.rowCount(); ++row)
+        {
+            const auto mover = std::find(moverRows.begin(), moverRows.end(), row);
+            if (mover == moverRows.end())
+            {
+                const std::span<const MilliFunds> source = m_ours.weightRow(row);
+                for (const std::int32_t column : openColumns)
+                {
+                    weights.push_back(source[static_cast<std::size_t>(column)]);
+                }
+                continue;
+            }
+            const std::size_t moverSlot = static_cast<std::size_t>(mover - moverRows.begin());
+            const std::vector<MilliFunds> acting = actingWeights(row, movers[moverSlot]);
+            for (const std::int32_t column : openColumns)
+            {
+                weights.push_back(acting[static_cast<std::size_t>(column)]);
+            }
+        }
+        AssignmentSolver solver;
+        solver.solve(m_ours.rowCount(), static_cast<std::int32_t>(openColumns.size()), weights);
+        return owned + solver.optimum() - jointEnemyOptimum(captured);
+    }
+
+    JointPlanStockValuer::JointPlanStockValuer(PropertyStockField & field,
+                                               std::span<const KnownUnitLink> unitLinks)
+        : m_field(field)
+    {
+        for (std::size_t index = 0; index < unitLinks.size(); ++index)
+        {
+            if (unitLinks[index].engineUnitId != NO_UNIT)
+            {
+                m_knowledgeOf.emplace(unitLinks[index].engineUnitId, static_cast<std::int32_t>(index));
+            }
+        }
+    }
+
+    std::int32_t JointPlanStockValuer::rowOf(std::int32_t engineUnitId) const
+    {
+        const auto known = m_knowledgeOf.find(engineUnitId);
+        if (known == m_knowledgeOf.end())
+        {
+            return NO_STOCK_ROW;
+        }
+        return m_field.ourRowOf(known->second);
+    }
+
+    MilliFunds JointPlanStockValuer::planStock(const TurnPlan & plan)
+    {
+        std::vector<PlanRowAction> actions;
+        for (std::int32_t index = 0; index < plan.actionCount(); ++index)
+        {
+            const PlannedAction & action = plan.action(index);
+            if (!isLiveState(action.state))
+            {
+                continue;
+            }
+            const std::int32_t row = rowOf(action.unitId);
+            if (row == NO_STOCK_ROW)
+            {
+                continue;
+            }
+            actions.push_back(PlanRowAction{
+                .row = row,
+                .destination = action.destination,
+                .captures = action.kind == PlanBundleKind::Capture ||
+                            action.kind == PlanBundleKind::MoveAndCapture,
+            });
+        }
+        return m_field.jointStock(actions);
+    }
+
+    MilliFunds JointPlanStockValuer::originStock() const
+    {
+        return m_field.originStock();
+    }
+
+    MilliFunds JointPlanStockValuer::stockCeiling() const
+    {
+        return std::numeric_limits<MilliFunds>::max();
+    }
+
+    bool JointPlanStockValuer::affectsStock(std::int32_t engineUnitId) const
+    {
+        return rowOf(engineUnitId) != NO_STOCK_ROW;
     }
 
     PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,

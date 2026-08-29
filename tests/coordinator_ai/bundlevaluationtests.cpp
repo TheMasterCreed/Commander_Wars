@@ -15,6 +15,7 @@ namespace
     using Coordinator::BundleValuation;
     using Coordinator::captureComponent;
     using Coordinator::CaptureFacts;
+    using Coordinator::capturePropertyContinuation;
     using Coordinator::ContinuationDelta;
     using Coordinator::DEFAULT_CAPITAL_POLICY;
     using Coordinator::DEFAULT_ECONOMIC_RELEVANCE_HORIZON;
@@ -591,26 +592,34 @@ namespace
         const BundleValuation neutralValuation = valueOf(neutral, EXCHANGE_ACTOR, NO_POSITION, horizonTurns);
         const BundleValuation enemyValuation = valueOf(enemy, EXCHANGE_ACTOR, NO_POSITION, horizonTurns);
         const MilliFunds ownedTurns = horizonTurns - TURNS_UNTIL_OWNED;
-        expectAt(neutralValuation.continuation.propertyContinuation == SYMMETRIC_PROPERTY_RATE * ownedTurns,
-                 "the neutral capture pays its owner time stream", horizonTurns);
-        expectAt(enemyValuation.continuation.propertyContinuation == 2 * neutralValuation.continuation.propertyContinuation,
-                 "an enemy capture is exactly twice a neutral one", horizonTurns);
+        expectAt(capturePropertyContinuation(NEUTRAL_CAPTURE, horizonTurns) ==
+                     SYMMETRIC_PROPERTY_RATE * ownedTurns,
+                 "the neutral owner time stream prices by owned turns", horizonTurns);
+        expectAt(capturePropertyContinuation(ENEMY_CAPTURE, horizonTurns) ==
+                     2 * capturePropertyContinuation(NEUTRAL_CAPTURE, horizonTurns),
+                 "an enemy flip is exactly twice a neutral one", horizonTurns);
+        expectAt(neutralValuation.valid && neutralValuation.continuation.propertyContinuation == 0 &&
+                     neutralValuation.value().economicValue == 0,
+                 "joint plan stock carries neutral capture value", horizonTurns);
+        expectAt(enemyValuation.valid && enemyValuation.continuation.propertyContinuation == 0 &&
+                     enemyValuation.value().economicValue == 0,
+                 "joint plan stock carries enemy capture value", horizonTurns);
     }
 
     void testDelayingAnEnemyCaptureOfOursPreservesTwiceTheNeutralDelay(std::int32_t horizonTurns)
     {
-        const ActionBundle ourLossNow = bundleOf({captureComponent(LOSS_OF_OURS_NOW)}, ORIGIN_TILE);
-        const ActionBundle ourLossDelayed = bundleOf({captureComponent(LOSS_OF_OURS_DELAYED)}, ORIGIN_TILE);
-        const ActionBundle neutralLossNow = bundleOf({captureComponent(LOSS_OF_NEUTRAL_NOW)}, ORIGIN_TILE);
-        const ActionBundle neutralLossDelayed = bundleOf({captureComponent(LOSS_OF_NEUTRAL_DELAYED)}, ORIGIN_TILE);
         const MilliFunds oursPreserved =
-            valueOf(ourLossDelayed, EXCHANGE_ACTOR, NO_POSITION, horizonTurns).continuation.propertyContinuation -
-            valueOf(ourLossNow, EXCHANGE_ACTOR, NO_POSITION, horizonTurns).continuation.propertyContinuation;
+            capturePropertyContinuation(LOSS_OF_OURS_DELAYED, horizonTurns) -
+            capturePropertyContinuation(LOSS_OF_OURS_NOW, horizonTurns);
         const MilliFunds neutralPreserved =
-            valueOf(neutralLossDelayed, EXCHANGE_ACTOR, NO_POSITION, horizonTurns).continuation.propertyContinuation -
-            valueOf(neutralLossNow, EXCHANGE_ACTOR, NO_POSITION, horizonTurns).continuation.propertyContinuation;
+            capturePropertyContinuation(LOSS_OF_NEUTRAL_DELAYED, horizonTurns) -
+            capturePropertyContinuation(LOSS_OF_NEUTRAL_NOW, horizonTurns);
         expectAt(neutralPreserved == SYMMETRIC_PROPERTY_RATE, "delaying a neutral capture preserves one turn of income", horizonTurns);
         expectAt(oursPreserved == 2 * neutralPreserved, "delaying an enemy capture of ours preserves exactly twice as much", horizonTurns);
+        const ActionBundle ourLossNow = bundleOf({captureComponent(LOSS_OF_OURS_NOW)}, ORIGIN_TILE);
+        expectAt(valueOf(ourLossNow, EXCHANGE_ACTOR, NO_POSITION, horizonTurns)
+                         .continuation.propertyContinuation == 0,
+                 "capture bundles do not write the legacy continuation field", horizonTurns);
     }
 
     void testKillIsRemainingBookPlusContinuationRemoved(std::int32_t horizonTurns)

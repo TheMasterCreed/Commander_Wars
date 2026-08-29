@@ -1505,6 +1505,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiPropertyStockTests)
 
+    add_executable(CoordinatorAiJointPropertyTests
+        tests/coordinator_ai/jointpropertytests.cpp
+    )
+    target_include_directories(CoordinatorAiJointPropertyTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiJointPropertyTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiJointPropertyTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiJointPropertyTests
+        COMMAND CoordinatorAiJointPropertyTests
+    )
+    cow_set_arena_test_path(CoordinatorAiJointPropertyTests)
+
     add_executable(CoordinatorAiPlanningTypesTests
         tests/coordinator_ai/planningtypestests.cpp
     )

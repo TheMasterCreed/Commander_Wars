@@ -11,6 +11,7 @@
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/bundlevaluation.h"
 #include "ai/coordinator/coordinatorcommon.h"
+#include "ai/coordinator/planstockvaluer.h"
 #include "ai/coordinator/turnplan.h"
 
 namespace Coordinator
@@ -64,7 +65,22 @@ namespace Coordinator
         PlanActionIds actionIds;
         std::vector<KnownUnitLink> unitLinks;
         std::vector<AssignmentActor> actors;
+        PlanStockValuer* pStockValuer{nullptr};
     };
+
+    inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)
+    {
+        if (input.pStockValuer == nullptr)
+        {
+            return 0;
+        }
+        return input.pStockValuer->planStock(plan) - input.pStockValuer->originStock();
+    }
+
+    inline bool stockCoupled(const AssignmentInput & input, std::int32_t engineUnitId)
+    {
+        return input.pStockValuer != nullptr && input.pStockValuer->affectsStock(engineUnitId);
+    }
 
     struct AssignmentStats
     {
@@ -715,7 +731,7 @@ namespace Coordinator
             greedyInit(result, actors, input);
             const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
             settle(result.plan, input, actors, sweepOrder, result.stats);
-            const std::vector<ConflictEdge> edges = conflictEdges(actors, sweepOrder);
+            const std::vector<ConflictEdge> edges = conflictEdges(input, actors, sweepOrder);
             improveBySwaps(result.plan, input, actors, edges, result.stats);
             enumerateClusters(result.plan, input, actors, sweepOrder, edges, result.stats);
             finishPlan(result);
@@ -759,6 +775,7 @@ namespace Coordinator
             std::vector<std::int32_t> current;
             std::vector<std::int32_t> best;
             MilliFunds bestTotal{0};
+            bool stockLive{false};
             bool hasBest{false};
             std::int32_t states{0};
             bool aborted{false};
@@ -844,6 +861,40 @@ namespace Coordinator
             return order;
         }
 
+        static bool settleStockActor(TurnPlan & plan, const AssignmentInput & input, ActorProgress & state)
+        {
+            const std::int32_t previousChosen = state.chosen;
+            const MilliFunds previousValue = state.seatedValue + planStockDelta(input, plan);
+            const std::vector<std::int32_t> options = incumbentFirstOptions(state);
+            unseatActor(plan, state);
+            std::int32_t bestOption = previousChosen;
+            MilliFunds bestValue = previousValue;
+            for (const std::int32_t option : options)
+            {
+                if (option == previousChosen)
+                {
+                    continue;
+                }
+                const SeatOutcome outcome = seatOption(plan, input, state, option);
+                if (outcome.claim != ReservationResult::Granted)
+                {
+                    continue;
+                }
+                const MilliFunds value = outcome.value + planStockDelta(input, plan);
+                unseatActor(plan, state);
+                if (value > bestValue)
+                {
+                    bestOption = option;
+                    bestValue = value;
+                }
+            }
+            if (seatOption(plan, input, state, bestOption).claim != ReservationResult::Granted)
+            {
+                seatBestClaimable(plan, input, state, options);
+            }
+            return state.chosen != previousChosen;
+        }
+
         static void settle(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
                            const std::vector<std::int32_t> & sweepOrder, AssignmentStats & stats)
         {
@@ -854,6 +905,15 @@ namespace Coordinator
                 for (const std::int32_t slot : sweepOrder)
                 {
                     ActorProgress & state = actors[static_cast<std::size_t>(slot)];
+                    if (stockCoupled(input, state.pActor->engineUnitId))
+                    {
+                        if (settleStockActor(plan, input, state))
+                        {
+                            moved = true;
+                            ++stats.settlingMoves;
+                        }
+                        continue;
+                    }
                     const MilliFunds previousValue = state.seatedValue;
                     const std::vector<std::int32_t> options = incumbentFirstOptions(state);
                     unseatActor(plan, state);
@@ -871,14 +931,18 @@ namespace Coordinator
             }
         }
 
-        static std::vector<ConflictEdge> conflictEdges(const std::vector<ActorProgress> & actors,
+        static std::vector<ConflictEdge> conflictEdges(const AssignmentInput & input,
+                                                       const std::vector<ActorProgress> & actors,
                                                        const std::vector<std::int32_t> & sweepOrder)
         {
             std::vector<ActorResources> resources;
+            std::vector<bool> coupled;
             resources.reserve(actors.size());
+            coupled.reserve(actors.size());
             for (const ActorProgress & state : actors)
             {
                 resources.push_back(actorResourcesOf(state));
+                coupled.push_back(stockCoupled(input, state.pActor->engineUnitId));
             }
             std::vector<ConflictEdge> edges;
             for (std::size_t left = 0; left < sweepOrder.size(); ++left)
@@ -887,7 +951,10 @@ namespace Coordinator
                 {
                     const std::int32_t leftSlot = sweepOrder[left];
                     const std::int32_t rightSlot = sweepOrder[right];
-                    if (actorsContest(resources[static_cast<std::size_t>(leftSlot)],
+                    const bool stockPair = coupled[static_cast<std::size_t>(leftSlot)] &&
+                                           coupled[static_cast<std::size_t>(rightSlot)];
+                    if (stockPair ||
+                        actorsContest(resources[static_cast<std::size_t>(leftSlot)],
                                       resources[static_cast<std::size_t>(rightSlot)]))
                     {
                         edges.push_back(ConflictEdge{leftSlot, rightSlot});
@@ -940,7 +1007,13 @@ namespace Coordinator
             ActorProgress & right = actors[static_cast<std::size_t>(edge.right)];
             search.leftOptions = incumbentFirstOptions(left);
             search.rightOptions = incumbentFirstOptions(right);
-            const MilliFunds incumbentTotal = left.seatedValue + right.seatedValue;
+            const bool stockLive = stockCoupled(input, left.pActor->engineUnitId) ||
+                                   stockCoupled(input, right.pActor->engineUnitId);
+            MilliFunds incumbentTotal = left.seatedValue + right.seatedValue;
+            if (stockLive)
+            {
+                incumbentTotal += planStockDelta(input, plan);
+            }
             const TurnPlan snapshot = plan;
             const std::vector<ActorSeat> seats = recordSeats(actors, search.members);
             unseatMembers(plan, actors, search.members);
@@ -968,7 +1041,11 @@ namespace Coordinator
                     ++search.states;
                     if (rightOutcome.claim == ReservationResult::Granted)
                     {
-                        const MilliFunds total = leftOutcome.value + rightOutcome.value;
+                        MilliFunds total = leftOutcome.value + rightOutcome.value;
+                        if (stockLive)
+                        {
+                            total += planStockDelta(input, plan);
+                        }
                         if (!search.hasBest || total > search.bestTotal)
                         {
                             search.bestLeft = leftOption;
@@ -997,9 +1074,14 @@ namespace Coordinator
                 seatOption(plan, input, left, search.bestLeft);
             const SeatOutcome rightReplay =
                 seatOption(plan, input, right, search.bestRight);
+            MilliFunds replayed = leftReplay.value + rightReplay.value;
+            if (stockLive)
+            {
+                replayed += planStockDelta(input, plan);
+            }
             if (leftReplay.claim == ReservationResult::Granted &&
                 rightReplay.claim == ReservationResult::Granted &&
-                leftReplay.value + rightReplay.value == search.bestTotal)
+                replayed == search.bestTotal)
             {
                 return true;
             }
@@ -1112,9 +1194,14 @@ namespace Coordinator
         {
             if (depth == search.members.size())
             {
-                if (!search.hasBest || total > search.bestTotal)
+                MilliFunds value = total;
+                if (search.stockLive)
                 {
-                    search.bestTotal = total;
+                    value += planStockDelta(input, plan);
+                }
+                if (!search.hasBest || value > search.bestTotal)
+                {
+                    search.bestTotal = value;
                     search.best = search.current;
                     search.hasBest = true;
                 }
@@ -1130,7 +1217,7 @@ namespace Coordinator
                     return;
                 }
                 ++search.states;
-                if (search.hasBest &&
+                if (!search.stockLive && search.hasBest &&
                     assignmentUpperBound(total, optionValue(state, option),
                                          search.ceilings[depth + 1]) <= search.bestTotal)
                 {
@@ -1173,6 +1260,10 @@ namespace Coordinator
                 }
                 replayed += outcome.value;
             }
+            if (complete && search.stockLive)
+            {
+                replayed += planStockDelta(input, plan);
+            }
             if (complete && replayed == search.bestTotal)
             {
                 return true;
@@ -1190,7 +1281,19 @@ namespace Coordinator
             ClusterSearch search;
             search.members = members;
             buildSearchOptions(actors, search);
-            const MilliFunds incumbentTotal = seatedTotal(actors, members);
+            for (const std::int32_t slot : members)
+            {
+                if (stockCoupled(input, actors[static_cast<std::size_t>(slot)].pActor->engineUnitId))
+                {
+                    search.stockLive = true;
+                    break;
+                }
+            }
+            MilliFunds incumbentTotal = seatedTotal(actors, members);
+            if (search.stockLive)
+            {
+                incumbentTotal += planStockDelta(input, plan);
+            }
             const TurnPlan snapshot = plan;
             const std::vector<ActorSeat> seats = recordSeats(actors, members);
             unseatMembers(plan, actors, members);

@@ -340,11 +340,6 @@ namespace Coordinator
                 }
                 case ComponentKind::Capture:
                 {
-                    if (!actorAlive)
-                    {
-                        break;
-                    }
-                    result.continuation.propertyContinuation += capturePropertyContinuation(component.capture, context.horizonTurns);
                     break;
                 }
                 case ComponentKind::Service:
