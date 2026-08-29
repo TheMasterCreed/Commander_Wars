@@ -747,6 +747,12 @@ namespace Coordinator
         }
 
     private:
+        enum class SearchPricingMode : std::int8_t
+        {
+            LegacyScalar,
+            PairSwapInterval,
+        };
+
         struct ActorSeat
         {
             std::int32_t chosen{NO_CANDIDATE};
@@ -754,23 +760,11 @@ namespace Coordinator
             MilliFunds seatedValue{0};
         };
 
-        struct PairSearch
-        {
-            std::vector<std::int32_t> members;
-            std::vector<std::int32_t> leftOptions;
-            std::vector<std::int32_t> rightOptions;
-            std::int32_t bestLeft{NO_CANDIDATE};
-            std::int32_t bestRight{NO_CANDIDATE};
-            MilliFunds bestTotal{0};
-            bool hasBest{false};
-            std::int32_t states{0};
-            bool aborted{false};
-        };
-
         struct ExactSearchOutcome
         {
             bool improved{false};
             bool aborted{false};
+            bool liveFailure{false};
             std::int32_t states{0};
         };
 
@@ -780,14 +774,23 @@ namespace Coordinator
             std::vector<std::vector<std::int32_t>> options;
             std::vector<MilliFunds> ceilings;
             std::vector<std::int32_t> current;
-            std::vector<std::int32_t> best;
+            std::vector<std::int32_t> legacyBest;
+            std::vector<std::int32_t> bestFeasiblePlan;
             MilliFunds bestTotal{0};
             bool stockLive{false};
-            MilliFunds propertyCeiling{0};
-            MilliFunds propertyAtStart{0};
+            MilliFunds propertyCeilingInSearchBasis{0};
+            MilliFunds propertyOriginInSearchBasis{0};
+            MilliFunds fixedEconomic{0};
+            MilliFunds incumbentLower{0};
+            MilliFunds bestFeasibleEconomic{0};
             bool hasBest{false};
             std::int32_t states{0};
             bool aborted{false};
+            bool liveFailure{false};
+            SearchPricingMode pricingMode{
+                SearchPricingMode::LegacyScalar
+            };
+            LivePlanStockQuote bestFeasibleQuote;
         };
 
         static std::vector<ActorProgress> prepareActors(const AssignmentInput & input, AssignmentStats & stats)
@@ -1007,103 +1010,13 @@ namespace Coordinator
             }
         }
 
-        static bool searchPair(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
-                               const ConflictEdge & edge, AssignmentStats & stats)
-        {
-            PairSearch search;
-            search.members = {edge.left, edge.right};
-            ActorProgress & left = actors[static_cast<std::size_t>(edge.left)];
-            ActorProgress & right = actors[static_cast<std::size_t>(edge.right)];
-            search.leftOptions = incumbentFirstOptions(left);
-            search.rightOptions = incumbentFirstOptions(right);
-            const bool stockLive = stockCoupled(input, left.pActor->engineUnitId) ||
-                                   stockCoupled(input, right.pActor->engineUnitId);
-            MilliFunds incumbentTotal = left.seatedValue + right.seatedValue;
-            if (stockLive)
-            {
-                incumbentTotal += planStockDelta(input, plan);
-            }
-            const TurnPlan snapshot = plan;
-            const std::vector<ActorSeat> seats = recordSeats(actors, search.members);
-            unseatMembers(plan, actors, search.members);
-            for (const std::int32_t leftOption : search.leftOptions)
-            {
-                if (searchBudgetExhausted(stats, search.states))
-                {
-                    search.aborted = true;
-                    break;
-                }
-                const SeatOutcome leftOutcome = seatOption(plan, input, left, leftOption);
-                ++search.states;
-                if (leftOutcome.claim != ReservationResult::Granted)
-                {
-                    continue;
-                }
-                for (const std::int32_t rightOption : search.rightOptions)
-                {
-                    if (searchBudgetExhausted(stats, search.states))
-                    {
-                        search.aborted = true;
-                        break;
-                    }
-                    const SeatOutcome rightOutcome = seatOption(plan, input, right, rightOption);
-                    ++search.states;
-                    if (rightOutcome.claim == ReservationResult::Granted)
-                    {
-                        MilliFunds total = leftOutcome.value + rightOutcome.value;
-                        if (stockLive)
-                        {
-                            total += planStockDelta(input, plan);
-                        }
-                        if (!search.hasBest || total > search.bestTotal)
-                        {
-                            search.bestLeft = leftOption;
-                            search.bestRight = rightOption;
-                            search.bestTotal = total;
-                            search.hasBest = true;
-                        }
-                    }
-                    unseatActor(plan, right);
-                }
-                unseatActor(plan, left);
-                if (search.aborted)
-                {
-                    break;
-                }
-            }
-            stats.swapStates += search.states;
-            plan = snapshot;
-            restoreSeats(actors, search.members, seats);
-            if (search.aborted || !search.hasBest || search.bestTotal <= incumbentTotal)
-            {
-                return false;
-            }
-            unseatMembers(plan, actors, search.members);
-            const SeatOutcome leftReplay =
-                seatOption(plan, input, left, search.bestLeft);
-            const SeatOutcome rightReplay =
-                seatOption(plan, input, right, search.bestRight);
-            MilliFunds replayed = leftReplay.value + rightReplay.value;
-            if (stockLive)
-            {
-                replayed += planStockDelta(input, plan);
-            }
-            if (leftReplay.claim == ReservationResult::Granted &&
-                rightReplay.claim == ReservationResult::Granted &&
-                replayed == search.bestTotal)
-            {
-                return true;
-            }
-            ++stats.replayFailures;
-            plan = snapshot;
-            restoreSeats(actors, search.members, seats);
-            return false;
-        }
-
         static void improveBySwaps(TurnPlan & plan, const AssignmentInput & input,
                                    std::vector<ActorProgress> & actors,
                                    const std::vector<ConflictEdge> & edges, AssignmentStats & stats)
         {
+            const bool liveIntervals =
+                input.pStockValuer != nullptr &&
+                input.pStockValuer->livePairSwapIntervals();
             for (std::int32_t sweep = 0; sweep < SWAP_SWEEP_CAP; ++sweep)
             {
                 bool improved = false;
@@ -1113,13 +1026,33 @@ namespace Coordinator
                     {
                         return;
                     }
-                    if (searchPair(plan, input, actors, edge, stats))
+                    const std::vector<std::int32_t> pair{
+                        edge.left,
+                        edge.right,
+                    };
+                    const ExactSearchOutcome outcome =
+                        runExactSearch(
+                            plan,
+                            input,
+                            actors,
+                            pair,
+                            NO_CANDIDATE_CAP,
+                            stats,
+                            liveIntervals
+                                ? SearchPricingMode::PairSwapInterval
+                                : SearchPricingMode::LegacyScalar);
+                    stats.swapStates += outcome.states;
+                    if (outcome.improved)
                     {
                         ++stats.swapImprovements;
                         improved = true;
                     }
                 }
-                if (!improved)
+                const bool refined =
+                    liveIntervals &&
+                    input.pStockValuer->refineLiveAtBoundary(
+                        AssignPhase::BetweenSwapSweeps);
+                if (!improved && !refined)
                 {
                     return;
                 }
@@ -1174,13 +1107,34 @@ namespace Coordinator
             return total;
         }
 
-        static void buildSearchOptions(const std::vector<ActorProgress> & actors, ClusterSearch & search)
+        static MilliFunds seatedPlanTotal(
+            const TurnPlan & plan,
+            const std::vector<ActorProgress> & actors)
+        {
+            MilliFunds total = 0;
+            for (const ActorProgress & state : actors)
+            {
+                if (state.actionIndex != NO_ACTION &&
+                    isLiveState(
+                        plan.action(state.actionIndex).state))
+                {
+                    total += state.seatedValue;
+                }
+            }
+            return total;
+        }
+
+        static void buildSearchOptions(
+            const std::vector<ActorProgress> & actors,
+            ClusterSearch & search,
+            std::int32_t candidateCap)
         {
             for (const std::int32_t slot : search.members)
             {
                 const ActorProgress & state = actors[static_cast<std::size_t>(slot)];
                 search.options.push_back(cappedOptions(
-                    incumbentFirstOptions(state), CLUSTER_CANDIDATE_CAP));
+                    incumbentFirstOptions(state),
+                    candidateCap));
             }
             search.ceilings.assign(search.members.size() + 1, 0);
             for (std::size_t depth = search.members.size(); depth > 0; --depth)
@@ -1203,6 +1157,44 @@ namespace Coordinator
         {
             if (depth == search.members.size())
             {
+                if (search.stockLive &&
+                    search.pricingMode ==
+                        SearchPricingMode::PairSwapInterval)
+                {
+                    const MilliFunds economic =
+                        search.fixedEconomic + total;
+                    const LivePlanStockQuote quote =
+                        input.pStockValuer->livePlanStock(
+                            plan,
+                            economic,
+                            true);
+                    if (!quote.valid ||
+                        !quote.lowerWitnessReplays)
+                    {
+                        search.liveFailure = true;
+                        search.aborted = true;
+                        return;
+                    }
+                    const MilliFunds lower =
+                        economic +
+                        quote.stockAbsolute.lower;
+                    const MilliFunds upper =
+                        economic +
+                        quote.stockAbsolute.upper;
+                    if (upper <= search.incumbentLower)
+                    {
+                        return;
+                    }
+                    if (lower > search.incumbentLower)
+                    {
+                        search.bestFeasibleEconomic = economic;
+                        search.bestFeasibleQuote = quote;
+                        search.incumbentLower = lower;
+                        search.bestFeasiblePlan =
+                            search.current;
+                    }
+                    return;
+                }
                 MilliFunds value = total;
                 if (search.stockLive)
                 {
@@ -1211,7 +1203,7 @@ namespace Coordinator
                 if (!search.hasBest || value > search.bestTotal)
                 {
                     search.bestTotal = value;
-                    search.best = search.current;
+                    search.legacyBest = search.current;
                     search.hasBest = true;
                 }
                 return;
@@ -1226,15 +1218,31 @@ namespace Coordinator
                     return;
                 }
                 ++search.states;
-                MilliFunds upper = assignmentUpperBound(
-                    total, optionValue(state, option), search.ceilings[depth + 1]);
-                if (search.stockLive)
-                {
-                    upper = assignmentUpperBound(
-                        total, optionValue(state, option), search.ceilings[depth + 1],
-                        search.propertyCeiling, search.propertyAtStart);
-                }
-                if (search.hasBest && upper <= search.bestTotal)
+                const MilliFunds seatedBase =
+                    search.stockLive &&
+                            search.pricingMode ==
+                                SearchPricingMode::PairSwapInterval
+                        ? search.fixedEconomic + total
+                        : total;
+                const MilliFunds propertyOrigin =
+                    search.pricingMode ==
+                            SearchPricingMode::PairSwapInterval
+                        ? 0
+                        : search.propertyOriginInSearchBasis;
+                const MilliFunds incumbentThreshold =
+                    search.pricingMode ==
+                            SearchPricingMode::PairSwapInterval
+                        ? search.incumbentLower
+                        : search.bestTotal;
+                const MilliFunds upper =
+                    assignmentUpperBound(
+                        seatedBase,
+                        optionValue(state, option),
+                        search.ceilings[depth + 1],
+                        search.propertyCeilingInSearchBasis,
+                        propertyOrigin);
+                if (search.hasBest &&
+                    upper <= incumbentThreshold)
                 {
                     return;
                 }
@@ -1254,6 +1262,63 @@ namespace Coordinator
             }
         }
 
+        static bool replayLiveSolution(
+            TurnPlan & plan,
+            const AssignmentInput & input,
+            std::vector<ActorProgress> & actors,
+            const ClusterSearch & search,
+            const TurnPlan & snapshot,
+            const std::vector<ActorSeat> & seats,
+            AssignmentStats & stats)
+        {
+            unseatMembers(plan, actors, search.members);
+            bool complete = true;
+            for (std::size_t depth = 0;
+                 depth < search.members.size();
+                 ++depth)
+            {
+                ActorProgress & state =
+                    actors[static_cast<std::size_t>(
+                        search.members[depth])];
+                const SeatOutcome outcome =
+                    seatOption(
+                        plan,
+                        input,
+                        state,
+                        search.bestFeasiblePlan[depth]);
+                if (outcome.claim !=
+                    ReservationResult::Granted)
+                {
+                    complete = false;
+                    break;
+                }
+            }
+            const MilliFunds economic =
+                seatedPlanTotal(plan, actors);
+            const LivePlanStockQuote replayed =
+                complete
+                    ? input.pStockValuer->livePlanStock(
+                          plan,
+                          economic,
+                          false)
+                    : LivePlanStockQuote{};
+            if (complete &&
+                replayed.valid &&
+                replayed.lowerWitnessReplays &&
+                replayed.key ==
+                    search.bestFeasibleQuote.key &&
+                economic +
+                        replayed.stockAbsolute.lower ==
+                    search.incumbentLower)
+            {
+                return true;
+            }
+            ++stats.replayFailures;
+            plan = snapshot;
+            restoreSeats(actors, search.members, seats);
+            return false;
+        }
+
         static bool replaySolution(TurnPlan & plan, const AssignmentInput & input,
                                    std::vector<ActorProgress> & actors, const ClusterSearch & search,
                                    const TurnPlan & snapshot, const std::vector<ActorSeat> & seats,
@@ -1267,7 +1332,11 @@ namespace Coordinator
                 ActorProgress & state =
                     actors[static_cast<std::size_t>(search.members[depth])];
                 const SeatOutcome outcome =
-                    seatOption(plan, input, state, search.best[depth]);
+                    seatOption(
+                        plan,
+                        input,
+                        state,
+                        search.legacyBest[depth]);
                 if (outcome.claim != ReservationResult::Granted)
                 {
                     complete = false;
@@ -1291,35 +1360,136 @@ namespace Coordinator
 
         static ExactSearchOutcome runExactSearch(
             TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
-            const std::vector<std::int32_t> & members, AssignmentStats & stats)
+            const std::vector<std::int32_t> & members,
+            std::int32_t candidateCap,
+            AssignmentStats & stats,
+            SearchPricingMode pricingMode)
         {
             ClusterSearch search;
             search.members = members;
-            buildSearchOptions(actors, search);
+            search.pricingMode = pricingMode;
+            buildSearchOptions(actors, search, candidateCap);
             for (const std::int32_t slot : members)
             {
                 if (stockCoupled(input, actors[static_cast<std::size_t>(slot)].pActor->engineUnitId))
                 {
                     search.stockLive = true;
-                    search.propertyCeiling = input.pStockValuer->stockCeiling();
-                    search.propertyAtStart = input.pStockValuer->originStock();
+                    search.propertyCeilingInSearchBasis =
+                        input.pStockValuer->stockCeiling();
                     break;
                 }
             }
+            const bool liveIntervals =
+                search.stockLive &&
+                pricingMode ==
+                    SearchPricingMode::PairSwapInterval;
             MilliFunds incumbentTotal = seatedTotal(actors, members);
-            if (search.stockLive)
-            {
-                incumbentTotal += planStockDelta(input, plan);
-            }
             const TurnPlan snapshot = plan;
             const std::vector<ActorSeat> seats = recordSeats(actors, members);
+            std::vector<std::int32_t> incumbentChoices;
+            incumbentChoices.reserve(seats.size());
+            for (const ActorSeat & seat : seats)
+            {
+                incumbentChoices.push_back(seat.chosen);
+            }
+            if (liveIntervals)
+            {
+                search.bestFeasibleEconomic =
+                    seatedPlanTotal(plan, actors);
+                search.bestFeasibleQuote =
+                    input.pStockValuer->livePlanStock(
+                        plan,
+                        search.bestFeasibleEconomic,
+                        false);
+                if (!search.bestFeasibleQuote.valid ||
+                    !search.bestFeasibleQuote
+                         .lowerWitnessReplays)
+                {
+                    ExactSearchOutcome fallback =
+                        runExactSearch(
+                            plan,
+                            input,
+                            actors,
+                            members,
+                            candidateCap,
+                            stats,
+                            SearchPricingMode::LegacyScalar);
+                    fallback.liveFailure = true;
+                    return fallback;
+                }
+                search.bestFeasiblePlan = incumbentChoices;
+                search.incumbentLower =
+                    search.bestFeasibleEconomic +
+                    search.bestFeasibleQuote
+                        .stockAbsolute.lower;
+                search.hasBest = true;
+            }
+            else if (search.stockLive)
+            {
+                search.propertyOriginInSearchBasis =
+                    input.pStockValuer->originStock();
+                incumbentTotal += planStockDelta(input, plan);
+            }
             unseatMembers(plan, actors, members);
+            search.fixedEconomic =
+                seatedPlanTotal(plan, actors);
             searchCluster(plan, input, actors, search, 0, 0, stats);
             ExactSearchOutcome outcome;
             outcome.states = search.states;
             outcome.aborted = search.aborted;
+            outcome.liveFailure = search.liveFailure;
             plan = snapshot;
             restoreSeats(actors, members, seats);
+            if (liveIntervals)
+            {
+                if (search.liveFailure)
+                {
+                    ExactSearchOutcome fallback =
+                        runExactSearch(
+                            plan,
+                            input,
+                            actors,
+                            members,
+                            candidateCap,
+                            stats,
+                            SearchPricingMode::LegacyScalar);
+                    fallback.states += outcome.states;
+                    fallback.liveFailure = true;
+                    return fallback;
+                }
+                if (search.aborted ||
+                    !search.hasBest ||
+                    search.bestFeasiblePlan ==
+                        incumbentChoices)
+                {
+                    return outcome;
+                }
+                outcome.improved =
+                    replayLiveSolution(
+                        plan,
+                        input,
+                        actors,
+                        search,
+                        snapshot,
+                        seats,
+                        stats);
+                if (outcome.improved)
+                {
+                    return outcome;
+                }
+                ExactSearchOutcome fallback =
+                    runExactSearch(
+                        plan,
+                        input,
+                        actors,
+                        members,
+                        candidateCap,
+                        stats,
+                        SearchPricingMode::LegacyScalar);
+                fallback.states += outcome.states;
+                fallback.liveFailure = true;
+                return fallback;
+            }
             if (search.aborted || !search.hasBest || search.bestTotal <= incumbentTotal)
             {
                 return outcome;
@@ -1358,7 +1528,14 @@ namespace Coordinator
                     continue;
                 }
                 const ExactSearchOutcome outcome =
-                    runExactSearch(plan, input, actors, members, stats);
+                    runExactSearch(
+                        plan,
+                        input,
+                        actors,
+                        members,
+                        CLUSTER_CANDIDATE_CAP,
+                        stats,
+                        SearchPricingMode::LegacyScalar);
                 stats.enumerationStates += outcome.states;
                 if (outcome.aborted)
                 {

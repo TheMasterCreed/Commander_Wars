@@ -366,6 +366,15 @@ void verifyPropertyBounds(const PropertyBoundInstance & instance, std::size_t de
             instance, depth + 1, seated + option.value, choices, taken, atStart);
         expect(bound >= exact,
                "property ceiling bound dominates every reachable completion");
+        constexpr MilliFunds FIXED_ECONOMIC = 137;
+        const MilliFunds liveBound = assignmentUpperBound(
+            FIXED_ECONOMIC + seated,
+            option.value,
+            remainingCeiling(instance.base, depth + 1),
+            ceiling,
+            0);
+        expect(liveBound >= FIXED_ECONOMIC + exact + atStart,
+               "absolute interval bound dominates every reachable completion");
         ++nodes;
         verifyPropertyBounds(instance, depth + 1, seated + option.value,
                              choices, taken, ceiling, atStart, nodes);

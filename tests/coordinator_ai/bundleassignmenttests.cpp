@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <utility>
@@ -13,6 +14,7 @@ using Coordinator::AssignmentActor;
 using Coordinator::AssignmentInput;
 using Coordinator::AssignmentResult;
 using Coordinator::AssignmentStats;
+using Coordinator::AssignPhase;
 using Coordinator::CandidateBundle;
 using Coordinator::captureComponent;
 using Coordinator::CaptureFacts;
@@ -24,10 +26,12 @@ using Coordinator::MilliFunds;
 using Coordinator::NO_ACTION;
 using Coordinator::NO_CANDIDATE;
 using Coordinator::PlanActionIds;
+using Coordinator::PlanStockValuer;
 using Coordinator::PlanActionState;
 using Coordinator::PlanBundleKind;
 using Coordinator::PlannedAction;
 using Coordinator::ReservationResult;
+using Coordinator::StockInterval;
 using Coordinator::TilePoint;
 using Coordinator::TurnPlan;
 
@@ -67,6 +71,130 @@ void expect(bool condition, const char* description)
         ++failures;
     }
 }
+
+enum class IntervalFailure
+{
+    None,
+    IncumbentWitness,
+    LeafQuote,
+    ReplayQuote,
+};
+
+class PairIntervalValuer final : public PlanStockValuer
+{
+public:
+    explicit PairIntervalValuer(IntervalFailure failure)
+        : m_failure(failure)
+    {
+    }
+
+    MilliFunds planStock(const TurnPlan &) override
+    {
+        ++scalarCalls;
+        return 0;
+    }
+
+    MilliFunds originStock() const override
+    {
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        return 0;
+    }
+
+    bool affectsStock(std::int32_t) const override
+    {
+        return true;
+    }
+
+    bool livePairSwapIntervals() const override
+    {
+        return true;
+    }
+
+    Coordinator::LivePlanStockQuote livePlanStock(
+        const TurnPlan & plan,
+        MilliFunds,
+        bool pricingLeaf) override
+    {
+        Coordinator::LivePlanStockQuote quote;
+        if (pricingLeaf)
+        {
+            ++liveLeaves;
+            if (m_failure == IntervalFailure::LeafQuote &&
+                !m_failed)
+            {
+                m_failed = true;
+                return quote;
+            }
+        }
+        else
+        {
+            ++nonLeafQuotes;
+            if (m_failure ==
+                    IntervalFailure::IncumbentWitness &&
+                !m_failed)
+            {
+                m_failed = true;
+                quote.valid = true;
+                return quote;
+            }
+        }
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action = plan.action(index);
+            if (!Coordinator::isLiveState(action.state))
+            {
+                continue;
+            }
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::fromAction(
+                    action.unitId,
+                    action.destination.x,
+                    action.destination.y,
+                    false));
+        }
+        std::sort(quote.key.begin(), quote.key.end());
+        if (!pricingLeaf &&
+            m_failure == IntervalFailure::ReplayQuote &&
+            nonLeafQuotes == 2)
+        {
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::fromAction(
+                    -1,
+                    -1,
+                    -1,
+                    false));
+        }
+        quote.stockAbsolute = StockInterval{0, 0};
+        quote.valid = true;
+        quote.lowerWitnessReplays = true;
+        return quote;
+    }
+
+    bool refineLiveAtBoundary(AssignPhase phase) override
+    {
+        ++refinementBoundaries;
+        wrongRefinementPhase =
+            wrongRefinementPhase ||
+            phase != AssignPhase::BetweenSwapSweeps;
+        return false;
+    }
+
+    std::int32_t scalarCalls{0};
+    std::int32_t liveLeaves{0};
+    std::int32_t nonLeafQuotes{0};
+    std::int32_t refinementBoundaries{0};
+    bool wrongRefinementPhase{false};
+
+private:
+    IntervalFailure m_failure;
+    bool m_failed{false};
+};
 
 PlanActionIds testActionIds()
 {
@@ -428,6 +556,74 @@ void testPairSearchResolvesADestinationConflict()
     expect(result.stats.swapImprovements == 1 && result.stats.swapStates > 0, "the exact pair search is reported");
 }
 
+bool isExpectedSwap(const AssignmentResult & result)
+{
+    const PlannedAction* pAttacker =
+        actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport =
+        actionOf(result, SUPPORT_UNIT);
+    return
+        pAttacker != nullptr &&
+        pAttacker->destination == SPARE_TILE &&
+        pSupport != nullptr &&
+        pSupport->destination == CONTESTED_TILE &&
+        plannedTotal(result) == GOOD_VALUE + FAIR_VALUE;
+}
+
+void testPairIntervalsPreserveExactAssignment()
+{
+    PairIntervalValuer valuer(IntervalFailure::None);
+    AssignmentInput input = destinationSwapInput();
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    expect(isExpectedSwap(result),
+           "exact pair intervals preserve the scalar assignment");
+    expect(valuer.liveLeaves > 0 &&
+               valuer.nonLeafQuotes >= 2,
+           "pair search prices leaves and replays its winner");
+    expect(valuer.refinementBoundaries > 0 &&
+               !valuer.wrongRefinementPhase,
+           "refinement runs only between swap sweeps");
+}
+
+void testPairIntervalFailuresFallBackExactly()
+{
+    PairIntervalValuer exact(IntervalFailure::None);
+    AssignmentInput exactInput = destinationSwapInput();
+    exactInput.pStockValuer = &exact;
+    MaximumValueAssignment::assign(exactInput);
+
+    std::int32_t exactFallbacks = 0;
+    const std::vector<IntervalFailure> failures{
+        IntervalFailure::IncumbentWitness,
+        IntervalFailure::LeafQuote,
+        IntervalFailure::ReplayQuote,
+    };
+    for (const IntervalFailure failure : failures)
+    {
+        PairIntervalValuer valuer(failure);
+        AssignmentInput input = destinationSwapInput();
+        input.pStockValuer = &valuer;
+        const AssignmentResult result =
+            MaximumValueAssignment::assign(input);
+        expect(isExpectedSwap(result),
+               "live failure preserves the scalar winner");
+        if (valuer.scalarCalls > exact.scalarCalls)
+        {
+            ++exactFallbacks;
+        }
+        if (failure == IntervalFailure::ReplayQuote)
+        {
+            expect(result.stats.replayFailures > 0,
+                   "winner replay mismatch is detected");
+        }
+    }
+    expect(exactFallbacks ==
+               static_cast<std::int32_t>(failures.size()),
+           "each live failure performs an exact scalar fallback");
+}
+
 void testPairAssignmentReplaysDeterministically()
 {
     const AssignmentResult first = MaximumValueAssignment::assign(destinationSwapInput());
@@ -594,6 +790,8 @@ int main()
     testActorResourcesExposeTileAndTargetConflicts();
     testSettlingDropsALosingFallback();
     testPairSearchResolvesADestinationConflict();
+    testPairIntervalsPreserveExactAssignment();
+    testPairIntervalFailuresFallBackExactly();
     testPairAssignmentReplaysDeterministically();
     testTrimmedFireValueUsesOnlyGrantedDamage();
     testClusterSearchFindsTheThreeActorImprovement();
