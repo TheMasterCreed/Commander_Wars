@@ -279,6 +279,7 @@ SCENARIO_ASSERTIONS = {
         "discovery-custom-contract",
         "discovery-factory-available",
         "discovery-funds-availability",
+        "discovery-future-legality",
         "discovery-modified-cost",
         "discovery-nest-available",
         "discovery-non-unit-menu",
@@ -301,11 +302,22 @@ SCENARIO_ASSERTIONS = {
         "planner-carrier-needs-ground-cargo",
         "planner-cheapest-floors-first",
         "planner-counter-buys-better-now",
+        "planner-counter-explicit-future-legality",
+        "planner-counter-future-legal-unaffordable",
+        "planner-counter-ground-aa-turn-saturation",
         "planner-counter-heavy-remains-valid",
+        "planner-counter-indirect-turn-saturation",
+        "planner-counter-plan-order-invariant",
+        "planner-counter-relevant-future-coverage",
         "planner-counter-saving-cases",
+        "planner-counter-shared-future-budget",
+        "planner-coverage-before-defense",
         "planner-cross-type-indirect-saturation",
+        "planner-canonical-ferry-modifiers",
         "planner-deferred-selection",
         "planner-deployment-unknown-fallback",
+        "planner-deployment-order-independent",
+        "planner-deployment-turn-boundaries",
         "planner-deterministic-state",
         "planner-disabled-candidate-revival",
         "planner-duplicate-demand-survives",
@@ -319,10 +331,12 @@ SCENARIO_ASSERTIONS = {
         "planner-ferry-hulls-capped",
         "planner-ferry-outranks-counter",
         "planner-ferry-saving-cases",
+        "planner-fighter-aa-specialist",
         "planner-floor-ground-capturers-only",
         "planner-floor-ignores-affordability",
         "planner-free-budget-isolation",
         "planner-global-rng-isolation",
+        "planner-ground-aa-quota",
         "planner-handled-skip",
         "planner-indirect-setup-delay",
         "planner-late-rescan-baseline",
@@ -330,6 +344,11 @@ SCENARIO_ASSERTIONS = {
         "planner-max-indirect-cap",
         "planner-modified-cost",
         "planner-negative-scorer-skip",
+        "planner-negative-cost-ordering",
+        "planner-offense-duplicate-composition-slots",
+        "planner-offense-fourth-enters-top-three",
+        "planner-offense-neutral-gap-reconstruction",
+        "planner-offense-phantoms-one-slot",
         "planner-ordinary-rescan-unlocks",
         "planner-player-isolation",
         "planner-phase-action-validation",
@@ -346,6 +365,7 @@ SCENARIO_ASSERTIONS = {
         "planner-terrain-aware-deployment",
         "planner-terminal-live-failure",
         "planner-turn-one-capturer-precedence",
+        "planner-third-indirect-penalty",
         "planner-unaffordable-candidate-order",
         "planner-unsupported-fallback",
         "planner-urgent-ferry-precedence",
@@ -466,8 +486,8 @@ def test_counterpoint_strategy_resources_are_isolated_and_system_scoped() -> Non
         assert re.search(rf"\b{re.escape(field)}\b", strategy_source)
 
     assert "PLANNER_STATE_VARIABLE_ID : \"COUNTERPOINT_STATE\"" in strategy_source
-    assert re.search(r"\bSTRATEGY_VERSION\s*:\s*14\b", strategy_source)
-    assert re.search(r"\bPLANNER_STATE_SCHEMA_VERSION\s*:\s*2\b", strategy_source)
+    assert re.search(r"\bSTRATEGY_VERSION\s*:\s*16\b", strategy_source)
+    assert re.search(r"\bPLANNER_STATE_SCHEMA_VERSION\s*:\s*4\b", strategy_source)
     assert "_loadPlannerState" in strategy_source
     assert "_savePlannerState" in strategy_source
     assert "readDataListString" in strategy_source
@@ -661,8 +681,12 @@ def test_rule_selection_exposes_the_ai_behavior_setting() -> None:
     assert "RuleSelectionScript.setAiBehaviorValue(input);" in block
     # In-game Rules must stay read-only.
     assert "<enabled>currentMenu.getRuleChangeEabled()</enabled>" in block
-    # Placed in the Gameplay tab, which precedes the Fog tab in the tabbed layout.
-    assert rules_xml.index('"gameplay"') < rules_xml.index("AI behavior:") < rules_xml.index("Fog of war:")
+    ai_tab = re.search(
+        r'<Tab>\s*<name>"ai"</name>(?:(?!</Tab>).)*?AI behavior:.*?</Tab>',
+        rules_xml,
+        re.S,
+    )
+    assert ai_tab is not None, "AI behavior selector is outside the AI tab"
 
     for helper in ("getAiBehaviorRule", "getAiBehaviorValue", "setAiBehaviorValue"):
         assert re.search(rf"\b{helper}\s*:\s*function\b", rules_script)

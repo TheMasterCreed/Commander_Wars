@@ -985,31 +985,46 @@ var CounterpointCharacterization =
         scoringContext.ownCoverage[STRATEGY_ENEMY_ID] = 0;
         var contextBefore = JSON.stringify(scoringContext);
         counter.cost = 1;
-        var counterScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        var counterScore = COUNTERPOINTAI._evaluateStaticCombat(
             counter,
             [enemy],
             scoringContext
-        );
+        ).baseCombatScore;
         counter.cost = STRATEGY_IGNORED_TRANSACTION_COST;
-        var repeatedCounterScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        var repeatedCounterScore = COUNTERPOINTAI._evaluateStaticCombat(
             counter,
             [enemy],
             scoringContext
-        );
-        var nullSafeCounterScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        ).baseCombatScore;
+        var nullSafeCounterScore = COUNTERPOINTAI._evaluateStaticCombat(
             counter,
             [null, enemy, undefined],
             scoringContext
-        );
-        var weakScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        ).baseCombatScore;
+        var weakScore = COUNTERPOINTAI._evaluateStaticCombat(
             weak,
             [enemy],
             scoringContext
-        );
-        var secondWeakScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        ).baseCombatScore;
+        var secondWeakScore = COUNTERPOINTAI._evaluateStaticCombat(
             secondWeak,
             [enemy],
             scoringContext
+        ).baseCombatScore;
+        counter.purchaseUtility = COUNTERPOINTAI._purchaseUtility(
+            counterScore,
+            counter.strategicValue,
+            counter
+        );
+        weak.purchaseUtility = COUNTERPOINTAI._purchaseUtility(
+            weakScore,
+            weak.strategicValue,
+            weak
+        );
+        secondWeak.purchaseUtility = COUNTERPOINTAI._purchaseUtility(
+            secondWeakScore,
+            secondWeak.strategicValue,
+            secondWeak
         );
         var contributions = [
             1,
@@ -1119,16 +1134,16 @@ var CounterpointCharacterization =
             ),
             tankFerryStats : { tanks : 0, capacity : 0 }
         };
-        var dilutionAloneScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        var dilutionAloneScore = COUNTERPOINTAI._evaluateStaticCombat(
             dilutionTarget,
             [dilutionCounter],
             dilutionAloneContext
-        );
-        var dilutionChaffScore = COUNTERPOINTAI._scoreUnitAgainstEnemies(
+        ).baseCombatScore;
+        var dilutionChaffScore = COUNTERPOINTAI._evaluateStaticCombat(
             dilutionTarget,
             [dilutionCounter, dilutionChaff],
             dilutionChaffContext
-        );
+        ).baseCombatScore;
         CounterpointCharacterization.assertValue(
             isFinite(dilutionAloneScore) && isFinite(dilutionChaffScore) &&
                 dilutionChaffScore <= dilutionAloneScore,
@@ -1678,6 +1693,8 @@ var CounterpointCharacterization =
         var transactionCosts = data.getTransactionCosts();
         var strategicValues = data.getStrategicValues();
         var enabledList = data.getEnabledList();
+        var legalIgnoringFundsList =
+            data.getLegalIgnoringFundsList();
         var snapshot =
         {
             x : data.getX(),
@@ -1687,7 +1704,8 @@ var CounterpointCharacterization =
             unitIds : [],
             transactionCosts : [],
             strategicValues : [],
-            enabledList : []
+            enabledList : [],
+            legalIgnoringFundsList : []
         };
         for (var index = 0; index < unitIds.length; ++index)
         {
@@ -1695,6 +1713,9 @@ var CounterpointCharacterization =
             snapshot.transactionCosts.push(transactionCosts[index]);
             snapshot.strategicValues.push(strategicValues[index]);
             snapshot.enabledList.push(enabledList[index]);
+            snapshot.legalIgnoringFundsList.push(
+                legalIgnoringFundsList[index]
+            );
         }
         CounterpointCharacterization.assertValue(
             snapshot.x === DISCOVERY_X &&
@@ -1706,7 +1727,8 @@ var CounterpointCharacterization =
             unitIds.length > 0 &&
                 unitIds.length === transactionCosts.length &&
                 transactionCosts.length === strategicValues.length &&
-                strategicValues.length === enabledList.length,
+                strategicValues.length === enabledList.length &&
+                enabledList.length === legalIgnoringFundsList.length,
             actionId + "-vectors"
         );
         return snapshot;
@@ -1894,19 +1916,25 @@ var CounterpointCharacterization =
             transactionCost : transactionCost,
             strategicValue : Math.max(1, transactionCost),
             enabled : true,
+            legalIgnoringFunds : true,
             domain : COUNTERPOINTAI.DOMAIN_GROUND,
             canCapture : canCapture,
             isTransporter : false,
-            isAA : false,
+            isAASpecialist : false,
+            countsTowardAATarget : false,
             isIndirect : false,
-            isDirectCombat : !canCapture,
             canTransportTank : false,
+            isGroundFerry : false,
+            ferryCapacity : 0,
             indirectStacked : false,
             turnOnePriority : false,
             urgentFerry : false,
-            movement : 0,
             intrinsicMobilityFactor : 1,
             baseCombatScore : canCapture ? 0 : 1,
+            staticDefenseScore : 0,
+            staticRawDefenseScore : 0,
+            staticCombatFactor : 1,
+            offenseProfile : [],
             coverageProfile : [],
             airCoverageDelta : 0,
             deploymentTurns : 0,
@@ -2268,6 +2296,11 @@ var CounterpointCharacterization =
             false
         );
         weak.baseCombatScore = weakDamage;
+        weak.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : weakDamage
+        }];
         weak.coverageProfile = [{
             threatIndex : 0,
             coverageDelta : weakDamage,
@@ -2279,6 +2312,11 @@ var CounterpointCharacterization =
             false
         );
         strong.baseCombatScore = PLANNER_COUNTER_STRONG_DAMAGE;
+        strong.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : PLANNER_COUNTER_STRONG_DAMAGE
+        }];
         strong.coverageProfile = [{
             threatIndex : 0,
             coverageDelta : PLANNER_COUNTER_STRONG_DAMAGE,
@@ -2290,6 +2328,11 @@ var CounterpointCharacterization =
             false
         );
         elite.baseCombatScore = PLANNER_COUNTER_ELITE_DAMAGE;
+        elite.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : PLANNER_COUNTER_ELITE_DAMAGE
+        }];
         elite.coverageProfile = [{
             threatIndex : 0,
             coverageDelta : PLANNER_COUNTER_ELITE_DAMAGE,
@@ -2319,13 +2362,7 @@ var CounterpointCharacterization =
             ownCoverage : ownCoverage,
             baseline : {
                 fieldedCounts : [],
-                fieldedRoles : {
-                    indirect : 0,
-                    antiAir : 0,
-                    directCombat : 0,
-                    capture : 0,
-                    transport : 0
-                },
+                fieldedRoles : { indirect : 0 },
                 threats : [{
                     key : "1:counter-enemy-tank",
                     id : "counter-enemy-tank",
@@ -2335,7 +2372,9 @@ var CounterpointCharacterization =
                 }],
                 baseAirCoverage : 0,
                 airNeed : 0,
-                attackAirShare : 0
+                attackAirShare : 0,
+                tankFerryTanks : 0,
+                tankFerryCapacity : 0
             }
         };
     },
@@ -2465,6 +2504,8 @@ var CounterpointCharacterization =
         );
         var elite = context.plans[0].candidates[2];
         elite.baseCombatScore = PLANNER_COUNTER_FERRY_ELITE_SCORE;
+        elite.offenseProfile[0].offensiveContribution =
+            PLANNER_COUNTER_FERRY_ELITE_SCORE;
         elite.coverageProfile[0].coverageDelta =
             PLANNER_COUNTER_FERRY_ELITE_SCORE;
         var projected = CounterpointCharacterization.plannerCounterProjected(context);
@@ -2635,17 +2676,13 @@ var CounterpointCharacterization =
     {
         return {
             fieldedCounts : [],
-            fieldedRoles : {
-                indirect : 0,
-                antiAir : 0,
-                directCombat : 0,
-                capture : 0,
-                transport : 0
-            },
+            fieldedRoles : { indirect : 0 },
             threats : [],
             baseAirCoverage : 0,
             airNeed : 0,
-            attackAirShare : 0
+            attackAirShare : 0,
+            tankFerryTanks : 0,
+            tankFerryCapacity : 0
         };
     },
 
@@ -3287,7 +3324,6 @@ var CounterpointCharacterization =
             cost,
             candidate
         );
-        candidate.movement = 5;
         return candidate;
     },
 
@@ -3321,9 +3357,8 @@ var CounterpointCharacterization =
     plannerAirBaseline : function(airNeed)
     {
         var baseline = CounterpointCharacterization.plannerTestBaseline();
-        baseline.fieldedCounts = [{ id : "fighter-like", count : 1 }];
         baseline.threats = [{
-            key : "1:air-threat",
+            key : "#air-threat",
             id : "air-threat",
             need : airNeed,
             baseCoverage : 0,
@@ -3334,31 +3369,625 @@ var CounterpointCharacterization =
         return baseline;
     },
 
-    plannerAirCandidate : function(score, airCoverage)
+    plannerClassifiedAACandidate : function(id, domain, indirect,
+                                            score, airCoverage)
     {
         var candidate = CounterpointCharacterization.plannerMarginalCandidate(
-            "fighter-like",
+            id,
             10000,
             score
         );
-        candidate.isAA = true;
-        candidate.airCoverageDelta = airCoverage;
+        candidate.domain = domain;
+        var data = CounterpointCharacterization.makeStrategyDescriptor(
+            id,
+            domain,
+            10000,
+            5,
+            indirect ? 2 : 1,
+            indirect ? 3 : 1
+        );
+        data.maxDamageVsAir = 100;
+        data.armoredDamage = 0;
+        data.damageById["air-threat"] = 100;
+        data.hasAttackWeapon = true;
+        data.hasDirectChannel = !indirect;
+        data.hasIndirectChannel = indirect;
+        candidate.scoreData = data;
+        var plan = CounterpointCharacterization.plannerTestPlan(
+            "aa-classification-" + id,
+            10000,
+            candidate
+        );
+        var enemy = CounterpointCharacterization.makeStrategyDescriptor(
+            "air-threat",
+            COUNTERPOINTAI.DOMAIN_AIR,
+            10000,
+            5,
+            1,
+            1
+        );
+        enemy.hpSum = 1;
+        enemy.hasAttackWeapon = true;
+        var context = {
+            enemyComposition : [enemy],
+            threatProfile : COUNTERPOINTAI._analyzeEnemyComp([enemy]),
+            phantomThreats : [],
+            phantomAirPresent : false,
+            indirectRangeDeltas : {},
+            banIndirects : false,
+            groundCarriers : {},
+            islandMode : false,
+            ferry : null,
+            staticThreats : [{
+                key : "#air-threat",
+                id : "air-threat",
+                need : 100,
+                baseCoverage : 0,
+                isAirThreat : true
+            }],
+            staticThreatIndexes : { "#air-threat" : 0 },
+            deploymentSystem : null,
+            deploymentMap : null,
+            deploymentEnemies : [],
+            deploymentQueries : 0,
+            deploymentCache : Object.create(null),
+            deploymentTargetCache : Object.create(null)
+        };
+        var state = CounterpointCharacterization.plannerTestState([plan]);
+        state.dynamicBaseline =
+            CounterpointCharacterization.plannerAirBaseline(100);
+        COUNTERPOINTAI._scorePlanCandidates(
+            [plan],
+            context,
+            2,
+            COUNTERPOINTAI._projectedTurnContext(state)
+        );
+        candidate.baseCombatScore = score;
+        candidate.staticDefenseScore = 0;
+        candidate.staticRawDefenseScore = 0;
+        candidate.staticCombatFactor = 1;
+        candidate.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : score
+        }];
         candidate.coverageProfile = [{
             threatIndex : 0,
             coverageDelta : airCoverage,
             staticWeight : 1
         }];
+        candidate.airCoverageDelta = airCoverage;
         return candidate;
+    },
+
+    plannerAAClassificationRegressions : function()
+    {
+        var fighter =
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "fighter-like",
+                COUNTERPOINTAI.DOMAIN_AIR,
+                false,
+                100,
+                100
+            );
+        var missile =
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "missile-like",
+                COUNTERPOINTAI.DOMAIN_GROUND,
+                true,
+                100,
+                100
+            );
+        var shortBaseline =
+            CounterpointCharacterization.plannerAirBaseline(100);
+        var coveredBaseline = JSON.parse(JSON.stringify(shortBaseline));
+        coveredBaseline.baseAirCoverage = 100;
+        var shortState = CounterpointCharacterization.plannerTestState([]);
+        shortState.dynamicBaseline = shortBaseline;
+        var coveredState = CounterpointCharacterization.plannerTestState([]);
+        coveredState.dynamicBaseline = coveredBaseline;
+        var fighterShort = COUNTERPOINTAI._evaluateMarginalPurchase(
+            fighter,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(shortState),
+            fighter.transactionCost
+        );
+        var fighterCovered = COUNTERPOINTAI._evaluateMarginalPurchase(
+            fighter,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(coveredState),
+            fighter.transactionCost
+        );
+        var missileShort = COUNTERPOINTAI._evaluateMarginalPurchase(
+            missile,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(shortState),
+            missile.transactionCost
+        );
+        var missileCovered = COUNTERPOINTAI._evaluateMarginalPurchase(
+            missile,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(coveredState),
+            missile.transactionCost
+        );
+        var completedMissile =
+            CounterpointCharacterization.plannerExecutedTestPlan(
+                "ground-aa-completed",
+                missile
+            );
+        var targets = {
+            aaPerTurn : 1,
+            indirectRemaining : -1
+        };
+        return {
+            fighter : fighter.isAASpecialist &&
+                !fighter.countsTowardAATarget &&
+                fighterShort.adjustedCombatScore >
+                    fighterCovered.adjustedCombatScore &&
+                !COUNTERPOINTAI._turnSaturatedSkipped(
+                    fighter,
+                    [completedMissile],
+                    targets
+                ),
+            missile : missile.isAASpecialist &&
+                missile.countsTowardAATarget &&
+                missileShort.adjustedCombatScore >
+                    missileCovered.adjustedCombatScore &&
+                COUNTERPOINTAI._turnSaturatedSkipped(
+                    missile,
+                    [completedMissile],
+                    targets
+                )
+        };
+    },
+
+    plannerNegativeUtilityRegressions : function()
+    {
+        var cheap = CounterpointCharacterization.plannerMarginalCandidate(
+            "negative-cheap",
+            10000,
+            -100
+        );
+        var expensive = CounterpointCharacterization.plannerMarginalCandidate(
+            "negative-expensive",
+            30000,
+            -100
+        );
+        var equalPlan = CounterpointCharacterization.plannerTestPlan(
+            "negative-equal-plan",
+            30000,
+            cheap
+        );
+        equalPlan.candidates.push(expensive);
+        equalPlan.order = [1, 0];
+        COUNTERPOINTAI._refreshPlanCostKinds(equalPlan);
+        var equalState =
+            CounterpointCharacterization.plannerTestState([equalPlan]);
+        var equalSelected = COUNTERPOINTAI._selectPlanCandidate(
+            equalState,
+            0,
+            30000,
+            equalState.turnTargets
+        ) && equalPlan.selected === 0;
+
+        var lessBad =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "negative-less-bad",
+                30000,
+                -50
+            );
+        var worse = CounterpointCharacterization.plannerMarginalCandidate(
+            "negative-worse",
+            10000,
+            -100
+        );
+        var rankedPlan = CounterpointCharacterization.plannerTestPlan(
+            "negative-ranked-plan",
+            30000,
+            worse
+        );
+        rankedPlan.candidates.push(lessBad);
+        rankedPlan.order = [0, 1];
+        COUNTERPOINTAI._refreshPlanCostKinds(rankedPlan);
+        var rankedState =
+            CounterpointCharacterization.plannerTestState([rankedPlan]);
+        var rankedSelected = COUNTERPOINTAI._selectPlanCandidate(
+            rankedState,
+            0,
+            30000,
+            rankedState.turnTargets
+        ) && rankedPlan.selected === 1;
+        return equalSelected && rankedSelected &&
+            cheap.purchaseUtility === -100 &&
+            expensive.purchaseUtility === -100 &&
+            lessBad.purchaseUtility === -50 &&
+            worse.purchaseUtility === -100;
+    },
+
+    plannerCoverageBeforeDefenseRegression : function()
+    {
+        var candidate =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "coverage-before-defense",
+                10000,
+                10
+            );
+        candidate.staticDefenseScore = 90;
+        candidate.staticRawDefenseScore = 90;
+        candidate.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : 100
+        }];
+        candidate.coverageProfile = [{
+            threatIndex : 0,
+            coverageDelta : 100,
+            staticWeight : 1
+        }];
+        var baseline = CounterpointCharacterization.plannerTestBaseline();
+        baseline.threats = [{
+            key : "#coverage-threat",
+            id : "coverage-threat",
+            need : 100,
+            baseCoverage : 0,
+            isAirThreat : false
+        }];
+        var unsaturatedState =
+            CounterpointCharacterization.plannerTestState([]);
+        unsaturatedState.dynamicBaseline = baseline;
+        var saturatedState =
+            CounterpointCharacterization.plannerTestState([]);
+        saturatedState.dynamicBaseline =
+            JSON.parse(JSON.stringify(baseline));
+        saturatedState.dynamicBaseline.threats[0].baseCoverage = 1000;
+        var unsaturated = COUNTERPOINTAI._evaluateMarginalPurchase(
+            candidate,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(unsaturatedState),
+            candidate.transactionCost
+        );
+        var saturated = COUNTERPOINTAI._evaluateMarginalPurchase(
+            candidate,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(saturatedState),
+            candidate.transactionCost
+        );
+        return unsaturated.adjustedCombatScore > 0 &&
+            saturated.adjustedCombatScore < 0;
+    },
+
+    plannerOffenseProfileRegressions : function()
+    {
+        var indexes = {
+            "#duplicate" : 0,
+            "#other" : 1,
+            "#third" : 2,
+            "#fourth" : 3,
+            "#phantom-a" : 4,
+            "#phantom-b" : 5
+        };
+        var evaluation = {
+            threatProfile : [
+                {
+                    key : "#duplicate",
+                    coverageDelta : 30,
+                    staticContribution : 100,
+                    phantom : false
+                },
+                {
+                    key : "#duplicate",
+                    coverageDelta : 20,
+                    staticContribution : 90,
+                    phantom : false
+                },
+                {
+                    key : "#other",
+                    coverageDelta : 25,
+                    staticContribution : 80,
+                    phantom : false
+                },
+                {
+                    key : "#third",
+                    coverageDelta : 15,
+                    staticContribution : 70,
+                    phantom : false
+                },
+                {
+                    key : "#fourth",
+                    coverageDelta : 10,
+                    staticContribution : 60,
+                    phantom : false
+                },
+                {
+                    key : "#phantom-a",
+                    coverageDelta : 20,
+                    staticContribution : 85,
+                    phantom : true
+                },
+                {
+                    key : "#phantom-b",
+                    coverageDelta : 20,
+                    staticContribution : 75,
+                    phantom : true
+                }
+            ]
+        };
+        var offense = COUNTERPOINTAI._compactOffenseProfile(
+            evaluation,
+            indexes
+        );
+        var coverage = COUNTERPOINTAI._compactCoverageProfile(
+            evaluation,
+            indexes
+        );
+        var candidate = CounterpointCharacterization.plannerMarginalCandidate(
+            "profile-candidate",
+            10000,
+            1
+        );
+        candidate.offenseProfile = offense;
+        candidate.coverageProfile = coverage;
+        candidate.staticDefenseScore = 20;
+        candidate.staticRawDefenseScore = 20;
+        var baseline = CounterpointCharacterization.plannerTestBaseline();
+        baseline.threats = [];
+        for (var threatIndex = 0; threatIndex < 6; ++threatIndex)
+        {
+            baseline.threats.push({
+                key : "#profile-" + threatIndex,
+                id : "profile-" + threatIndex,
+                need : 100,
+                baseCoverage : 100,
+                isAirThreat : false
+            });
+        }
+        var state = CounterpointCharacterization.plannerTestState([]);
+        state.dynamicBaseline = baseline;
+        var projected = COUNTERPOINTAI._projectedTurnContext(state);
+        var canonicalOffense = COUNTERPOINTAI._sumTopN(
+            [100, 90, 80, 70, 60, 85],
+            COUNTERPOINTAI.TOP_N_WEIGHTS
+        );
+        candidate.baseCombatScore =
+            COUNTERPOINTAI._combatScoreFromComponents(
+                canonicalOffense,
+                candidate.staticDefenseScore,
+                candidate.staticRawDefenseScore
+            );
+        var neutralScore = COUNTERPOINTAI._projectedCombatScore(
+            candidate,
+            projected
+        );
+        var phantomOnly = JSON.parse(JSON.stringify(candidate));
+        phantomOnly.staticDefenseScore = 0;
+        phantomOnly.staticRawDefenseScore = 0;
+        phantomOnly.offenseProfile = [
+            {
+                threatIndex : 0,
+                phantom : false,
+                offensiveContribution : 100
+            },
+            {
+                threatIndex : 4,
+                phantom : true,
+                offensiveContribution : 85
+            },
+            {
+                threatIndex : 5,
+                phantom : true,
+                offensiveContribution : 75
+            }
+        ];
+        var phantomScore = COUNTERPOINTAI._projectedCombatScore(
+            phantomOnly,
+            projected
+        );
+        var saturated = JSON.parse(JSON.stringify(candidate));
+        saturated.staticDefenseScore = 0;
+        saturated.staticRawDefenseScore = 0;
+        saturated.offenseProfile = [
+            {
+                threatIndex : 0,
+                phantom : false,
+                offensiveContribution : 100
+            },
+            {
+                threatIndex : 1,
+                phantom : false,
+                offensiveContribution : 90
+            },
+            {
+                threatIndex : 2,
+                phantom : false,
+                offensiveContribution : 80
+            },
+            {
+                threatIndex : 3,
+                phantom : false,
+                offensiveContribution : 70
+            }
+        ];
+        projected.coverageByThreat[0] = 10000;
+        var adjustedFirst = 100 * COUNTERPOINTAI._coverageGapFactor(
+            projected.coverageByThreat[0],
+            baseline.threats[0].need,
+            saturated.strategicValue
+        );
+        var saturatedScore = COUNTERPOINTAI._projectedCombatScore(
+            saturated,
+            projected
+        );
+        var expectedSaturated = COUNTERPOINTAI._sumTopN(
+            [adjustedFirst, 90, 80, 70],
+            COUNTERPOINTAI.TOP_N_WEIGHTS
+        );
+        var truncatedSaturated = COUNTERPOINTAI._sumTopN(
+            [adjustedFirst, 90, 80],
+            COUNTERPOINTAI.TOP_N_WEIGHTS
+        );
+        var duplicateSlots = 0;
+        for (var offenseIndex = 0;
+             offenseIndex < offense.length;
+             ++offenseIndex)
+        {
+            if (offense[offenseIndex].threatIndex === 0 &&
+                offense[offenseIndex].phantom === false)
+            {
+                duplicateSlots += 1;
+            }
+        }
+        var duplicateCoverage = 0;
+        for (var coverageIndex = 0;
+             coverageIndex < coverage.length;
+             ++coverageIndex)
+        {
+            if (coverage[coverageIndex].threatIndex === 0)
+            {
+                duplicateCoverage += 1;
+            }
+        }
+        return {
+            phantoms : CounterpointCharacterization.almostEqual(
+                phantomScore,
+                COUNTERPOINTAI._sumTopN(
+                    [100, 85],
+                    COUNTERPOINTAI.TOP_N_WEIGHTS
+                )
+            ),
+            duplicates : duplicateSlots === 2 && duplicateCoverage === 1,
+            lateMatchup : offense.length >
+                    COUNTERPOINTAI.TOP_N_WEIGHTS.length &&
+                offense.length <=
+                    COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
+                CounterpointCharacterization.almostEqual(
+                    saturatedScore,
+                    expectedSaturated
+                ) &&
+                saturatedScore > truncatedSaturated,
+            neutral : CounterpointCharacterization.almostEqual(
+                neutralScore,
+                candidate.baseCombatScore
+            )
+        };
+    },
+
+    plannerThirdIndirectRegression : function()
+    {
+        var candidate =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "third-indirect",
+                6000,
+                100
+            );
+        candidate.isIndirect = true;
+        var secondBaseline =
+            CounterpointCharacterization.plannerTestBaseline();
+        secondBaseline.fieldedRoles.indirect = 1;
+        var thirdBaseline =
+            CounterpointCharacterization.plannerTestBaseline();
+        thirdBaseline.fieldedRoles.indirect = 2;
+        var secondState =
+            CounterpointCharacterization.plannerTestState([]);
+        secondState.dynamicBaseline = secondBaseline;
+        var thirdState =
+            CounterpointCharacterization.plannerTestState([]);
+        thirdState.dynamicBaseline = thirdBaseline;
+        var second = COUNTERPOINTAI._evaluateMarginalPurchase(
+            candidate,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(secondState),
+            candidate.transactionCost
+        );
+        var third = COUNTERPOINTAI._evaluateMarginalPurchase(
+            candidate,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(thirdState),
+            candidate.transactionCost
+        );
+        return CounterpointCharacterization.almostEqual(
+                second.adjustedCombatScore,
+                100
+            ) &&
+            CounterpointCharacterization.almostEqual(
+                third.adjustedCombatScore,
+                100 * COUNTERPOINTAI.INDIRECT_ROLE_STACK_FACTOR
+            );
+    },
+
+    plannerFerryMarginalRegressions : function()
+    {
+        var ferry = CounterpointCharacterization.plannerMarginalCandidate(
+            "tank-ferry",
+            12000,
+            100
+        );
+        ferry.isTransporter = true;
+        ferry.canTransportTank = true;
+        ferry.isGroundFerry = true;
+        ferry.ferryCapacity = 1;
+        var demandBaseline =
+            CounterpointCharacterization.plannerTestBaseline();
+        demandBaseline.tankFerryTanks = 2;
+        var firstState =
+            CounterpointCharacterization.plannerTestState([]);
+        firstState.dynamicBaseline = demandBaseline;
+        var first = COUNTERPOINTAI._evaluateMarginalPurchase(
+            ferry,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(firstState),
+            ferry.transactionCost
+        );
+        var secondState = CounterpointCharacterization.plannerTestState([
+            CounterpointCharacterization.plannerExecutedTestPlan(
+                "tank-ferry-first",
+                ferry
+            )
+        ]);
+        secondState.dynamicBaseline =
+            JSON.parse(JSON.stringify(demandBaseline));
+        var second = COUNTERPOINTAI._evaluateMarginalPurchase(
+            ferry,
+            null,
+            COUNTERPOINTAI._projectedTurnContext(secondState),
+            ferry.transactionCost
+        );
+        var expectedFirst = 100 *
+            COUNTERPOINTAI.ISLAND_TANK_FERRY_DEMAND_BOOST;
+        var expectedSecond = expectedFirst *
+            COUNTERPOINTAI.ISLAND_TRANSPORT_DIVERSITY *
+            COUNTERPOINTAI.SAME_TURN_DUPLICATE_FACTOR;
+        return CounterpointCharacterization.almostEqual(
+                first.adjustedCombatScore,
+                expectedFirst
+            ) &&
+            CounterpointCharacterization.almostEqual(
+                second.adjustedCombatScore,
+                expectedSecond
+            );
     },
 
     plannerMarginalRegressions : function()
     {
-        var first = CounterpointCharacterization.plannerAirCandidate(100, 100);
-        var second = CounterpointCharacterization.plannerAirCandidate(100, 100);
+        var first =
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "fighter-like",
+                COUNTERPOINTAI.DOMAIN_AIR,
+                false,
+                100,
+                100
+            );
+        var second =
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "fighter-like",
+                COUNTERPOINTAI.DOMAIN_AIR,
+                false,
+                100,
+                100
+            );
         var alternative = CounterpointCharacterization.plannerMarginalCandidate(
             "alternative-like",
             10000,
-            60
+            70
         );
         var executed = CounterpointCharacterization.plannerExecutedTestPlan(
             "air-first",
@@ -3406,9 +4035,21 @@ var CounterpointCharacterization =
             choice.rejected.indexOf(0) < 0;
 
         var demandedFirst =
-            CounterpointCharacterization.plannerAirCandidate(500, 100);
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "fighter-demand-like",
+                COUNTERPOINTAI.DOMAIN_AIR,
+                false,
+                500,
+                100
+            );
         var demandedSecond =
-            CounterpointCharacterization.plannerAirCandidate(500, 100);
+            CounterpointCharacterization.plannerClassifiedAACandidate(
+                "fighter-demand-like",
+                COUNTERPOINTAI.DOMAIN_AIR,
+                false,
+                500,
+                100
+            );
         var weakAlternative =
             CounterpointCharacterization.plannerMarginalCandidate(
                 "weak-alternative-like",
@@ -3524,20 +4165,30 @@ var CounterpointCharacterization =
         };
     },
 
-    plannerSavingContext : function(futureScore, futureDeploymentTurns)
+    plannerSavingContext : function(futureScore, futureDeploymentTurns,
+                                     immediateCoverage, futureCoverage,
+                                     futureEnabled)
     {
+        var currentCoverage = immediateCoverage === undefined ?
+            30 : immediateCoverage;
+        var delayedCoverage = futureCoverage === undefined ?
+            100 : futureCoverage;
         var immediate = CounterpointCharacterization.plannerMarginalCandidate(
             "move-six-immediate",
             22000,
             300
         );
         immediate.domain = COUNTERPOINTAI.DOMAIN_AIR;
-        immediate.movement = 6;
         immediate.deploymentKnown = true;
         immediate.deploymentTurns = 1;
+        immediate.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : 300
+        }];
         immediate.coverageProfile = [{
             threatIndex : 0,
-            coverageDelta : 30,
+            coverageDelta : currentCoverage,
             staticWeight : 1
         }];
         var future = CounterpointCharacterization.plannerMarginalCandidate(
@@ -3546,12 +4197,18 @@ var CounterpointCharacterization =
             futureScore
         );
         future.domain = COUNTERPOINTAI.DOMAIN_AIR;
-        future.movement = 4;
+        future.enabled = futureEnabled === undefined ? true : futureEnabled;
+        future.legalIgnoringFunds = true;
         future.deploymentKnown = true;
         future.deploymentTurns = futureDeploymentTurns;
+        future.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : futureScore
+        }];
         future.coverageProfile = [{
             threatIndex : 0,
-            coverageDelta : 100,
+            coverageDelta : delayedCoverage,
             staticWeight : 1
         }];
         var plan = CounterpointCharacterization.plannerTestPlan(
@@ -3582,6 +4239,293 @@ var CounterpointCharacterization =
             },
             projected : COUNTERPOINTAI._projectedTurnContext(state)
         };
+    },
+
+    plannerSharedFutureBudgetRegression : function()
+    {
+        var forced = CounterpointCharacterization.plannerMarginalCandidate(
+            "shared-heavy",
+            28000,
+            1000
+        );
+        forced.domain = COUNTERPOINTAI.DOMAIN_AIR;
+        forced.enabled = false;
+        forced.legalIgnoringFunds = true;
+        forced.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : 1000
+        }];
+        forced.coverageProfile = [{
+            threatIndex : 0,
+            coverageDelta : 100,
+            staticWeight : 1
+        }];
+        var firstSibling =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "shared-sibling-one",
+                3000,
+                100
+            );
+        firstSibling.domain = COUNTERPOINTAI.DOMAIN_AIR;
+        var secondSibling = JSON.parse(JSON.stringify(firstSibling));
+        secondSibling.id = "shared-sibling-two";
+        var forcedPlan = CounterpointCharacterization.plannerTestPlan(
+            "shared-forced-plan",
+            0,
+            forced
+        );
+        var firstPlan = CounterpointCharacterization.plannerTestPlan(
+            "shared-first-plan",
+            0,
+            firstSibling
+        );
+        var secondPlan = CounterpointCharacterization.plannerTestPlan(
+            "shared-second-plan",
+            0,
+            secondSibling
+        );
+        var plans = [forcedPlan, firstPlan, secondPlan];
+        var baseline = CounterpointCharacterization.plannerTestBaseline();
+        baseline.threats = [{
+            key : "#shared-threat",
+            id : "shared-threat",
+            need : 100,
+            baseCoverage : 0,
+            isAirThreat : false
+        }];
+        var state = CounterpointCharacterization.plannerTestState(plans);
+        state.dynamicBaseline = baseline;
+        var context = { plans : plans };
+        var projected = COUNTERPOINTAI._projectedTurnContext(state);
+        var opportunity = COUNTERPOINTAI._counterLineupOpportunity(
+            context,
+            32000,
+            projected,
+            0,
+            {
+                planIndex : 0,
+                candidateIndex : 0,
+                cost : 28000
+            }
+        );
+        var answers = COUNTERPOINTAI._futureCounterAnswers(
+            context,
+            0,
+            4000,
+            32000,
+            projected,
+            28000,
+            1,
+            100
+        );
+        return {
+            budget : opportunity.feasible &&
+                opportunity.totalSpent <= 32000 &&
+                opportunity.totalSpent - forced.transactionCost <= 4000,
+            futureLegal : !forced.enabled && answers.length === 1 &&
+                answers[0].candidateIndex === 0
+        };
+    },
+
+    plannerCounterPlanOrderRegression : function()
+    {
+        function makePlan(key, currentScore)
+        {
+            var current =
+                CounterpointCharacterization.plannerMarginalCandidate(
+                    key + "-current",
+                    7000,
+                    currentScore
+                );
+            current.coverageProfile = [{
+                threatIndex : 0,
+                coverageDelta : 10,
+                staticWeight : 1
+            }];
+            var cheap =
+                CounterpointCharacterization.plannerMarginalCandidate(
+                    key + "-floor",
+                    3000,
+                    -10
+                );
+            var future =
+                CounterpointCharacterization.plannerMarginalCandidate(
+                    key + "-future",
+                    10000,
+                    1000
+                );
+            future.enabled = false;
+            future.legalIgnoringFunds = true;
+            future.coverageProfile = [{
+                threatIndex : 0,
+                coverageDelta : 100,
+                staticWeight : 1
+            }];
+            var plan = CounterpointCharacterization.plannerTestPlan(
+                key,
+                0,
+                current
+            );
+            plan.candidates.push(cheap);
+            plan.candidates.push(future);
+            plan.order = [0, 2, 1];
+            COUNTERPOINTAI._refreshPlanCostKinds(plan);
+            return plan;
+        }
+
+        function evaluate(plans)
+        {
+            var baseline =
+                CounterpointCharacterization.plannerTestBaseline();
+            baseline.threats = [{
+                key : "#order-threat",
+                id : "order-threat",
+                need : 100,
+                baseCoverage : 0,
+                isAirThreat : false
+            }];
+            var state =
+                CounterpointCharacterization.plannerTestState(plans);
+            state.dynamicBaseline = baseline;
+            var projected =
+                COUNTERPOINTAI._projectedTurnContext(state);
+            var context = { plans : plans };
+            var turnTargets = {
+                aaPerTurn : -1,
+                indirectRemaining : -1
+            };
+            return {
+                opportunity : COUNTERPOINTAI._counterLineupOpportunity(
+                    context,
+                    4000,
+                    projected,
+                    0,
+                    null,
+                    turnTargets
+                ),
+                target : COUNTERPOINTAI._counterTarget(
+                    context,
+                    projected,
+                    4000,
+                    6000,
+                    1,
+                    turnTargets
+                )
+            };
+        }
+
+        var firstPlan = makePlan("order-first", 100);
+        var bestPlan = makePlan("order-best", 200);
+        var forward = evaluate([firstPlan, bestPlan]);
+        var reverse = evaluate([bestPlan, firstPlan]);
+        return forward.opportunity.lineup.length === 1 &&
+            forward.opportunity.lineup[0].planKey === "order-best" &&
+            JSON.stringify(forward.opportunity.lineup) ===
+                JSON.stringify(reverse.opportunity.lineup) &&
+            CounterpointCharacterization.almostEqual(
+                forward.opportunity.totalUtility,
+                reverse.opportunity.totalUtility
+            ) &&
+            forward.opportunity.totalSpent ===
+                reverse.opportunity.totalSpent &&
+            forward.target === 10000 &&
+            reverse.target === forward.target;
+    },
+
+    plannerCounterSaturationRegressions : function()
+    {
+        var indirect = CounterpointCharacterization.plannerSavingContext(
+            1000,
+            1,
+            0,
+            100,
+            false
+        );
+        indirect.state.plans[0].candidates[1].isIndirect = true;
+        var indirectTarget = COUNTERPOINTAI._counterTarget(
+            indirect.context,
+            indirect.projected,
+            22000,
+            6000,
+            1,
+            { aaPerTurn : -1, indirectRemaining : 0 }
+        );
+        var exemptTarget = COUNTERPOINTAI._counterTarget(
+            indirect.context,
+            indirect.projected,
+            22000,
+            6000,
+            1,
+            { aaPerTurn : -1, indirectRemaining : -1 }
+        );
+
+        var aa = CounterpointCharacterization.plannerSavingContext(
+            1000,
+            1,
+            0,
+            100,
+            false
+        );
+        aa.state.plans[0].candidates[1].countsTowardAATarget = true;
+        var completedAA =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "completed-ground-aa",
+                8000,
+                100
+            );
+        completedAA.countsTowardAATarget = true;
+        aa.state.plans.push(
+            CounterpointCharacterization.plannerExecutedTestPlan(
+                "completed-ground-aa-plan",
+                completedAA
+            )
+        );
+        aa.context.plans = aa.state.plans;
+        aa.projected = COUNTERPOINTAI._projectedTurnContext(aa.state);
+        var aaTarget = COUNTERPOINTAI._counterTarget(
+            aa.context,
+            aa.projected,
+            22000,
+            6000,
+            1,
+            { aaPerTurn : 1, indirectRemaining : -1 }
+        );
+        return {
+            indirect : indirectTarget === 0 && exemptTarget === 28000,
+            antiAir : aa.projected.completedBuildCounts.groundAA === 1 &&
+                aaTarget === 0
+        };
+    },
+
+    plannerFutureLegalityRegression : function()
+    {
+        function actionData(explicitLegal)
+        {
+            var data = {
+                getUnitIds : function() { return ["future-mod-unit"]; },
+                getTransactionCosts : function() { return [28000]; },
+                getStrategicValues : function() { return [28000]; },
+                getEnabledList : function() { return [false]; }
+            };
+            if (explicitLegal !== undefined)
+            {
+                data.getLegalIgnoringFundsList = function()
+                {
+                    return [explicitLegal];
+                };
+            }
+            return data;
+        }
+        var legacy =
+            COUNTERPOINTAI._copyProductionCandidates(actionData())[0];
+        var explicit =
+            COUNTERPOINTAI._copyProductionCandidates(actionData(true))[0];
+        var explicitIllegal =
+            COUNTERPOINTAI._copyProductionCandidates(actionData(false))[0];
+        return !legacy.legalIgnoringFunds &&
+            explicit.legalIgnoringFunds &&
+            !explicitIllegal.legalIgnoringFunds;
     },
 
     plannerCanonicalSavingRegressions : function()
@@ -3627,6 +4571,37 @@ var CounterpointCharacterization =
             22000,
             5
         );
+        var genericOnly = CounterpointCharacterization.plannerSavingContext(
+            1000,
+            1,
+            60,
+            60,
+            false
+        );
+        var genericTarget = COUNTERPOINTAI._counterTarget(
+            genericOnly.context,
+            genericOnly.projected,
+            22000,
+            6000,
+            1
+        );
+        var relevant = CounterpointCharacterization.plannerSavingContext(
+            1000,
+            1,
+            60,
+            100,
+            false
+        );
+        var relevantTarget = COUNTERPOINTAI._counterTarget(
+            relevant.context,
+            relevant.projected,
+            22000,
+            6000,
+            1
+        );
+        var shared =
+            CounterpointCharacterization
+                .plannerSharedFutureBudgetRegression();
         COUNTERPOINTAI.SAVE_FOR_COUNTERS = previousEnabled;
         COUNTERPOINTAI.COUNTER_SAVE_MIN_DAY = previousMinDay;
         COUNTERPOINTAI.COUNTER_SAVE_MAX_TURNS = previousTurns;
@@ -3634,7 +4609,12 @@ var CounterpointCharacterization =
         COUNTERPOINTAI.SAVE_DELAY_UTILITY_TAX = previousDelay;
         return {
             immediate : immediateHold === 0 && immediateSelected,
-            heavy : heavyHold > 0
+            heavy : heavyHold > 0,
+            sharedBudget : shared.budget,
+            futureLegal : shared.futureLegal,
+            relevantCoverage : genericTarget === 0 &&
+                relevantTarget === 28000 &&
+                relevant.state.plans[0].candidates[1].enabled === false
         };
     },
 
@@ -3659,8 +4639,13 @@ var CounterpointCharacterization =
                 1000,
                 100
             );
-        firstCandidate.isAA = true;
+        firstCandidate.isAASpecialist = true;
         firstCandidate.airCoverageDelta = 50;
+        firstCandidate.offenseProfile = [{
+            threatIndex : 0,
+            phantom : false,
+            offensiveContribution : 100
+        }];
         firstCandidate.coverageProfile = [{
             threatIndex : 0,
             coverageDelta : 50,
@@ -3813,7 +4798,6 @@ var CounterpointCharacterization =
             false
         );
         ferry.isTransporter = true;
-        ferry.isDirectCombat = false;
         ferry.urgentFerry = true;
         var ferryCombat = CounterpointCharacterization.plannerMarginalCandidate(
             "urgent-ferry-combat",
@@ -3963,6 +4947,148 @@ var CounterpointCharacterization =
         };
     },
 
+    plannerDeploymentOrderRegression : function()
+    {
+        var previousLimit = COUNTERPOINTAI.MAX_DEPLOYMENT_PATH_QUERIES;
+        COUNTERPOINTAI.MAX_DEPLOYMENT_PATH_QUERIES = 1;
+        function run(ids)
+        {
+            var candidates = [];
+            for (var index = 0; index < ids.length; ++index)
+            {
+                var candidate =
+                    CounterpointCharacterization.plannerMarginalCandidate(
+                        ids[index],
+                        ids[index] === "deployment-fast" ? 9000 : 10000,
+                        100
+                    );
+                candidate.strategicValue = 10000;
+                candidate.scoreData =
+                    CounterpointCharacterization.makeStrategyDescriptor(
+                        ids[index],
+                        COUNTERPOINTAI.DOMAIN_GROUND,
+                        10000,
+                        5,
+                        1,
+                        1
+                    );
+                candidate.scoreData.damageById["deployment-threat"] = 100;
+                candidate.scoreData.hasAttackWeapon = true;
+                candidates.push(candidate);
+            }
+            var plan = CounterpointCharacterization.plannerTestPlan(
+                "deployment-order-plan",
+                10000,
+                candidates[0]
+            );
+            plan.candidates.push(candidates[1]);
+            plan.order = [0, 1];
+            COUNTERPOINTAI._refreshPlanCostKinds(plan);
+            var baseline =
+                CounterpointCharacterization.plannerTestBaseline();
+            baseline.threats = [{
+                key : "#deployment-threat",
+                id : "deployment-threat",
+                need : 100,
+                baseCoverage : 0,
+                isAirThreat : false
+            }];
+            var state =
+                CounterpointCharacterization.plannerTestState([plan]);
+            state.dynamicBaseline = baseline;
+            var enemy =
+                CounterpointCharacterization.makeStrategyDescriptor(
+                    "deployment-threat",
+                    COUNTERPOINTAI.DOMAIN_GROUND,
+                    10000,
+                    5,
+                    1,
+                    1
+                );
+            enemy.hpSum = 1;
+            var context = {
+                enemyComposition : [enemy],
+                threatProfile : COUNTERPOINTAI._analyzeEnemyComp([enemy]),
+                phantomThreats : [],
+                phantomAirPresent : false,
+                indirectRangeDeltas : {},
+                banIndirects : false,
+                groundCarriers : {},
+                islandMode : false,
+                ferry : null,
+                staticThreats : baseline.threats,
+                staticThreatIndexes : { "#deployment-threat" : 0 },
+                deploymentSystem : {
+                    getDummyUnit : function(id)
+                    {
+                        return {
+                            getMovementType : function()
+                            {
+                                return id;
+                            }
+                        };
+                    },
+                    estimateCounterpointDeploymentTurns : function(
+                        x, y, id)
+                    {
+                        return id === "deployment-fast" ? 1 : 5;
+                    }
+                },
+                deploymentMap : {
+                    getMapWidth : function() { return 6; },
+                    getMapHeight : function() { return 6; }
+                },
+                deploymentEnemies : [{
+                    getUnitID : function()
+                    {
+                        return "deployment-threat";
+                    },
+                    getX : function() { return 5; },
+                    getY : function() { return 5; }
+                }],
+                deploymentQueries : 0,
+                deploymentCache : Object.create(null),
+                deploymentTargetCache : Object.create(null)
+            };
+            COUNTERPOINTAI._scorePlanCandidates(
+                [plan],
+                context,
+                2,
+                COUNTERPOINTAI._projectedTurnContext(state)
+            );
+            var selected = COUNTERPOINTAI._selectPlanCandidate(
+                state,
+                0,
+                10000,
+                state.turnTargets
+            );
+            return {
+                id : selected ? plan.candidates[plan.selected].id : "",
+                fallback : context.deploymentBudgetExhausted === true &&
+                    !plan.candidates[0].deploymentKnown &&
+                    !plan.candidates[1].deploymentKnown
+            };
+        }
+        try
+        {
+            var forward = run([
+                "deployment-fast",
+                "deployment-slow"
+            ]);
+            var reverse = run([
+                "deployment-slow",
+                "deployment-fast"
+            ]);
+            return forward.fallback && reverse.fallback &&
+                forward.id === reverse.id &&
+                forward.id === "deployment-fast";
+        }
+        finally
+        {
+            COUNTERPOINTAI.MAX_DEPLOYMENT_PATH_QUERIES = previousLimit;
+        }
+    },
+
     plannerDeploymentRegressions : function(system, map)
     {
         var nodeLimit = map.getMapWidth() * map.getMapHeight();
@@ -4016,8 +5142,13 @@ var CounterpointCharacterization =
 
         var originalMissileInit = Global.MISSILE.init;
         var originalTankInit = Global.LIGHT_TANK.init;
+        var originalTankMovement =
+            Global.MOVE_TANK.getMovementpoints;
         var tireTurns = -1;
         var tankTurns = -1;
+        var boundaryThree = -1;
+        var boundaryBlocked = -1;
+        var boundaryTwo = -1;
         try
         {
             Global.MISSILE.init = function(unit)
@@ -4052,11 +5183,61 @@ var CounterpointCharacterization =
                 false,
                 nodeLimit
             );
+            Global.MOVE_TANK.getMovementpoints = function()
+            {
+                return 3;
+            };
+            boundaryThree =
+                system.estimateCounterpointDeploymentTurns(
+                    0,
+                    0,
+                    "LIGHT_TANK",
+                    4,
+                    0,
+                    1,
+                    1,
+                    false,
+                    nodeLimit
+                );
+            Global.MOVE_TANK.getMovementpoints = function()
+            {
+                return 6;
+            };
+            boundaryBlocked =
+                system.estimateCounterpointDeploymentTurns(
+                    0,
+                    0,
+                    "LIGHT_TANK",
+                    2,
+                    0,
+                    1,
+                    1,
+                    false,
+                    nodeLimit
+                );
+            Global.MOVE_TANK.getMovementpoints = function()
+            {
+                return 2;
+            };
+            boundaryTwo =
+                system.estimateCounterpointDeploymentTurns(
+                    0,
+                    0,
+                    "LIGHT_TANK",
+                    3,
+                    0,
+                    1,
+                    1,
+                    false,
+                    nodeLimit
+                );
         }
         finally
         {
             Global.MISSILE.init = originalMissileInit;
             Global.LIGHT_TANK.init = originalTankInit;
+            Global.MOVE_TANK.getMovementpoints =
+                originalTankMovement;
         }
         var movedIndirect = system.estimateCounterpointDeploymentTurns(
             0,
@@ -4119,6 +5300,9 @@ var CounterpointCharacterization =
             factorySpecific : rearTurns > frontTurns && frontTurns > 0 &&
                 frontUtility.purchaseUtility > rearUtility.purchaseUtility,
             terrainMovement : tireTurns > tankTurns && tankTurns > 0,
+            turnBoundaries : boundaryThree === 3 &&
+                boundaryBlocked === COUNTERPOINTAI.DEPLOYMENT_UNREACHABLE &&
+                boundaryTwo === 1,
             indirectSetup : movedIndirect === movedDirect + 1 &&
                 movedDirect > 0 && alreadyInRange === 1,
             unknownFallback : unknown === COUNTERPOINTAI.DEPLOYMENT_UNKNOWN &&
@@ -4128,7 +5312,10 @@ var CounterpointCharacterization =
                     fallbackEvaluation.adjustedCombatScore,
                     fallback.baseCombatScore *
                         fallback.intrinsicMobilityFactor
-                )
+                ),
+            orderIndependent :
+                CounterpointCharacterization
+                    .plannerDeploymentOrderRegression()
         };
     },
 
@@ -4390,6 +5577,51 @@ var CounterpointCharacterization =
             CounterpointCharacterization.plannerSpecialResultHandshake(),
             "planner-special-result-handshake"
         );
+        var aaClassification =
+            CounterpointCharacterization.plannerAAClassificationRegressions();
+        CounterpointCharacterization.assertValue(
+            aaClassification.fighter,
+            "planner-fighter-aa-specialist"
+        );
+        CounterpointCharacterization.assertValue(
+            aaClassification.missile,
+            "planner-ground-aa-quota"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization.plannerNegativeUtilityRegressions(),
+            "planner-negative-cost-ordering"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization
+                .plannerCoverageBeforeDefenseRegression(),
+            "planner-coverage-before-defense"
+        );
+        var offenseProfiles =
+            CounterpointCharacterization.plannerOffenseProfileRegressions();
+        CounterpointCharacterization.assertValue(
+            offenseProfiles.phantoms,
+            "planner-offense-phantoms-one-slot"
+        );
+        CounterpointCharacterization.assertValue(
+            offenseProfiles.duplicates,
+            "planner-offense-duplicate-composition-slots"
+        );
+        CounterpointCharacterization.assertValue(
+            offenseProfiles.lateMatchup,
+            "planner-offense-fourth-enters-top-three"
+        );
+        CounterpointCharacterization.assertValue(
+            offenseProfiles.neutral,
+            "planner-offense-neutral-gap-reconstruction"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization.plannerThirdIndirectRegression(),
+            "planner-third-indirect-penalty"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization.plannerFerryMarginalRegressions(),
+            "planner-canonical-ferry-modifiers"
+        );
         var marginal =
             CounterpointCharacterization.plannerMarginalRegressions();
         CounterpointCharacterization.assertValue(
@@ -4421,6 +5653,39 @@ var CounterpointCharacterization =
         CounterpointCharacterization.assertValue(
             saving.heavy,
             "planner-counter-heavy-remains-valid"
+        );
+        CounterpointCharacterization.assertValue(
+            saving.sharedBudget,
+            "planner-counter-shared-future-budget"
+        );
+        CounterpointCharacterization.assertValue(
+            saving.futureLegal,
+            "planner-counter-future-legal-unaffordable"
+        );
+        CounterpointCharacterization.assertValue(
+            saving.relevantCoverage,
+            "planner-counter-relevant-future-coverage"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization
+                .plannerCounterPlanOrderRegression(),
+            "planner-counter-plan-order-invariant"
+        );
+        var saturation =
+            CounterpointCharacterization
+                .plannerCounterSaturationRegressions();
+        CounterpointCharacterization.assertValue(
+            saturation.indirect,
+            "planner-counter-indirect-turn-saturation"
+        );
+        CounterpointCharacterization.assertValue(
+            saturation.antiAir,
+            "planner-counter-ground-aa-turn-saturation"
+        );
+        CounterpointCharacterization.assertValue(
+            CounterpointCharacterization
+                .plannerFutureLegalityRegression(),
+            "planner-counter-explicit-future-legality"
         );
         var reconstruction =
             CounterpointCharacterization.plannerStateReconstructionRegressions();
@@ -4471,12 +5736,20 @@ var CounterpointCharacterization =
             "planner-terrain-aware-deployment"
         );
         CounterpointCharacterization.assertValue(
+            deployment.turnBoundaries,
+            "planner-deployment-turn-boundaries"
+        );
+        CounterpointCharacterization.assertValue(
             deployment.indirectSetup,
             "planner-indirect-setup-delay"
         );
         CounterpointCharacterization.assertValue(
             deployment.unknownFallback,
             "planner-deployment-unknown-fallback"
+        );
+        CounterpointCharacterization.assertValue(
+            deployment.orderIndependent,
+            "planner-deployment-order-independent"
         );
 
         var factoryData = CounterpointCharacterization.snapshotPlannerData(
@@ -4610,8 +5883,10 @@ var CounterpointCharacterization =
                         boundedCandidateIndex
                     ];
                 profilesBounded = profilesBounded &&
+                    boundedCandidate.offenseProfile.length <=
+                        COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
                     boundedCandidate.coverageProfile.length <=
-                        COUNTERPOINTAI.TOP_N_WEIGHTS.length &&
+                        COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
                     boundedCandidate.scoreData === undefined;
             }
         }
@@ -4886,6 +6161,10 @@ var CounterpointCharacterization =
         CounterpointCharacterization.assertValue(
             !noFundsData.actionAvailable && !noFundsData.enabledList[infantryIndex],
             "discovery-funds-availability"
+        );
+        CounterpointCharacterization.assertValue(
+            noFundsData.legalIgnoringFundsList[infantryIndex],
+            "discovery-future-legality"
         );
         firstPlayer.setFunds(DISCOVERY_STARTING_FUNDS);
 
