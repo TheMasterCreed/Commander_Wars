@@ -50,6 +50,10 @@ constexpr MilliFunds GOOD_VALUE = 900;
 constexpr MilliFunds FAIR_VALUE = 800;
 constexpr MilliFunds POOR_VALUE = 100;
 constexpr MilliFunds LOSING_VALUE = -50;
+constexpr MilliFunds CLUSTER_OPTIMUM = 2450;
+constexpr MilliFunds CLUSTER_SETTLED = 1800;
+constexpr MilliFunds CLUSTER_MIDDLE_VALUE = 850;
+constexpr MilliFunds CLUSTER_TAIL_VALUE = 700;
 constexpr std::int32_t TARGET_HP_STEPS = 3;
 constexpr std::int32_t LETHAL_DAMAGE_STEPS = 3;
 
@@ -454,6 +458,129 @@ void testTrimmedFireValueUsesOnlyGrantedDamage()
     expect(Coordinator::grantedFireValue(fire, staticValue, 2) == 2600,
            "trimmed fire keeps granted capital and prorated credit");
 }
+
+AssignmentInput threeActorClusterInput()
+{
+    std::vector<CandidateBundle> attacker{
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, CONTESTED_TILE, BEST_VALUE),
+        valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, SPARE_TILE, GOOD_VALUE),
+    };
+    std::vector<CandidateBundle> support{
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, CONTESTED_TILE, CLUSTER_MIDDLE_VALUE),
+        valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, FAR_TILE, FAIR_VALUE),
+    };
+    std::vector<CandidateBundle> tail{
+        valuedCandidate(TARGET_INDEX, TARGET_TILE, FAR_TILE, CLUSTER_TAIL_VALUE),
+    };
+    return inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(attacker)),
+        actorWith(SUPPORT_INDEX, SUPPORT_UNIT, std::move(support)),
+        actorWith(TARGET_INDEX, TARGET_UNIT, std::move(tail)),
+    });
+}
+
+void testClusterSearchFindsTheThreeActorImprovement()
+{
+    const AssignmentResult result = MaximumValueAssignment::assign(threeActorClusterInput());
+    const PlannedAction* pAttacker = actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport = actionOf(result, SUPPORT_UNIT);
+    const PlannedAction* pTail = actionOf(result, TARGET_UNIT);
+    expect(result.stats.settlingMoves == 0, "settling cannot unlock the cluster");
+    expect(result.stats.swapImprovements == 0, "no pair improves the settled total");
+    expect(CLUSTER_OPTIMUM > CLUSTER_SETTLED, "the fixture has a strict cluster gain");
+    expect(plannedTotal(result) == CLUSTER_OPTIMUM, "cluster search reaches the exact optimum");
+    expect(pAttacker != nullptr && pAttacker->destination == SPARE_TILE,
+           "the first actor releases the shared tile");
+    expect(pSupport != nullptr && pSupport->destination == CONTESTED_TILE,
+           "the middle actor takes the shared tile");
+    expect(pTail != nullptr && pTail->destination == FAR_TILE,
+           "the tail actor takes the released middle tile");
+    expect(result.stats.clustersTotal == 1 && result.stats.clustersEnumerated == 1,
+           "the connected component is enumerated once");
+    expect(result.stats.clustersCapped == 0 && result.stats.enumerationStates > 0,
+           "the small component completes inside its caps");
+}
+
+AssignmentInput oversizedComponentInput()
+{
+    constexpr std::int32_t actorCount = MaximumValueAssignment::CLUSTER_ACTOR_CAP + 1;
+    constexpr std::int32_t firstUnit = 100;
+    constexpr MilliFunds privateValue = 100;
+    std::vector<AssignmentActor> actors;
+    for (std::int32_t slot = 0; slot < actorCount; ++slot)
+    {
+        const TilePoint origin{0, slot};
+        const TilePoint privateTile{5, slot};
+        std::vector<CandidateBundle> candidates{
+            valuedCandidate(slot, origin, CONTESTED_TILE, BEST_VALUE - slot * 10),
+            valuedCandidate(slot, origin, privateTile, privateValue),
+        };
+        actors.push_back(actorWith(slot, firstUnit + slot, std::move(candidates)));
+    }
+    return inputWith(std::move(actors));
+}
+
+void testOversizedComponentKeepsItsSettledPlan()
+{
+    constexpr std::int32_t actorCount = MaximumValueAssignment::CLUSTER_ACTOR_CAP + 1;
+    constexpr MilliFunds expectedTotal = BEST_VALUE + (actorCount - 1) * POOR_VALUE;
+    const AssignmentResult result = MaximumValueAssignment::assign(oversizedComponentInput());
+    expect(result.stats.clustersTotal == 1, "the overlap graph has one component");
+    expect(result.stats.clustersCapped == 1 && result.stats.clustersEnumerated == 0,
+           "the oversized component is not enumerated");
+    expect(plannedTotal(result) == expectedTotal, "the cap preserves the settled plan");
+    expect(result.stats.assignedUnits == actorCount, "every capped actor keeps a feasible action");
+}
+
+bool samePlan(const AssignmentResult & left, const AssignmentResult & right)
+{
+    if (left.executionOrder != right.executionOrder ||
+        left.plan.actionCount() != right.plan.actionCount())
+    {
+        return false;
+    }
+    for (std::int32_t index = 0; index < left.plan.actionCount(); ++index)
+    {
+        const PlannedAction & leftAction = left.plan.action(index);
+        const PlannedAction & rightAction = right.plan.action(index);
+        if (leftAction.unitId != rightAction.unitId ||
+            leftAction.destination != rightAction.destination ||
+            leftAction.state != rightAction.state)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void testClusterSearchReplaysDeterministically()
+{
+    const AssignmentResult first = MaximumValueAssignment::assign(threeActorClusterInput());
+    const AssignmentResult replay = MaximumValueAssignment::assign(threeActorClusterInput());
+    expect(samePlan(first, replay), "cluster assignment replays exactly");
+    expect(first.stats.enumerationStates == replay.stats.enumerationStates,
+           "cluster traversal visits the same states");
+    expect(first.stats.replayFailures == 0 && replay.stats.replayFailures == 0,
+           "both winning searches reproduce their selected seats");
+}
+
+void testCapsAndSharedBudgetBoundTheSearch()
+{
+    const std::vector<std::int32_t> options{0, 1, 2, NO_CANDIDATE, 3};
+    expect(Coordinator::cappedOptions(options, 2) ==
+               std::vector<std::int32_t>({0, 1, NO_CANDIDATE}),
+           "candidate capping preserves the unassigned option");
+    expect(Coordinator::cappedOptions(options, Coordinator::NO_CANDIDATE_CAP) == options,
+           "the uncapped sentinel preserves every option");
+
+    AssignmentStats stats;
+    stats.swapStates = Coordinator::ASSIGNMENT_STATE_BUDGET - 1;
+    expect(!Coordinator::searchBudgetExhausted(stats),
+           "the final shared-budget state remains available");
+    stats.enumerationStates = 1;
+    expect(Coordinator::searchBudgetExhausted(stats),
+           "pair and cluster visits share one hard budget");
+}
 }
 
 int main()
@@ -469,5 +596,9 @@ int main()
     testPairSearchResolvesADestinationConflict();
     testPairAssignmentReplaysDeterministically();
     testTrimmedFireValueUsesOnlyGrantedDamage();
+    testClusterSearchFindsTheThreeActorImprovement();
+    testOversizedComponentKeepsItsSettledPlan();
+    testClusterSearchReplaysDeterministically();
+    testCapsAndSharedBudgetBoundTheSearch();
     return failures == 0 ? 0 : 1;
 }

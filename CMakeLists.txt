@@ -1466,6 +1466,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiBundleAssignmentTests)
 
+    add_executable(CoordinatorAiAssignmentBoundProof
+        tests/coordinator_ai/assignmentboundproof.cpp
+    )
+    target_include_directories(CoordinatorAiAssignmentBoundProof PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiAssignmentBoundProof PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiAssignmentBoundProof PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiAssignmentBoundProof
+        COMMAND CoordinatorAiAssignmentBoundProof
+    )
+    cow_set_arena_test_path(CoordinatorAiAssignmentBoundProof)
+
     add_executable(CoordinatorAiPlanningTypesTests
         tests/coordinator_ai/planningtypestests.cpp
     )

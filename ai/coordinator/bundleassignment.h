@@ -81,6 +81,10 @@ namespace Coordinator
         std::int32_t settlingSweeps{0};
         std::int32_t settlingMoves{0};
         std::int32_t swapImprovements{0};
+        std::int32_t clustersTotal{0};
+        std::int32_t clustersEnumerated{0};
+        std::int32_t clustersCapped{0};
+        std::int32_t enumerationStates{0};
         std::int32_t swapStates{0};
         std::int32_t replayFailures{0};
     };
@@ -306,6 +310,13 @@ namespace Coordinator
     }
 
     constexpr std::int32_t NO_CANDIDATE = -1;
+    constexpr std::int32_t NO_CANDIDATE_CAP = -1;
+    constexpr std::int32_t ASSIGNMENT_STATE_BUDGET = 200000;
+
+    inline bool searchBudgetExhausted(const AssignmentStats & stats, std::int32_t pendingStates = 0)
+    {
+        return stats.swapStates + stats.enumerationStates + pendingStates >= ASSIGNMENT_STATE_BUDGET;
+    }
 
     struct ActorProgress
     {
@@ -336,6 +347,24 @@ namespace Coordinator
             return 0;
         }
         return state.pActor->candidates[static_cast<std::size_t>(option)].valuation.value().economicValue;
+    }
+
+    inline MilliFunds assignmentUpperBound(MilliFunds seatedValue, MilliFunds optionValue,
+                                           MilliFunds remainingCeiling)
+    {
+        return seatedValue + optionValue + remainingCeiling;
+    }
+
+    inline bool isPruneOrderLicensed(std::span<const MilliFunds> orderedValues)
+    {
+        for (std::size_t slot = 1; slot < orderedValues.size(); ++slot)
+        {
+            if (orderedValues[slot] > orderedValues[slot - 1])
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     inline MilliFunds proRatedCredit(MilliFunds credit, std::int32_t granted, std::int32_t dealt)
@@ -436,6 +465,20 @@ namespace Coordinator
             ordered.push_back(state.chosen);
         }
         return ordered;
+    }
+
+    inline std::vector<std::int32_t> cappedOptions(const std::vector<std::int32_t> & options, std::int32_t cap)
+    {
+        if (cap == NO_CANDIDATE_CAP || static_cast<std::int32_t>(options.size()) <= cap)
+        {
+            return options;
+        }
+        std::vector<std::int32_t> capped(options.begin(), options.begin() + cap);
+        if (std::find(capped.begin(), capped.end(), NO_CANDIDATE) == capped.end())
+        {
+            capped.push_back(NO_CANDIDATE);
+        }
+        return capped;
     }
 
     inline void unseatActor(TurnPlan & plan, ActorProgress & state)
@@ -661,6 +704,9 @@ namespace Coordinator
     {
         static constexpr std::int32_t SETTLING_SWEEP_CAP = 8;
         static constexpr std::int32_t SWAP_SWEEP_CAP = 4;
+        static constexpr std::int32_t CLUSTER_ACTOR_CAP = 6;
+        static constexpr std::int32_t CLUSTER_CANDIDATE_CAP = 12;
+        static constexpr std::int32_t CLUSTER_STATE_CAP = 20000;
 
         static AssignmentResult assign(const AssignmentInput & input)
         {
@@ -669,7 +715,9 @@ namespace Coordinator
             greedyInit(result, actors, input);
             const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
             settle(result.plan, input, actors, sweepOrder, result.stats);
-            improveBySwaps(result.plan, input, actors, conflictEdges(actors, sweepOrder), result.stats);
+            const std::vector<ConflictEdge> edges = conflictEdges(actors, sweepOrder);
+            improveBySwaps(result.plan, input, actors, edges, result.stats);
+            enumerateClusters(result.plan, input, actors, sweepOrder, edges, result.stats);
             finishPlan(result);
             countAssignments(result.plan, actors, result.stats);
             return result;
@@ -693,6 +741,27 @@ namespace Coordinator
             MilliFunds bestTotal{0};
             bool hasBest{false};
             std::int32_t states{0};
+            bool aborted{false};
+        };
+
+        struct ExactSearchOutcome
+        {
+            bool improved{false};
+            bool aborted{false};
+            std::int32_t states{0};
+        };
+
+        struct ClusterSearch
+        {
+            std::vector<std::int32_t> members;
+            std::vector<std::vector<std::int32_t>> options;
+            std::vector<MilliFunds> ceilings;
+            std::vector<std::int32_t> current;
+            std::vector<std::int32_t> best;
+            MilliFunds bestTotal{0};
+            bool hasBest{false};
+            std::int32_t states{0};
+            bool aborted{false};
         };
 
         static std::vector<ActorProgress> prepareActors(const AssignmentInput & input, AssignmentStats & stats)
@@ -877,6 +946,11 @@ namespace Coordinator
             unseatMembers(plan, actors, search.members);
             for (const std::int32_t leftOption : search.leftOptions)
             {
+                if (searchBudgetExhausted(stats, search.states))
+                {
+                    search.aborted = true;
+                    break;
+                }
                 const SeatOutcome leftOutcome = seatOption(plan, input, left, leftOption);
                 ++search.states;
                 if (leftOutcome.claim != ReservationResult::Granted)
@@ -885,6 +959,11 @@ namespace Coordinator
                 }
                 for (const std::int32_t rightOption : search.rightOptions)
                 {
+                    if (searchBudgetExhausted(stats, search.states))
+                    {
+                        search.aborted = true;
+                        break;
+                    }
                     const SeatOutcome rightOutcome = seatOption(plan, input, right, rightOption);
                     ++search.states;
                     if (rightOutcome.claim == ReservationResult::Granted)
@@ -901,19 +980,26 @@ namespace Coordinator
                     unseatActor(plan, right);
                 }
                 unseatActor(plan, left);
+                if (search.aborted)
+                {
+                    break;
+                }
             }
             stats.swapStates += search.states;
             plan = snapshot;
             restoreSeats(actors, search.members, seats);
-            if (!search.hasBest || search.bestTotal <= incumbentTotal)
+            if (search.aborted || !search.hasBest || search.bestTotal <= incumbentTotal)
             {
                 return false;
             }
             unseatMembers(plan, actors, search.members);
-            const MilliFunds replayed =
-                seatOption(plan, input, left, search.bestLeft).value +
-                seatOption(plan, input, right, search.bestRight).value;
-            if (replayed == search.bestTotal)
+            const SeatOutcome leftReplay =
+                seatOption(plan, input, left, search.bestLeft);
+            const SeatOutcome rightReplay =
+                seatOption(plan, input, right, search.bestRight);
+            if (leftReplay.claim == ReservationResult::Granted &&
+                rightReplay.claim == ReservationResult::Granted &&
+                leftReplay.value + rightReplay.value == search.bestTotal)
             {
                 return true;
             }
@@ -932,6 +1018,10 @@ namespace Coordinator
                 bool improved = false;
                 for (const ConflictEdge & edge : edges)
                 {
+                    if (searchBudgetExhausted(stats))
+                    {
+                        return;
+                    }
                     if (searchPair(plan, input, actors, edge, stats))
                     {
                         ++stats.swapImprovements;
@@ -941,6 +1031,222 @@ namespace Coordinator
                 if (!improved)
                 {
                     return;
+                }
+            }
+        }
+
+        static std::vector<std::vector<std::int32_t>> buildAdjacency(
+            std::size_t actorCount, const std::vector<ConflictEdge> & edges)
+        {
+            std::vector<std::vector<std::int32_t>> adjacency(actorCount);
+            for (const ConflictEdge & edge : edges)
+            {
+                adjacency[static_cast<std::size_t>(edge.left)].push_back(edge.right);
+                adjacency[static_cast<std::size_t>(edge.right)].push_back(edge.left);
+            }
+            return adjacency;
+        }
+
+        static std::vector<std::int32_t> collectComponent(
+            std::int32_t root, const std::vector<ActorProgress> & actors,
+            const std::vector<std::vector<std::int32_t>> & adjacency, std::vector<bool> & visited)
+        {
+            std::vector<std::int32_t> members;
+            std::vector<std::int32_t> frontier{root};
+            visited[static_cast<std::size_t>(root)] = true;
+            while (!frontier.empty())
+            {
+                const std::int32_t current = frontier.back();
+                frontier.pop_back();
+                members.push_back(current);
+                for (const std::int32_t neighbour : adjacency[static_cast<std::size_t>(current)])
+                {
+                    if (!visited[static_cast<std::size_t>(neighbour)])
+                    {
+                        visited[static_cast<std::size_t>(neighbour)] = true;
+                        frontier.push_back(neighbour);
+                    }
+                }
+            }
+            std::sort(members.begin(), members.end(), ActorIdOrder{&actors});
+            return members;
+        }
+
+        static MilliFunds seatedTotal(const std::vector<ActorProgress> & actors,
+                                      const std::vector<std::int32_t> & members)
+        {
+            MilliFunds total = 0;
+            for (const std::int32_t slot : members)
+            {
+                total += actors[static_cast<std::size_t>(slot)].seatedValue;
+            }
+            return total;
+        }
+
+        static void buildSearchOptions(const std::vector<ActorProgress> & actors, ClusterSearch & search)
+        {
+            for (const std::int32_t slot : search.members)
+            {
+                const ActorProgress & state = actors[static_cast<std::size_t>(slot)];
+                search.options.push_back(cappedOptions(
+                    incumbentFirstOptions(state), CLUSTER_CANDIDATE_CAP));
+            }
+            search.ceilings.assign(search.members.size() + 1, 0);
+            for (std::size_t depth = search.members.size(); depth > 0; --depth)
+            {
+                const ActorProgress & state =
+                    actors[static_cast<std::size_t>(search.members[depth - 1])];
+                MilliFunds best = 0;
+                for (const std::int32_t option : search.options[depth - 1])
+                {
+                    best = std::max(best, optionValue(state, option));
+                }
+                search.ceilings[depth - 1] = best + search.ceilings[depth];
+            }
+            search.current.assign(search.members.size(), NO_CANDIDATE);
+        }
+
+        static void searchCluster(TurnPlan & plan, const AssignmentInput & input,
+                                  std::vector<ActorProgress> & actors, ClusterSearch & search,
+                                  std::size_t depth, MilliFunds total, AssignmentStats & stats)
+        {
+            if (depth == search.members.size())
+            {
+                if (!search.hasBest || total > search.bestTotal)
+                {
+                    search.bestTotal = total;
+                    search.best = search.current;
+                    search.hasBest = true;
+                }
+                return;
+            }
+            ActorProgress & state = actors[static_cast<std::size_t>(search.members[depth])];
+            for (const std::int32_t option : search.options[depth])
+            {
+                if (search.states >= CLUSTER_STATE_CAP ||
+                    searchBudgetExhausted(stats, search.states))
+                {
+                    search.aborted = true;
+                    return;
+                }
+                ++search.states;
+                if (search.hasBest &&
+                    assignmentUpperBound(total, optionValue(state, option),
+                                         search.ceilings[depth + 1]) <= search.bestTotal)
+                {
+                    return;
+                }
+                const SeatOutcome outcome = seatOption(plan, input, state, option);
+                if (outcome.claim != ReservationResult::Granted)
+                {
+                    continue;
+                }
+                search.current[depth] = option;
+                searchCluster(plan, input, actors, search, depth + 1,
+                              total + outcome.value, stats);
+                unseatActor(plan, state);
+                if (search.aborted)
+                {
+                    return;
+                }
+            }
+        }
+
+        static bool replaySolution(TurnPlan & plan, const AssignmentInput & input,
+                                   std::vector<ActorProgress> & actors, const ClusterSearch & search,
+                                   const TurnPlan & snapshot, const std::vector<ActorSeat> & seats,
+                                   AssignmentStats & stats)
+        {
+            unseatMembers(plan, actors, search.members);
+            MilliFunds replayed = 0;
+            bool complete = true;
+            for (std::size_t depth = 0; depth < search.members.size(); ++depth)
+            {
+                ActorProgress & state =
+                    actors[static_cast<std::size_t>(search.members[depth])];
+                const SeatOutcome outcome =
+                    seatOption(plan, input, state, search.best[depth]);
+                if (outcome.claim != ReservationResult::Granted)
+                {
+                    complete = false;
+                    break;
+                }
+                replayed += outcome.value;
+            }
+            if (complete && replayed == search.bestTotal)
+            {
+                return true;
+            }
+            ++stats.replayFailures;
+            plan = snapshot;
+            restoreSeats(actors, search.members, seats);
+            return false;
+        }
+
+        static ExactSearchOutcome runExactSearch(
+            TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & members, AssignmentStats & stats)
+        {
+            ClusterSearch search;
+            search.members = members;
+            buildSearchOptions(actors, search);
+            const MilliFunds incumbentTotal = seatedTotal(actors, members);
+            const TurnPlan snapshot = plan;
+            const std::vector<ActorSeat> seats = recordSeats(actors, members);
+            unseatMembers(plan, actors, members);
+            searchCluster(plan, input, actors, search, 0, 0, stats);
+            ExactSearchOutcome outcome;
+            outcome.states = search.states;
+            outcome.aborted = search.aborted;
+            plan = snapshot;
+            restoreSeats(actors, members, seats);
+            if (search.aborted || !search.hasBest || search.bestTotal <= incumbentTotal)
+            {
+                return outcome;
+            }
+            outcome.improved = replaySolution(
+                plan, input, actors, search, snapshot, seats, stats);
+            return outcome;
+        }
+
+        static void enumerateClusters(TurnPlan & plan, const AssignmentInput & input,
+                                      std::vector<ActorProgress> & actors,
+                                      const std::vector<std::int32_t> & sweepOrder,
+                                      const std::vector<ConflictEdge> & edges,
+                                      AssignmentStats & stats)
+        {
+            const std::vector<std::vector<std::int32_t>> adjacency =
+                buildAdjacency(actors.size(), edges);
+            std::vector<bool> visited(actors.size(), false);
+            for (const std::int32_t root : sweepOrder)
+            {
+                if (visited[static_cast<std::size_t>(root)])
+                {
+                    continue;
+                }
+                const std::vector<std::int32_t> members =
+                    collectComponent(root, actors, adjacency, visited);
+                if (members.size() < 2)
+                {
+                    continue;
+                }
+                ++stats.clustersTotal;
+                if (static_cast<std::int32_t>(members.size()) > CLUSTER_ACTOR_CAP ||
+                    searchBudgetExhausted(stats))
+                {
+                    ++stats.clustersCapped;
+                    continue;
+                }
+                const ExactSearchOutcome outcome =
+                    runExactSearch(plan, input, actors, members, stats);
+                stats.enumerationStates += outcome.states;
+                if (outcome.aborted)
+                {
+                    ++stats.clustersCapped;
+                }
+                else
+                {
+                    ++stats.clustersEnumerated;
                 }
             }
         }

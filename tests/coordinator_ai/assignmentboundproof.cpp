@@ -1,0 +1,286 @@
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <span>
+#include <vector>
+
+#include "ai/coordinator/bundleassignment.h"
+
+namespace
+{
+using Coordinator::assignmentUpperBound;
+using Coordinator::isPruneOrderLicensed;
+using Coordinator::MilliFunds;
+
+constexpr std::int32_t NO_RESOURCE = -1;
+constexpr std::int32_t ROW_COUNT = 4;
+constexpr std::int32_t RESOURCE_COUNT = 4;
+constexpr std::int32_t INSTANCE_COUNT = 300;
+constexpr std::int32_t VALUE_MINIMUM = -40;
+constexpr std::int32_t VALUE_MAXIMUM = 120;
+constexpr std::int32_t OPTION_INCLUDED_IN = 4;
+constexpr std::uint32_t GENERATOR_SEED = 0x4B3B0A5Du;
+constexpr std::uint32_t XORSHIFT_LEFT = 13u;
+constexpr std::uint32_t XORSHIFT_RIGHT = 17u;
+constexpr std::uint32_t XORSHIFT_LAST = 5u;
+
+int failures = 0;
+
+void expect(bool condition, const char* description)
+{
+    if (!condition)
+    {
+        std::printf("FAILED: %s\n", description);
+        ++failures;
+    }
+}
+
+struct Option
+{
+    std::int32_t resource{NO_RESOURCE};
+    MilliFunds value{0};
+};
+
+struct Instance
+{
+    std::vector<std::vector<Option>> rows;
+};
+
+std::uint32_t nextRandom(std::uint32_t & state)
+{
+    state ^= state << XORSHIFT_LEFT;
+    state ^= state >> XORSHIFT_RIGHT;
+    state ^= state << XORSHIFT_LAST;
+    return state;
+}
+
+std::int32_t nextInRange(std::uint32_t & state, std::int32_t low, std::int32_t high)
+{
+    const std::uint32_t span = static_cast<std::uint32_t>(high - low + 1);
+    return low + static_cast<std::int32_t>(nextRandom(state) % span);
+}
+
+Instance generateInstance(std::uint32_t & state)
+{
+    Instance instance;
+    for (std::int32_t row = 0; row < ROW_COUNT; ++row)
+    {
+        std::vector<Option> options;
+        for (std::int32_t resource = 0; resource < RESOURCE_COUNT; ++resource)
+        {
+            if (nextInRange(state, 0, OPTION_INCLUDED_IN - 1) != 0)
+            {
+                options.push_back(Option{
+                    resource,
+                    nextInRange(state, VALUE_MINIMUM, VALUE_MAXIMUM),
+                });
+            }
+        }
+        options.push_back(Option{});
+        for (std::size_t slot = options.size(); slot > 1; --slot)
+        {
+            const std::size_t other =
+                static_cast<std::size_t>(nextRandom(state) % slot);
+            std::swap(options[slot - 1], options[other]);
+        }
+        instance.rows.push_back(std::move(options));
+    }
+    return instance;
+}
+
+bool canTake(const std::vector<bool> & taken, const Option & option)
+{
+    return option.resource == NO_RESOURCE ||
+           !taken[static_cast<std::size_t>(option.resource)];
+}
+
+void setTaken(std::vector<bool> & taken, const Option & option, bool value)
+{
+    if (option.resource != NO_RESOURCE)
+    {
+        taken[static_cast<std::size_t>(option.resource)] = value;
+    }
+}
+
+MilliFunds remainingCeiling(const Instance & instance, std::size_t depth)
+{
+    MilliFunds ceiling = 0;
+    for (std::size_t row = depth; row < instance.rows.size(); ++row)
+    {
+        MilliFunds best = 0;
+        for (const Option & option : instance.rows[row])
+        {
+            best = std::max(best, option.value);
+        }
+        ceiling += best;
+    }
+    return ceiling;
+}
+
+MilliFunds exactBestAdditional(const Instance & instance, std::size_t depth,
+                               std::vector<bool> & taken)
+{
+    if (depth == instance.rows.size())
+    {
+        return 0;
+    }
+    MilliFunds best = std::numeric_limits<MilliFunds>::min();
+    for (const Option & option : instance.rows[depth])
+    {
+        if (!canTake(taken, option))
+        {
+            continue;
+        }
+        setTaken(taken, option, true);
+        best = std::max(best, option.value +
+                                 exactBestAdditional(instance, depth + 1, taken));
+        setTaken(taken, option, false);
+    }
+    return best;
+}
+
+void verifyEveryReachableBound(const Instance & instance, std::size_t depth,
+                               MilliFunds seated, std::vector<bool> & taken,
+                               std::int32_t & nodes)
+{
+    if (depth == instance.rows.size())
+    {
+        return;
+    }
+    for (const Option & option : instance.rows[depth])
+    {
+        if (!canTake(taken, option))
+        {
+            continue;
+        }
+        const MilliFunds bound = assignmentUpperBound(
+            seated, option.value, remainingCeiling(instance, depth + 1));
+        setTaken(taken, option, true);
+        const MilliFunds exact = seated + option.value +
+                                 exactBestAdditional(instance, depth + 1, taken);
+        expect(bound >= exact,
+               "the suffix bound dominates every legal completion");
+        ++nodes;
+        verifyEveryReachableBound(
+            instance, depth + 1, seated + option.value, taken, nodes);
+        setTaken(taken, option, false);
+    }
+}
+
+struct Search
+{
+    MilliFunds best{0};
+    bool hasBest{false};
+};
+
+std::vector<Option> orderedOptions(const std::vector<Option> & source)
+{
+    std::vector<Option> options = source;
+    std::stable_sort(options.begin(), options.end(),
+                     [](const Option & left, const Option & right)
+                     {
+                         return left.value > right.value;
+                     });
+    return options;
+}
+
+std::vector<MilliFunds> valuesOf(std::span<const Option> options)
+{
+    std::vector<MilliFunds> values;
+    values.reserve(options.size());
+    for (const Option & option : options)
+    {
+        values.push_back(option.value);
+    }
+    return values;
+}
+
+void boundedSearch(const Instance & instance, std::size_t depth, MilliFunds seated,
+                   std::vector<bool> & taken, Search & search)
+{
+    if (depth == instance.rows.size())
+    {
+        if (!search.hasBest || seated > search.best)
+        {
+            search.best = seated;
+            search.hasBest = true;
+        }
+        return;
+    }
+    const std::vector<Option> options = orderedOptions(instance.rows[depth]);
+    const std::vector<MilliFunds> values = valuesOf(options);
+    expect(isPruneOrderLicensed(std::span<const MilliFunds>(values)),
+           "the searched option list licenses an early return");
+    for (const Option & option : options)
+    {
+        const MilliFunds bound = assignmentUpperBound(
+            seated, option.value, remainingCeiling(instance, depth + 1));
+        if (search.hasBest && bound <= search.best)
+        {
+            return;
+        }
+        if (!canTake(taken, option))
+        {
+            continue;
+        }
+        setTaken(taken, option, true);
+        boundedSearch(instance, depth + 1, seated + option.value, taken, search);
+        setTaken(taken, option, false);
+    }
+}
+
+void proveGeneratedInstances()
+{
+    std::uint32_t state = GENERATOR_SEED;
+    std::int32_t nodes = 0;
+    for (std::int32_t index = 0; index < INSTANCE_COUNT; ++index)
+    {
+        const Instance instance = generateInstance(state);
+        std::vector<bool> proofTaken(RESOURCE_COUNT, false);
+        verifyEveryReachableBound(instance, 0, 0, proofTaken, nodes);
+
+        std::vector<bool> truthTaken(RESOURCE_COUNT, false);
+        const MilliFunds exact = exactBestAdditional(instance, 0, truthTaken);
+        std::vector<bool> searchTaken(RESOURCE_COUNT, false);
+        Search search;
+        boundedSearch(instance, 0, 0, searchTaken, search);
+        expect(search.hasBest, "the bounded search finds a legal completion");
+        expect(search.best == exact,
+               "the bounded search matches exhaustive enumeration");
+    }
+    expect(nodes > INSTANCE_COUNT,
+           "the proof visited non-root states across the generated sweep");
+}
+
+void proveOrderingLicenseIsNecessary()
+{
+    const std::vector<MilliFunds> licensed{80, 60, 5};
+    const std::vector<MilliFunds> unlicensed{60, 5, 80};
+    expect(isPruneOrderLicensed(std::span<const MilliFunds>(licensed)),
+           "descending terms license abandoning the remaining list");
+    expect(!isPruneOrderLicensed(std::span<const MilliFunds>(unlicensed)),
+           "a later larger term forbids abandoning the remaining list");
+
+    MilliFunds best = unlicensed.front();
+    for (std::size_t slot = 1; slot < unlicensed.size(); ++slot)
+    {
+        if (assignmentUpperBound(0, unlicensed[slot], 0) <= best)
+        {
+            break;
+        }
+        best = std::max(best, unlicensed[slot]);
+    }
+    expect(best == 60,
+           "the frozen unlicensed order demonstrates the lost optimum");
+    expect(*std::max_element(unlicensed.begin(), unlicensed.end()) == 80,
+           "the same list has a strictly better omitted option");
+}
+}
+
+int main()
+{
+    proveGeneratedInstances();
+    proveOrderingLicenseIsNecessary();
+    return failures == 0 ? 0 : 1;
+}
