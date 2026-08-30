@@ -879,7 +879,8 @@
 
     _compactOffenseProfile : function(evaluation, threatIndexes)
     {
-        var profile = [];
+        var realProfile = [];
+        var phantomProfile = [];
         var threats = evaluation.threatProfile || [];
         for (var index = 0; index < threats.length; ++index)
         {
@@ -889,16 +890,17 @@
             {
                 continue;
             }
-            profile.push({
+            var entry = {
                 threatIndex : threatIndex,
                 phantom : threat.phantom === true,
                 offensiveContribution : Math.min(
                     COUNTERPOINTAI.PLANNER_VALUE_MAX,
                     threat.staticContribution
                 )
-            });
+            };
+            (entry.phantom ? phantomProfile : realProfile).push(entry);
         }
-        profile.sort(function(left, right)
+        var sortProfile = function(left, right)
         {
             if (left.offensiveContribution !== right.offensiveContribution)
             {
@@ -911,8 +913,13 @@
             }
             return left.phantom === right.phantom ? 0 :
                 (left.phantom ? 1 : -1);
-        });
-        return profile.slice(0, COUNTERPOINTAI._coverageProfileLimit());
+        };
+        realProfile.sort(sortProfile);
+        phantomProfile.sort(sortProfile);
+        var limit = COUNTERPOINTAI._coverageProfileLimit();
+        return realProfile.slice(0, limit).concat(
+            phantomProfile.slice(0, limit)
+        );
     },
 
     _compactCoverageProfile : function(evaluation, threatIndexes)
@@ -2356,12 +2363,15 @@
 
     _validOffenseProfile : function(profile, threatCount)
     {
+        var limit = COUNTERPOINTAI._coverageProfileLimit();
         if (!Array.isArray(profile) ||
-            profile.length > COUNTERPOINTAI._coverageProfileLimit() ||
+            profile.length > limit * 2 ||
             (profile.length > 0 && threatCount <= 0))
         {
             return false;
         }
+        var realCount = 0;
+        var phantomCount = 0;
         for (var index = 0; index < profile.length; ++index)
         {
             var entry = profile[index];
@@ -2377,6 +2387,18 @@
                     0,
                     COUNTERPOINTAI.PLANNER_VALUE_MAX
                 ))
+            {
+                return false;
+            }
+            if (entry.phantom)
+            {
+                phantomCount += 1;
+            }
+            else
+            {
+                realCount += 1;
+            }
+            if (realCount > limit || phantomCount > limit)
             {
                 return false;
             }
@@ -6202,7 +6224,11 @@
             }
             if (utility > best.utility ||
                 (utility === best.utility &&
-                 orderPosition < best.orderPosition))
+                 (candidate.transactionCost < best.cost ||
+                  (candidate.transactionCost === best.cost &&
+                   (orderPosition < best.orderPosition ||
+                    (orderPosition === best.orderPosition &&
+                     candidateIndex < best.candidateIndex))))))
             {
                 best.candidateIndex = candidateIndex;
                 best.utility = utility;
@@ -6353,11 +6379,16 @@
                 if (globalBest === null ||
                     selected.utility > globalBest.selected.utility ||
                     (selected.utility === globalBest.selected.utility &&
-                     (selected.orderPosition <
-                        globalBest.selected.orderPosition ||
-                      (selected.orderPosition ===
-                           globalBest.selected.orderPosition &&
-                       candidatePlan.key < globalBest.plan.key))))
+                     (selected.cost < globalBest.selected.cost ||
+                      (selected.cost === globalBest.selected.cost &&
+                       (selected.orderPosition <
+                            globalBest.selected.orderPosition ||
+                        (selected.orderPosition ===
+                             globalBest.selected.orderPosition &&
+                         (candidatePlan.key < globalBest.plan.key ||
+                          (candidatePlan.key === globalBest.plan.key &&
+                           selected.candidateIndex <
+                               globalBest.selected.candidateIndex))))))))
                 {
                     globalBest = {
                         unfilledIndex : unfilledIndex,

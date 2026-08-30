@@ -3720,6 +3720,111 @@ var CounterpointCharacterization =
             evaluation,
             indexes
         );
+        var limit = COUNTERPOINTAI._coverageProfileLimit();
+        var overflowEvaluation = { threatProfile : [] };
+        var overflowIndexes = Object.create(null);
+        var overflowRealContributions = [100, 90, 80, 70];
+        for (var realIndex = 0;
+             realIndex < overflowRealContributions.length;
+             ++realIndex)
+        {
+            var realKey = "#overflow-real-" + realIndex;
+            overflowIndexes[realKey] = realIndex;
+            overflowEvaluation.threatProfile.push({
+                key : realKey,
+                coverageDelta : overflowRealContributions[realIndex],
+                staticContribution : overflowRealContributions[realIndex],
+                phantom : false
+            });
+        }
+        var overflowPhantomCount = limit + 3;
+        for (var phantomIndex = 0;
+             phantomIndex < overflowPhantomCount;
+             ++phantomIndex)
+        {
+            var phantomKey = "#overflow-phantom-" + phantomIndex;
+            overflowIndexes[phantomKey] =
+                overflowRealContributions.length + phantomIndex;
+            overflowEvaluation.threatProfile.push({
+                key : phantomKey,
+                coverageDelta : 1000 + phantomIndex,
+                staticContribution : 1000 + phantomIndex,
+                phantom : true
+            });
+        }
+        var overflowOffense = COUNTERPOINTAI._compactOffenseProfile(
+            overflowEvaluation,
+            overflowIndexes
+        );
+        var overflowRealCount = 0;
+        var retainedPhantomCount = 0;
+        for (var overflowIndex = 0;
+             overflowIndex < overflowOffense.length;
+             ++overflowIndex)
+        {
+            if (overflowOffense[overflowIndex].phantom)
+            {
+                retainedPhantomCount += 1;
+            }
+            else
+            {
+                overflowRealCount += 1;
+            }
+        }
+        var overflowCandidate =
+            CounterpointCharacterization.plannerMarginalCandidate(
+                "overflow-profile-candidate",
+                10000,
+                1
+            );
+        overflowCandidate.offenseProfile = overflowOffense;
+        overflowCandidate.staticDefenseScore = 0;
+        overflowCandidate.staticRawDefenseScore = 0;
+        var overflowBaseline =
+            CounterpointCharacterization.plannerTestBaseline();
+        overflowBaseline.threats = [];
+        for (var overflowThreatIndex = 0;
+             overflowThreatIndex <
+                overflowRealContributions.length + overflowPhantomCount;
+             ++overflowThreatIndex)
+        {
+            overflowBaseline.threats.push({
+                key : "#overflow-" + overflowThreatIndex,
+                id : "overflow-" + overflowThreatIndex,
+                need : 100,
+                baseCoverage : 100,
+                isAirThreat : false
+            });
+        }
+        var overflowState =
+            CounterpointCharacterization.plannerTestState([]);
+        overflowState.dynamicBaseline = overflowBaseline;
+        var overflowProjected =
+            COUNTERPOINTAI._projectedTurnContext(overflowState);
+        var bestOverflowPhantom = 1000 + overflowPhantomCount - 1;
+        overflowCandidate.baseCombatScore = COUNTERPOINTAI._sumTopN(
+            overflowRealContributions.concat([bestOverflowPhantom]),
+            COUNTERPOINTAI.TOP_N_WEIGHTS
+        );
+        var overflowNeutral = COUNTERPOINTAI._projectedCombatScore(
+            overflowCandidate,
+            overflowProjected
+        );
+        var tooManyReal = [];
+        var tooManyPhantoms = [];
+        for (var invalidIndex = 0; invalidIndex <= limit; ++invalidIndex)
+        {
+            tooManyReal.push({
+                threatIndex : 0,
+                phantom : false,
+                offensiveContribution : 1
+            });
+            tooManyPhantoms.push({
+                threatIndex : 0,
+                phantom : true,
+                offensiveContribution : 1
+            });
+        }
         var candidate = CounterpointCharacterization.plannerMarginalCandidate(
             "profile-candidate",
             10000,
@@ -3855,6 +3960,23 @@ var CounterpointCharacterization =
                 )
             ),
             duplicates : duplicateSlots === 2 && duplicateCoverage === 1,
+            realCapacity :
+                overflowRealCount === overflowRealContributions.length &&
+                retainedPhantomCount === limit,
+            bounded :
+                overflowOffense.length <= limit * 2 &&
+                COUNTERPOINTAI._validOffenseProfile(
+                    overflowOffense,
+                    overflowBaseline.threats.length
+                ) &&
+                !COUNTERPOINTAI._validOffenseProfile(
+                    tooManyReal,
+                    overflowBaseline.threats.length
+                ) &&
+                !COUNTERPOINTAI._validOffenseProfile(
+                    tooManyPhantoms,
+                    overflowBaseline.threats.length
+                ),
             lateMatchup : offense.length >
                     COUNTERPOINTAI.TOP_N_WEIGHTS.length &&
                 offense.length <=
@@ -3865,9 +3987,13 @@ var CounterpointCharacterization =
                 ) &&
                 saturatedScore > truncatedSaturated,
             neutral : CounterpointCharacterization.almostEqual(
-                neutralScore,
-                candidate.baseCombatScore
-            )
+                    neutralScore,
+                    candidate.baseCombatScore
+                ) &&
+                CounterpointCharacterization.almostEqual(
+                    overflowNeutral,
+                    overflowCandidate.baseCombatScore
+                )
         };
     },
 
@@ -4431,6 +4557,165 @@ var CounterpointCharacterization =
                 reverse.opportunity.totalSpent &&
             forward.target === 10000 &&
             reverse.target === forward.target;
+    },
+
+    plannerCounterCostTieRegressions : function()
+    {
+        function makeCandidate(id, cost, score)
+        {
+            return CounterpointCharacterization.plannerMarginalCandidate(
+                id,
+                cost,
+                score
+            );
+        }
+
+        function makePlan(key, candidates, order)
+        {
+            var plan = CounterpointCharacterization.plannerTestPlan(
+                key,
+                0,
+                candidates[0]
+            );
+            plan.candidates = candidates;
+            plan.order = order;
+            COUNTERPOINTAI._refreshPlanCostKinds(plan);
+            return plan;
+        }
+
+        function evaluate(plans, surplus)
+        {
+            var state =
+                CounterpointCharacterization.plannerTestState(plans);
+            var projected =
+                COUNTERPOINTAI._projectedTurnContext(state);
+            return {
+                projected : projected,
+                opportunity : COUNTERPOINTAI._counterLineupOpportunity(
+                    { plans : plans },
+                    surplus,
+                    projected,
+                    0,
+                    null,
+                    {
+                        aaPerTurn : -1,
+                        indirectRemaining : -1
+                    }
+                )
+            };
+        }
+
+        var sameExpensive = makeCandidate(
+            "same-expensive",
+            1000,
+            100
+        );
+        var sameCheap = makeCandidate("same-cheap", 500, 100);
+        var samePlan = makePlan(
+            "same-plan",
+            [sameExpensive, sameCheap],
+            [0, 1]
+        );
+        var sameEvaluation = evaluate([samePlan], 500);
+        var sameBest = COUNTERPOINTAI._counterBestPlanCandidate(
+            { plans : [samePlan] },
+            samePlan,
+            1000,
+            sameEvaluation.projected,
+            true,
+            {
+                aaPerTurn : -1,
+                indirectRemaining : -1
+            }
+        );
+
+        var crossExpensivePlan = makePlan(
+            "cross-expensive-plan",
+            [makeCandidate("cross-expensive", 1000, 100)],
+            [0]
+        );
+        var crossCheapPlan = makePlan(
+            "cross-cheap-plan",
+            [makeCandidate("cross-cheap", 500, 100)],
+            [0]
+        );
+        var crossForward = evaluate(
+            [crossExpensivePlan, crossCheapPlan],
+            0
+        ).opportunity;
+        var crossReverse = evaluate(
+            [crossCheapPlan, crossExpensivePlan],
+            0
+        ).opportunity;
+
+        var siblingChoicePlan = makePlan(
+            "sibling-choice-plan",
+            [
+                makeCandidate("sibling-expensive", 1000, 100),
+                makeCandidate("sibling-cheap", 500, 100)
+            ],
+            [0, 1]
+        );
+        var siblingPlan = makePlan(
+            "sibling-positive-plan",
+            [
+                makeCandidate("sibling-floor", 500, -10),
+                makeCandidate("sibling-positive", 1000, 50)
+            ],
+            [1, 0]
+        );
+        var siblingForward = evaluate(
+            [siblingChoicePlan, siblingPlan],
+            500
+        ).opportunity;
+        var siblingReverse = evaluate(
+            [siblingPlan, siblingChoicePlan],
+            500
+        ).opportunity;
+        var expectedCrossLineup = JSON.stringify([
+            {
+                planKey : "cross-cheap-plan",
+                candidateId : "cross-cheap"
+            },
+            {
+                planKey : "cross-expensive-plan",
+                candidateId : "cross-expensive"
+            }
+        ]);
+        var expectedSiblingLineup = JSON.stringify([
+            {
+                planKey : "sibling-choice-plan",
+                candidateId : "sibling-cheap"
+            },
+            {
+                planKey : "sibling-positive-plan",
+                candidateId : "sibling-positive"
+            }
+        ]);
+        return {
+            samePlan : sameBest.candidateIndex === 1 &&
+                sameBest.cost === 500,
+            crossPlan :
+                JSON.stringify(crossForward.lineup) ===
+                    expectedCrossLineup,
+            sibling :
+                JSON.stringify(siblingForward.lineup) ===
+                    expectedSiblingLineup &&
+                siblingForward.totalSpent === 1500,
+            orderInvariant :
+                JSON.stringify(crossReverse.lineup) ===
+                    expectedCrossLineup &&
+                JSON.stringify(siblingReverse.lineup) ===
+                    expectedSiblingLineup &&
+                CounterpointCharacterization.almostEqual(
+                    crossForward.totalUtility,
+                    crossReverse.totalUtility
+                ) &&
+                CounterpointCharacterization.almostEqual(
+                    siblingForward.totalUtility,
+                    siblingReverse.totalUtility
+                )
+        };
     },
 
     plannerCounterSaturationRegressions : function()
@@ -5607,6 +5892,14 @@ var CounterpointCharacterization =
             "planner-offense-duplicate-composition-slots"
         );
         CounterpointCharacterization.assertValue(
+            offenseProfiles.realCapacity,
+            "planner-offense-real-survives-phantom-cap"
+        );
+        CounterpointCharacterization.assertValue(
+            offenseProfiles.bounded,
+            "planner-offense-independent-profile-bounds"
+        );
+        CounterpointCharacterization.assertValue(
             offenseProfiles.lateMatchup,
             "planner-offense-fourth-enters-top-three"
         );
@@ -5670,6 +5963,25 @@ var CounterpointCharacterization =
             CounterpointCharacterization
                 .plannerCounterPlanOrderRegression(),
             "planner-counter-plan-order-invariant"
+        );
+        var costTies =
+            CounterpointCharacterization
+                .plannerCounterCostTieRegressions();
+        CounterpointCharacterization.assertValue(
+            costTies.samePlan,
+            "planner-counter-same-plan-cheaper-tie"
+        );
+        CounterpointCharacterization.assertValue(
+            costTies.crossPlan,
+            "planner-counter-cross-plan-cheaper-tie"
+        );
+        CounterpointCharacterization.assertValue(
+            costTies.sibling,
+            "planner-counter-cheaper-preserves-sibling"
+        );
+        CounterpointCharacterization.assertValue(
+            costTies.orderInvariant,
+            "planner-counter-cost-tie-order-invariant"
         );
         var saturation =
             CounterpointCharacterization
@@ -5882,8 +6194,30 @@ var CounterpointCharacterization =
                     firstState.plans[boundedPlanIndex].candidates[
                         boundedCandidateIndex
                     ];
+                var boundedRealCount = 0;
+                var boundedPhantomCount = 0;
+                for (var boundedOffenseIndex = 0;
+                     boundedOffenseIndex <
+                        boundedCandidate.offenseProfile.length;
+                     ++boundedOffenseIndex)
+                {
+                    if (boundedCandidate.offenseProfile[
+                            boundedOffenseIndex
+                        ].phantom)
+                    {
+                        boundedPhantomCount += 1;
+                    }
+                    else
+                    {
+                        boundedRealCount += 1;
+                    }
+                }
                 profilesBounded = profilesBounded &&
                     boundedCandidate.offenseProfile.length <=
+                        COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES * 2 &&
+                    boundedRealCount <=
+                        COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
+                    boundedPhantomCount <=
                         COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
                     boundedCandidate.coverageProfile.length <=
                         COUNTERPOINTAI.MAX_COVERAGE_PROFILE_ENTRIES &&
