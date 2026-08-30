@@ -100,6 +100,7 @@ namespace Coordinator
         std::int32_t clustersTotal{0};
         std::int32_t clustersEnumerated{0};
         std::int32_t clustersCapped{0};
+        std::int32_t clustersSkippedStockBudget{0};
         std::int32_t enumerationStates{0};
         std::int32_t swapStates{0};
         std::int32_t replayFailures{0};
@@ -1525,6 +1526,23 @@ namespace Coordinator
                     searchBudgetExhausted(stats))
                 {
                     ++stats.clustersCapped;
+                    continue;
+                }
+                const bool stockCluster =
+                    std::any_of(
+                        members.begin(),
+                        members.end(),
+                        [&](std::int32_t slot)
+                        {
+                            return stockCoupled(
+                                input,
+                                actors[static_cast<std::size_t>(slot)]
+                                    .pActor->engineUnitId);
+                        });
+                if (stockCluster)
+                {
+                    ++stats.clustersCapped;
+                    ++stats.clustersSkippedStockBudget;
                     continue;
                 }
                 const ExactSearchOutcome outcome =

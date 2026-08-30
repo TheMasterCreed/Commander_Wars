@@ -83,14 +83,21 @@ enum class IntervalFailure
 class PairIntervalValuer final : public PlanStockValuer
 {
 public:
-    explicit PairIntervalValuer(IntervalFailure failure)
-        : m_failure(failure)
+    explicit PairIntervalValuer(
+        IntervalFailure failure,
+        std::int32_t affectedUnit = Coordinator::NO_UNIT)
+        : m_failure(failure),
+          m_affectedUnit(affectedUnit)
     {
     }
 
     MilliFunds planStock(const TurnPlan &) override
     {
         ++scalarCalls;
+        if (m_liveQuoteSeen)
+        {
+            ++scalarCallsAfterLiveQuote;
+        }
         return 0;
     }
 
@@ -104,9 +111,10 @@ public:
         return 0;
     }
 
-    bool affectsStock(std::int32_t) const override
+    bool affectsStock(std::int32_t engineUnitId) const override
     {
-        return true;
+        return m_affectedUnit == Coordinator::NO_UNIT ||
+               m_affectedUnit == engineUnitId;
     }
 
     bool livePairSwapIntervals() const override
@@ -119,6 +127,7 @@ public:
         MilliFunds,
         bool pricingLeaf) override
     {
+        m_liveQuoteSeen = true;
         Coordinator::LivePlanStockQuote quote;
         if (pricingLeaf)
         {
@@ -186,6 +195,7 @@ public:
     }
 
     std::int32_t scalarCalls{0};
+    std::int32_t scalarCallsAfterLiveQuote{0};
     std::int32_t liveLeaves{0};
     std::int32_t nonLeafQuotes{0};
     std::int32_t refinementBoundaries{0};
@@ -193,7 +203,36 @@ public:
 
 private:
     IntervalFailure m_failure;
+    std::int32_t m_affectedUnit;
     bool m_failed{false};
+    bool m_liveQuoteSeen{false};
+};
+
+class BudgetExhaustingValuer final : public PlanStockValuer
+{
+public:
+    MilliFunds planStock(const TurnPlan &) override
+    {
+        return 0;
+    }
+
+    MilliFunds originStock() const override
+    {
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        return SEARCH_SLACK;
+    }
+
+    bool affectsStock(std::int32_t) const override
+    {
+        return true;
+    }
+
+private:
+    static constexpr MilliFunds SEARCH_SLACK = 1;
 };
 
 PlanActionIds testActionIds()
@@ -572,7 +611,9 @@ bool isExpectedSwap(const AssignmentResult & result)
 
 void testPairIntervalsPreserveExactAssignment()
 {
-    PairIntervalValuer valuer(IntervalFailure::None);
+    PairIntervalValuer valuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
     AssignmentInput input = destinationSwapInput();
     input.pStockValuer = &valuer;
     const AssignmentResult result =
@@ -585,6 +626,21 @@ void testPairIntervalsPreserveExactAssignment()
     expect(valuer.refinementBoundaries > 0 &&
                !valuer.wrongRefinementPhase,
            "refinement runs only between swap sweeps");
+    expect(result.plan.actionCount() == 2 &&
+               result.executionOrder.size() == 2,
+           "the retained pair winner remains replayable");
+    expect(result.stats.swapImprovements == 1 &&
+               result.stats.replayFailures == 0,
+           "the live pair improvement lands without replay failure");
+    expect(result.stats.clustersTotal == 1 &&
+               result.stats.clustersSkippedStockBudget == 1 &&
+               result.stats.clustersCapped == 1,
+           "the later stock component is explicitly skipped");
+    expect(result.stats.clustersEnumerated == 0 &&
+               result.stats.enumerationStates == 0,
+           "the stock component does not enter cluster enumeration");
+    expect(valuer.scalarCallsAfterLiveQuote == 0,
+           "cluster bypass makes no scalar stock call after live pair pricing");
 }
 
 void testPairIntervalFailuresFallBackExactly()
@@ -693,8 +749,64 @@ void testClusterSearchFindsTheThreeActorImprovement()
            "the tail actor takes the released middle tile");
     expect(result.stats.clustersTotal == 1 && result.stats.clustersEnumerated == 1,
            "the connected component is enumerated once");
-    expect(result.stats.clustersCapped == 0 && result.stats.enumerationStates > 0,
+    expect(result.stats.clustersCapped == 0 &&
+               result.stats.clustersSkippedStockBudget == 0 &&
+               result.stats.enumerationStates > 0,
            "the small component completes inside its caps");
+}
+
+void testMixedStockClusterKeepsTheSettledPlan()
+{
+    PairIntervalValuer valuer(
+        IntervalFailure::None,
+        TARGET_UNIT);
+    AssignmentInput input = threeActorClusterInput();
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    const PlannedAction* pAttacker =
+        actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport =
+        actionOf(result, SUPPORT_UNIT);
+    const PlannedAction* pTail =
+        actionOf(result, TARGET_UNIT);
+    expect(result.stats.settlingMoves == 0 &&
+               result.stats.swapImprovements == 0,
+           "settling and pair search retain the mixed incumbent");
+    expect(result.plan.actionCount() == 3 &&
+               result.executionOrder.size() == 2,
+           "the pre-cluster action set and live order are retained");
+    expect(pAttacker != nullptr &&
+               pAttacker->destination == CONTESTED_TILE &&
+               pAttacker->marginalValue.economicValue == BEST_VALUE &&
+               pAttacker->state == PlanActionState::Pending,
+           "the settled attacker seat is retained");
+    expect(pSupport != nullptr &&
+               pSupport->destination == FAR_TILE &&
+               pSupport->marginalValue.economicValue == FAIR_VALUE &&
+               pSupport->state == PlanActionState::Pending,
+           "the settled support seat is retained");
+    expect(pTail != nullptr &&
+               pTail->state == PlanActionState::Abandoned,
+           "the blocked mixed-component tail remains unassigned");
+    expect(plannedTotal(result) == CLUSTER_SETTLED &&
+               result.stats.assignedUnits == 2 &&
+               result.stats.unassignedUnits == 1,
+           "the exact settled value and assignment counts are retained");
+    expect(result.plan.destinationClaimant(CONTESTED_TILE) ==
+               pAttacker->actionIndex &&
+               result.plan.destinationClaimant(FAR_TILE) ==
+                   pSupport->actionIndex &&
+               result.stats.replayFailures == 0,
+           "the retained result keeps replayable destination claims");
+    expect(result.stats.clustersTotal == 1 &&
+               result.stats.clustersSkippedStockBudget == 1 &&
+               result.stats.clustersCapped == 1,
+           "one stock member skips the whole mixed component");
+    expect(result.stats.clustersEnumerated == 0 &&
+               result.stats.enumerationStates == 0 &&
+               valuer.scalarCallsAfterLiveQuote == 0,
+           "the mixed component performs no scalar cluster search");
 }
 
 AssignmentInput oversizedComponentInput()
@@ -720,12 +832,20 @@ void testOversizedComponentKeepsItsSettledPlan()
 {
     constexpr std::int32_t actorCount = MaximumValueAssignment::CLUSTER_ACTOR_CAP + 1;
     constexpr MilliFunds expectedTotal = BEST_VALUE + (actorCount - 1) * POOR_VALUE;
-    const AssignmentResult result = MaximumValueAssignment::assign(oversizedComponentInput());
+    PairIntervalValuer valuer(IntervalFailure::None);
+    AssignmentInput input = oversizedComponentInput();
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
     expect(result.stats.clustersTotal == 1, "the overlap graph has one component");
-    expect(result.stats.clustersCapped == 1 && result.stats.clustersEnumerated == 0,
+    expect(result.stats.clustersCapped == 1 &&
+               result.stats.clustersEnumerated == 0 &&
+               result.stats.clustersSkippedStockBudget == 0,
            "the oversized component is not enumerated");
     expect(plannedTotal(result) == expectedTotal, "the cap preserves the settled plan");
     expect(result.stats.assignedUnits == actorCount, "every capped actor keeps a feasible action");
+    expect(valuer.scalarCallsAfterLiveQuote == 0,
+           "the actor cap takes precedence over stock classification");
 }
 
 bool samePlan(const AssignmentResult & left, const AssignmentResult & right)
@@ -739,14 +859,82 @@ bool samePlan(const AssignmentResult & left, const AssignmentResult & right)
     {
         const PlannedAction & leftAction = left.plan.action(index);
         const PlannedAction & rightAction = right.plan.action(index);
-        if (leftAction.unitId != rightAction.unitId ||
+        if (leftAction.actionIndex != rightAction.actionIndex ||
+            leftAction.unitId != rightAction.unitId ||
+            leftAction.kind != rightAction.kind ||
+            leftAction.actionId != rightAction.actionId ||
+            leftAction.path != rightAction.path ||
             leftAction.destination != rightAction.destination ||
+            leftAction.target != rightAction.target ||
+            leftAction.targetUnitId != rightAction.targetUnitId ||
+            leftAction.marginalValue != rightAction.marginalValue ||
+            leftAction.plannedDamageSteps != rightAction.plannedDamageSteps ||
             leftAction.state != rightAction.state)
         {
             return false;
         }
     }
     return true;
+}
+
+std::vector<std::int32_t> statsSnapshot(
+    const AssignmentStats & stats)
+{
+    return {
+        stats.assignedUnits,
+        stats.unassignedUnits,
+        stats.candidates,
+        stats.unsupportedCandidates,
+        stats.conflicts,
+        stats.overkillRejections,
+        stats.staleRejections,
+        stats.invalidActions,
+        stats.vacateConflicts,
+        stats.unorderedActions,
+        stats.settlingSweeps,
+        stats.settlingMoves,
+        stats.swapImprovements,
+        stats.clustersTotal,
+        stats.clustersEnumerated,
+        stats.clustersCapped,
+        stats.clustersSkippedStockBudget,
+        stats.enumerationStates,
+        stats.swapStates,
+        stats.replayFailures,
+    };
+}
+
+void testStockPairBypassReplaysDeterministically()
+{
+    PairIntervalValuer firstValuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    AssignmentInput firstInput = destinationSwapInput();
+    firstInput.pStockValuer = &firstValuer;
+    const AssignmentResult first =
+        MaximumValueAssignment::assign(firstInput);
+
+    PairIntervalValuer replayValuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    AssignmentInput replayInput = destinationSwapInput();
+    replayInput.pStockValuer = &replayValuer;
+    const AssignmentResult replay =
+        MaximumValueAssignment::assign(replayInput);
+
+    expect(samePlan(first, replay),
+           "stock bypass replays the exact actions, order, and values");
+    expect(statsSnapshot(first.stats) ==
+               statsSnapshot(replay.stats),
+           "stock bypass repeats every assignment statistic");
+    expect(plannedTotal(first) == GOOD_VALUE + FAIR_VALUE &&
+               plannedTotal(first) == plannedTotal(replay),
+           "stock bypass repeats the selected economic value");
+    expect(firstValuer.scalarCalls ==
+               replayValuer.scalarCalls &&
+               firstValuer.scalarCallsAfterLiveQuote == 0 &&
+               replayValuer.scalarCallsAfterLiveQuote == 0,
+           "stock bypass repeats pricing without cluster scalar calls");
 }
 
 void testClusterSearchReplaysDeterministically()
@@ -758,6 +946,82 @@ void testClusterSearchReplaysDeterministically()
            "cluster traversal visits the same states");
     expect(first.stats.replayFailures == 0 && replay.stats.replayFailures == 0,
            "both winning searches reproduce their selected seats");
+}
+
+void testOneStockActorDoesNotCountAsAClusterSkip()
+{
+    PairIntervalValuer valuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    AssignmentInput input = destinationSwapInput();
+    input.actors.resize(1);
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    expect(result.stats.clustersTotal == 0 &&
+               result.stats.clustersEnumerated == 0 &&
+               result.stats.clustersCapped == 0 &&
+               result.stats.clustersSkippedStockBudget == 0 &&
+               result.stats.enumerationStates == 0,
+           "a one-actor component is not a skipped cluster");
+    expect(result.stats.assignedUnits == 1 &&
+               plannedTotal(result) == BEST_VALUE,
+           "the single stock actor keeps its exact selected action");
+}
+
+AssignmentInput sharedBudgetInput()
+{
+    constexpr std::int32_t actorCount = 5;
+    constexpr std::int32_t candidatesPerActor = 150;
+    constexpr std::int32_t firstUnit = 100;
+    constexpr std::int32_t privateTileOffset = 10;
+    std::vector<AssignmentActor> actors;
+    actors.reserve(actorCount);
+    for (std::int32_t slot = 0; slot < actorCount; ++slot)
+    {
+        const TilePoint origin{slot, 0};
+        std::vector<CandidateBundle> candidates;
+        candidates.reserve(candidatesPerActor);
+        for (std::int32_t option = 0;
+             option < candidatesPerActor;
+             ++option)
+        {
+            candidates.push_back(
+                valuedCandidate(
+                    slot,
+                    origin,
+                    TilePoint{
+                        slot + privateTileOffset,
+                        option + privateTileOffset},
+                    BEST_VALUE));
+        }
+        actors.push_back(
+            actorWith(
+                slot,
+                firstUnit + slot,
+                std::move(candidates)));
+    }
+    return inputWith(std::move(actors));
+}
+
+void testSharedBudgetCapPrecedesStockClassification()
+{
+    BudgetExhaustingValuer valuer;
+    AssignmentInput input = sharedBudgetInput();
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    expect(result.stats.swapStates ==
+               Coordinator::ASSIGNMENT_STATE_BUDGET &&
+               Coordinator::searchBudgetExhausted(result.stats),
+           "pair searches exhaust the shared assignment budget");
+    expect(result.stats.clustersTotal == 1 &&
+               result.stats.clustersCapped == 1 &&
+               result.stats.clustersEnumerated == 0,
+           "the exhausted component uses the existing capped path");
+    expect(result.stats.clustersSkippedStockBudget == 0 &&
+               result.stats.enumerationStates == 0,
+           "shared-budget exhaustion is not double-counted as a stock skip");
 }
 
 void testCapsAndSharedBudgetBoundTheSearch()
@@ -795,8 +1059,12 @@ int main()
     testPairAssignmentReplaysDeterministically();
     testTrimmedFireValueUsesOnlyGrantedDamage();
     testClusterSearchFindsTheThreeActorImprovement();
+    testMixedStockClusterKeepsTheSettledPlan();
     testOversizedComponentKeepsItsSettledPlan();
+    testStockPairBypassReplaysDeterministically();
     testClusterSearchReplaysDeterministically();
+    testOneStockActorDoesNotCountAsAClusterSkip();
+    testSharedBudgetCapPrecedesStockClassification();
     testCapsAndSharedBudgetBoundTheSearch();
     return failures == 0 ? 0 : 1;
 }
