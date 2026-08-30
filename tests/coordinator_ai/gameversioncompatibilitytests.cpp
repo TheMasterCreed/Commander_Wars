@@ -122,7 +122,7 @@ void testAndroidVersionCoherence()
 
     checkEqual(androidVersionName, currentVersion().toString(), "Android and game version names match");
     checkEqual(androidVersionName, QStringLiteral("0.39.1-main"), "Android version name");
-    checkEqual(androidVersionCode, QStringLiteral("69"), "Android version code");
+    checkEqual(androidVersionCode, QStringLiteral("70"), "Android version code");
 }
 }
 
