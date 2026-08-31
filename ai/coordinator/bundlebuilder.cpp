@@ -190,6 +190,7 @@ namespace
         std::vector<MilliFunds> m_enemyShotsAtOrigin;
         std::int32_t m_generationIndex{0};
         std::int32_t m_actorEngineUnitId{Coordinator::NO_UNIT};
+        bool m_actorOnActiveFriendlyProduction{false};
     };
 
     Unit* CandidateBuilder::liveUnit(std::int32_t unitIndex)
@@ -456,6 +457,9 @@ namespace
         candidate.bundle.destination = option.destination;
         candidate.bundle.path = option.path;
         candidate.movementCost = option.costs;
+        candidate.vacatesActiveFriendlyProduction =
+            m_actorOnActiveFriendlyProduction &&
+            option.destination != actor.tile;
         candidate.actor = Coordinator::ActorFacts{
             .replacementCost = replacementCost(actor.unitIndex, *actor.pUnit),
             .hpSteps = actor.hpSteps,
@@ -781,6 +785,14 @@ namespace
             return result;
         }
         m_actorEngineUnitId = actor.pUnit->getUniqueID();
+        const Coordinator::PropertyFacts* pOriginProperty =
+            propertyAt(actor.tile);
+        m_actorOnActiveFriendlyProduction =
+            pOriginProperty != nullptr &&
+            pOriginProperty->canProduce &&
+            m_context.knowledge.relation(
+                pOriginProperty->ownerId) ==
+                Coordinator::Relation::Own;
         m_actorShotsAtOrigin = nextShotSpan(actor, VictimOverride{}, Coordinator::NO_UNIT);
         m_enemyShotsAtOrigin = enemyShotSpan(actor, VictimOverride{});
         UnitPathFindingSystem pfs(&m_context.map, actor.pUnit, &m_context.player);

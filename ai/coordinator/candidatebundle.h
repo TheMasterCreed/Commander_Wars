@@ -13,6 +13,7 @@ namespace Coordinator
         ActionBundle bundle;
         ActorFacts actor;
         std::int32_t movementCost{0};
+        bool vacatesActiveFriendlyProduction{false};
         std::vector<MilliFunds> actorNextShotsAtOrigin;
         std::vector<MilliFunds> actorNextShotsAtDestination;
         std::vector<MilliFunds> enemyShotsOnActorAtOrigin;

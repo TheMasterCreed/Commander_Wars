@@ -325,8 +325,20 @@ namespace Coordinator
         bool operator()(std::int32_t left, std::int32_t right) const
         {
             const std::vector<CandidateBundle> & candidates = *pCandidates;
-            return candidates[static_cast<std::size_t>(left)].valuation.value().economicValue >
-                   candidates[static_cast<std::size_t>(right)].valuation.value().economicValue;
+            const CandidateBundle & leftCandidate =
+                candidates[static_cast<std::size_t>(left)];
+            const CandidateBundle & rightCandidate =
+                candidates[static_cast<std::size_t>(right)];
+            const MilliFunds leftValue =
+                leftCandidate.valuation.value().economicValue;
+            const MilliFunds rightValue =
+                rightCandidate.valuation.value().economicValue;
+            if (leftValue != rightValue)
+            {
+                return leftValue > rightValue;
+            }
+            return leftCandidate.vacatesActiveFriendlyProduction &&
+                   !rightCandidate.vacatesActiveFriendlyProduction;
         }
     };
 

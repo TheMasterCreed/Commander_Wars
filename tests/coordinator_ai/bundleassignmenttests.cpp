@@ -798,6 +798,18 @@ CandidateBundle valuedCandidate(std::int32_t unitIndex, TilePoint origin, TilePo
     return candidate;
 }
 
+CandidateBundle productionVacatingCandidate(
+    std::int32_t unitIndex,
+    TilePoint origin,
+    TilePoint destination,
+    MilliFunds value)
+{
+    CandidateBundle candidate =
+        valuedCandidate(unitIndex, origin, destination, value);
+    candidate.vacatesActiveFriendlyProduction = true;
+    return candidate;
+}
+
 CandidateBundle firingCandidate(std::int32_t unitIndex, TilePoint origin, TilePoint destination,
                                 std::int32_t damageSteps, MilliFunds value)
 {
@@ -989,6 +1001,143 @@ void testCandidatePreparationIsStableAndIncludesGivingUp()
     expect(Coordinator::incumbentFirstOptions(state) ==
                std::vector<std::int32_t>({1, 0, NO_CANDIDATE, 2}),
            "the incumbent leads its equal value tier");
+}
+
+void testProductionVacateBreaksOnlyAnExactTie()
+{
+    std::vector<CandidateBundle> candidates{
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            ATTACKER_TILE,
+            GOOD_VALUE),
+        productionVacatingCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            GOOD_VALUE),
+        productionVacatingCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            SPARE_TILE,
+            FAIR_VALUE),
+    };
+    AssignmentStats stats;
+    const std::vector<std::int32_t> order =
+        Coordinator::plannableCandidateOrder(
+            testActionIds(),
+            testUnitLinks(),
+            candidates,
+            stats);
+    expect(
+        order == std::vector<std::int32_t>({1, 0, 2}),
+        "an exact tie puts a production vacate before wait");
+    expect(
+        candidates[0].valuation.value().economicValue ==
+                candidates[1].valuation.value().economicValue &&
+            candidates[2].valuation.value().economicValue <
+                candidates[0].valuation.value().economicValue,
+        "the production tie key does not alter economic values");
+
+    const AssignmentResult tied =
+        MaximumValueAssignment::assign(
+            inputWith({actorWith(
+                ATTACKER_INDEX,
+                ATTACKER_UNIT,
+                candidates)}));
+    const PlannedAction* pTied =
+        actionOf(tied, ATTACKER_UNIT);
+    expect(
+        pTied != nullptr &&
+            pTied->destination == CONTESTED_TILE,
+        "the assignment selects the equal production vacate");
+
+    std::vector<CandidateBundle> lowerCandidates{
+        candidates[0],
+        candidates[2],
+    };
+    const AssignmentResult lower =
+        MaximumValueAssignment::assign(
+            inputWith({actorWith(
+                ATTACKER_INDEX,
+                ATTACKER_UNIT,
+                std::move(lowerCandidates))}));
+    const PlannedAction* pLower =
+        actionOf(lower, ATTACKER_UNIT);
+    expect(
+        pLower != nullptr &&
+            pLower->destination == ATTACKER_TILE,
+        "a lower-value production vacate does not beat wait");
+
+    std::vector<CandidateBundle> ordinaryCandidates{
+        candidates[0],
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            GOOD_VALUE),
+    };
+    const AssignmentResult ordinary =
+        MaximumValueAssignment::assign(
+            inputWith({actorWith(
+                ATTACKER_INDEX,
+                ATTACKER_UNIT,
+                std::move(ordinaryCandidates))}));
+    const PlannedAction* pOrdinary =
+        actionOf(ordinary, ATTACKER_UNIT);
+    expect(
+        pOrdinary != nullptr &&
+            pOrdinary->destination == ATTACKER_TILE,
+        "an ordinary exact tie preserves stable wait order");
+}
+
+void testProductionVacateFallsThroughAnIllegalTie()
+{
+    AssignmentActor blocker =
+        actorWith(
+            SUPPORT_INDEX,
+            SUPPORT_UNIT,
+            {valuedCandidate(
+                SUPPORT_INDEX,
+                SUPPORT_TILE,
+                CONTESTED_TILE,
+                BEST_VALUE)});
+    AssignmentActor producer =
+        actorWith(
+            ATTACKER_INDEX,
+            ATTACKER_UNIT,
+            {
+                valuedCandidate(
+                    ATTACKER_INDEX,
+                    ATTACKER_TILE,
+                    ATTACKER_TILE,
+                    GOOD_VALUE),
+                productionVacatingCandidate(
+                    ATTACKER_INDEX,
+                    ATTACKER_TILE,
+                    CONTESTED_TILE,
+                    GOOD_VALUE),
+                productionVacatingCandidate(
+                    ATTACKER_INDEX,
+                    ATTACKER_TILE,
+                    SPARE_TILE,
+                    GOOD_VALUE),
+            });
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(
+            inputWith({
+                std::move(producer),
+                std::move(blocker),
+            }));
+    const PlannedAction* pProducer =
+        actionOf(result, ATTACKER_UNIT);
+    expect(
+        pProducer != nullptr &&
+            pProducer->destination == SPARE_TILE,
+        "an illegal production vacate falls through to a legal tied vacate");
+    expect(
+        result.stats.conflicts > 0,
+        "the blocked production vacate is rejected by normal legality");
 }
 
 void testSeatBestClaimableFallsThroughAConflict()
@@ -2117,6 +2266,8 @@ int main()
     testDestinationConflictRollsBackTheRefusedAction();
     testAttackAndCaptureClaimsRejectOverbooking();
     testCandidatePreparationIsStableAndIncludesGivingUp();
+    testProductionVacateBreaksOnlyAnExactTie();
+    testProductionVacateFallsThroughAnIllegalTie();
     testSeatBestClaimableFallsThroughAConflict();
     testReplanRevivesAndCanAbandonAnAction();
     testActorResourcesExposeTileAndTargetConflicts();
