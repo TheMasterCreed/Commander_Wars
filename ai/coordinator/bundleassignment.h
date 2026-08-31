@@ -932,6 +932,15 @@ namespace Coordinator
             PairSwapInterval,
         };
 
+        enum class PairPricingResult : std::int8_t
+        {
+            NotPair,
+            NonStockExactScalar,
+            LiveInterval,
+            LiveIntervalUnavailable,
+            LiveIntervalFailure,
+        };
+
         struct ActorSeat
         {
             std::int32_t chosen{NO_CANDIDATE};
@@ -950,6 +959,9 @@ namespace Coordinator
             MilliFunds resultLower{0};
             MilliFunds resultUpper{0};
             bool resultKnown{false};
+            PairPricingResult pairPricing{
+                PairPricingResult::NotPair
+            };
             struct PairExactAuditSnapshot
             {
                 TurnPlan incumbentPlan;
@@ -962,6 +974,77 @@ namespace Coordinator
             };
             std::optional<PairExactAuditSnapshot> pairAudit;
         };
+
+        static QString tracePairPricing(
+            PairPricingResult result)
+        {
+            switch (result)
+            {
+                case PairPricingResult::
+                    NonStockExactScalar:
+                    return QStringLiteral(
+                        "NON_STOCK_EXACT_SCALAR");
+                case PairPricingResult::LiveInterval:
+                    return QStringLiteral(
+                        "LIVE_INTERVAL");
+                case PairPricingResult::
+                    LiveIntervalUnavailable:
+                    return QStringLiteral(
+                        "LIVE_INTERVAL_UNAVAILABLE");
+                case PairPricingResult::
+                    LiveIntervalFailure:
+                    return QStringLiteral(
+                        "LIVE_INTERVAL_FAILURE");
+                case PairPricingResult::NotPair:
+                    return QStringLiteral(
+                        "LEGACY_SCALAR");
+            }
+            return QStringLiteral("UNKNOWN");
+        }
+
+        static QString tracePairRequestedPricing(
+            PairPricingResult result)
+        {
+            return result ==
+                       PairPricingResult::
+                           NonStockExactScalar
+                       ? QStringLiteral(
+                             "NON_STOCK_EXACT_SCALAR")
+                       : QStringLiteral(
+                             "LIVE_INTERVAL");
+        }
+
+        static QString tracePairResultReason(
+            const ExactSearchOutcome & outcome)
+        {
+            switch (outcome.pairPricing)
+            {
+                case PairPricingResult::
+                    LiveIntervalUnavailable:
+                    return QStringLiteral(
+                        "LIVE_INTERVAL_UNAVAILABLE");
+                case PairPricingResult::
+                    LiveIntervalFailure:
+                    return QStringLiteral(
+                        "LIVE_INTERVAL_FAILURE");
+                case PairPricingResult::LiveInterval:
+                    return outcome.improved
+                               ? QStringLiteral(
+                                     "LOWER_ABOVE_INCUMBENT_UPPER")
+                               : QStringLiteral(
+                                     "NO_CERTIFIED_REPLACEMENT");
+                case PairPricingResult::
+                    NonStockExactScalar:
+                    return outcome.improved
+                               ? QStringLiteral(
+                                     "EXACT_SCALAR_IMPROVEMENT")
+                               : QStringLiteral(
+                                     "EXACT_SCALAR_RETAINED");
+                case PairPricingResult::NotPair:
+                    return QStringLiteral("NOT_PAIR");
+            }
+            return QStringLiteral("UNKNOWN");
+        }
 
         struct StockDecompositionRequest
         {
@@ -985,7 +1068,6 @@ namespace Coordinator
             MilliFunds incumbentUpper{0};
             MilliFunds winnerLower{0};
             MilliFunds winnerUpper{0};
-            bool liveFailure{false};
             ExactSearchOutcome::PairExactAuditSnapshot snapshot;
         };
 
@@ -1010,6 +1092,7 @@ namespace Coordinator
             MilliFunds propertyOriginInSearchBasis{0};
             MilliFunds fixedEconomic{0};
             MilliFunds incumbentLower{0};
+            MilliFunds incumbentUpper{0};
             MilliFunds bestFeasibleEconomic{0};
             bool hasBest{false};
             std::int32_t states{0};
@@ -1766,9 +1849,7 @@ namespace Coordinator
                             pair,
                             NO_CANDIDATE_CAP,
                             stats,
-                            liveIntervals
-                                ? SearchPricingMode::PairSwapInterval
-                                : SearchPricingMode::LegacyScalar);
+                            SearchPricingMode::PairSwapInterval);
                     stats.swapStates += outcome.states;
                     if (outcome.improved)
                     {
@@ -1805,8 +1886,6 @@ namespace Coordinator
                                         outcome.resultLower,
                                     .winnerUpper =
                                         outcome.resultUpper,
-                                    .liveFailure =
-                                        outcome.liveFailure,
                                     .snapshot =
                                         std::move(
                                             *outcome.pairAudit),
@@ -1839,7 +1918,7 @@ namespace Coordinator
                         input.pTrace->record(
                             QStringLiteral("PAIR_RESULT"),
                             QStringLiteral(
-                                "sweep=%1 actors=%2 incumbent=%3 final=%4 states=%5 accepted=%6 aborted=%7 liveFailure=%8 requestedPricing=%9 effectivePricing=%10 incumbentLower=%11 incumbentUpper=%12 winnerLower=%13 winnerUpper=%14 winnerKnown=%15 winnerExact=%16")
+                                "sweep=%1 actors=%2 incumbent=%3 final=%4 states=%5 accepted=%6 aborted=%7 liveFailure=%8 requestedPricing=%9 effectivePricing=%10 incumbentLower=%11 incumbentUpper=%12 winnerLower=%13 winnerUpper=%14 winnerKnown=%15 winnerExact=%16 reason=%17")
                                 .arg(sweep)
                                 .arg(traceActorIds(actors, pair))
                                 .arg(traceIndices(
@@ -1852,21 +1931,10 @@ namespace Coordinator
                                     outcome.aborted))
                                 .arg(traceBool(
                                     outcome.liveFailure))
-                                .arg(
-                                    liveIntervals
-                                        ? QStringLiteral(
-                                              "LIVE_INTERVAL")
-                                        : QStringLiteral(
-                                              "LEGACY_SCALAR"))
-                                .arg(
-                                    outcome.liveFailure
-                                        ? QStringLiteral(
-                                              "LEGACY_SCALAR_FALLBACK")
-                                        : liveIntervals
-                                              ? QStringLiteral(
-                                                    "LIVE_INTERVAL")
-                                              : QStringLiteral(
-                                                    "LEGACY_SCALAR"))
+                                .arg(tracePairRequestedPricing(
+                                    outcome.pairPricing))
+                                .arg(tracePairPricing(
+                                    outcome.pairPricing))
                                 .arg(outcome.incumbentLower)
                                 .arg(outcome.incumbentUpper)
                                 .arg(outcome.resultLower)
@@ -1876,7 +1944,9 @@ namespace Coordinator
                                 .arg(traceBool(
                                     outcome.resultKnown &&
                                     outcome.resultLower ==
-                                        outcome.resultUpper)));
+                                        outcome.resultUpper))
+                                .arg(tracePairResultReason(
+                                    outcome)));
                     }
                 }
                 const bool refined =
@@ -2019,13 +2089,15 @@ namespace Coordinator
                             input.pTrace->record(
                                 QStringLiteral("PAIR_COMPARE"),
                                 QStringLiteral(
-                                    "actors=%1 challenger=%2 economic=%3 valid=%4 lowerWitnessReplays=%5 reason=UNREPLAYABLE accepted=false states=%6")
+                                    "actors=%1 challenger=%2 economic=%3 stockLower=NA stockUpper=NA challengerLower=NA challengerUpper=NA incumbentLower=%4 incumbentUpper=%5 valid=%6 lowerWitnessReplays=%7 states=%8 reason=LIVE_INTERVAL_FAILURE accepted=false")
                                     .arg(traceActorIds(
                                         actors,
                                         search.members))
                                     .arg(traceIndices(
                                         search.current))
                                     .arg(economic)
+                                    .arg(search.incumbentLower)
+                                    .arg(search.incumbentUpper)
                                     .arg(traceBool(quote.valid))
                                     .arg(traceBool(
                                         quote.lowerWitnessReplays))
@@ -2041,12 +2113,10 @@ namespace Coordinator
                     const MilliFunds upper =
                         economic +
                         quote.stockAbsolute.upper;
-                    const MilliFunds incumbentLower =
-                        search.incumbentLower;
                     const bool pruned =
-                        upper <= incumbentLower;
+                        upper <= search.incumbentLower;
                     const bool accepted =
-                        lower > incumbentLower;
+                        lower > search.incumbentUpper;
                     if (input.pTrace != nullptr &&
                         input.pTrace->stockDetailsEnabled() &&
                         search.members.size() == 2)
@@ -2054,7 +2124,7 @@ namespace Coordinator
                         input.pTrace->record(
                             QStringLiteral("PAIR_COMPARE"),
                             QStringLiteral(
-                                "actors=%1 challenger=%2 economic=%3 stockLower=%4 stockUpper=%5 challengerLower=%6 challengerUpper=%7 incumbentLower=%8 exact=%9 completeValue=%10 states=%11 reason=%12 accepted=%13")
+                                "actors=%1 challenger=%2 economic=%3 stockLower=%4 stockUpper=%5 challengerLower=%6 challengerUpper=%7 incumbentLower=%8 incumbentUpper=%9 exact=%10 completeValue=%11 states=%12 reason=%13 accepted=%14")
                                 .arg(traceActorIds(
                                     actors,
                                     search.members))
@@ -2065,7 +2135,8 @@ namespace Coordinator
                                 .arg(quote.stockAbsolute.upper)
                                 .arg(lower)
                                 .arg(upper)
-                                .arg(incumbentLower)
+                                .arg(search.incumbentLower)
+                                .arg(search.incumbentUpper)
                                 .arg(traceBool(lower == upper))
                                 .arg(
                                     lower == upper
@@ -2075,10 +2146,10 @@ namespace Coordinator
                                 .arg(
                                     pruned
                                         ? QStringLiteral(
-                                              "UPPER_NOT_ABOVE_INCUMBENT")
+                                              "UPPER_NOT_ABOVE_INCUMBENT_LOWER")
                                         : accepted
                                               ? QStringLiteral(
-                                                    "LOWER_ABOVE_INCUMBENT")
+                                                    "LOWER_ABOVE_INCUMBENT_UPPER")
                                               : QStringLiteral(
                                                     "INTERVAL_OVERLAP"))
                                 .arg(traceBool(accepted)));
@@ -2087,11 +2158,12 @@ namespace Coordinator
                     {
                         return;
                     }
-                    if (lower > search.incumbentLower)
+                    if (lower > search.incumbentUpper)
                     {
                         search.bestFeasibleEconomic = economic;
                         search.bestFeasibleQuote = quote;
                         search.incumbentLower = lower;
+                        search.incumbentUpper = upper;
                         search.bestFeasiblePlan =
                             search.current;
                     }
@@ -2111,7 +2183,7 @@ namespace Coordinator
                     input.pTrace->record(
                         QStringLiteral("PAIR_COMPARE"),
                         QStringLiteral(
-                            "actors=%1 challenger=%2 completeValue=%3 incumbentComplete=%4 exact=true states=%5 reason=%6 accepted=%7")
+                            "actors=%1 challenger=%2 challengerLower=%3 challengerUpper=%3 incumbentLower=%4 incumbentUpper=%4 completeValue=%3 incumbentComplete=%4 exact=true states=%5 reason=%6 accepted=%7")
                             .arg(traceActorIds(
                                 actors,
                                 search.members))
@@ -2279,7 +2351,10 @@ namespace Coordinator
                     search.bestFeasibleQuote.key &&
                 economic +
                         replayed.stockAbsolute.lower ==
-                    search.incumbentLower)
+                    search.incumbentLower &&
+                economic +
+                        replayed.stockAbsolute.upper ==
+                    search.incumbentUpper)
             {
                 return true;
             }
@@ -2349,10 +2424,29 @@ namespace Coordinator
                     break;
                 }
             }
+            const bool pairSearch =
+                pricingMode ==
+                SearchPricingMode::PairSwapInterval;
+            const bool liveIntervalSupport =
+                input.pStockValuer != nullptr &&
+                input.pStockValuer->livePairSwapIntervals();
             const bool liveIntervals =
                 search.stockLive &&
-                pricingMode ==
-                    SearchPricingMode::PairSwapInterval;
+                pairSearch &&
+                liveIntervalSupport;
+            ExactSearchOutcome outcome;
+            if (pairSearch)
+            {
+                outcome.pairPricing =
+                    !search.stockLive
+                        ? PairPricingResult::
+                              NonStockExactScalar
+                        : liveIntervalSupport
+                              ? PairPricingResult::
+                                    LiveInterval
+                              : PairPricingResult::
+                                    LiveIntervalUnavailable;
+            }
             MilliFunds incumbentTotal = seatedTotal(actors, members);
             MilliFunds incumbentLower = incumbentTotal;
             MilliFunds incumbentUpper = incumbentTotal;
@@ -2384,15 +2478,31 @@ namespace Coordinator
                         .arg(traceIndices(incumbentChoices))
                         .arg(incumbentTotal)
                         .arg(traceBool(search.stockLive))
-                        .arg(
-                            liveIntervals
-                                ? QStringLiteral("LIVE_INTERVAL")
-                                : QStringLiteral("LEGACY_SCALAR"))
+                        .arg(tracePairPricing(
+                            outcome.pairPricing))
                         .arg(candidateCap)
                         .arg(
                             ASSIGNMENT_STATE_BUDGET -
                             stats.swapStates -
                             stats.enumerationStates));
+            }
+            if (outcome.pairPricing ==
+                PairPricingResult::
+                    LiveIntervalUnavailable)
+            {
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled() &&
+                    members.size() == 2)
+                {
+                    input.pTrace->record(
+                        QStringLiteral("PAIR_COMPARE"),
+                        QStringLiteral(
+                            "actors=%1 challenger=NONE challengerLower=NA challengerUpper=NA incumbentLower=NA incumbentUpper=NA states=0 reason=LIVE_INTERVAL_UNAVAILABLE accepted=false")
+                            .arg(traceActorIds(
+                                actors,
+                                members)));
+                }
+                return outcome;
             }
             if (liveIntervals)
             {
@@ -2407,28 +2517,41 @@ namespace Coordinator
                     !search.bestFeasibleQuote
                          .lowerWitnessReplays)
                 {
-                    ExactSearchOutcome fallback =
-                        runExactSearch(
-                            plan,
-                            input,
-                            actors,
-                            members,
-                            candidateCap,
-                            stats,
-                            SearchPricingMode::LegacyScalar);
-                    fallback.liveFailure = true;
-                    return fallback;
+                    outcome.liveFailure = true;
+                    outcome.pairPricing =
+                        PairPricingResult::
+                            LiveIntervalFailure;
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled() &&
+                        members.size() == 2)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("PAIR_COMPARE"),
+                            QStringLiteral(
+                                "actors=%1 challenger=NONE challengerLower=NA challengerUpper=NA incumbentLower=NA incumbentUpper=NA valid=%2 lowerWitnessReplays=%3 states=0 reason=LIVE_INTERVAL_FAILURE accepted=false")
+                                .arg(traceActorIds(
+                                    actors,
+                                    members))
+                                .arg(traceBool(
+                                    search.bestFeasibleQuote
+                                        .valid))
+                                .arg(traceBool(
+                                    search.bestFeasibleQuote
+                                        .lowerWitnessReplays)));
+                    }
+                    return outcome;
                 }
                 search.bestFeasiblePlan = incumbentChoices;
                 search.incumbentLower =
                     search.bestFeasibleEconomic +
                     search.bestFeasibleQuote
                         .stockAbsolute.lower;
-                incumbentLower = search.incumbentLower;
-                incumbentUpper =
+                search.incumbentUpper =
                     search.bestFeasibleEconomic +
                     search.bestFeasibleQuote
                         .stockAbsolute.upper;
+                incumbentLower = search.incumbentLower;
+                incumbentUpper = search.incumbentUpper;
                 search.hasBest = true;
                 if (input.pTrace != nullptr &&
                     input.pTrace->stockDetailsEnabled() &&
@@ -2437,7 +2560,7 @@ namespace Coordinator
                     input.pTrace->record(
                         QStringLiteral("PAIR_INCUMBENT"),
                         QStringLiteral(
-                            "actors=%1 candidates=%2 economic=%3 stockLower=%4 stockUpper=%5 incumbentLower=%6 exact=%7 lowerWitnessReplays=%8")
+                            "actors=%1 candidates=%2 economic=%3 stockLower=%4 stockUpper=%5 incumbentLower=%6 incumbentUpper=%7 exact=%8 lowerWitnessReplays=%9")
                             .arg(traceActorIds(
                                 actors,
                                 members))
@@ -2449,6 +2572,7 @@ namespace Coordinator
                             .arg(search.bestFeasibleQuote
                                      .stockAbsolute.upper)
                             .arg(search.incumbentLower)
+                            .arg(search.incumbentUpper)
                             .arg(traceBool(
                                 search.bestFeasibleQuote
                                         .stockAbsolute.lower ==
@@ -2486,7 +2610,6 @@ namespace Coordinator
             search.fixedEconomic =
                 seatedPlanTotal(plan, actors);
             searchCluster(plan, input, actors, search, 0, 0, stats);
-            ExactSearchOutcome outcome;
             outcome.states = search.states;
             outcome.aborted = search.aborted;
             outcome.liveFailure = search.liveFailure;
@@ -2497,9 +2620,7 @@ namespace Coordinator
                 outcome.resultLower =
                     search.incumbentLower;
                 outcome.resultUpper =
-                    search.bestFeasibleEconomic +
-                    search.bestFeasibleQuote
-                        .stockAbsolute.upper;
+                    search.incumbentUpper;
                 outcome.resultKnown = true;
             }
             else if (search.hasBest)
@@ -2514,21 +2635,22 @@ namespace Coordinator
             {
                 if (search.liveFailure)
                 {
-                    ExactSearchOutcome fallback =
-                        runExactSearch(
-                            plan,
-                            input,
-                            actors,
-                            members,
-                            candidateCap,
-                            stats,
-                            SearchPricingMode::LegacyScalar);
-                    fallback.states += outcome.states;
-                    fallback.liveFailure = true;
-                    return fallback;
+                    outcome.pairPricing =
+                        PairPricingResult::
+                            LiveIntervalFailure;
+                    outcome.resultLower = incumbentLower;
+                    outcome.resultUpper = incumbentUpper;
+                    outcome.resultKnown = true;
+                    return outcome;
                 }
-                if (search.aborted ||
-                    !search.hasBest ||
+                if (search.aborted)
+                {
+                    outcome.resultLower = incumbentLower;
+                    outcome.resultUpper = incumbentUpper;
+                    outcome.resultKnown = true;
+                    return outcome;
+                }
+                if (!search.hasBest ||
                     search.bestFeasiblePlan ==
                         incumbentChoices)
                 {
@@ -2571,18 +2693,14 @@ namespace Coordinator
                     }
                     return outcome;
                 }
-                ExactSearchOutcome fallback =
-                    runExactSearch(
-                        plan,
-                        input,
-                        actors,
-                        members,
-                        candidateCap,
-                        stats,
-                        SearchPricingMode::LegacyScalar);
-                fallback.states += outcome.states;
-                fallback.liveFailure = true;
-                return fallback;
+                outcome.liveFailure = true;
+                outcome.pairPricing =
+                    PairPricingResult::
+                        LiveIntervalFailure;
+                outcome.resultLower = incumbentLower;
+                outcome.resultUpper = incumbentUpper;
+                outcome.resultKnown = true;
+                return outcome;
             }
             if (search.aborted || !search.hasBest || search.bestTotal <= incumbentTotal)
             {
@@ -2901,11 +3019,8 @@ namespace Coordinator
             const QString pricing =
                 request.snapshot.liveIntervalPricing
                     ? QStringLiteral("LIVE_INTERVAL")
-                    : request.liveFailure
-                          ? QStringLiteral(
-                                "LEGACY_SCALAR_FALLBACK")
-                          : QStringLiteral(
-                                "LEGACY_SCALAR");
+                    : QStringLiteral(
+                          "NON_STOCK_EXACT_SCALAR");
             input.pTrace->record(
                 QStringLiteral("PAIR_EXACT_AUDIT"),
                 QStringLiteral(

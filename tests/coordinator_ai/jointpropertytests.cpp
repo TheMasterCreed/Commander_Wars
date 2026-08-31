@@ -107,6 +107,45 @@ namespace
             return engineUnitId == FIRST_UNIT || engineUnitId == SECOND_UNIT;
         }
 
+        bool livePairSwapIntervals() const override
+        {
+            return true;
+        }
+
+        Coordinator::LivePlanStockQuote livePlanStock(
+            const TurnPlan & plan,
+            MilliFunds,
+            bool) override
+        {
+            Coordinator::LivePlanStockQuote quote;
+            for (std::int32_t index = 0;
+                 index < plan.actionCount();
+                 ++index)
+            {
+                const PlannedAction & action =
+                    plan.action(index);
+                if (!Coordinator::isLiveState(
+                        action.state))
+                {
+                    continue;
+                }
+                quote.key.push_back(
+                    Coordinator::CanonicalPlanActionKey::
+                        fromAction(
+                            action.unitId,
+                            action.destination.x,
+                            action.destination.y,
+                            false));
+            }
+            std::sort(quote.key.begin(), quote.key.end());
+            const MilliFunds stock = planStock(plan);
+            quote.stockAbsolute =
+                Coordinator::StockInterval{stock, stock};
+            quote.valid = true;
+            quote.lowerWitnessReplays = true;
+            return quote;
+        }
+
         std::int32_t ceilingCalls() const
         {
             return m_ceilingCalls;

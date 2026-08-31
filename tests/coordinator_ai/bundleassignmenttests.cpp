@@ -84,6 +84,7 @@ enum class IntervalFailure
     IncumbentWitness,
     LeafQuote,
     ReplayQuote,
+    ReplayUpper,
 };
 
 class PairIntervalValuer final : public PlanStockValuer
@@ -250,6 +251,244 @@ private:
     std::int32_t m_affectedUnit;
     bool m_failed{false};
     bool m_liveQuoteSeen{false};
+};
+
+struct PairPlanValue
+{
+    StockInterval interval;
+    MilliFunds exact{0};
+};
+
+class CertifiedPairValuer final : public PlanStockValuer
+{
+public:
+    CertifiedPairValuer(
+        PairPlanValue incumbent,
+        PairPlanValue challenger,
+        PairPlanValue intermediate =
+            PairPlanValue{
+                StockInterval{-1000000, -1000000},
+                -1000000},
+        IntervalFailure failure =
+            IntervalFailure::None,
+        bool liveSupported = true)
+        : m_incumbent(incumbent),
+          m_challenger(challenger),
+          m_intermediate(intermediate),
+          m_failure(failure),
+          m_liveSupported(liveSupported)
+    {
+    }
+
+    MilliFunds planStock(const TurnPlan & plan) override
+    {
+        ++scalarCalls;
+        if (m_liveQuoteSeen)
+        {
+            ++scalarCallsAfterLiveQuote;
+        }
+        return 0;
+    }
+
+    MilliFunds originStock() const override
+    {
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        return 1000000;
+    }
+
+    bool affectsStock(std::int32_t engineUnitId) const override
+    {
+        return engineUnitId == ATTACKER_UNIT;
+    }
+
+    bool livePairSwapIntervals() const override
+    {
+        return m_liveSupported;
+    }
+
+    Coordinator::LivePlanStockQuote livePlanStock(
+        const TurnPlan & plan,
+        MilliFunds economic,
+        bool pricingLeaf) override
+    {
+        m_liveQuoteSeen = true;
+        Coordinator::LivePlanStockQuote quote;
+        if (pricingLeaf)
+        {
+            ++liveLeaves;
+            if (m_failure == IntervalFailure::LeafQuote &&
+                liveLeaves == 2)
+            {
+                return quote;
+            }
+        }
+        else
+        {
+            ++nonLeafQuotes;
+            if (m_failure ==
+                    IntervalFailure::IncumbentWitness &&
+                nonLeafQuotes == 1)
+            {
+                quote.valid = true;
+                return quote;
+            }
+        }
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (!Coordinator::isLiveState(
+                    action.state))
+            {
+                continue;
+            }
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::
+                    fromAction(
+                        action.unitId,
+                        action.destination.x,
+                        action.destination.y,
+                        false));
+        }
+        std::sort(quote.key.begin(), quote.key.end());
+        const PairPlanValue value = valueFor(plan);
+        quote.stockAbsolute = StockInterval{
+            value.interval.lower - economic,
+            value.interval.upper - economic,
+        };
+        if (!pricingLeaf &&
+            nonLeafQuotes == 2 &&
+            m_failure == IntervalFailure::ReplayQuote)
+        {
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::
+                    fromAction(-1, -1, -1, false));
+        }
+        if (!pricingLeaf &&
+            nonLeafQuotes == 2 &&
+            m_failure == IntervalFailure::ReplayUpper)
+        {
+            ++quote.stockAbsolute.upper;
+        }
+        quote.valid = true;
+        quote.lowerWitnessReplays = true;
+        return quote;
+    }
+
+    bool refineLiveAtBoundary(AssignPhase) override
+    {
+        return false;
+    }
+
+    PlanStockAudit auditPlanStock(
+        const TurnPlan & plan) override
+    {
+        ++auditCalls;
+        PlanStockAudit audit;
+        audit.available = true;
+        audit.scalarStockAbsolute =
+            valueFor(plan).exact -
+            economicValue(plan);
+        audit.ours.provenExact = true;
+        audit.ours.witnessReplays = true;
+        audit.enemy.provenExact = true;
+        audit.enemy.witnessReplays = true;
+        audit.scalarExact = true;
+        audit.scalarWitnessReplays = true;
+        audit.originExact = true;
+        audit.originWitnessReplays = true;
+        return audit;
+    }
+
+    std::int32_t scalarCalls{0};
+    std::int32_t scalarCallsAfterLiveQuote{0};
+    std::int32_t liveLeaves{0};
+    std::int32_t nonLeafQuotes{0};
+    std::int32_t auditCalls{0};
+
+private:
+    PairPlanValue m_incumbent;
+    PairPlanValue m_challenger;
+    PairPlanValue m_intermediate;
+    IntervalFailure m_failure;
+    bool m_liveSupported{true};
+    bool m_liveQuoteSeen{false};
+
+    static bool hasLiveAction(
+        const TurnPlan & plan,
+        std::int32_t unitId,
+        TilePoint destination)
+    {
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (Coordinator::isLiveState(
+                    action.state) &&
+                action.unitId == unitId &&
+                action.destination == destination)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static MilliFunds economicValue(
+        const TurnPlan & plan)
+    {
+        MilliFunds total = 0;
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (Coordinator::isLiveState(
+                    action.state))
+            {
+                total +=
+                    action.marginalValue.economicValue;
+            }
+        }
+        return total;
+    }
+
+    PairPlanValue valueFor(
+        const TurnPlan & plan) const
+    {
+        if (hasLiveAction(
+                plan,
+                ATTACKER_UNIT,
+                CONTESTED_TILE))
+        {
+            return m_incumbent;
+        }
+        if (hasLiveAction(
+                plan,
+                ATTACKER_UNIT,
+                SPARE_TILE))
+        {
+            return hasLiveAction(
+                       plan,
+                       SUPPORT_UNIT,
+                       CONTESTED_TILE)
+                       ? m_challenger
+                       : m_intermediate;
+        }
+        return PairPlanValue{
+            StockInterval{-1000000, -1000000},
+            -1000000,
+        };
+    }
 };
 
 class DecompositionValuer final : public PlanStockValuer
@@ -917,6 +1156,299 @@ bool isExpectedSwap(const AssignmentResult & result)
         plannedTotal(result) == GOOD_VALUE + FAIR_VALUE;
 }
 
+bool isIncumbentPair(const AssignmentResult & result)
+{
+    const PlannedAction* pAttacker =
+        actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport =
+        actionOf(result, SUPPORT_UNIT);
+    return
+        pAttacker != nullptr &&
+        pAttacker->destination == CONTESTED_TILE &&
+        pSupport != nullptr &&
+        pSupport->destination == SUPPORT_TILE;
+}
+
+bool isIntermediatePair(
+    const AssignmentResult & result)
+{
+    const PlannedAction* pAttacker =
+        actionOf(result, ATTACKER_UNIT);
+    const PlannedAction* pSupport =
+        actionOf(result, SUPPORT_UNIT);
+    return
+        pAttacker != nullptr &&
+        pAttacker->destination == SPARE_TILE &&
+        pSupport != nullptr &&
+        pSupport->destination == SUPPORT_TILE;
+}
+
+bool samePlan(
+    const AssignmentResult & left,
+    const AssignmentResult & right);
+
+std::vector<std::int32_t> statsSnapshot(
+    const AssignmentStats & stats);
+
+AssignmentResult assignCertifiedPair(
+    CertifiedPairValuer & valuer,
+    RecordingTrace* pTrace = nullptr)
+{
+    AssignmentInput input = destinationSwapInput();
+    input.pStockValuer = &valuer;
+    input.pTrace = pTrace;
+    return MaximumValueAssignment::assign(input);
+}
+
+void testOverlappingIntervalsRetainIncumbent()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{18, 78}, 60},
+        PairPlanValue{StockInterval{20, 70}, 30});
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedPair(valuer, &trace);
+    expect(isIncumbentPair(result) &&
+               result.stats.swapImprovements == 0,
+           "a higher overlapping lower bound retains the incumbent");
+    expect(trace.containsFields(
+               QStringLiteral("PAIR_COMPARE"),
+               QStringList{
+                   QStringLiteral("challengerLower=20"),
+                   QStringLiteral("challengerUpper=70"),
+                   QStringLiteral("incumbentLower=18"),
+                   QStringLiteral("incumbentUpper=78"),
+                   QStringLiteral("reason=INTERVAL_OVERLAP"),
+                   QStringLiteral("accepted=false"),
+               }),
+           "overlap diagnostics carry both intervals");
+}
+
+void testBeanRegressionRetainsIncumbent()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{-12, 78}, 18},
+        PairPlanValue{StockInterval{-8, 70}, 11});
+    const AssignmentResult result =
+        assignCertifiedPair(valuer);
+    expect(isIncumbentPair(result) &&
+               result.stats.swapImprovements == 0,
+           "the Bean-shaped exact regression retains its incumbent");
+    expect(valuer.auditCalls == 0,
+           "an overlapping Bean challenger is not audited as a winner");
+}
+
+void testSeparatedIntervalsReplaceIncumbent()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{10, 20}, 15},
+        PairPlanValue{StockInterval{21, 30}, 25});
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedPair(valuer, &trace);
+    expect(isExpectedSwap(result) &&
+               result.stats.swapImprovements == 1,
+           "separated intervals certify a pair replacement");
+    expect(trace.containsFields(
+               QStringLiteral("PAIR_COMPARE"),
+               QStringList{
+                   QStringLiteral("challengerLower=21"),
+                   QStringLiteral("incumbentUpper=20"),
+                   QStringLiteral(
+                       "reason=LOWER_ABOVE_INCUMBENT_UPPER"),
+                   QStringLiteral("accepted=true"),
+               }),
+           "certified replacement diagnostics name the strict proof");
+}
+
+void testTouchingIntervalsRetainIncumbent()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{10, 20}, 15},
+        PairPlanValue{StockInterval{20, 30}, 25});
+    const AssignmentResult result =
+        assignCertifiedPair(valuer);
+    expect(isIncumbentPair(result) &&
+               result.stats.swapImprovements == 0,
+           "touching intervals do not prove strict improvement");
+}
+
+void testCollapsedIntervalImprovementReplaces()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{10, 10}, 10},
+        PairPlanValue{StockInterval{11, 11}, 11});
+    const AssignmentResult result =
+        assignCertifiedPair(valuer);
+    expect(isExpectedSwap(result) &&
+               result.stats.swapImprovements == 1,
+           "strict collapsed values replace the incumbent");
+}
+
+void testCollapsedIntervalEqualityRetains()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{10, 10}, 10},
+        PairPlanValue{StockInterval{10, 10}, 10});
+    const AssignmentResult result =
+        assignCertifiedPair(valuer);
+    expect(isIncumbentPair(result) &&
+               result.stats.swapImprovements == 0,
+           "equal collapsed values retain the incumbent");
+}
+
+void testSuccessiveReplacementUpdatesBothBounds()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{0, 10}, 5},
+        PairPlanValue{StockInterval{11, 30}, 15},
+        PairPlanValue{StockInterval{20, 25}, 22});
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedPair(valuer, &trace);
+    expect(isExpectedSwap(result) &&
+               result.stats.swapImprovements == 1,
+           "the first certified winner survives a later overlap");
+    expect(trace.containsFields(
+               QStringLiteral("PAIR_COMPARE"),
+               QStringList{
+                   QStringLiteral("challengerLower=20"),
+                   QStringLiteral("challengerUpper=25"),
+                   QStringLiteral("incumbentLower=11"),
+                   QStringLiteral("incumbentUpper=30"),
+                   QStringLiteral("reason=INTERVAL_OVERLAP"),
+                   QStringLiteral("accepted=false"),
+               }),
+           "a replacement updates both retained thresholds");
+}
+
+void testUnavailableStockIntervalsRetainIncumbent()
+{
+    CertifiedPairValuer valuer(
+        PairPlanValue{StockInterval{10, 10}, 10},
+        PairPlanValue{StockInterval{100, 100}, 100},
+        PairPlanValue{
+            StockInterval{-1000000, -1000000},
+            -1000000},
+        IntervalFailure::None,
+        false);
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedPair(valuer, &trace);
+    expect(isIncumbentPair(result) &&
+               result.stats.swapImprovements == 0 &&
+               valuer.liveLeaves == 0,
+           "unavailable stock intervals retain the incumbent");
+    expect(trace.containsFields(
+               QStringLiteral("PAIR_COMPARE"),
+               QStringList{
+                   QStringLiteral(
+                       "reason=LIVE_INTERVAL_UNAVAILABLE"),
+                   QStringLiteral("accepted=false"),
+               }) &&
+               trace.containsFields(
+                   QStringLiteral("PAIR_RESULT"),
+                   QStringLiteral(
+                       "effectivePricing=LIVE_INTERVAL_UNAVAILABLE")),
+           "unavailable live support is reported as unresolved");
+}
+
+void testLiveIntervalFailuresRestoreIncumbent()
+{
+    const std::vector<IntervalFailure> failures{
+        IntervalFailure::IncumbentWitness,
+        IntervalFailure::LeafQuote,
+        IntervalFailure::ReplayQuote,
+        IntervalFailure::ReplayUpper,
+    };
+    for (const IntervalFailure failure : failures)
+    {
+        CertifiedPairValuer firstValuer(
+            PairPlanValue{StockInterval{10, 10}, 10},
+            PairPlanValue{StockInterval{11, 11}, 11},
+            PairPlanValue{
+                StockInterval{-1000000, -1000000},
+                -1000000},
+            failure);
+        CertifiedPairValuer replayValuer(
+            PairPlanValue{StockInterval{10, 10}, 10},
+            PairPlanValue{StockInterval{11, 11}, 11},
+            PairPlanValue{
+                StockInterval{-1000000, -1000000},
+                -1000000},
+            failure);
+        RecordingTrace trace;
+        const AssignmentResult first =
+            assignCertifiedPair(firstValuer, &trace);
+        const AssignmentResult replay =
+            assignCertifiedPair(replayValuer);
+        expect(isIncumbentPair(first) &&
+                   first.stats.swapImprovements == 0 &&
+                   samePlan(first, replay),
+               "live interval failure restores a deterministic incumbent");
+        expect(firstValuer.scalarCallsAfterLiveQuote == 0 &&
+                   replayValuer.scalarCallsAfterLiveQuote == 0,
+               "live failure never invokes stock scalar fallback");
+        expect(trace.containsFields(
+                   QStringLiteral("PAIR_RESULT"),
+                   QStringLiteral(
+                       "effectivePricing=LIVE_INTERVAL_FAILURE")),
+               "live failure is reported as unresolved");
+        if (failure == IntervalFailure::ReplayQuote ||
+            failure == IntervalFailure::ReplayUpper)
+        {
+            expect(first.stats.replayFailures > 0,
+                   "replay mismatch is detected before restoration");
+        }
+    }
+}
+
+void testNonStockPairRemainsExact()
+{
+    RecordingTrace trace;
+    AssignmentInput input = destinationSwapInput();
+    input.pTrace = &trace;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    expect(isExpectedSwap(result) &&
+               result.stats.swapImprovements == 1,
+           "non-stock exact scalar pair refinement still improves");
+    expect(trace.containsFields(
+               QStringLiteral("PAIR_RESULT"),
+               QStringList{
+                   QStringLiteral(
+                       "requestedPricing=NON_STOCK_EXACT_SCALAR"),
+                   QStringLiteral(
+                       "effectivePricing=NON_STOCK_EXACT_SCALAR"),
+                   QStringLiteral("winnerExact=true"),
+               }),
+           "non-stock scalar diagnostics remain explicitly exact");
+}
+
+void testCertifiedPairOrderingIsDeterministic()
+{
+    CertifiedPairValuer firstValuer(
+        PairPlanValue{StockInterval{10, 20}, 15},
+        PairPlanValue{StockInterval{21, 30}, 25});
+    CertifiedPairValuer replayValuer(
+        PairPlanValue{StockInterval{10, 20}, 15},
+        PairPlanValue{StockInterval{21, 30}, 25});
+    RecordingTrace firstTrace;
+    RecordingTrace replayTrace;
+    const AssignmentResult first =
+        assignCertifiedPair(firstValuer, &firstTrace);
+    const AssignmentResult replay =
+        assignCertifiedPair(replayValuer, &replayTrace);
+    expect(samePlan(first, replay) &&
+               first.executionOrder ==
+                   replay.executionOrder &&
+               statsSnapshot(first.stats) ==
+                   statsSnapshot(replay.stats),
+           "certified pair selection repeats actions and witnesses");
+    expect(firstTrace.records == replayTrace.records,
+           "certified pair traversal repeats diagnostics");
+}
+
 void testPairIntervalsPreserveExactAssignment()
 {
     PairIntervalValuer valuer(
@@ -951,14 +1483,8 @@ void testPairIntervalsPreserveExactAssignment()
            "cluster bypass makes no scalar stock call after live pair pricing");
 }
 
-void testPairIntervalFailuresFallBackExactly()
+void testPairIntervalFailuresRetainIncumbent()
 {
-    PairIntervalValuer exact(IntervalFailure::None);
-    AssignmentInput exactInput = destinationSwapInput();
-    exactInput.pStockValuer = &exact;
-    MaximumValueAssignment::assign(exactInput);
-
-    std::int32_t exactFallbacks = 0;
     const std::vector<IntervalFailure> failures{
         IntervalFailure::IncumbentWitness,
         IntervalFailure::LeafQuote,
@@ -971,21 +1497,17 @@ void testPairIntervalFailuresFallBackExactly()
         input.pStockValuer = &valuer;
         const AssignmentResult result =
             MaximumValueAssignment::assign(input);
-        expect(isExpectedSwap(result),
-               "live failure preserves the scalar winner");
-        if (valuer.scalarCalls > exact.scalarCalls)
-        {
-            ++exactFallbacks;
-        }
+        expect(isIncumbentPair(result) &&
+                   result.stats.swapImprovements == 0,
+               "live failure retains the pair incumbent");
+        expect(valuer.scalarCallsAfterLiveQuote == 0,
+               "live failure performs no stock scalar fallback");
         if (failure == IntervalFailure::ReplayQuote)
         {
             expect(result.stats.replayFailures > 0,
-                   "winner replay mismatch is detected");
+                    "winner replay mismatch is detected");
         }
     }
-    expect(exactFallbacks ==
-               static_cast<std::int32_t>(failures.size()),
-           "each live failure performs an exact scalar fallback");
 }
 
 void testPairAssignmentReplaysDeterministically()
@@ -1312,24 +1834,24 @@ AssignmentInput sharedBudgetInput()
     return inputWith(std::move(actors));
 }
 
-void testSharedBudgetCapPrecedesStockClassification()
+void testUnavailableStockPairPrecedesSharedBudget()
 {
     BudgetExhaustingValuer valuer;
     AssignmentInput input = sharedBudgetInput();
     input.pStockValuer = &valuer;
     const AssignmentResult result =
         MaximumValueAssignment::assign(input);
-    expect(result.stats.swapStates ==
-               Coordinator::ASSIGNMENT_STATE_BUDGET &&
-               Coordinator::searchBudgetExhausted(result.stats),
-           "pair searches exhaust the shared assignment budget");
+    expect(result.stats.swapStates == 0 &&
+               !Coordinator::searchBudgetExhausted(
+                   result.stats),
+           "unavailable stock pair pricing spends no search budget");
     expect(result.stats.clustersTotal == 1 &&
                result.stats.clustersCapped == 1 &&
                result.stats.clustersEnumerated == 0,
            "the exhausted component uses the existing capped path");
-    expect(result.stats.clustersSkippedStockBudget == 0 &&
+    expect(result.stats.clustersSkippedStockBudget == 1 &&
                result.stats.enumerationStates == 0,
-           "shared-budget exhaustion is not double-counted as a stock skip");
+           "the existing stock cluster policy remains distinct");
 }
 
 void testCapsAndSharedBudgetBoundTheSearch()
@@ -1600,8 +2122,19 @@ int main()
     testActorResourcesExposeTileAndTargetConflicts();
     testSettlingDropsALosingFallback();
     testPairSearchResolvesADestinationConflict();
+    testOverlappingIntervalsRetainIncumbent();
+    testBeanRegressionRetainsIncumbent();
+    testSeparatedIntervalsReplaceIncumbent();
+    testTouchingIntervalsRetainIncumbent();
+    testCollapsedIntervalImprovementReplaces();
+    testCollapsedIntervalEqualityRetains();
+    testSuccessiveReplacementUpdatesBothBounds();
+    testUnavailableStockIntervalsRetainIncumbent();
+    testLiveIntervalFailuresRestoreIncumbent();
+    testNonStockPairRemainsExact();
+    testCertifiedPairOrderingIsDeterministic();
     testPairIntervalsPreserveExactAssignment();
-    testPairIntervalFailuresFallBackExactly();
+    testPairIntervalFailuresRetainIncumbent();
     testPairAssignmentReplaysDeterministically();
     testTrimmedFireValueUsesOnlyGrantedDamage();
     testClusterSearchFindsTheThreeActorImprovement();
@@ -1610,7 +2143,7 @@ int main()
     testStockPairBypassReplaysDeterministically();
     testClusterSearchReplaysDeterministically();
     testOneStockActorDoesNotCountAsAClusterSkip();
-    testSharedBudgetCapPrecedesStockClassification();
+    testUnavailableStockPairPrecedesSharedBudget();
     testCapsAndSharedBudgetBoundTheSearch();
     testStockDecompositionIsDeferredAndNeutral();
     testDecisionTraceIsNeutralAndDeterministic();
