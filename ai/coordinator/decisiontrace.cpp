@@ -78,12 +78,12 @@ namespace
 
         bool candidateDetailsEnabled() const override
         {
-            return m_candidateDetails;
+            return m_active && m_candidateDetails;
         }
 
         bool stockDetailsEnabled() const override
         {
-            return m_stockDetails;
+            return m_active && m_stockDetails;
         }
 
         void record(const QString & category, const QString & fields) override
@@ -107,14 +107,19 @@ namespace
             m_buffer.push_back(std::move(line));
         }
 
-        void flush() override
+        bool flush() override
         {
-            if (!m_active || m_buffer.empty())
+            if (!m_active)
             {
-                return;
+                return false;
+            }
+            if (m_buffer.empty())
+            {
+                return true;
             }
             m_active = writeTraceLines(m_path, m_buffer);
             m_buffer.clear();
+            return m_active;
         }
 
     private:
@@ -138,6 +143,16 @@ bool Coordinator::decisionTraceEnabled()
 #endif
 }
 
+bool Coordinator::planningTimingAuditEnabled()
+{
+#ifdef GAMEDEBUG
+    return qgetenv("COW_COORDINATED_TIMING_AUDIT") ==
+           QByteArray("1");
+#else
+    return false;
+#endif
+}
+
 std::unique_ptr<Coordinator::DecisionTrace>
 Coordinator::openDecisionTrace(const DecisionTraceIdentity & identity)
 {
@@ -147,13 +162,53 @@ Coordinator::openDecisionTrace(const DecisionTraceIdentity & identity)
     {
         return nullptr;
     }
+    const QString path =
+        pSettings->getUserPath() +
+        QStringLiteral("coordinated-ai.log");
+    if (!writeTraceLines(path, QStringList{}))
+    {
+        return nullptr;
+    }
     return std::make_unique<FileDecisionTrace>(
         identity,
-        pSettings->getUserPath() + QStringLiteral("coordinated-ai.log"),
+        path,
         pSettings->getCoordinatedDecisionLogCandidates(),
         pSettings->getCoordinatedDecisionLogStock());
 #else
     static_cast<void>(identity);
     return nullptr;
+#endif
+}
+
+void Coordinator::writePlanningTimingAudit(
+    const DecisionTraceIdentity & identity,
+    const QString & fields)
+{
+#ifdef GAMEDEBUG
+    Settings* pSettings = Settings::getInstance();
+    if (!planningTimingAuditEnabled() ||
+        pSettings == nullptr)
+    {
+        return;
+    }
+    QString line =
+        QStringLiteral("[COORD][PHASE_TIMING] day=%1 player=%2 ai=COORDINATED rng=unused plan=%3 horizon=%4")
+            .arg(identity.day)
+            .arg(identity.playerId)
+            .arg(identity.planSequence)
+            .arg(identity.horizonTurns);
+    if (!fields.isEmpty())
+    {
+        line += QLatin1Char(' ');
+        line += fields;
+    }
+    writeTraceLines(
+        pSettings->getUserPath() +
+            QStringLiteral(
+                "coordinated-ai-timing.log"),
+        QStringList{line});
+#else
+    static_cast<void>(identity);
+    static_cast<void>(fields);
 #endif
 }

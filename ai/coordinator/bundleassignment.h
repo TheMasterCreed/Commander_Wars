@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -69,6 +70,7 @@ namespace Coordinator
         std::vector<AssignmentActor> actors;
         PlanStockValuer* pStockValuer{nullptr};
         DecisionTrace* pTrace{nullptr};
+        bool measureTimings{false};
     };
 
     inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)
@@ -841,7 +843,10 @@ namespace Coordinator
         {
             using Clock = std::chrono::steady_clock;
             AssignmentResult result;
-            const bool timed = input.pTrace != nullptr;
+            DeferredAudits audits;
+            const bool timed =
+                input.measureTimings ||
+                input.pTrace != nullptr;
             Clock::time_point phaseStart;
             if (timed)
             {
@@ -866,7 +871,13 @@ namespace Coordinator
                 phaseStart = Clock::now();
             }
             const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
-            settle(result.plan, input, actors, sweepOrder, result.stats);
+            settle(
+                result.plan,
+                input,
+                actors,
+                sweepOrder,
+                result.stats,
+                audits);
             if (timed)
             {
                 result.phaseTiming.settlingNanos =
@@ -876,7 +887,13 @@ namespace Coordinator
                 phaseStart = Clock::now();
             }
             const std::vector<ConflictEdge> edges = conflictEdges(input, actors, sweepOrder);
-            improveBySwaps(result.plan, input, actors, edges, result.stats);
+            improveBySwaps(
+                result.plan,
+                input,
+                actors,
+                edges,
+                result.stats,
+                audits);
             if (timed)
             {
                 result.phaseTiming.pairRefinementNanos =
@@ -904,6 +921,7 @@ namespace Coordinator
                         Clock::now() - phaseStart)
                         .count();
             }
+            recordDeferredAudits(input, audits);
             return result;
         }
 
@@ -932,6 +950,50 @@ namespace Coordinator
             MilliFunds resultLower{0};
             MilliFunds resultUpper{0};
             bool resultKnown{false};
+            struct PairExactAuditSnapshot
+            {
+                TurnPlan incumbentPlan;
+                TurnPlan winnerPlan;
+                MilliFunds incumbentEconomic{0};
+                MilliFunds winnerEconomic{0};
+                std::vector<std::int32_t> incumbentChoices;
+                std::vector<std::int32_t> winnerChoices;
+                bool liveIntervalPricing{false};
+            };
+            std::optional<PairExactAuditSnapshot> pairAudit;
+        };
+
+        struct StockDecompositionRequest
+        {
+            std::int32_t sweep{0};
+            std::int32_t actor{NO_UNIT};
+            std::int32_t actorKnowledge{NO_UNIT};
+            std::int32_t candidate{NO_CANDIDATE};
+            PlanBundleKind kind{PlanBundleKind::Wait};
+            TilePoint destination{INVALID_TILE};
+            MilliFunds seatedValue{0};
+            MilliFunds bookedStockDelta{0};
+            MilliFunds bookedCompleteValue{0};
+            TurnPlan plan;
+        };
+
+        struct PairExactAuditRequest
+        {
+            std::int32_t sweep{0};
+            std::vector<std::int32_t> actors;
+            MilliFunds incumbentLower{0};
+            MilliFunds incumbentUpper{0};
+            MilliFunds winnerLower{0};
+            MilliFunds winnerUpper{0};
+            bool liveFailure{false};
+            ExactSearchOutcome::PairExactAuditSnapshot snapshot;
+        };
+
+        struct DeferredAudits
+        {
+            std::vector<StockDecompositionRequest>
+                stockDecompositions;
+            std::vector<PairExactAuditRequest> pairAudits;
         };
 
         struct ClusterSearch
@@ -1197,11 +1259,98 @@ namespace Coordinator
             return order;
         }
 
+        static bool isCaptureKind(PlanBundleKind kind)
+        {
+            return kind == PlanBundleKind::Capture ||
+                   kind == PlanBundleKind::MoveAndCapture;
+        }
+
+        static bool hasSameDestinationCapturePeer(
+            const ActorProgress & state,
+            std::int32_t option)
+        {
+            if (option < 0 ||
+                option >= static_cast<std::int32_t>(
+                              state.pActor->candidates.size()))
+            {
+                return false;
+            }
+            const CandidateBundle & candidate =
+                state.pActor->candidates[
+                    static_cast<std::size_t>(option)];
+            const bool captures =
+                isCaptureKind(planBundleKindOf(candidate.bundle));
+            for (const std::int32_t peer : state.options)
+            {
+                if (peer < 0 ||
+                    peer == option ||
+                    peer >= static_cast<std::int32_t>(
+                                state.pActor->candidates.size()))
+                {
+                    continue;
+                }
+                const CandidateBundle & other =
+                    state.pActor->candidates[
+                        static_cast<std::size_t>(peer)];
+                if (other.bundle.destination ==
+                        candidate.bundle.destination &&
+                    isCaptureKind(
+                        planBundleKindOf(other.bundle)) !=
+                        captures)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static void deferStockDecomposition(
+            const TurnPlan & plan,
+            const AssignmentInput & input,
+            const ActorProgress & state,
+            std::int32_t option,
+            std::int32_t sweep,
+            MilliFunds seatedValue,
+            MilliFunds bookedStockDelta,
+            MilliFunds bookedCompleteValue,
+            DeferredAudits & audits)
+        {
+            if (input.pTrace == nullptr ||
+                !input.pTrace->stockDetailsEnabled() ||
+                input.pStockValuer == nullptr ||
+                !hasSameDestinationCapturePeer(state, option))
+            {
+                return;
+            }
+            const CandidateBundle & candidate =
+                state.pActor->candidates[
+                    static_cast<std::size_t>(option)];
+            audits.stockDecompositions.push_back(
+                StockDecompositionRequest{
+                    .sweep = sweep,
+                    .actor = state.pActor->engineUnitId,
+                    .actorKnowledge =
+                        state.pActor->knowledgeUnitIndex,
+                    .candidate = option,
+                    .kind =
+                        planBundleKindOf(candidate.bundle),
+                    .destination =
+                        candidate.bundle.destination,
+                    .seatedValue = seatedValue,
+                    .bookedStockDelta =
+                        bookedStockDelta,
+                    .bookedCompleteValue =
+                        bookedCompleteValue,
+                    .plan = plan,
+                });
+        }
+
         static bool settleStockActor(
             TurnPlan & plan,
             const AssignmentInput & input,
             ActorProgress & state,
-            std::int32_t sweep)
+            std::int32_t sweep,
+            DeferredAudits & audits)
         {
             const std::int32_t previousChosen = state.chosen;
             const MilliFunds previousSeated = state.seatedValue;
@@ -1209,6 +1358,16 @@ namespace Coordinator
                 planStockDelta(input, plan);
             const MilliFunds previousValue =
                 previousSeated + previousStockDelta;
+            deferStockDecomposition(
+                plan,
+                input,
+                state,
+                previousChosen,
+                sweep,
+                previousSeated,
+                previousStockDelta,
+                previousValue,
+                audits);
             if (previousChosen != NO_CANDIDATE &&
                 previousChosen <
                     static_cast<std::int32_t>(
@@ -1283,6 +1442,16 @@ namespace Coordinator
                         AssignmentResult::CandidateCompleteValue{
                             value, true};
                 }
+                deferStockDecomposition(
+                    plan,
+                    input,
+                    state,
+                    option,
+                    sweep,
+                    outcome.value,
+                    challengerStockDelta,
+                    value,
+                    audits);
                 unseatActor(plan, state);
                 const bool accepted = value > bestValue;
                 if (input.pTrace != nullptr &&
@@ -1386,8 +1555,13 @@ namespace Coordinator
             return changed;
         }
 
-        static void settle(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
-                           const std::vector<std::int32_t> & sweepOrder, AssignmentStats & stats)
+        static void settle(
+            TurnPlan & plan,
+            const AssignmentInput & input,
+            std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & sweepOrder,
+            AssignmentStats & stats,
+            DeferredAudits & audits)
         {
             for (std::int32_t sweep = 0; sweep < SETTLING_SWEEP_CAP; ++sweep)
             {
@@ -1399,7 +1573,11 @@ namespace Coordinator
                     if (stockCoupled(input, state.pActor->engineUnitId))
                     {
                         if (settleStockActor(
-                                plan, input, state, sweep))
+                                plan,
+                                input,
+                                state,
+                                sweep,
+                                audits))
                         {
                             moved = true;
                             ++stats.settlingMoves;
@@ -1549,9 +1727,13 @@ namespace Coordinator
             }
         }
 
-        static void improveBySwaps(TurnPlan & plan, const AssignmentInput & input,
-                                   std::vector<ActorProgress> & actors,
-                                   const std::vector<ConflictEdge> & edges, AssignmentStats & stats)
+        static void improveBySwaps(
+            TurnPlan & plan,
+            const AssignmentInput & input,
+            std::vector<ActorProgress> & actors,
+            const std::vector<ConflictEdge> & edges,
+            AssignmentStats & stats,
+            DeferredAudits & audits)
         {
             const bool liveIntervals =
                 input.pStockValuer != nullptr &&
@@ -1576,7 +1758,7 @@ namespace Coordinator
                         incumbentChoices =
                             chosenOptions(actors, pair);
                     }
-                    const ExactSearchOutcome outcome =
+                    ExactSearchOutcome outcome =
                         runExactSearch(
                             plan,
                             input,
@@ -1595,6 +1777,40 @@ namespace Coordinator
                         if (input.pTrace != nullptr)
                         {
                             invalidateCompleteValues(actors);
+                        }
+                        if (outcome.pairAudit.has_value())
+                        {
+                            std::vector<std::int32_t>
+                                actorIds;
+                            actorIds.reserve(pair.size());
+                            for (const std::int32_t slot : pair)
+                            {
+                                actorIds.push_back(
+                                    actors[
+                                        static_cast<std::size_t>(
+                                            slot)]
+                                        .pActor
+                                        ->engineUnitId);
+                            }
+                            audits.pairAudits.push_back(
+                                PairExactAuditRequest{
+                                    .sweep = sweep,
+                                    .actors =
+                                        std::move(actorIds),
+                                    .incumbentLower =
+                                        outcome.incumbentLower,
+                                    .incumbentUpper =
+                                        outcome.incumbentUpper,
+                                    .winnerLower =
+                                        outcome.resultLower,
+                                    .winnerUpper =
+                                        outcome.resultUpper,
+                                    .liveFailure =
+                                        outcome.liveFailure,
+                                    .snapshot =
+                                        std::move(
+                                            *outcome.pairAudit),
+                                });
                         }
                     }
                     if (input.pTrace != nullptr)
@@ -2141,6 +2357,14 @@ namespace Coordinator
             MilliFunds incumbentLower = incumbentTotal;
             MilliFunds incumbentUpper = incumbentTotal;
             const TurnPlan snapshot = plan;
+            MilliFunds incumbentEconomic = 0;
+            if (input.pTrace != nullptr &&
+                input.pTrace->stockDetailsEnabled() &&
+                members.size() == 2)
+            {
+                incumbentEconomic =
+                    seatedPlanTotal(plan, actors);
+            }
             const std::vector<ActorSeat> seats = recordSeats(actors, members);
             std::vector<std::int32_t> incumbentChoices;
             incumbentChoices.reserve(seats.size());
@@ -2321,6 +2545,30 @@ namespace Coordinator
                         stats);
                 if (outcome.improved)
                 {
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled() &&
+                        members.size() == 2)
+                    {
+                        outcome.pairAudit =
+                            ExactSearchOutcome::
+                                PairExactAuditSnapshot{
+                                    .incumbentPlan =
+                                        snapshot,
+                                    .winnerPlan = plan,
+                                    .incumbentEconomic =
+                                        incumbentEconomic,
+                                    .winnerEconomic =
+                                        seatedPlanTotal(
+                                            plan,
+                                            actors),
+                                    .incumbentChoices =
+                                        incumbentChoices,
+                                    .winnerChoices =
+                                        search.bestFeasiblePlan,
+                                    .liveIntervalPricing =
+                                        true,
+                                };
+                    }
                     return outcome;
                 }
                 ExactSearchOutcome fallback =
@@ -2342,7 +2590,416 @@ namespace Coordinator
             }
             outcome.improved = replaySolution(
                 plan, input, actors, search, snapshot, seats, stats);
+            if (outcome.improved &&
+                input.pTrace != nullptr &&
+                input.pTrace->stockDetailsEnabled() &&
+                input.pStockValuer != nullptr &&
+                members.size() == 2)
+            {
+                outcome.pairAudit =
+                    ExactSearchOutcome::
+                        PairExactAuditSnapshot{
+                            .incumbentPlan = snapshot,
+                            .winnerPlan = plan,
+                            .incumbentEconomic =
+                                incumbentEconomic,
+                            .winnerEconomic =
+                                seatedPlanTotal(
+                                    plan,
+                                    actors),
+                            .incumbentChoices =
+                                incumbentChoices,
+                            .winnerChoices =
+                                chosenOptions(
+                                    actors,
+                                    members),
+                            .liveIntervalPricing =
+                                false,
+                        };
+            }
             return outcome;
+        }
+
+        static QString traceAuditValue(
+            bool available,
+            MilliFunds value)
+        {
+            return available
+                ? QString::number(value)
+                : QStringLiteral("NA");
+        }
+
+        static QString traceAuditIndices(
+            const std::vector<std::int32_t> & values)
+        {
+            const QString text = traceIndices(values);
+            return text.isEmpty()
+                ? QStringLiteral("NONE")
+                : text;
+        }
+
+        static QString stockAuditReason(
+            const PlanStockAudit & audit,
+            bool requireOrigin)
+        {
+            if (!audit.available)
+            {
+                return QStringLiteral(
+                    "DECOMPOSITION_MISMATCH");
+            }
+            if (!audit.scalarExact)
+            {
+                return QStringLiteral("SCALAR_UNPROVEN");
+            }
+            if (!audit.scalarWitnessReplays)
+            {
+                return QStringLiteral(
+                    "SCALAR_WITNESS_REPLAY_FAILED");
+            }
+            if (requireOrigin && !audit.originExact)
+            {
+                return QStringLiteral("ORIGIN_UNPROVEN");
+            }
+            if (requireOrigin &&
+                !audit.originWitnessReplays)
+            {
+                return QStringLiteral(
+                    "ORIGIN_WITNESS_REPLAY_FAILED");
+            }
+            return QStringLiteral("PROVEN");
+        }
+
+        static const PlanStockActionAudit*
+        matchingActionAudit(
+            const PlanStockAudit & audit,
+            const StockDecompositionRequest & request)
+        {
+            const bool captures =
+                isCaptureKind(request.kind);
+            for (const PlanStockActionAudit & action :
+                 audit.actions)
+            {
+                if (action.knowledgeIndex ==
+                        request.actorKnowledge &&
+                    action.destination ==
+                        request.destination &&
+                    action.captures == captures)
+                {
+                    return &action;
+                }
+            }
+            return nullptr;
+        }
+
+        static void recordStockDecomposition(
+            const AssignmentInput & input,
+            const StockDecompositionRequest & request,
+            std::int32_t comparisonCandidate)
+        {
+            const PlanStockAudit audit =
+                input.pStockValuer->auditPlanStock(
+                    request.plan);
+            const MilliFunds scalarStockDelta =
+                audit.scalarStockAbsolute -
+                audit.liveOriginStock;
+            const MilliFunds exactCompleteValue =
+                request.seatedValue +
+                scalarStockDelta;
+            const MilliFunds sequentialAdjustment =
+                audit.ours.bookedValue -
+                audit.ourOpenOptimum -
+                (audit.enemy.bookedValue -
+                 audit.jointEnemyOptimum);
+            const bool observedMatchesAudit =
+                audit.available &&
+                scalarStockDelta ==
+                    request.bookedStockDelta &&
+                exactCompleteValue ==
+                    request.bookedCompleteValue;
+            const bool exact =
+                observedMatchesAudit &&
+                audit.scalarExact &&
+                audit.scalarWitnessReplays &&
+                audit.originExact &&
+                audit.originWitnessReplays;
+            QString reason =
+                stockAuditReason(audit, true);
+            if (reason == QStringLiteral("PROVEN") &&
+                !observedMatchesAudit)
+            {
+                reason = QStringLiteral(
+                    "OBSERVED_SCALAR_MISMATCH");
+            }
+            const PlanStockActionAudit* pAction =
+                matchingActionAudit(audit, request);
+
+            QString fields = QStringLiteral(
+                "sweep=%1 actor=%2 actorKnowledge=%3 candidate=%4 comparisonCandidate=%5 kind=%6 destination=%7 economicSeatedValue=%8 capturedColumns=%9 ownedBaseline=%10 ownershipFlipSwingTotal=%11 ourOpenOptimum=%12 jointEnemyOptimum=%13 floorStockAbsolute=%14")
+                .arg(request.sweep)
+                .arg(request.actor)
+                .arg(request.actorKnowledge)
+                .arg(request.candidate)
+                .arg(comparisonCandidate)
+                .arg(traceBundleKind(request.kind))
+                .arg(traceTile(request.destination))
+                .arg(request.seatedValue)
+                .arg(traceAuditIndices(
+                    audit.capturedColumns))
+                .arg(audit.ownedBaseline)
+                .arg(audit.ownershipFlipSwingTotal)
+                .arg(audit.ourOpenOptimum)
+                .arg(audit.jointEnemyOptimum)
+                .arg(audit.floorStockAbsolute);
+            fields += QStringLiteral(
+                " ourFloor=%1 ourRelaxed=%2 ourRepair=%3 ourSearch=%4 ourBooked=%5 ourSearchStates=%6 ourCertificate=%7 ourSearchCompleted=%8 ourProvenExact=%9 ourWitnessReplays=%10")
+                .arg(audit.ours.floorValue)
+                .arg(audit.ours.relaxedValue)
+                .arg(audit.ours.repairValue)
+                .arg(audit.ours.searchValue)
+                .arg(audit.ours.bookedValue)
+                .arg(audit.ours.searchStates)
+                .arg(traceBool(audit.ours.certificate))
+                .arg(traceBool(
+                    audit.ours.searchCompleted))
+                .arg(traceBool(audit.ours.provenExact))
+                .arg(traceBool(
+                    audit.ours.witnessReplays));
+            fields += QStringLiteral(
+                " enemyFloor=%1 enemyRelaxed=%2 enemyRepair=%3 enemySearch=%4 enemyBooked=%5 enemySearchStates=%6 enemyCertificate=%7 enemySearchCompleted=%8 enemyProvenExact=%9 enemyWitnessReplays=%10")
+                .arg(audit.enemy.floorValue)
+                .arg(audit.enemy.relaxedValue)
+                .arg(audit.enemy.repairValue)
+                .arg(audit.enemy.searchValue)
+                .arg(audit.enemy.bookedValue)
+                .arg(audit.enemy.searchStates)
+                .arg(traceBool(
+                    audit.enemy.certificate))
+                .arg(traceBool(
+                    audit.enemy.searchCompleted))
+                .arg(traceBool(
+                    audit.enemy.provenExact))
+                .arg(traceBool(
+                    audit.enemy.witnessReplays));
+            fields += QStringLiteral(
+                " sequentialAdjustment=%1 scalarStockAbsolute=%2 originStock=%3 originScalarStock=%4 scalarStockDelta=%5 observedStockDelta=%6 observedCompleteValue=%7 observedMatchesAudit=%8 auditAvailable=%9 exactStockAbsolute=%10 exactStockDelta=%11 exactCompleteValue=%12 exactAvailable=%13 reason=%14")
+                .arg(sequentialAdjustment)
+                .arg(audit.scalarStockAbsolute)
+                .arg(audit.liveOriginStock)
+                .arg(audit.originScalarStock)
+                .arg(scalarStockDelta)
+                .arg(request.bookedStockDelta)
+                .arg(request.bookedCompleteValue)
+                .arg(traceBool(observedMatchesAudit))
+                .arg(traceBool(audit.available))
+                .arg(traceAuditValue(
+                    exact,
+                    audit.scalarStockAbsolute))
+                .arg(traceAuditValue(
+                    exact,
+                    scalarStockDelta))
+                .arg(traceAuditValue(
+                    exact,
+                    exactCompleteValue))
+                .arg(traceBool(exact))
+                .arg(reason);
+            if (pAction == nullptr)
+            {
+                fields += QStringLiteral(
+                    " propertyIndex=NA stockColumn=NA currentOwnerSign=NA currentCapturePoints=NA currentCapturerKnowledge=NA carriedCapturePoints=NA captureRate=NA turnsUntilOwned=NA capturedColumn=NA");
+            }
+            else
+            {
+                fields += QStringLiteral(
+                    " propertyIndex=%1 stockColumn=%2 currentOwnerSign=%3 currentCapturePoints=%4 currentCapturerKnowledge=%5 carriedCapturePoints=%6 captureRate=%7 turnsUntilOwned=%8 capturedColumn=%9")
+                    .arg(pAction->propertyIndex)
+                    .arg(pAction->stockColumn)
+                    .arg(pAction->currentOwnerSign)
+                    .arg(pAction->currentCapturePoints)
+                    .arg(
+                        pAction
+                            ->currentCapturerKnowledge)
+                    .arg(pAction->carriedCapturePoints)
+                    .arg(pAction->captureRate)
+                    .arg(pAction->turnsUntilOwned)
+                    .arg(traceBool(
+                        pAction->capturedColumn));
+            }
+            input.pTrace->record(
+                QStringLiteral("STOCK_DECOMPOSITION"),
+                fields);
+        }
+
+        static QString pairAuditReason(
+            const PlanStockAudit & incumbent,
+            const PlanStockAudit & winner)
+        {
+            const QString incumbentReason =
+                stockAuditReason(incumbent, false);
+            if (incumbentReason != QStringLiteral("PROVEN"))
+            {
+                return QStringLiteral("INCUMBENT_%1")
+                    .arg(incumbentReason);
+            }
+            const QString winnerReason =
+                stockAuditReason(winner, false);
+            if (winnerReason != QStringLiteral("PROVEN"))
+            {
+                return QStringLiteral("WINNER_%1")
+                    .arg(winnerReason);
+            }
+            return QStringLiteral("PROVEN");
+        }
+
+        static void recordPairExactAudit(
+            const AssignmentInput & input,
+            const PairExactAuditRequest & request)
+        {
+            const PlanStockAudit incumbent =
+                input.pStockValuer->auditPlanStock(
+                    request.snapshot.incumbentPlan);
+            const PlanStockAudit winner =
+                input.pStockValuer->auditPlanStock(
+                    request.snapshot.winnerPlan);
+            const bool exact =
+                incumbent.available &&
+                incumbent.scalarExact &&
+                incumbent.scalarWitnessReplays &&
+                winner.available &&
+                winner.scalarExact &&
+                winner.scalarWitnessReplays;
+            const MilliFunds incumbentComplete =
+                request.snapshot.incumbentEconomic +
+                incumbent.scalarStockAbsolute;
+            const MilliFunds winnerComplete =
+                request.snapshot.winnerEconomic +
+                winner.scalarStockAbsolute;
+            const MilliFunds exactDelta =
+                winnerComplete - incumbentComplete;
+            const bool liveBoundsComparable =
+                exact &&
+                request.snapshot.liveIntervalPricing;
+            const QString incumbentInLiveBounds =
+                liveBoundsComparable
+                    ? traceBool(
+                          incumbentComplete >=
+                              request.incumbentLower &&
+                          incumbentComplete <=
+                              request.incumbentUpper)
+                    : QStringLiteral("NA");
+            const QString winnerInLiveBounds =
+                liveBoundsComparable
+                    ? traceBool(
+                          winnerComplete >=
+                              request.winnerLower &&
+                          winnerComplete <=
+                              request.winnerUpper)
+                    : QStringLiteral("NA");
+            const QString exactImprovement =
+                exact
+                    ? traceBool(exactDelta > 0)
+                    : QStringLiteral("NA");
+            const QString pricing =
+                request.snapshot.liveIntervalPricing
+                    ? QStringLiteral("LIVE_INTERVAL")
+                    : request.liveFailure
+                          ? QStringLiteral(
+                                "LEGACY_SCALAR_FALLBACK")
+                          : QStringLiteral(
+                                "LEGACY_SCALAR");
+            input.pTrace->record(
+                QStringLiteral("PAIR_EXACT_AUDIT"),
+                QStringLiteral(
+                    "sweep=%1 actors=%2 incumbent=%3 winner=%4 liveIncumbentLower=%5 liveIncumbentUpper=%6 liveWinnerLower=%7 liveWinnerUpper=%8 incumbentEconomic=%9 winnerEconomic=%10 incumbentScalarStockAbsolute=%11 winnerScalarStockAbsolute=%12 scalarIncumbentCompleteValue=%13 scalarWinnerCompleteValue=%14 scalarDelta=%15 exactIncumbentCompleteValue=%16 exactWinnerCompleteValue=%17 exactDelta=%18 exactImprovement=%19 auditValid=%20 incumbentInLiveBounds=%21 winnerInLiveBounds=%22 pricing=%23 reason=%24 basis=FULL_PLAN_ECONOMIC_PLUS_STOCK_ABSOLUTE")
+                    .arg(request.sweep)
+                    .arg(traceAuditIndices(
+                        request.actors))
+                    .arg(traceAuditIndices(
+                        request.snapshot
+                            .incumbentChoices))
+                    .arg(traceAuditIndices(
+                        request.snapshot
+                            .winnerChoices))
+                    .arg(request.incumbentLower)
+                    .arg(request.incumbentUpper)
+                    .arg(request.winnerLower)
+                    .arg(request.winnerUpper)
+                    .arg(
+                        request.snapshot
+                            .incumbentEconomic)
+                    .arg(
+                        request.snapshot
+                            .winnerEconomic)
+                    .arg(
+                        incumbent
+                            .scalarStockAbsolute)
+                    .arg(winner.scalarStockAbsolute)
+                    .arg(incumbentComplete)
+                    .arg(winnerComplete)
+                    .arg(exactDelta)
+                    .arg(traceAuditValue(
+                        exact,
+                        incumbentComplete))
+                    .arg(traceAuditValue(
+                        exact,
+                        winnerComplete))
+                    .arg(traceAuditValue(
+                        exact,
+                        exactDelta))
+                    .arg(exactImprovement)
+                    .arg(traceBool(exact))
+                    .arg(incumbentInLiveBounds)
+                    .arg(winnerInLiveBounds)
+                    .arg(pricing)
+                    .arg(pairAuditReason(
+                        incumbent,
+                        winner)));
+        }
+
+        static void recordDeferredAudits(
+            const AssignmentInput & input,
+            const DeferredAudits & audits)
+        {
+            if (input.pTrace == nullptr ||
+                !input.pTrace->stockDetailsEnabled() ||
+                input.pStockValuer == nullptr)
+            {
+                return;
+            }
+            for (const StockDecompositionRequest & request :
+                 audits.stockDecompositions)
+            {
+                const bool captures =
+                    isCaptureKind(request.kind);
+                const StockDecompositionRequest* pPeer =
+                    nullptr;
+                for (const StockDecompositionRequest & other :
+                     audits.stockDecompositions)
+                {
+                    if (&other != &request &&
+                        other.sweep == request.sweep &&
+                        other.actor == request.actor &&
+                        other.destination ==
+                            request.destination &&
+                        isCaptureKind(other.kind) !=
+                            captures)
+                    {
+                        pPeer = &other;
+                        break;
+                    }
+                }
+                if (pPeer != nullptr)
+                {
+                    recordStockDecomposition(
+                        input,
+                        request,
+                        pPeer->candidate);
+                }
+            }
+            for (const PairExactAuditRequest & request :
+                 audits.pairAudits)
+            {
+                recordPairExactAudit(input, request);
+            }
         }
 
         static void enumerateClusters(TurnPlan & plan, const AssignmentInput & input,

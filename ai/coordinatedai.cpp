@@ -107,6 +107,26 @@ QString selectionDecisionBasis(
     }
     return QStringLiteral("UNKNOWN");
 }
+
+QString selectionPhaseName(
+    Coordinator::AssignmentResult::SelectionPhase phase)
+{
+    switch (phase)
+    {
+        case Coordinator::AssignmentResult::SelectionPhase::None:
+            return QStringLiteral("NONE");
+        case Coordinator::AssignmentResult::SelectionPhase::Greedy:
+            return QStringLiteral("GREEDY");
+        case Coordinator::AssignmentResult::SelectionPhase::Settling:
+            return QStringLiteral("SETTLING");
+        case Coordinator::AssignmentResult::SelectionPhase::
+            PairRefinement:
+            return QStringLiteral("PAIR_REFINEMENT");
+        case Coordinator::AssignmentResult::SelectionPhase::Cluster:
+            return QStringLiteral("CLUSTER");
+    }
+    return QStringLiteral("UNKNOWN");
+}
 }
 
 CoordinatedAi::CoordinatedAi(GameMap* pMap)
@@ -133,7 +153,9 @@ void CoordinatedAi::process()
         if (m_coPowerDay != m_pMap->getCurrentDay())
         {
             m_coPowerDay = m_pMap->getCurrentDay();
-            const bool timed = Coordinator::decisionTraceEnabled();
+            const bool timed =
+                Coordinator::decisionTraceEnabled() ||
+                Coordinator::planningTimingAuditEnabled();
             std::chrono::steady_clock::time_point coPowerStart;
             if (timed)
             {
@@ -185,7 +207,9 @@ bool CoordinatedAi::ensureFactLayers()
 void CoordinatedAi::buildFactLayers()
 {
     using Clock = std::chrono::steady_clock;
-    const bool timed = Coordinator::decisionTraceEnabled();
+    const bool timed =
+        Coordinator::decisionTraceEnabled() ||
+        Coordinator::planningTimingAuditEnabled();
     Clock::time_point factStart;
     if (timed)
     {
@@ -264,7 +288,6 @@ void CoordinatedAi::buildTurnPlan()
         Coordinator::openDecisionTrace(traceIdentity);
     if (m_decisionTrace != nullptr)
     {
-        planningStart = Clock::now();
         m_decisionTrace->record(
             QStringLiteral("PLAN_BEGIN"),
             QStringLiteral(
@@ -272,6 +295,20 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(m_dayStartKnowledge.width())
                 .arg(m_dayStartKnowledge.height())
                 .arg(m_properties.size()));
+        if (!m_decisionTrace->flush())
+        {
+            m_decisionTrace.reset();
+        }
+    }
+    const bool timed =
+        m_decisionTrace != nullptr ||
+        Coordinator::planningTimingAuditEnabled();
+    if (timed)
+    {
+        planningStart = Clock::now();
+    }
+    if (m_decisionTrace != nullptr)
+    {
         for (std::size_t propertyIndex = 0;
              propertyIndex < m_properties.size();
              ++propertyIndex)
@@ -307,6 +344,7 @@ void CoordinatedAi::buildTurnPlan()
         m_propertyStock, input.unitLinks);
     input.pStockValuer = &stockValuer;
     input.pTrace = m_decisionTrace.get();
+    input.measureTimings = timed;
     Coordinator::DamageOracle oracle(*m_pMap);
     oracle.clear();
     Coordinator::BundleBuildStats buildStats;
@@ -366,7 +404,7 @@ void CoordinatedAi::buildTurnPlan()
         actor.knowledgeUnitIndex = static_cast<qint32>(slot);
         actor.engineUnitId = pUnit->getUniqueID();
         Clock::time_point candidateStart;
-        if (m_decisionTrace != nullptr)
+        if (timed)
         {
             candidateStart = Clock::now();
         }
@@ -380,7 +418,7 @@ void CoordinatedAi::buildTurnPlan()
             oracle,
             actor.knowledgeUnitIndex,
             buildStats);
-        if (m_decisionTrace != nullptr)
+        if (timed)
         {
             const std::int32_t generatedCandidateCount =
                 buildStats.candidateCount - generatedBefore;
@@ -393,23 +431,26 @@ void CoordinatedAi::buildTurnPlan()
             maxCandidatesPerActor = std::max(
                 maxCandidatesPerActor,
                 generatedCandidateCount);
-            actorTimings.push_back(ActorTiming{
-                .knowledgeUnitIndex =
-                    actor.knowledgeUnitIndex,
-                .engineUnitId = actor.engineUnitId,
-                .generatedCandidateCount =
-                    generatedCandidateCount,
-                .validCandidateCount =
-                    static_cast<std::int32_t>(
-                        actor.candidates.size()),
-                .nanos = actorCandidateNanos,
-            });
+            if (m_decisionTrace != nullptr)
+            {
+                actorTimings.push_back(ActorTiming{
+                    .knowledgeUnitIndex =
+                        actor.knowledgeUnitIndex,
+                    .engineUnitId = actor.engineUnitId,
+                    .generatedCandidateCount =
+                        generatedCandidateCount,
+                    .validCandidateCount =
+                        static_cast<std::int32_t>(
+                            actor.candidates.size()),
+                    .nanos = actorCandidateNanos,
+                });
+            }
         }
         input.actors.push_back(std::move(actor));
     }
 
     std::int32_t stockCoupledActors = 0;
-    if (m_decisionTrace != nullptr)
+    if (timed)
     {
         for (const Coordinator::AssignmentActor & actor :
              input.actors)
@@ -422,7 +463,7 @@ void CoordinatedAi::buildTurnPlan()
         }
     }
     Clock::time_point continuationStart;
-    if (m_decisionTrace != nullptr)
+    if (timed)
     {
         continuationStart = Clock::now();
     }
@@ -436,7 +477,7 @@ void CoordinatedAi::buildTurnPlan()
                 std::move(catalog), ledger));
     }
     const std::int64_t continuationPricingPrepareNanos =
-        m_decisionTrace == nullptr
+        !timed
             ? 0
             : std::chrono::duration_cast<
                   std::chrono::nanoseconds>(
@@ -444,37 +485,22 @@ void CoordinatedAi::buildTurnPlan()
                   .count();
     m_assignment = Coordinator::MaximumValueAssignment::assign(input);
     recordCaptureDecisions(input);
+    recordProductionBlocks(input);
     const std::int64_t turnPlanNanos =
-        m_decisionTrace == nullptr
+        !timed
             ? 0
             : std::chrono::duration_cast<
                   std::chrono::nanoseconds>(
                   Clock::now() - planningStart)
                   .count();
-    if (m_decisionTrace != nullptr)
+    const Coordinator::AssignmentResult::PhaseTiming &
+        assignmentTiming = m_assignment.phaseTiming;
+    const Coordinator::AssignmentStats & stats =
+        m_assignment.stats;
+    QString phaseTimingFields;
+    if (timed)
     {
-        m_decisionTrace->record(
-            QStringLiteral("BUILD_STATS"),
-            QStringLiteral(
-                "actors=%1 totalCandidates=%2 validCandidates=%3 invalidCandidates=%4 missingUnits=%5 damageOracleCalls=%6 damageOracleHits=%7 maxCandidatesPerActor=%8 stockCoupledActors=%9")
-                .arg(input.actors.size())
-                .arg(buildStats.candidateCount)
-                .arg(buildStats.candidateCount -
-                     buildStats.invalidCount)
-                .arg(buildStats.invalidCount)
-                .arg(buildStats.missingUnits)
-                .arg(buildStats.oracleCalls)
-                .arg(buildStats.oracleHits)
-                .arg(maxCandidatesPerActor)
-                .arg(stockCoupledActors));
-        m_decisionTrace->flush();
-
-        const Coordinator::AssignmentResult::PhaseTiming &
-            assignmentTiming = m_assignment.phaseTiming;
-        const Coordinator::AssignmentStats & stats =
-            m_assignment.stats;
-        m_decisionTrace->record(
-            QStringLiteral("PHASE_TIMING"),
+        phaseTimingFields =
             QStringLiteral(
                 "actorCount=%1 factLayersNanos=%2 propertyStockBuildNanos=%3 coPowerCheckNanos=%4 candidateBuildNanos=%5 continuationPricingPrepareNanos=%6 assignmentPrepareNanos=%7 greedyNanos=%8 settlingNanos=%9 pairRefinementNanos=%10 clusterNanos=%11 finishPlanNanos=%12 totalPlanningNanos=%13 totalCandidates=%14 maxCandidatesPerActor=%15 damageOracleCalls=%16 damageOracleHits=%17 stockCoupledActors=%18 settlingSweeps=%19 settlingMoves=%20 swapStates=%21 swapImprovements=%22 clustersTotal=%23 clustersEnumerated=%24 clustersCapped=%25 clustersSkippedStockBudget=%26 enumerationStates=%27 planSequence=%28")
                 .arg(input.actors.size())
@@ -506,7 +532,29 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(stats.clustersCapped)
                 .arg(stats.clustersSkippedStockBudget)
                 .arg(stats.enumerationStates)
-                .arg(m_planSequence));
+                .arg(m_planSequence);
+    }
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("BUILD_STATS"),
+            QStringLiteral(
+                "actors=%1 totalCandidates=%2 validCandidates=%3 invalidCandidates=%4 missingUnits=%5 damageOracleCalls=%6 damageOracleHits=%7 maxCandidatesPerActor=%8 stockCoupledActors=%9")
+                .arg(input.actors.size())
+                .arg(buildStats.candidateCount)
+                .arg(buildStats.candidateCount -
+                     buildStats.invalidCount)
+                .arg(buildStats.invalidCount)
+                .arg(buildStats.missingUnits)
+                .arg(buildStats.oracleCalls)
+                .arg(buildStats.oracleHits)
+                .arg(maxCandidatesPerActor)
+                .arg(stockCoupledActors));
+        m_decisionTrace->flush();
+
+        m_decisionTrace->record(
+            QStringLiteral("PHASE_TIMING"),
+            phaseTimingFields);
         for (const ActorTiming & timing : actorTimings)
         {
             m_decisionTrace->record(
@@ -521,6 +569,9 @@ void CoordinatedAi::buildTurnPlan()
         }
         m_decisionTrace->flush();
     }
+    Coordinator::writePlanningTimingAudit(
+        traceIdentity,
+        phaseTimingFields);
 }
 
 Unit* CoordinatedAi::plannableUnit(
@@ -893,6 +944,222 @@ void CoordinatedAi::recordCaptureDecisions(
                         ? QStringLiteral("NONE")
                         : selectionDecisionBasis(
                               pSelection->phase)));
+    }
+}
+
+void CoordinatedAi::recordProductionBlocks(
+    const Coordinator::AssignmentInput & input)
+{
+    if (m_decisionTrace == nullptr ||
+        !m_decisionTrace->stockDetailsEnabled())
+    {
+        return;
+    }
+    for (const Coordinator::AssignmentResult::Selection &
+         selection : m_assignment.selections)
+    {
+        if (selection.actionIndex ==
+                Coordinator::NO_ACTION ||
+            selection.candidateIndex < 0)
+        {
+            continue;
+        }
+        const Coordinator::AssignmentActor* pActor =
+            nullptr;
+        for (const Coordinator::AssignmentActor & actor :
+             input.actors)
+        {
+            if (actor.engineUnitId ==
+                selection.engineUnitId)
+            {
+                pActor = &actor;
+                break;
+            }
+        }
+        if (pActor == nullptr ||
+            selection.candidateIndex >=
+                static_cast<std::int32_t>(
+                    pActor->candidates.size()))
+        {
+            continue;
+        }
+        const Coordinator::PlannedAction & selectedAction =
+            m_assignment.plan.action(
+                selection.actionIndex);
+        if (!Coordinator::isLiveState(
+                selectedAction.state))
+        {
+            continue;
+        }
+        const Coordinator::CandidateBundle & selected =
+            pActor->candidates[
+                static_cast<std::size_t>(
+                    selection.candidateIndex)];
+        const Coordinator::TilePoint origin =
+            selected.bundle.origin;
+        if (selectedAction.destination != origin)
+        {
+            continue;
+        }
+        const std::int32_t propertyIndex =
+            m_propertyStock.propertyIndexAt(origin);
+        if (propertyIndex ==
+                Coordinator::NO_PROPERTY_INDEX ||
+            propertyIndex >=
+                static_cast<std::int32_t>(
+                    m_properties.size()))
+        {
+            continue;
+        }
+        const Coordinator::PropertyFacts & property =
+            m_properties[
+                static_cast<std::size_t>(
+                    propertyIndex)];
+        if (!property.canProduce ||
+            m_dayStartKnowledge.relation(
+                property.ownerId) !=
+                Coordinator::Relation::Own)
+        {
+            continue;
+        }
+
+        std::int32_t vacatingCandidates = 0;
+        std::int32_t legalVacatingCandidates = 0;
+        std::int32_t bestCandidate =
+            Coordinator::NO_CANDIDATE;
+        std::int32_t bestGenerated = -1;
+        Coordinator::PlanBundleKind bestKind =
+            Coordinator::PlanBundleKind::Wait;
+        Coordinator::TilePoint bestDestination =
+            Coordinator::INVALID_TILE;
+        Coordinator::TerminalValue bestValue;
+        for (std::size_t candidateIndex = 0;
+             candidateIndex <
+                 pActor->candidates.size();
+             ++candidateIndex)
+        {
+            const Coordinator::CandidateBundle & candidate =
+                pActor->candidates[candidateIndex];
+            if (candidate.bundle.destination == origin)
+            {
+                continue;
+            }
+            ++vacatingCandidates;
+            Coordinator::TurnPlan auditPlan =
+                m_assignment.plan;
+            Coordinator::AssignmentStats auditStats;
+            const std::vector<Coordinator::CandidateBundle>
+                singleCandidate{candidate};
+            if (!Coordinator::replanAction(
+                    auditPlan,
+                    selection.actionIndex,
+                    input.actionIds,
+                    input.unitLinks,
+                    singleCandidate,
+                    auditStats))
+            {
+                continue;
+            }
+            ++legalVacatingCandidates;
+            const Coordinator::TerminalValue value =
+                auditPlan
+                    .action(selection.actionIndex)
+                    .marginalValue;
+            const std::int32_t index =
+                static_cast<std::int32_t>(
+                    candidateIndex);
+            if (bestCandidate ==
+                    Coordinator::NO_CANDIDATE ||
+                value > bestValue ||
+                (value == bestValue &&
+                 index < bestCandidate))
+            {
+                bestCandidate = index;
+                bestGenerated =
+                    candidate.generationIndex;
+                bestKind =
+                    Coordinator::planBundleKindOf(
+                        candidate.bundle);
+                bestDestination =
+                    candidate.bundle.destination;
+                bestValue = value;
+            }
+        }
+        const bool hasLegalVacating =
+            bestCandidate != Coordinator::NO_CANDIDATE;
+        const bool equalValue =
+            hasLegalVacating &&
+            bestValue == selectedAction.marginalValue;
+        const QString unitType =
+            selection.knowledgeUnitIndex >= 0 &&
+                    selection.knowledgeUnitIndex <
+                        static_cast<std::int32_t>(
+                            m_dayStartKnowledge
+                                .units()
+                                .size())
+                ? m_dayStartKnowledge
+                      .units()[
+                          static_cast<std::size_t>(
+                              selection
+                                  .knowledgeUnitIndex)]
+                      .unitId
+                : QStringLiteral("UNKNOWN");
+        m_decisionTrace->record(
+            QStringLiteral("PRODUCTION_BLOCK"),
+            QStringLiteral(
+                "actor=%1 actorKnowledge=%2 unitType=%3 property=%4 productionTile=%5 selectedCandidate=%6 selectedGenerated=%7 selectedKind=%8 selectedDestination=%9 selectedTerminal=%10 selectedValue=%11 selectedEconomicValue=%11 selectedSeatedValue=%12 selectionPhase=%13 selectionBasis=%14 vacatingCandidates=%15 legalVacatingCandidates=%16 noLegalVacatingCandidate=%17 bestVacatingCandidate=%18 bestVacatingGenerated=%19 bestVacatingKind=%20 bestVacatingDestination=%21 bestVacatingTerminal=%22 bestVacatingCandidateValue=%23 bestVacatingEconomicValue=%23 equalValue=%24 equalEconomicValue=%24 comparisonBasis=MARGINAL_TERMINAL_VALUE")
+                .arg(selection.engineUnitId)
+                .arg(selection.knowledgeUnitIndex)
+                .arg(unitType)
+                .arg(propertyIndex)
+                .arg(Coordinator::traceTile(origin))
+                .arg(selection.candidateIndex)
+                .arg(selected.generationIndex)
+                .arg(Coordinator::traceBundleKind(
+                    selectedAction.kind))
+                .arg(Coordinator::traceTile(
+                    selectedAction.destination))
+                .arg(static_cast<std::int32_t>(
+                    selectedAction
+                        .marginalValue.terminal))
+                .arg(selectedAction
+                         .marginalValue
+                         .economicValue)
+                .arg(selection.seatedValue)
+                .arg(selectionPhaseName(
+                    selection.phase))
+                .arg(selectionDecisionBasis(
+                    selection.phase))
+                .arg(vacatingCandidates)
+                .arg(legalVacatingCandidates)
+                .arg(Coordinator::traceBool(
+                    !hasLegalVacating))
+                .arg(bestCandidate)
+                .arg(bestGenerated)
+                .arg(
+                    hasLegalVacating
+                        ? Coordinator::traceBundleKind(
+                              bestKind)
+                        : QStringLiteral("NONE"))
+                .arg(
+                    hasLegalVacating
+                        ? Coordinator::traceTile(
+                              bestDestination)
+                        : Coordinator::traceTile(
+                              Coordinator::INVALID_TILE))
+                .arg(
+                    hasLegalVacating
+                        ? QString::number(
+                              static_cast<std::int32_t>(
+                                  bestValue.terminal))
+                        : QStringLiteral("NA"))
+                .arg(
+                    hasLegalVacating
+                        ? QString::number(
+                              bestValue.economicValue)
+                        : QStringLiteral("NA"))
+                .arg(Coordinator::traceBool(
+                    equalValue)));
     }
 }
 

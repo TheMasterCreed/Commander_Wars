@@ -45,6 +45,16 @@ namespace Coordinator
         bool captures{false};
     };
 
+    struct JointStockDecomposition
+    {
+        std::vector<std::int32_t> capturedColumns;
+        MilliFunds ownedBaseline{0};
+        MilliFunds ownershipFlipSwingTotal{0};
+        MilliFunds ourOpenOptimum{0};
+        MilliFunds jointEnemyOptimum{0};
+        MilliFunds stockAbsolute{0};
+    };
+
     class PropertyStockField
     {
     public:
@@ -55,6 +65,8 @@ namespace Coordinator
 
         MilliFunds destinationStock(const PropertyStockActor & actor, const PropertyStockOutcome & outcome);
         MilliFunds jointStock(std::span<const PlanRowAction> actions);
+        JointStockDecomposition jointStockDecomposition(
+            std::span<const PlanRowAction> actions);
         MilliFunds stockCeiling() const;
 
         std::int32_t propertyIndexAt(const TilePoint & tile) const;

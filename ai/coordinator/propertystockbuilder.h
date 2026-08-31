@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -71,6 +72,7 @@ namespace Coordinator
             MilliFunds economicValue,
             bool pricingLeaf) override;
         bool refineLiveAtBoundary(AssignPhase phase) override;
+        PlanStockAudit auditPlanStock(const TurnPlan & plan) override;
         MilliFunds planStockFloor(const TurnPlan & plan);
         ContinuationPricingCatalog continuationPricingCatalog(
             const AssignmentInput & input) const;
@@ -104,6 +106,13 @@ namespace Coordinator
         std::vector<PlanRowAction> planActions(const TurnPlan & plan) const;
         static std::vector<PlanRowAction> planActions(
             const ContinuationKey & key);
+        PlanStockAudit stockAudit(
+            std::span<const PlanRowAction> actions);
+        static SequentialStockAudit sequentialAudit(
+            const SequentialTierResult & tier,
+            bool witnessReplays);
+        std::vector<PlanStockActionAudit> actionAudits(
+            std::span<const PlanRowAction> actions) const;
         std::int64_t mandatoryTariffFor(std::size_t actionCount) const;
         std::int64_t ourRerunTariff() const;
         std::int64_t enemyRerunTariff(
@@ -170,6 +179,7 @@ namespace Coordinator
         mutable std::vector<SequentialClassTable> m_ourClassTables;
         mutable std::map<std::vector<std::int32_t>, MilliFunds>
             m_enemySequentialOptima;
+        std::optional<PlanStockAudit> m_auditOrigin;
         mutable bool m_originCached{false};
         mutable MilliFunds m_sequentialOrigin{0};
         mutable std::map<std::vector<std::int64_t>,

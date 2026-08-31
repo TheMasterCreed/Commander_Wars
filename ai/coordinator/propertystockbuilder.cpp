@@ -429,18 +429,35 @@ namespace Coordinator
         return solver.optimum();
     }
 
-    MilliFunds PropertyStockField::jointStock(std::span<const PlanRowAction> actions)
+    JointStockDecomposition PropertyStockField::jointStockDecomposition(
+        std::span<const PlanRowAction> actions)
     {
-        const JointActionFacts facts = jointActionFacts(actions);
-        MilliFunds owned = m_ownedBaseline;
+        JointActionFacts facts = jointActionFacts(actions);
+        JointStockDecomposition result;
+        result.ownedBaseline = m_ownedBaseline;
         for (const std::int32_t column : facts.capturedColumns)
         {
-            owned += ownershipFlipSwing(
+            result.ownershipFlipSwingTotal += ownershipFlipSwing(
                 m_ours.columns[static_cast<std::size_t>(column)],
                 m_horizonTurns);
         }
-        return owned + ourOpenOptimum(facts) -
-               jointEnemyOptimum(facts.capturedColumns);
+        result.ourOpenOptimum = ourOpenOptimum(facts);
+        result.jointEnemyOptimum =
+            jointEnemyOptimum(facts.capturedColumns);
+        result.stockAbsolute =
+            result.ownedBaseline +
+            result.ownershipFlipSwingTotal +
+            result.ourOpenOptimum -
+            result.jointEnemyOptimum;
+        result.capturedColumns =
+            std::move(facts.capturedColumns);
+        return result;
+    }
+
+    MilliFunds PropertyStockField::jointStock(
+        std::span<const PlanRowAction> actions)
+    {
+        return jointStockDecomposition(actions).stockAbsolute;
     }
 
     MilliFunds PropertyStockField::stockCeiling() const
@@ -1476,6 +1493,166 @@ namespace Coordinator
         return m_field.jointStock(planActions(plan));
     }
 
+    SequentialStockAudit JointPlanStockValuer::sequentialAudit(
+        const SequentialTierResult & tier,
+        bool witnessReplays)
+    {
+        return SequentialStockAudit{
+            .floorValue = tier.floorValue,
+            .relaxedValue = tier.relaxedValue,
+            .repairValue = tier.repairValue,
+            .searchValue = tier.searchValue,
+            .bookedValue = tier.bookedValue,
+            .searchStates = tier.searchStates,
+            .certificate = tier.certificate,
+            .searchCompleted = tier.searchCompleted,
+            .witnessReplays = witnessReplays,
+            .provenExact =
+                tier.certificate ||
+                tier.searchCompleted ||
+                tier.bookedValue == tier.relaxedValue,
+        };
+    }
+
+    std::vector<PlanStockActionAudit>
+    JointPlanStockValuer::actionAudits(
+        std::span<const PlanRowAction> actions) const
+    {
+        std::vector<PlanStockActionAudit> result;
+        result.reserve(actions.size());
+        for (const PlanRowAction & action : actions)
+        {
+            if (action.row < 0 ||
+                action.row >= m_field.m_ours.rowCount())
+            {
+                continue;
+            }
+            const PropertyStockRow & row =
+                m_field.m_ours.rows[
+                    static_cast<std::size_t>(action.row)];
+            PlanStockActionAudit audit{
+                .knowledgeIndex = row.knowledgeIndex,
+                .destination = action.destination,
+                .captures = action.captures,
+                .propertyIndex =
+                    m_field.propertyIndexAt(action.destination),
+                .stockColumn =
+                    m_field.columnSlotAt(action.destination),
+                .captureRate = row.captureRate,
+            };
+            if (audit.stockColumn != NO_STOCK_COLUMN)
+            {
+                const std::size_t column =
+                    static_cast<std::size_t>(audit.stockColumn);
+                audit.currentOwnerSign = static_cast<std::int32_t>(
+                    m_field.m_ours.columns[column].ownerBefore);
+                audit.currentCapturePoints =
+                    m_field.m_columnCapturePoints[column];
+                audit.currentCapturerKnowledge =
+                    m_field.m_columnCapturer[column];
+                audit.carriedCapturePoints =
+                    m_field.carriedFor(row, audit.stockColumn);
+                if (action.captures)
+                {
+                    audit.carriedCapturePoints += row.captureRate;
+                }
+                audit.turnsUntilOwned = captureTurnsFor(
+                    audit.carriedCapturePoints,
+                    row.captureRate,
+                    m_field.m_capturePointsToCapture);
+                audit.capturedColumn =
+                    action.captures &&
+                    audit.carriedCapturePoints >=
+                        m_field.m_capturePointsToCapture;
+            }
+            result.push_back(audit);
+        }
+        return result;
+    }
+
+    PlanStockAudit JointPlanStockValuer::stockAudit(
+        std::span<const PlanRowAction> actions)
+    {
+        const JointStockDecomposition floor =
+            m_field.jointStockDecomposition(actions);
+        const OurSequentialSolve ours =
+            solveOurSequential(actions,
+                               SEQUENTIAL_SEARCH_STATE_CAP,
+                               true);
+        const EnemySequentialSolve enemy =
+            solveEnemySequential(ours.capturedColumns,
+                                 SEQUENTIAL_SEARCH_STATE_CAP,
+                                 true);
+        PlanStockAudit result{
+            .capturedColumns = floor.capturedColumns,
+            .ownedBaseline = floor.ownedBaseline,
+            .ownershipFlipSwingTotal =
+                floor.ownershipFlipSwingTotal,
+            .ourOpenOptimum = floor.ourOpenOptimum,
+            .jointEnemyOptimum = floor.jointEnemyOptimum,
+            .floorStockAbsolute = floor.stockAbsolute,
+            .ours = sequentialAudit(
+                ours.tier,
+                ours.witnessReplays),
+            .enemy = sequentialAudit(
+                enemy.tier,
+                enemy.witnessReplays),
+            .scalarStockAbsolute =
+                ours.owned +
+                ours.tier.bookedValue -
+                enemy.tier.bookedValue,
+            .actions = actionAudits(actions),
+        };
+        result.available =
+            ours.capturedColumns == floor.capturedColumns &&
+            ours.owned ==
+                floor.ownedBaseline +
+                    floor.ownershipFlipSwingTotal &&
+            ours.tier.floorValue ==
+                floor.ourOpenOptimum &&
+            enemy.tier.floorValue ==
+                floor.jointEnemyOptimum;
+        result.scalarExact =
+            result.available &&
+            result.ours.provenExact &&
+            result.enemy.provenExact;
+        result.scalarWitnessReplays =
+            result.available &&
+            result.ours.witnessReplays &&
+            result.enemy.witnessReplays;
+        return result;
+    }
+
+    PlanStockAudit JointPlanStockValuer::auditPlanStock(
+        const TurnPlan & plan)
+    {
+        const MilliFunds origin = originStock();
+        if (!m_auditOrigin.has_value())
+        {
+            m_auditOrigin =
+                stockAudit(std::span<const PlanRowAction>());
+        }
+        const std::vector<PlanRowAction> actions =
+            planActions(plan);
+        PlanStockAudit result =
+            actions.empty()
+                ? *m_auditOrigin
+                : stockAudit(actions);
+        const bool originMatches =
+            m_auditOrigin->available &&
+            m_auditOrigin->scalarStockAbsolute == origin;
+        result.liveOriginStock = origin;
+        result.originScalarStock =
+            m_auditOrigin->scalarStockAbsolute;
+        result.originExact =
+            originMatches &&
+            m_auditOrigin->scalarExact;
+        result.originWitnessReplays =
+            originMatches &&
+            m_auditOrigin->scalarWitnessReplays;
+        return result;
+    }
+
     MilliFunds JointPlanStockValuer::originStock() const
     {
         if (!m_originCached)
@@ -1740,8 +1917,7 @@ namespace Coordinator
             stateCap,
             nullptr,
             captureWitness);
-        if (captureWitness &&
-            solved.tier.bookedValue > solved.tier.floorValue)
+        if (captureWitness)
         {
             solved.witnessReplays = replaySequentialWitness(
                 instance,
@@ -1878,8 +2054,7 @@ namespace Coordinator
             stateCap,
             &rowSource,
             captureWitness);
-        if (captureWitness &&
-            solved.tier.bookedValue > solved.tier.floorValue)
+        if (captureWitness)
         {
             solved.witnessReplays = replaySequentialWitness(
                 instance,

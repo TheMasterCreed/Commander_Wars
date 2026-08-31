@@ -28,11 +28,15 @@ namespace Coordinator
         virtual bool candidateDetailsEnabled() const = 0;
         virtual bool stockDetailsEnabled() const = 0;
         virtual void record(const QString & category, const QString & fields) = 0;
-        virtual void flush() = 0;
+        virtual bool flush() = 0;
     };
 
     bool decisionTraceEnabled();
+    bool planningTimingAuditEnabled();
     std::unique_ptr<DecisionTrace> openDecisionTrace(const DecisionTraceIdentity & identity);
+    void writePlanningTimingAudit(
+        const DecisionTraceIdentity & identity,
+        const QString & fields);
 
     inline QString traceBool(bool value)
     {

@@ -29,6 +29,8 @@ using Coordinator::MilliFunds;
 using Coordinator::NO_ACTION;
 using Coordinator::NO_CANDIDATE;
 using Coordinator::PlanActionIds;
+using Coordinator::PlanStockActionAudit;
+using Coordinator::PlanStockAudit;
 using Coordinator::PlanStockValuer;
 using Coordinator::PlanActionState;
 using Coordinator::PlanBundleKind;
@@ -61,6 +63,7 @@ constexpr MilliFunds CLUSTER_OPTIMUM = 2450;
 constexpr MilliFunds CLUSTER_SETTLED = 1800;
 constexpr MilliFunds CLUSTER_MIDDLE_VALUE = 850;
 constexpr MilliFunds CLUSTER_TAIL_VALUE = 700;
+constexpr MilliFunds FULL_PLAN_AUDIT_STOCK = 77;
 constexpr std::int32_t TARGET_HP_STEPS = 3;
 constexpr std::int32_t LETHAL_DAMAGE_STEPS = 3;
 
@@ -130,6 +133,7 @@ public:
         MilliFunds,
         bool pricingLeaf) override
     {
+        liveAfterAudit = liveAfterAudit || auditSeen;
         m_liveQuoteSeen = true;
         Coordinator::LivePlanStockQuote quote;
         if (pricingLeaf)
@@ -190,6 +194,7 @@ public:
 
     bool refineLiveAtBoundary(AssignPhase phase) override
     {
+        liveAfterAudit = liveAfterAudit || auditSeen;
         ++refinementBoundaries;
         wrongRefinementPhase =
             wrongRefinementPhase ||
@@ -197,18 +202,203 @@ public:
         return false;
     }
 
+    PlanStockAudit auditPlanStock(
+        const TurnPlan & plan) override
+    {
+        auditSeen = true;
+        ++auditCalls;
+        PlanStockAudit audit;
+        audit.available = true;
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (Coordinator::isLiveState(
+                    action.state) &&
+                action.unitId == TARGET_UNIT)
+            {
+                audit.scalarStockAbsolute =
+                    FULL_PLAN_AUDIT_STOCK;
+                break;
+            }
+        }
+        audit.ours.provenExact = true;
+        audit.ours.witnessReplays = true;
+        audit.enemy.provenExact = true;
+        audit.enemy.witnessReplays = true;
+        audit.scalarExact = true;
+        audit.scalarWitnessReplays = true;
+        audit.originExact = true;
+        audit.originWitnessReplays = true;
+        return audit;
+    }
+
     std::int32_t scalarCalls{0};
     std::int32_t scalarCallsAfterLiveQuote{0};
     std::int32_t liveLeaves{0};
     std::int32_t nonLeafQuotes{0};
     std::int32_t refinementBoundaries{0};
+    std::int32_t auditCalls{0};
     bool wrongRefinementPhase{false};
+    bool auditSeen{false};
+    bool liveAfterAudit{false};
 
 private:
     IntervalFailure m_failure;
     std::int32_t m_affectedUnit;
     bool m_failed{false};
     bool m_liveQuoteSeen{false};
+};
+
+class DecompositionValuer final : public PlanStockValuer
+{
+public:
+    explicit DecompositionValuer(
+        MilliFunds auditedOrigin = 0)
+        : m_auditedOrigin(auditedOrigin)
+    {
+    }
+
+    MilliFunds planStock(const TurnPlan & plan) override
+    {
+        scalarAfterAudit =
+            scalarAfterAudit || auditSeen;
+        return stockFor(plan);
+    }
+
+    MilliFunds originStock() const override
+    {
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        return POSITIONAL_STOCK;
+    }
+
+    bool affectsStock(std::int32_t engineUnitId) const override
+    {
+        return engineUnitId == ATTACKER_UNIT;
+    }
+
+    PlanStockAudit auditPlanStock(
+        const TurnPlan & plan) override
+    {
+        auditSeen = true;
+        ++auditCalls;
+        PlanStockAudit audit;
+        audit.available = true;
+        audit.ownedBaseline = 0;
+        audit.ourOpenOptimum =
+            stockFor(plan) == CAPTURE_STOCK
+                ? CAPTURE_FLOOR
+                : POSITIONAL_FLOOR;
+        audit.floorStockAbsolute =
+            audit.ourOpenOptimum;
+        audit.ours.floorValue =
+            audit.ourOpenOptimum;
+        audit.ours.relaxedValue =
+            stockFor(plan);
+        audit.ours.bookedValue =
+            stockFor(plan);
+        audit.ours.provenExact = true;
+        audit.ours.witnessReplays = true;
+        audit.enemy.provenExact = true;
+        audit.enemy.witnessReplays = true;
+        audit.scalarStockAbsolute =
+            stockFor(plan);
+        audit.liveOriginStock = originStock();
+        audit.originScalarStock = m_auditedOrigin;
+        audit.scalarExact = true;
+        audit.scalarWitnessReplays = true;
+        audit.originExact =
+            audit.liveOriginStock ==
+            audit.originScalarStock;
+        audit.originWitnessReplays =
+            audit.originExact;
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (!Coordinator::isLiveState(
+                    action.state) ||
+                action.unitId != ATTACKER_UNIT)
+            {
+                continue;
+            }
+            audit.actions.push_back(
+                PlanStockActionAudit{
+                    .knowledgeIndex =
+                        ATTACKER_INDEX,
+                    .destination =
+                        action.destination,
+                    .captures =
+                        action.kind ==
+                        PlanBundleKind::
+                            MoveAndCapture,
+                    .propertyIndex = 4,
+                    .stockColumn = 2,
+                    .currentOwnerSign = 0,
+                    .currentCapturePoints = 0,
+                    .currentCapturerKnowledge =
+                        Coordinator::NO_UNIT,
+                    .carriedCapturePoints =
+                        action.kind ==
+                                PlanBundleKind::
+                                    MoveAndCapture
+                            ? 10
+                            : 0,
+                    .captureRate = 10,
+                    .turnsUntilOwned =
+                        action.kind ==
+                                PlanBundleKind::
+                                    MoveAndCapture
+                            ? 1
+                            : 2,
+                    .capturedColumn = false,
+                });
+        }
+        return audit;
+    }
+
+    std::int32_t auditCalls{0};
+    bool auditSeen{false};
+    bool scalarAfterAudit{false};
+
+private:
+    MilliFunds m_auditedOrigin{0};
+
+    static constexpr MilliFunds POSITIONAL_STOCK = 29000;
+    static constexpr MilliFunds CAPTURE_STOCK = 24000;
+    static constexpr MilliFunds POSITIONAL_FLOOR = 6000;
+    static constexpr MilliFunds CAPTURE_FLOOR = 7000;
+
+    static MilliFunds stockFor(const TurnPlan & plan)
+    {
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (!Coordinator::isLiveState(
+                    action.state) ||
+                action.unitId != ATTACKER_UNIT)
+            {
+                continue;
+            }
+            return action.kind ==
+                           PlanBundleKind::
+                               MoveAndCapture
+                       ? CAPTURE_STOCK
+                       : POSITIONAL_STOCK;
+        }
+        return 0;
+    }
 };
 
 class BudgetExhaustingValuer final : public PlanStockValuer
@@ -258,9 +448,10 @@ public:
         records.push_back(category + QLatin1Char(' ') + fields);
     }
 
-    void flush() override
+    bool flush() override
     {
         ++flushes;
+        return true;
     }
 
     bool contains(const QString & category) const
@@ -272,6 +463,61 @@ public:
             {
                 return record.startsWith(
                     category + QLatin1Char(' '));
+            });
+    }
+
+    std::int32_t count(const QString & category) const
+    {
+        return static_cast<std::int32_t>(
+            std::count_if(
+                records.begin(),
+                records.end(),
+                [&](const QString & record)
+                {
+                    return record.startsWith(
+                        category +
+                        QLatin1Char(' '));
+                }));
+    }
+
+    bool containsFields(
+        const QString & category,
+        const QString & fragment) const
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const QString & record)
+            {
+                return record.startsWith(
+                           category +
+                           QLatin1Char(' ')) &&
+                       record.contains(fragment);
+            });
+    }
+
+    bool containsFields(
+        const QString & category,
+        const QStringList & fragments) const
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const QString & record)
+            {
+                if (!record.startsWith(
+                        category +
+                        QLatin1Char(' ')))
+                {
+                    return false;
+                }
+                return std::all_of(
+                    fragments.begin(),
+                    fragments.end(),
+                    [&](const QString & fragment)
+                    {
+                        return record.contains(fragment);
+                    });
             });
     }
 
@@ -625,6 +871,24 @@ AssignmentInput destinationSwapInput()
         actorWith(ATTACKER_INDEX, ATTACKER_UNIT, std::move(attacker)),
         actorWith(SUPPORT_INDEX, SUPPORT_UNIT, std::move(support)),
     });
+}
+
+AssignmentInput fullPlanDestinationSwapInput()
+{
+    AssignmentInput input = destinationSwapInput();
+    std::vector<CandidateBundle> third{
+        valuedCandidate(
+            TARGET_INDEX,
+            TARGET_TILE,
+            FAR_TILE,
+            POOR_VALUE),
+    };
+    input.actors.push_back(
+        actorWith(
+            TARGET_INDEX,
+            TARGET_UNIT,
+            std::move(third)));
+    return input;
 }
 
 void testPairSearchResolvesADestinationConflict()
@@ -1086,13 +1350,152 @@ void testCapsAndSharedBudgetBoundTheSearch()
            "pair and cluster visits share one hard budget");
 }
 
+AssignmentInput decompositionInput()
+{
+    std::vector<CandidateBundle> candidates{
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            FAIR_VALUE),
+        capturingCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            FAIR_VALUE),
+    };
+    return inputWith({
+        actorWith(
+            ATTACKER_INDEX,
+            ATTACKER_UNIT,
+            std::move(candidates)),
+    });
+}
+
+void testStockDecompositionIsDeferredAndNeutral()
+{
+    DecompositionValuer baselineValuer;
+    AssignmentInput baselineInput =
+        decompositionInput();
+    baselineInput.pStockValuer =
+        &baselineValuer;
+    const AssignmentResult baseline =
+        MaximumValueAssignment::assign(
+            baselineInput);
+
+    DecompositionValuer tracedValuer;
+    RecordingTrace firstTrace;
+    AssignmentInput tracedInput =
+        decompositionInput();
+    tracedInput.pStockValuer = &tracedValuer;
+    tracedInput.pTrace = &firstTrace;
+    const AssignmentResult traced =
+        MaximumValueAssignment::assign(
+            tracedInput);
+
+    DecompositionValuer replayValuer;
+    RecordingTrace replayTrace;
+    AssignmentInput replayInput =
+        decompositionInput();
+    replayInput.pStockValuer = &replayValuer;
+    replayInput.pTrace = &replayTrace;
+    const AssignmentResult replay =
+        MaximumValueAssignment::assign(
+            replayInput);
+
+    const PlannedAction* pSelected =
+        actionOf(traced, ATTACKER_UNIT);
+    expect(pSelected != nullptr &&
+               pSelected->kind ==
+                   PlanBundleKind::Move,
+           "the higher stock positional candidate remains selected");
+    expect(samePlan(baseline, traced) &&
+               samePlan(traced, replay),
+           "stock decomposition does not change the selected plan");
+    expect(statsSnapshot(baseline.stats) ==
+               statsSnapshot(traced.stats) &&
+               statsSnapshot(traced.stats) ==
+                   statsSnapshot(replay.stats),
+           "stock decomposition does not change assignment statistics");
+    expect(baselineValuer.auditCalls == 0 &&
+               tracedValuer.auditCalls == 2 &&
+               replayValuer.auditCalls == 2 &&
+               !tracedValuer.scalarAfterAudit &&
+               !replayValuer.scalarAfterAudit,
+           "same-destination audits run after scalar planning finishes");
+    expect(firstTrace.count(
+               QStringLiteral(
+                   "STOCK_DECOMPOSITION")) == 2 &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "STOCK_DECOMPOSITION"),
+                   QStringLiteral(
+                       "kind=POSITIONAL")) &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "STOCK_DECOMPOSITION"),
+                   QStringLiteral(
+                       "kind=MOVE_AND_CAPTURE")),
+           "both seated sides of the capture comparison are recorded");
+    expect(firstTrace.containsFields(
+               QStringLiteral(
+                   "STOCK_DECOMPOSITION"),
+               QStringList{
+                   QStringLiteral("kind=POSITIONAL"),
+                   QStringLiteral(
+                       "observedStockDelta=29000"),
+                   QStringLiteral(
+                       "observedMatchesAudit=true"),
+               }) &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "STOCK_DECOMPOSITION"),
+                   QStringList{
+                       QStringLiteral(
+                           "kind=MOVE_AND_CAPTURE"),
+                       QStringLiteral(
+                           "observedStockDelta=24000"),
+                       QStringLiteral(
+                           "observedMatchesAudit=true"),
+                   }),
+           "each decomposition receipt binds kind, scalar value, and validity");
+    expect(firstTrace.records ==
+               replayTrace.records,
+           "stock decomposition records replay deterministically");
+
+    DecompositionValuer mismatchValuer(1);
+    RecordingTrace mismatchTrace;
+    AssignmentInput mismatchInput =
+        decompositionInput();
+    mismatchInput.pStockValuer =
+        &mismatchValuer;
+    mismatchInput.pTrace = &mismatchTrace;
+    const AssignmentResult mismatch =
+        MaximumValueAssignment::assign(
+            mismatchInput);
+    expect(samePlan(traced, mismatch) &&
+               mismatchTrace.containsFields(
+                   QStringLiteral(
+                       "STOCK_DECOMPOSITION"),
+                   QStringList{
+                       QStringLiteral("originStock=0"),
+                       QStringLiteral(
+                           "originScalarStock=1"),
+                       QStringLiteral(
+                           "exactAvailable=false"),
+                       QStringLiteral(
+                           "reason=ORIGIN_UNPROVEN"),
+                   }),
+           "origin mismatch receipts expose both origin values");
+}
+
 void testDecisionTraceIsNeutralAndDeterministic()
 {
     PairIntervalValuer baselineValuer(
         IntervalFailure::None,
         ATTACKER_UNIT);
     AssignmentInput baselineInput =
-        destinationSwapInput();
+        fullPlanDestinationSwapInput();
     baselineInput.pStockValuer =
         &baselineValuer;
     const AssignmentResult baseline =
@@ -1104,7 +1507,7 @@ void testDecisionTraceIsNeutralAndDeterministic()
         ATTACKER_UNIT);
     RecordingTrace firstTrace;
     AssignmentInput tracedInput =
-        destinationSwapInput();
+        fullPlanDestinationSwapInput();
     tracedInput.pStockValuer =
         &tracedValuer;
     tracedInput.pTrace = &firstTrace;
@@ -1117,7 +1520,7 @@ void testDecisionTraceIsNeutralAndDeterministic()
         ATTACKER_UNIT);
     RecordingTrace replayTrace;
     AssignmentInput replayInput =
-        destinationSwapInput();
+        fullPlanDestinationSwapInput();
     replayInput.pStockValuer =
         &replayValuer;
     replayInput.pTrace = &replayTrace;
@@ -1144,10 +1547,42 @@ void testDecisionTraceIsNeutralAndDeterministic()
                firstTrace.contains(
                    QStringLiteral("PAIR_RESULT")) &&
                firstTrace.contains(
+                   QStringLiteral(
+                       "PAIR_EXACT_AUDIT")) &&
+               firstTrace.contains(
                    QStringLiteral("FINAL_PLAN")) &&
                firstTrace.contains(
                    QStringLiteral("FINAL_STATS")),
            "decision tracing covers assignment decision phases");
+    expect(baselineValuer.auditCalls == 0 &&
+               tracedValuer.auditCalls == 2 &&
+               replayValuer.auditCalls == 2 &&
+               !tracedValuer.liveAfterAudit &&
+               !replayValuer.liveAfterAudit,
+           "pair exact audits run only after live selection finishes");
+    expect(firstTrace.count(
+               QStringLiteral(
+                   "PAIR_EXACT_AUDIT")) == 1 &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "PAIR_EXACT_AUDIT"),
+                   QStringLiteral(
+                       "exactImprovement=true")) &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "PAIR_EXACT_AUDIT"),
+                   QStringLiteral(
+                       "basis=FULL_PLAN_ECONOMIC_PLUS_STOCK_ABSOLUTE")) &&
+               firstTrace.containsFields(
+                   QStringLiteral(
+                       "PAIR_EXACT_AUDIT"),
+                   QStringList{
+                       QStringLiteral(
+                           "incumbentScalarStockAbsolute=77"),
+                       QStringLiteral(
+                           "winnerScalarStockAbsolute=77"),
+                   }),
+           "the accepted live pair has one exact full-plan receipt");
     expect(traced.selections.size() ==
                tracedInput.actors.size(),
            "decision tracing retains one final selection receipt per actor");
@@ -1177,6 +1612,7 @@ int main()
     testOneStockActorDoesNotCountAsAClusterSkip();
     testSharedBudgetCapPrecedesStockClassification();
     testCapsAndSharedBudgetBoundTheSearch();
+    testStockDecompositionIsDeferredAndNeutral();
     testDecisionTraceIsNeutralAndDeterministic();
     return failures == 0 ? 0 : 1;
 }

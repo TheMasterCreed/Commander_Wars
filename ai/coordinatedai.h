@@ -53,6 +53,8 @@ private:
     void failPlannedAction(qint32 actionIndex);
     bool replanFailedAction(qint32 actionIndex);
     void recordCaptureDecisions(const Coordinator::AssignmentInput & input);
+    void recordProductionBlocks(
+        const Coordinator::AssignmentInput & input);
     const Coordinator::AssignmentResult::Selection* selectionForAction(
         qint32 actionIndex) const;
 
