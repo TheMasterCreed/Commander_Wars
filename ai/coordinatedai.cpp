@@ -1,9 +1,12 @@
 #include "ai/coordinatedai.h"
 
+#include <algorithm>
+#include <chrono>
 #include <utility>
 
 #include "ai/coordinator/attackopportunitybuilder.h"
 #include "ai/coordinator/bundlebuilder.h"
+#include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/engineactionbuilder.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
@@ -26,6 +29,83 @@ bool sameExecutionIntent(
            left.destination == right.destination &&
            left.target == right.target &&
            left.targetUnitId == right.targetUnitId;
+}
+
+QString relationName(Coordinator::Relation relation)
+{
+    switch (relation)
+    {
+        case Coordinator::Relation::Own:
+            return QStringLiteral("OWN");
+        case Coordinator::Relation::Allied:
+            return QStringLiteral("ALLIED");
+        case Coordinator::Relation::Enemy:
+            return QStringLiteral("ENEMY");
+        case Coordinator::Relation::Neutral:
+            return QStringLiteral("NEUTRAL");
+    }
+    return QStringLiteral("UNKNOWN");
+}
+
+QString engineActionFailureName(
+    Coordinator::EngineActionFailure failure)
+{
+    switch (failure)
+    {
+        case Coordinator::EngineActionFailure::None:
+            return QStringLiteral("NONE");
+        case Coordinator::EngineActionFailure::InvalidShape:
+            return QStringLiteral("INVALID_SHAPE");
+        case Coordinator::EngineActionFailure::ActorUnavailable:
+            return QStringLiteral("ACTOR_UNAVAILABLE");
+        case Coordinator::EngineActionFailure::OriginMismatch:
+            return QStringLiteral("ORIGIN_MISMATCH");
+        case Coordinator::EngineActionFailure::IllegalAction:
+            return QStringLiteral("ILLEGAL_ACTION");
+        case Coordinator::EngineActionFailure::TargetUnavailable:
+            return QStringLiteral("TARGET_UNAVAILABLE");
+        case Coordinator::EngineActionFailure::InvalidTargetStep:
+            return QStringLiteral("INVALID_TARGET_STEP");
+    }
+    return QStringLiteral("UNKNOWN");
+}
+
+const Coordinator::BundleComponent* captureComponentOf(
+    const Coordinator::CandidateBundle* pCandidate)
+{
+    if (pCandidate == nullptr)
+    {
+        return nullptr;
+    }
+    const Coordinator::BundleComponent* pComponent =
+        Coordinator::singleComponentOf(pCandidate->bundle);
+    if (pComponent == nullptr ||
+        pComponent->kind != Coordinator::ComponentKind::Capture)
+    {
+        return nullptr;
+    }
+    return pComponent;
+}
+
+QString selectionDecisionBasis(
+    Coordinator::AssignmentResult::SelectionPhase phase)
+{
+    switch (phase)
+    {
+        case Coordinator::AssignmentResult::SelectionPhase::None:
+            return QStringLiteral("NONE");
+        case Coordinator::AssignmentResult::SelectionPhase::Greedy:
+            return QStringLiteral("GREEDY_SEATED_VALUE");
+        case Coordinator::AssignmentResult::SelectionPhase::Settling:
+            return QStringLiteral(
+                "SETTLING_CHALLENGER_COMPLETE_VALUE");
+        case Coordinator::AssignmentResult::SelectionPhase::
+            PairRefinement:
+            return QStringLiteral("PAIR_COMPARE_PLAN_BOUNDS");
+        case Coordinator::AssignmentResult::SelectionPhase::Cluster:
+            return QStringLiteral("CLUSTER_PLAN_COMPLETE_VALUE");
+    }
+    return QStringLiteral("UNKNOWN");
 }
 }
 
@@ -53,7 +133,27 @@ void CoordinatedAi::process()
         if (m_coPowerDay != m_pMap->getCurrentDay())
         {
             m_coPowerDay = m_pMap->getCurrentDay();
-            if (useStartOfDayCoPower())
+            const bool timed = Coordinator::decisionTraceEnabled();
+            std::chrono::steady_clock::time_point coPowerStart;
+            if (timed)
+            {
+                coPowerStart = std::chrono::steady_clock::now();
+            }
+            const bool usedCoPower = useStartOfDayCoPower();
+            if (timed)
+            {
+                m_coPowerCheckNanos =
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        coPowerStart)
+                        .count();
+            }
+            else
+            {
+                m_coPowerCheckNanos = 0;
+            }
+            if (usedCoPower)
             {
                 m_factLayersDay = UNBUILT_DAY;
                 return;
@@ -84,6 +184,13 @@ bool CoordinatedAi::ensureFactLayers()
 
 void CoordinatedAi::buildFactLayers()
 {
+    using Clock = std::chrono::steady_clock;
+    const bool timed = Coordinator::decisionTraceEnabled();
+    Clock::time_point factStart;
+    if (timed)
+    {
+        factStart = Clock::now();
+    }
     m_dayStartKnowledge =
         Coordinator::BattlefieldKnowledge::capture(*m_pMap, *m_pPlayer);
     m_mobilityFields.clear();
@@ -92,12 +199,34 @@ void CoordinatedAi::buildFactLayers()
             *m_pMap, m_dayStartKnowledge, m_mobilityFields);
     m_properties =
         Coordinator::buildPropertyEconomics(*m_pMap, m_dayStartKnowledge);
+    Clock::time_point propertyStockStart;
+    if (timed)
+    {
+        propertyStockStart = Clock::now();
+    }
     m_propertyStock = Coordinator::buildPropertyStockField(
         *m_pMap,
         m_dayStartKnowledge,
         m_properties,
         m_mobilityFields,
         Coordinator::makeValuationContext(*m_pMap).horizonTurns);
+    if (timed)
+    {
+        const Clock::time_point factEnd = Clock::now();
+        m_propertyStockBuildNanos =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                factEnd - propertyStockStart)
+                .count();
+        m_factLayersNanos =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                factEnd - factStart)
+                .count();
+    }
+    else
+    {
+        m_propertyStockBuildNanos = 0;
+        m_factLayersNanos = 0;
+    }
 }
 
 void CoordinatedAi::ensureTurnPlan()
@@ -112,21 +241,123 @@ void CoordinatedAi::ensureTurnPlan()
 
 void CoordinatedAi::buildTurnPlan()
 {
+    using Clock = std::chrono::steady_clock;
+    struct ActorTiming
+    {
+        qint32 knowledgeUnitIndex{Coordinator::NO_UNIT};
+        qint32 engineUnitId{Coordinator::NO_UNIT};
+        std::int32_t generatedCandidateCount{0};
+        std::int32_t validCandidateCount{0};
+        std::int64_t nanos{0};
+    };
+
+    Clock::time_point planningStart;
     m_executionCursor = 0;
+    ++m_planSequence;
+    const Coordinator::DecisionTraceIdentity traceIdentity{
+        .day = m_pMap->getCurrentDay(),
+        .playerId = m_pPlayer->getPlayerID(),
+        .planSequence = m_planSequence,
+        .horizonTurns = m_propertyStock.horizonTurns(),
+    };
+    m_decisionTrace =
+        Coordinator::openDecisionTrace(traceIdentity);
+    if (m_decisionTrace != nullptr)
+    {
+        planningStart = Clock::now();
+        m_decisionTrace->record(
+            QStringLiteral("PLAN_BEGIN"),
+            QStringLiteral(
+                "mapWidth=%1 mapHeight=%2 properties=%3")
+                .arg(m_dayStartKnowledge.width())
+                .arg(m_dayStartKnowledge.height())
+                .arg(m_properties.size()));
+        for (std::size_t propertyIndex = 0;
+             propertyIndex < m_properties.size();
+             ++propertyIndex)
+        {
+            const Coordinator::PropertyFacts & facts =
+                m_properties[propertyIndex];
+            const Coordinator::TilePoint tile{
+                facts.x, facts.y};
+            m_decisionTrace->record(
+                QStringLiteral("PROPERTY"),
+                QStringLiteral(
+                    "property=%1 stockColumn=%2 coordinate=%3 ownerId=%4 ownerSign=%5 capturable=%6 income=%7 currentCapturePoints=%8 currentCapturerKnowledge=%9 captureRate=%10 captureTurnsRemaining=%11")
+                    .arg(propertyIndex)
+                    .arg(m_propertyStock.columnSlotAt(tile))
+                    .arg(Coordinator::traceTile(tile))
+                    .arg(facts.ownerId)
+                    .arg(relationName(
+                        m_dayStartKnowledge.relation(
+                            facts.ownerId)))
+                    .arg(Coordinator::traceBool(
+                        facts.capturable))
+                    .arg(facts.incomePerTurn)
+                    .arg(facts.capturePoints)
+                    .arg(facts.capturerIndex)
+                    .arg(facts.captureRate)
+                    .arg(facts.captureTurnsRemaining));
+        }
+    }
     Coordinator::AssignmentInput input;
     input.actionIds = Coordinator::engineActionIds();
     input.unitLinks = linkKnownUnits(m_dayStartKnowledge);
     Coordinator::JointPlanStockValuer stockValuer(
         m_propertyStock, input.unitLinks);
     input.pStockValuer = &stockValuer;
+    input.pTrace = m_decisionTrace.get();
     Coordinator::DamageOracle oracle(*m_pMap);
     oracle.clear();
     Coordinator::BundleBuildStats buildStats;
+    std::vector<ActorTiming> actorTimings;
+    std::int64_t candidateBuildNanos = 0;
+    std::int32_t maxCandidatesPerActor = 0;
     const std::vector<Coordinator::KnownUnit> & units =
         m_dayStartKnowledge.units();
     for (std::size_t slot = 0; slot < units.size(); ++slot)
     {
         Unit* pUnit = plannableUnit(units[slot]);
+        if (m_decisionTrace != nullptr &&
+            m_dayStartKnowledge.relation(
+                units[slot].ownerId) ==
+                Coordinator::Relation::Own)
+        {
+            Unit* pLive = pUnit;
+            if (pLive == nullptr)
+            {
+                pLive = Coordinator::liveUnitFor(
+                    *m_pMap, units[slot]);
+            }
+            m_decisionTrace->record(
+                QStringLiteral("ACTOR"),
+                QStringLiteral(
+                    "actorKnowledge=%1 actor=%2 type=%3 origin=%4 hpSteps=%5 movementPoints=%6 canCapture=%7 captureRate=%8 hasMoved=%9 aiMode=%10 plannable=%11")
+                    .arg(slot)
+                    .arg(
+                        pLive == nullptr
+                            ? Coordinator::NO_UNIT
+                            : pLive->getUniqueID())
+                    .arg(units[slot].unitId)
+                    .arg(Coordinator::traceTile(
+                        Coordinator::TilePoint{
+                            units[slot].x,
+                            units[slot].y}))
+                    .arg(units[slot].hpRounded)
+                    .arg(units[slot].movementPoints)
+                    .arg(Coordinator::traceBool(
+                        units[slot].canCapture))
+                    .arg(units[slot].captureRate)
+                    .arg(Coordinator::traceBool(
+                        units[slot].hasMoved))
+                    .arg(
+                        pLive == nullptr
+                            ? -1
+                            : static_cast<qint32>(
+                                  pLive->getAiMode()))
+                    .arg(Coordinator::traceBool(
+                        pUnit != nullptr)));
+        }
         if (pUnit == nullptr)
         {
             continue;
@@ -134,6 +365,13 @@ void CoordinatedAi::buildTurnPlan()
         Coordinator::AssignmentActor actor;
         actor.knowledgeUnitIndex = static_cast<qint32>(slot);
         actor.engineUnitId = pUnit->getUniqueID();
+        Clock::time_point candidateStart;
+        if (m_decisionTrace != nullptr)
+        {
+            candidateStart = Clock::now();
+        }
+        const std::int32_t generatedBefore =
+            buildStats.candidateCount;
         actor.candidates = candidatesFor(
             m_dayStartKnowledge,
             m_attackOpportunities,
@@ -142,9 +380,52 @@ void CoordinatedAi::buildTurnPlan()
             oracle,
             actor.knowledgeUnitIndex,
             buildStats);
+        if (m_decisionTrace != nullptr)
+        {
+            const std::int32_t generatedCandidateCount =
+                buildStats.candidateCount - generatedBefore;
+            const std::int64_t actorCandidateNanos =
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    Clock::now() - candidateStart)
+                    .count();
+            candidateBuildNanos += actorCandidateNanos;
+            maxCandidatesPerActor = std::max(
+                maxCandidatesPerActor,
+                generatedCandidateCount);
+            actorTimings.push_back(ActorTiming{
+                .knowledgeUnitIndex =
+                    actor.knowledgeUnitIndex,
+                .engineUnitId = actor.engineUnitId,
+                .generatedCandidateCount =
+                    generatedCandidateCount,
+                .validCandidateCount =
+                    static_cast<std::int32_t>(
+                        actor.candidates.size()),
+                .nanos = actorCandidateNanos,
+            });
+        }
         input.actors.push_back(std::move(actor));
     }
 
+    std::int32_t stockCoupledActors = 0;
+    if (m_decisionTrace != nullptr)
+    {
+        for (const Coordinator::AssignmentActor & actor :
+             input.actors)
+        {
+            if (stockValuer.affectsStock(
+                    actor.engineUnitId))
+            {
+                ++stockCoupledActors;
+            }
+        }
+    }
+    Clock::time_point continuationStart;
+    if (m_decisionTrace != nullptr)
+    {
+        continuationStart = Clock::now();
+    }
     Coordinator::ContinuationPricingCatalog catalog =
         stockValuer.continuationPricingCatalog(input);
     Coordinator::RefinementLedger ledger;
@@ -154,7 +435,92 @@ void CoordinatedAi::buildTurnPlan()
             stockValuer.prepareContinuationPricing(
                 std::move(catalog), ledger));
     }
+    const std::int64_t continuationPricingPrepareNanos =
+        m_decisionTrace == nullptr
+            ? 0
+            : std::chrono::duration_cast<
+                  std::chrono::nanoseconds>(
+                  Clock::now() - continuationStart)
+                  .count();
     m_assignment = Coordinator::MaximumValueAssignment::assign(input);
+    recordCaptureDecisions(input);
+    const std::int64_t turnPlanNanos =
+        m_decisionTrace == nullptr
+            ? 0
+            : std::chrono::duration_cast<
+                  std::chrono::nanoseconds>(
+                  Clock::now() - planningStart)
+                  .count();
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("BUILD_STATS"),
+            QStringLiteral(
+                "actors=%1 totalCandidates=%2 validCandidates=%3 invalidCandidates=%4 missingUnits=%5 damageOracleCalls=%6 damageOracleHits=%7 maxCandidatesPerActor=%8 stockCoupledActors=%9")
+                .arg(input.actors.size())
+                .arg(buildStats.candidateCount)
+                .arg(buildStats.candidateCount -
+                     buildStats.invalidCount)
+                .arg(buildStats.invalidCount)
+                .arg(buildStats.missingUnits)
+                .arg(buildStats.oracleCalls)
+                .arg(buildStats.oracleHits)
+                .arg(maxCandidatesPerActor)
+                .arg(stockCoupledActors));
+        m_decisionTrace->flush();
+
+        const Coordinator::AssignmentResult::PhaseTiming &
+            assignmentTiming = m_assignment.phaseTiming;
+        const Coordinator::AssignmentStats & stats =
+            m_assignment.stats;
+        m_decisionTrace->record(
+            QStringLiteral("PHASE_TIMING"),
+            QStringLiteral(
+                "actorCount=%1 factLayersNanos=%2 propertyStockBuildNanos=%3 coPowerCheckNanos=%4 candidateBuildNanos=%5 continuationPricingPrepareNanos=%6 assignmentPrepareNanos=%7 greedyNanos=%8 settlingNanos=%9 pairRefinementNanos=%10 clusterNanos=%11 finishPlanNanos=%12 totalPlanningNanos=%13 totalCandidates=%14 maxCandidatesPerActor=%15 damageOracleCalls=%16 damageOracleHits=%17 stockCoupledActors=%18 settlingSweeps=%19 settlingMoves=%20 swapStates=%21 swapImprovements=%22 clustersTotal=%23 clustersEnumerated=%24 clustersCapped=%25 clustersSkippedStockBudget=%26 enumerationStates=%27 planSequence=%28")
+                .arg(input.actors.size())
+                .arg(m_factLayersNanos)
+                .arg(m_propertyStockBuildNanos)
+                .arg(m_coPowerCheckNanos)
+                .arg(candidateBuildNanos)
+                .arg(continuationPricingPrepareNanos)
+                .arg(assignmentTiming.prepareNanos)
+                .arg(assignmentTiming.greedyNanos)
+                .arg(assignmentTiming.settlingNanos)
+                .arg(assignmentTiming.pairRefinementNanos)
+                .arg(assignmentTiming.clusterNanos)
+                .arg(assignmentTiming.finishPlanNanos)
+                .arg(m_factLayersNanos +
+                     m_coPowerCheckNanos +
+                     turnPlanNanos)
+                .arg(buildStats.candidateCount)
+                .arg(maxCandidatesPerActor)
+                .arg(buildStats.oracleCalls)
+                .arg(buildStats.oracleHits)
+                .arg(stockCoupledActors)
+                .arg(stats.settlingSweeps)
+                .arg(stats.settlingMoves)
+                .arg(stats.swapStates)
+                .arg(stats.swapImprovements)
+                .arg(stats.clustersTotal)
+                .arg(stats.clustersEnumerated)
+                .arg(stats.clustersCapped)
+                .arg(stats.clustersSkippedStockBudget)
+                .arg(stats.enumerationStates)
+                .arg(m_planSequence));
+        for (const ActorTiming & timing : actorTimings)
+        {
+            m_decisionTrace->record(
+                QStringLiteral("ACTOR_TIMING"),
+                QStringLiteral(
+                    "actorKnowledge=%1 actor=%2 generatedCandidates=%3 validCandidates=%4 candidateGenerationNanos=%5")
+                    .arg(timing.knowledgeUnitIndex)
+                    .arg(timing.engineUnitId)
+                    .arg(timing.generatedCandidateCount)
+                    .arg(timing.validCandidateCount)
+                    .arg(timing.nanos));
+        }
+        m_decisionTrace->flush();
+    }
 }
 
 Unit* CoordinatedAi::plannableUnit(
@@ -220,9 +586,314 @@ CoordinatedAi::candidatesFor(
         .propertyStock = propertyStock,
         .oracle = oracle,
         .valuation = Coordinator::makeValuationContext(*m_pMap),
+        .pTrace = m_decisionTrace.get(),
     };
     return Coordinator::buildCandidateBundles(
         context, actorUnitIndex, stats);
+}
+
+const Coordinator::AssignmentResult::Selection*
+CoordinatedAi::selectionForAction(qint32 actionIndex) const
+{
+    for (const Coordinator::AssignmentResult::Selection &
+         selection : m_assignment.selections)
+    {
+        if (selection.actionIndex == actionIndex)
+        {
+            return &selection;
+        }
+    }
+    return nullptr;
+}
+
+void CoordinatedAi::recordCaptureDecisions(
+    const Coordinator::AssignmentInput & input)
+{
+    if (m_decisionTrace == nullptr)
+    {
+        return;
+    }
+    const std::vector<Coordinator::KnownUnit> & units =
+        m_dayStartKnowledge.units();
+    for (std::size_t knowledgeIndex = 0;
+         knowledgeIndex < units.size();
+         ++knowledgeIndex)
+    {
+        const Coordinator::KnownUnit & known =
+            units[knowledgeIndex];
+        if (!known.canCapture ||
+            m_dayStartKnowledge.relation(known.ownerId) !=
+                Coordinator::Relation::Own)
+        {
+            continue;
+        }
+        const Coordinator::AssignmentActor* pActor =
+            nullptr;
+        for (const Coordinator::AssignmentActor & actor :
+             input.actors)
+        {
+            if (actor.knowledgeUnitIndex ==
+                static_cast<std::int32_t>(
+                    knowledgeIndex))
+            {
+                pActor = &actor;
+                break;
+            }
+        }
+        if (pActor == nullptr)
+        {
+            Unit* pLive = Coordinator::liveUnitFor(
+                *m_pMap, known);
+            QString exclusionReason =
+                QStringLiteral("NOT_PLANNABLE");
+            if (known.hasMoved)
+            {
+                exclusionReason =
+                    QStringLiteral("KNOWLEDGE_HAS_MOVED");
+            }
+            else if (pLive == nullptr)
+            {
+                exclusionReason =
+                    QStringLiteral("LIVE_UNIT_MISSING");
+            }
+            else if (pLive->getHasMoved())
+            {
+                exclusionReason =
+                    QStringLiteral("LIVE_UNIT_HAS_MOVED");
+            }
+            else if (pLive->getAiMode() !=
+                     GameEnums::GameAi_Normal)
+            {
+                exclusionReason =
+                    QStringLiteral("AI_MODE_NOT_NORMAL");
+            }
+            const Coordinator::TilePoint origin{
+                known.x, known.y};
+            const std::int32_t currentProperty =
+                m_propertyStock.propertyIndexAt(origin);
+            const Coordinator::PropertyFacts* pCurrent =
+                currentProperty ==
+                        Coordinator::NO_PROPERTY_INDEX
+                    ? nullptr
+                    : &m_properties[
+                          static_cast<std::size_t>(
+                              currentProperty)];
+            const std::int32_t engineUnitId =
+                knowledgeIndex <
+                        input.unitLinks.size()
+                    ? input.unitLinks[knowledgeIndex]
+                          .engineUnitId
+                    : Coordinator::NO_UNIT;
+            m_decisionTrace->record(
+                QStringLiteral("CAPTURE_DECISION"),
+                QStringLiteral(
+                    "actor=%1 actorKnowledge=%2 type=%3 origin=%4 currentProperty=%5 currentCapturePoints=%6 currentCapturerKnowledge=%7 incumbentCandidate=-1 incumbentKind=NONE incumbentDst=(-1,-1) incumbentCompleteValue=NA selectedCandidate=-1 selectedKind=NONE selectedDst=(-1,-1) selectedSeatedValue=0 selectedCompleteValue=NA selectionPhase=NONE stayCaptureCandidate=-1 stayCaptureCompleteValue=NA abandonedPartialCapture=NA partialCaptureAtPlanStart=%8 abandonmentReason=NO_COORDINATED_FINAL_ACTION incumbentCompleteKnown=false selectedCompleteKnown=false stayCaptureCompleteKnown=false completeValueScope=NONE decisionBasis=EXCLUDED diagnosticApplicable=false excluded=true exclusionReason=%9")
+                    .arg(engineUnitId)
+                    .arg(knowledgeIndex)
+                    .arg(known.unitId)
+                    .arg(Coordinator::traceTile(origin))
+                    .arg(currentProperty)
+                    .arg(
+                        pCurrent == nullptr
+                            ? 0
+                            : pCurrent->capturePoints)
+                    .arg(
+                        pCurrent == nullptr
+                            ? Coordinator::NO_CAPTURER
+                            : pCurrent->capturerIndex)
+                    .arg(Coordinator::traceBool(
+                        pCurrent != nullptr &&
+                        pCurrent->capturerIndex ==
+                            static_cast<std::int32_t>(
+                                knowledgeIndex) &&
+                        pCurrent->capturePoints > 0))
+                    .arg(exclusionReason));
+            continue;
+        }
+        const Coordinator::AssignmentActor & actor =
+            *pActor;
+        const Coordinator::AssignmentResult::Selection*
+            pSelection = nullptr;
+        for (const Coordinator::AssignmentResult::Selection &
+             selection : m_assignment.selections)
+        {
+            if (selection.engineUnitId ==
+                actor.engineUnitId)
+            {
+                pSelection = &selection;
+                break;
+            }
+        }
+        const Coordinator::TilePoint origin{
+            known.x, known.y};
+        const std::int32_t currentProperty =
+            m_propertyStock.propertyIndexAt(origin);
+        const Coordinator::PropertyFacts* pCurrent =
+            currentProperty == Coordinator::NO_PROPERTY_INDEX
+                ? nullptr
+                : &m_properties[
+                      static_cast<std::size_t>(
+                          currentProperty)];
+
+        const auto candidateAt =
+            [&](std::int32_t candidateIndex)
+                -> const Coordinator::CandidateBundle*
+        {
+            if (candidateIndex < 0 ||
+                candidateIndex >=
+                    static_cast<std::int32_t>(
+                        actor.candidates.size()))
+            {
+                return nullptr;
+            }
+            return &actor.candidates[
+                static_cast<std::size_t>(
+                    candidateIndex)];
+        };
+        const auto completeKnown =
+            [&](std::int32_t candidateIndex)
+        {
+            return pSelection != nullptr &&
+                   candidateIndex >= 0 &&
+                   candidateIndex <
+                       static_cast<std::int32_t>(
+                           pSelection->completeValues.size()) &&
+                   pSelection
+                       ->completeValues[
+                           static_cast<std::size_t>(
+                               candidateIndex)]
+                       .known;
+        };
+        const auto completeValue =
+            [&](std::int32_t candidateIndex)
+        {
+            if (!completeKnown(candidateIndex))
+            {
+                return QStringLiteral("NA");
+            }
+            return QString::number(
+                pSelection
+                    ->completeValues[
+                        static_cast<std::size_t>(
+                            candidateIndex)]
+                    .value);
+        };
+
+        const std::int32_t incumbentCandidate =
+            pSelection == nullptr
+                ? Coordinator::NO_CANDIDATE
+                : pSelection->greedyCandidateIndex;
+        const std::int32_t selectedCandidate =
+            pSelection == nullptr
+                ? Coordinator::NO_CANDIDATE
+                : pSelection->candidateIndex;
+        const Coordinator::CandidateBundle* pIncumbent =
+            candidateAt(incumbentCandidate);
+        const Coordinator::CandidateBundle* pSelected =
+            candidateAt(selectedCandidate);
+        std::int32_t stayCaptureCandidate =
+            Coordinator::NO_CANDIDATE;
+        for (std::size_t candidateIndex = 0;
+             candidateIndex < actor.candidates.size();
+             ++candidateIndex)
+        {
+            const Coordinator::CandidateBundle & candidate =
+                actor.candidates[candidateIndex];
+            if (candidate.bundle.destination == origin &&
+                captureComponentOf(&candidate) != nullptr)
+            {
+                stayCaptureCandidate =
+                    static_cast<std::int32_t>(
+                        candidateIndex);
+                break;
+            }
+        }
+        const bool partialCapture =
+            pCurrent != nullptr &&
+            pCurrent->capturerIndex ==
+                actor.knowledgeUnitIndex &&
+            pCurrent->capturePoints > 0;
+        const bool continuesCurrentCapture =
+            pCurrent != nullptr &&
+            pSelected != nullptr &&
+            pSelected->bundle.destination == origin &&
+            captureComponentOf(pSelected) != nullptr;
+        const bool abandonedPartialCapture =
+            partialCapture && !continuesCurrentCapture;
+
+        m_decisionTrace->record(
+            QStringLiteral("CAPTURE_DECISION"),
+            QStringLiteral(
+                "actor=%1 actorKnowledge=%2 type=%3 origin=%4 currentProperty=%5 currentCapturePoints=%6 currentCapturerKnowledge=%7 incumbentCandidate=%8 incumbentKind=%9 incumbentDst=%10 incumbentCompleteValue=%11 selectedCandidate=%12 selectedKind=%13 selectedDst=%14 selectedSeatedValue=%15 selectedCompleteValue=%16 selectionPhase=%17 stayCaptureCandidate=%18 stayCaptureCompleteValue=%19 abandonedPartialCapture=%20 incumbentCompleteKnown=%21 selectedCompleteKnown=%22 stayCaptureCompleteKnown=%23 completeValueScope=SETTLING_TRIAL_SNAPSHOT decisionBasis=%24 diagnosticApplicable=true excluded=false exclusionReason=NONE")
+                .arg(actor.engineUnitId)
+                .arg(actor.knowledgeUnitIndex)
+                .arg(known.unitId)
+                .arg(Coordinator::traceTile(origin))
+                .arg(currentProperty)
+                .arg(
+                    pCurrent == nullptr
+                        ? 0
+                        : pCurrent->capturePoints)
+                .arg(
+                    pCurrent == nullptr
+                        ? Coordinator::NO_CAPTURER
+                        : pCurrent->capturerIndex)
+                .arg(incumbentCandidate)
+                .arg(
+                    pIncumbent == nullptr
+                        ? QStringLiteral("NONE")
+                        : Coordinator::traceBundleKind(
+                              Coordinator::planBundleKindOf(
+                                  pIncumbent->bundle)))
+                .arg(
+                    pIncumbent == nullptr
+                        ? Coordinator::traceTile(
+                              Coordinator::INVALID_TILE)
+                        : Coordinator::traceTile(
+                              pIncumbent->bundle.destination))
+                .arg(completeValue(
+                    incumbentCandidate))
+                .arg(selectedCandidate)
+                .arg(
+                    pSelected == nullptr
+                        ? QStringLiteral("NONE")
+                        : Coordinator::traceBundleKind(
+                              Coordinator::planBundleKindOf(
+                                  pSelected->bundle)))
+                .arg(
+                    pSelected == nullptr
+                        ? Coordinator::traceTile(
+                              Coordinator::INVALID_TILE)
+                        : Coordinator::traceTile(
+                              pSelected->bundle.destination))
+                .arg(
+                    pSelection == nullptr
+                        ? 0
+                        : pSelection->seatedValue)
+                .arg(completeValue(
+                    selectedCandidate))
+                .arg(
+                    pSelection == nullptr
+                        ? QStringLiteral("NONE")
+                        : Coordinator::traceSelectionPhase(
+                              pSelection->phase))
+                .arg(stayCaptureCandidate)
+                .arg(completeValue(
+                    stayCaptureCandidate))
+                .arg(Coordinator::traceBool(
+                    abandonedPartialCapture))
+                .arg(Coordinator::traceBool(
+                    completeKnown(incumbentCandidate)))
+                .arg(Coordinator::traceBool(
+                    completeKnown(selectedCandidate)))
+                .arg(Coordinator::traceBool(
+                    completeKnown(stayCaptureCandidate)))
+                .arg(
+                    pSelection == nullptr
+                        ? QStringLiteral("NONE")
+                        : selectionDecisionBasis(
+                              pSelection->phase)));
+    }
 }
 
 bool CoordinatedAi::useStartOfDayCoPower()
@@ -261,38 +932,162 @@ bool CoordinatedAi::executeNextPlannedAction()
 bool CoordinatedAi::performPlannedAction(
     qint32 actionIndex, bool & replanAllowed)
 {
+    const Coordinator::PlannedAction original =
+        m_assignment.plan.action(actionIndex);
+    const Coordinator::AssignmentResult::Selection*
+        pSelection = selectionForAction(actionIndex);
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("EXECUTION_ATTEMPT"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 candidate=%3 kind=%4 actionId=%5 path=%6 destination=%7 target=%8 targetUnit=%9")
+                .arg(original.unitId)
+                .arg(actionIndex)
+                .arg(
+                    pSelection == nullptr
+                        ? Coordinator::NO_CANDIDATE
+                        : pSelection->candidateIndex)
+                .arg(Coordinator::traceBundleKind(
+                    original.kind))
+                .arg(original.actionId)
+                .arg(Coordinator::tracePath(
+                    original.path))
+                .arg(Coordinator::traceTile(
+                    original.destination))
+                .arg(Coordinator::traceTile(
+                    original.target))
+                .arg(original.targetUnitId));
+    }
     Coordinator::EngineActionBuildResult result =
         Coordinator::buildEngineAction(
             *m_pMap,
             *m_pPlayer,
             m_assignment.plan.action(actionIndex));
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("EXECUTION_BUILD"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 attempt=INITIAL success=%3 failure=%4")
+                .arg(original.unitId)
+                .arg(actionIndex)
+                .arg(Coordinator::traceBool(
+                    static_cast<bool>(result)))
+                .arg(engineActionFailureName(
+                    result.failure)));
+    }
     if (!result)
     {
         if (!replanAllowed)
         {
             failPlannedAction(actionIndex);
+            if (m_decisionTrace != nullptr)
+            {
+                m_decisionTrace->record(
+                    QStringLiteral("EXECUTION_RESULT"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 success=false reason=REPLAN_ALREADY_USED")
+                        .arg(original.unitId)
+                        .arg(actionIndex));
+                m_decisionTrace->flush();
+            }
             return false;
         }
         replanAllowed = false;
         if (!replanFailedAction(actionIndex))
         {
             failPlannedAction(actionIndex);
+            if (m_decisionTrace != nullptr)
+            {
+                m_decisionTrace->record(
+                    QStringLiteral("EXECUTION_RESULT"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 success=false reason=REPLAN_FAILED")
+                        .arg(original.unitId)
+                        .arg(actionIndex));
+                m_decisionTrace->flush();
+            }
             return false;
         }
         result = Coordinator::buildEngineAction(
             *m_pMap,
             *m_pPlayer,
             m_assignment.plan.action(actionIndex));
+        if (m_decisionTrace != nullptr)
+        {
+            m_decisionTrace->record(
+                QStringLiteral("EXECUTION_BUILD"),
+                QStringLiteral(
+                    "actor=%1 actionIndex=%2 attempt=REPLAN success=%3 failure=%4")
+                    .arg(original.unitId)
+                    .arg(actionIndex)
+                    .arg(Coordinator::traceBool(
+                        static_cast<bool>(result)))
+                    .arg(engineActionFailureName(
+                        result.failure)));
+        }
         if (!result)
         {
             failPlannedAction(actionIndex);
+            if (m_decisionTrace != nullptr)
+            {
+                m_decisionTrace->record(
+                    QStringLiteral("EXECUTION_RESULT"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 success=false reason=REPLAN_BUILD_FAILED")
+                        .arg(original.unitId)
+                        .arg(actionIndex));
+                m_decisionTrace->flush();
+            }
             return false;
         }
     }
-    if (!m_assignment.plan.commit(actionIndex))
+    const bool committed =
+        m_assignment.plan.commit(actionIndex);
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("EXECUTION_COMMIT"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 success=%3")
+                .arg(original.unitId)
+                .arg(actionIndex)
+                .arg(Coordinator::traceBool(committed)));
+    }
+    if (!committed)
     {
         failPlannedAction(actionIndex);
+        if (m_decisionTrace != nullptr)
+        {
+            m_decisionTrace->record(
+                QStringLiteral("EXECUTION_RESULT"),
+                QStringLiteral(
+                    "actor=%1 actionIndex=%2 success=false reason=COMMIT_FAILED")
+                    .arg(original.unitId)
+                    .arg(actionIndex));
+            m_decisionTrace->flush();
+        }
         return false;
+    }
+    if (m_decisionTrace != nullptr)
+    {
+        const Coordinator::PlannedAction & finalAction =
+            m_assignment.plan.action(actionIndex);
+        m_decisionTrace->record(
+            QStringLiteral("EXECUTION_RESULT"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 success=true finalKind=%3 finalActionId=%4 finalDestination=%5 finalTarget=%6")
+                .arg(finalAction.unitId)
+                .arg(actionIndex)
+                .arg(Coordinator::traceBundleKind(
+                    finalAction.kind))
+                .arg(finalAction.actionId)
+                .arg(Coordinator::traceTile(
+                    finalAction.destination))
+                .arg(Coordinator::traceTile(
+                    finalAction.target)));
+        m_decisionTrace->flush();
     }
     emit sigPerformAction(result.action);
     return true;
@@ -308,6 +1103,24 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
 {
     const Coordinator::PlannedAction previous =
         m_assignment.plan.action(actionIndex);
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("REPLAN_BEGIN"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 originalKind=%3 originalActionId=%4 originalPath=%5 originalDestination=%6 originalTarget=%7")
+                .arg(previous.unitId)
+                .arg(actionIndex)
+                .arg(Coordinator::traceBundleKind(
+                    previous.kind))
+                .arg(previous.actionId)
+                .arg(Coordinator::tracePath(
+                    previous.path))
+                .arg(Coordinator::traceTile(
+                    previous.destination))
+                .arg(Coordinator::traceTile(
+                    previous.target)));
+    }
     const qint32 engineUnitId =
         previous.unitId;
     Unit* pUnit = m_pMap->getUnit(engineUnitId);
@@ -315,6 +1128,15 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
         pUnit->getOwner() != m_pPlayer ||
         pUnit->getHasMoved())
     {
+        if (m_decisionTrace != nullptr)
+        {
+            m_decisionTrace->record(
+                QStringLiteral("REPLAN_RESULT"),
+                QStringLiteral(
+                    "actor=%1 actionIndex=%2 success=false reason=ACTOR_UNAVAILABLE")
+                    .arg(engineUnitId)
+                    .arg(actionIndex));
+        }
         return false;
     }
     const Coordinator::BattlefieldKnowledge knowledge =
@@ -324,6 +1146,15 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
         pUnit->Unit::getX(), pUnit->Unit::getY());
     if (actorUnitIndex == Coordinator::NO_UNIT)
     {
+        if (m_decisionTrace != nullptr)
+        {
+            m_decisionTrace->record(
+                QStringLiteral("REPLAN_RESULT"),
+                QStringLiteral(
+                    "actor=%1 actionIndex=%2 success=false reason=ACTOR_NOT_IN_FRESH_KNOWLEDGE")
+                    .arg(engineUnitId)
+                    .arg(actionIndex));
+        }
         return false;
     }
     const Coordinator::AttackOpportunityField enemyReach =
@@ -350,15 +1181,44 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
             oracle,
             actorUnitIndex,
             buildStats);
+    if (m_decisionTrace != nullptr)
+    {
+        m_decisionTrace->record(
+            QStringLiteral("REPLAN_CANDIDATE_SET"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 actorKnowledge=%3 candidates=%4 generated=%5 invalid=%6")
+                .arg(engineUnitId)
+                .arg(actionIndex)
+                .arg(actorUnitIndex)
+                .arg(candidates.size())
+                .arg(buildStats.candidateCount)
+                .arg(buildStats.invalidCount));
+    }
     const Coordinator::PlanActionIds actionIds =
         Coordinator::engineActionIds();
     const std::vector<Coordinator::KnownUnitLink> unitLinks =
         linkKnownUnits(knowledge);
-    for (const Coordinator::CandidateBundle & candidate : candidates)
+    for (std::size_t candidateIndex = 0;
+         candidateIndex < candidates.size();
+         ++candidateIndex)
     {
+        const Coordinator::CandidateBundle & candidate =
+            candidates[candidateIndex];
         if (!Coordinator::isPlannableCandidate(
                 actionIds, unitLinks, candidate))
         {
+            if (m_decisionTrace != nullptr &&
+                m_decisionTrace
+                    ->candidateDetailsEnabled())
+            {
+                m_decisionTrace->record(
+                    QStringLiteral("REPLAN_SAME_INTENT"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 candidate=%3 plannable=false sameIntent=false claim=NOT_ATTEMPTED selected=false")
+                        .arg(engineUnitId)
+                        .arg(actionIndex)
+                        .arg(candidateIndex));
+            }
             continue;
         }
         const Coordinator::PlannedAction fresh =
@@ -367,26 +1227,99 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
                 unitLinks,
                 engineUnitId,
                 candidate);
-        if (sameExecutionIntent(previous, fresh))
+        const bool sameIntent =
+            sameExecutionIntent(previous, fresh);
+        if (m_decisionTrace != nullptr &&
+            m_decisionTrace
+                ->candidateDetailsEnabled() &&
+            !sameIntent)
         {
-            if (Coordinator::installCandidate(
+            m_decisionTrace->record(
+                QStringLiteral("REPLAN_SAME_INTENT"),
+                QStringLiteral(
+                    "actor=%1 actionIndex=%2 candidate=%3 plannable=true sameIntent=false claim=NOT_ATTEMPTED selected=false")
+                    .arg(engineUnitId)
+                    .arg(actionIndex)
+                    .arg(candidateIndex));
+        }
+        if (sameIntent)
+        {
+            const Coordinator::ReservationResult claim =
+                Coordinator::installCandidate(
                     m_assignment.plan,
                     actionIndex,
                     fresh,
-                    candidate) ==
+                    candidate);
+            if (m_decisionTrace != nullptr)
+            {
+                m_decisionTrace->record(
+                    QStringLiteral("REPLAN_SAME_INTENT"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 candidate=%3 generated=%4 plannable=true sameIntent=true claim=%5 selected=%6")
+                        .arg(engineUnitId)
+                        .arg(actionIndex)
+                        .arg(candidateIndex)
+                        .arg(candidate.generationIndex)
+                        .arg(Coordinator::
+                                 traceReservationResult(
+                                     claim))
+                        .arg(Coordinator::traceBool(
+                            claim ==
+                            Coordinator::
+                                ReservationResult::
+                                    Granted)));
+            }
+            if (claim ==
                 Coordinator::ReservationResult::Granted)
             {
+                if (m_decisionTrace != nullptr)
+                {
+                    m_decisionTrace->record(
+                        QStringLiteral("REPLAN_RESULT"),
+                        QStringLiteral(
+                            "actor=%1 actionIndex=%2 success=true mode=SAME_INTENT candidate=%3 finalKind=%4 finalDestination=%5")
+                            .arg(engineUnitId)
+                            .arg(actionIndex)
+                            .arg(candidateIndex)
+                            .arg(Coordinator::traceBundleKind(
+                                fresh.kind))
+                            .arg(Coordinator::traceTile(
+                                fresh.destination)));
+                }
                 return true;
             }
             break;
         }
     }
     Coordinator::AssignmentStats assignmentStats;
-    return Coordinator::replanAction(
+    std::int32_t selectedCandidate =
+        Coordinator::NO_CANDIDATE;
+    const bool replanned = Coordinator::replanAction(
         m_assignment.plan,
         actionIndex,
         actionIds,
         unitLinks,
         candidates,
-        assignmentStats);
+        assignmentStats,
+        m_decisionTrace.get(),
+        &selectedCandidate);
+    if (m_decisionTrace != nullptr)
+    {
+        const Coordinator::PlannedAction & replacement =
+            m_assignment.plan.action(actionIndex);
+        m_decisionTrace->record(
+            QStringLiteral("REPLAN_RESULT"),
+            QStringLiteral(
+                "actor=%1 actionIndex=%2 success=%3 mode=GENERIC candidate=%4 finalKind=%5 finalActionId=%6 finalDestination=%7")
+                .arg(engineUnitId)
+                .arg(actionIndex)
+                .arg(Coordinator::traceBool(replanned))
+                .arg(selectedCandidate)
+                .arg(Coordinator::traceBundleKind(
+                    replacement.kind))
+                .arg(replacement.actionId)
+                .arg(Coordinator::traceTile(
+                    replacement.destination)));
+    }
+    return replanned;
 }

@@ -1334,6 +1334,36 @@ void Settings::setLogActions(bool LogActions)
     m_LogActions = LogActions;
 }
 
+bool Settings::getCoordinatedDecisionLog()
+{
+    return m_coordinatedDecisionLog;
+}
+
+void Settings::setCoordinatedDecisionLog(bool enabled)
+{
+    m_coordinatedDecisionLog = enabled;
+}
+
+bool Settings::getCoordinatedDecisionLogCandidates()
+{
+    return m_coordinatedDecisionLogCandidates;
+}
+
+void Settings::setCoordinatedDecisionLogCandidates(bool enabled)
+{
+    m_coordinatedDecisionLogCandidates = enabled;
+}
+
+bool Settings::getCoordinatedDecisionLogStock()
+{
+    return m_coordinatedDecisionLogStock;
+}
+
+void Settings::setCoordinatedDecisionLogStock(bool enabled)
+{
+    m_coordinatedDecisionLogStock = enabled;
+}
+
 QStringList Settings::getActiveModVersions()
 {
     return m_activeModVersions;
@@ -1570,6 +1600,9 @@ void Settings::setup()
             MemoryManagement::create<Value<QStringList>>(kModsSettingsGroup, kModsSettingsGroup, &m_activeMods, QStringList(), QStringList(), QStringList()),
             // logging
             MemoryManagement::create<Value<bool>>("Logging", "LogActions", &m_LogActions, false, false, true),
+            MemoryManagement::create<Value<bool>>("Logging", "CoordinatedDecisionLog", &m_coordinatedDecisionLog, false, false, true),
+            MemoryManagement::create<Value<bool>>("Logging", "CoordinatedDecisionLogCandidates", &m_coordinatedDecisionLogCandidates, false, false, true),
+            MemoryManagement::create<Value<bool>>("Logging", "CoordinatedDecisionLogStock", &m_coordinatedDecisionLogStock, false, false, true),
             MemoryManagement::create<Value<GameConsole::eLogLevels>>("Logging", "LogLevel", &m_defaultLogLevel, static_cast<GameConsole::eLogLevels>(DEBUG_LEVEL), GameConsole::eLogLevels::eOFF, GameConsole::eLogLevels::eFATAL),
             MemoryManagement::create<Value<quint64>>("Logging", "LogModules", &m_defaultLogModuls, GameConsole::eGeneral | GameConsole::eJavaScript, 0, std::numeric_limits<quint64>::max()),
             MemoryManagement::create<Value<bool>>("Logging", "CreateAiTrainingData", &m_createAiTrainingData, false, false, true),

@@ -23,6 +23,7 @@ namespace Coordinator
 {
     class MobilityFieldCache;
     class PropertyStockField;
+    class DecisionTrace;
 
     inline const QString TURN_LIMIT_VICTORY_RULE = QStringLiteral("VICTORYRULE_TURNLIMIT");
     constexpr std::int32_t TURN_LIMIT_RULE_ITEM = 0;
@@ -199,6 +200,7 @@ namespace Coordinator
         const PropertyStockField & propertyStock;
         DamageOracle & oracle;
         ValuationContext valuation;
+        DecisionTrace* pTrace{nullptr};
     };
 
     struct BundleBuildStats

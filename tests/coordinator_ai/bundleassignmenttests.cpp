@@ -4,6 +4,8 @@
 #include <utility>
 #include <vector>
 
+#include <QStringList>
+
 #include "ai/coordinator/bundleassignment.h"
 
 namespace
@@ -18,6 +20,7 @@ using Coordinator::AssignPhase;
 using Coordinator::CandidateBundle;
 using Coordinator::captureComponent;
 using Coordinator::CaptureFacts;
+using Coordinator::DecisionTrace;
 using Coordinator::fireComponent;
 using Coordinator::FireFacts;
 using Coordinator::KnownUnitLink;
@@ -233,6 +236,47 @@ public:
 
 private:
     static constexpr MilliFunds SEARCH_SLACK = 1;
+};
+
+class RecordingTrace final : public DecisionTrace
+{
+public:
+    bool candidateDetailsEnabled() const override
+    {
+        return true;
+    }
+
+    bool stockDetailsEnabled() const override
+    {
+        return true;
+    }
+
+    void record(
+        const QString & category,
+        const QString & fields) override
+    {
+        records.push_back(category + QLatin1Char(' ') + fields);
+    }
+
+    void flush() override
+    {
+        ++flushes;
+    }
+
+    bool contains(const QString & category) const
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const QString & record)
+            {
+                return record.startsWith(
+                    category + QLatin1Char(' '));
+            });
+    }
+
+    QStringList records;
+    std::int32_t flushes{0};
 };
 
 PlanActionIds testActionIds()
@@ -1041,6 +1085,73 @@ void testCapsAndSharedBudgetBoundTheSearch()
     expect(Coordinator::searchBudgetExhausted(stats),
            "pair and cluster visits share one hard budget");
 }
+
+void testDecisionTraceIsNeutralAndDeterministic()
+{
+    PairIntervalValuer baselineValuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    AssignmentInput baselineInput =
+        destinationSwapInput();
+    baselineInput.pStockValuer =
+        &baselineValuer;
+    const AssignmentResult baseline =
+        MaximumValueAssignment::assign(
+            baselineInput);
+
+    PairIntervalValuer tracedValuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    RecordingTrace firstTrace;
+    AssignmentInput tracedInput =
+        destinationSwapInput();
+    tracedInput.pStockValuer =
+        &tracedValuer;
+    tracedInput.pTrace = &firstTrace;
+    const AssignmentResult traced =
+        MaximumValueAssignment::assign(
+            tracedInput);
+
+    PairIntervalValuer replayValuer(
+        IntervalFailure::None,
+        ATTACKER_UNIT);
+    RecordingTrace replayTrace;
+    AssignmentInput replayInput =
+        destinationSwapInput();
+    replayInput.pStockValuer =
+        &replayValuer;
+    replayInput.pTrace = &replayTrace;
+    const AssignmentResult replay =
+        MaximumValueAssignment::assign(
+            replayInput);
+
+    expect(samePlan(baseline, traced) &&
+               samePlan(traced, replay),
+           "decision tracing preserves every planned action and order");
+    expect(statsSnapshot(baseline.stats) ==
+               statsSnapshot(traced.stats) &&
+               statsSnapshot(traced.stats) ==
+                   statsSnapshot(replay.stats),
+           "decision tracing preserves every assignment statistic");
+    expect(firstTrace.records == replayTrace.records,
+           "decision tracing repeats every structural record exactly");
+    expect(firstTrace.contains(
+               QStringLiteral("GREEDY_PICK")) &&
+               firstTrace.contains(
+                   QStringLiteral("GREEDY")) &&
+               firstTrace.contains(
+                   QStringLiteral("SETTLING_CHALLENGER")) &&
+               firstTrace.contains(
+                   QStringLiteral("PAIR_RESULT")) &&
+               firstTrace.contains(
+                   QStringLiteral("FINAL_PLAN")) &&
+               firstTrace.contains(
+                   QStringLiteral("FINAL_STATS")),
+           "decision tracing covers assignment decision phases");
+    expect(traced.selections.size() ==
+               tracedInput.actors.size(),
+           "decision tracing retains one final selection receipt per actor");
+}
 }
 
 int main()
@@ -1066,5 +1177,6 @@ int main()
     testOneStockActorDoesNotCountAsAClusterSkip();
     testSharedBudgetCapPrecedesStockClassification();
     testCapsAndSharedBudgetBoundTheSearch();
+    testDecisionTraceIsNeutralAndDeterministic();
     return failures == 0 ? 0 : 1;
 }

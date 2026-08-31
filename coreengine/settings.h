@@ -530,6 +530,12 @@ public:
     Q_INVOKABLE void setAutoScrolling(bool autoScrolling);
     Q_INVOKABLE bool getLogActions();
     Q_INVOKABLE void setLogActions(bool LogActions);
+    Q_INVOKABLE bool getCoordinatedDecisionLog();
+    Q_INVOKABLE void setCoordinatedDecisionLog(bool enabled);
+    Q_INVOKABLE bool getCoordinatedDecisionLogCandidates();
+    Q_INVOKABLE void setCoordinatedDecisionLogCandidates(bool enabled);
+    Q_INVOKABLE bool getCoordinatedDecisionLogStock();
+    Q_INVOKABLE void setCoordinatedDecisionLogStock(bool enabled);
     Q_INVOKABLE bool getShowIngameCoordinates();
     Q_INVOKABLE void setShowIngameCoordinates(bool showIngameCoordinates);
     Q_INVOKABLE quint32 getWalkAnimationSpeedValue();
@@ -1064,6 +1070,9 @@ private:
 
     // logging
     bool m_LogActions{false};
+    bool m_coordinatedDecisionLog{false};
+    bool m_coordinatedDecisionLogCandidates{false};
+    bool m_coordinatedDecisionLogStock{false};
     GameConsole::eLogLevels m_defaultLogLevel{static_cast<GameConsole::eLogLevels>(DEBUG_LEVEL)};
     quint64 m_defaultLogModuls{GameConsole::eGeneral | GameConsole::eJavaScript};
 

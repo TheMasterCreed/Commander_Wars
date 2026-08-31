@@ -8,6 +8,7 @@
 
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coordinator/propertystockfield.h"
+#include "ai/coordinator/decisiontrace.h"
 #include "ai/coreai.h"
 
 #include "coreengine/gameconsole.h"
@@ -37,6 +38,45 @@ namespace
     constexpr qint32 NODE_COST_BOUND_MARGIN = 1;
     // GameAction::canBePerformed asks whether the action targets an empty field.
     constexpr bool EMPTY_FIELD_ACTION = false;
+
+    QString ownerSignName(Coordinator::OwnerSign owner)
+    {
+        switch (owner)
+        {
+            case Coordinator::OwnerSign::Enemy:
+                return QStringLiteral("ENEMY");
+            case Coordinator::OwnerSign::Neutral:
+                return QStringLiteral("NEUTRAL");
+            case Coordinator::OwnerSign::Ours:
+                return QStringLiteral("OURS");
+        }
+        return QStringLiteral("UNKNOWN");
+    }
+
+    QString candidateActionId(
+        Coordinator::PlanBundleKind kind)
+    {
+        switch (kind)
+        {
+            case Coordinator::PlanBundleKind::Wait:
+            case Coordinator::PlanBundleKind::Move:
+                return QString::fromLatin1(
+                    CoreAI::ACTION_WAIT);
+            case Coordinator::PlanBundleKind::Fire:
+            case Coordinator::PlanBundleKind::MoveAndFire:
+                return QString::fromLatin1(
+                    CoreAI::ACTION_FIRE);
+            case Coordinator::PlanBundleKind::Capture:
+            case Coordinator::PlanBundleKind::MoveAndCapture:
+                return QString::fromLatin1(
+                    CoreAI::ACTION_CAPTURE);
+            case Coordinator::PlanBundleKind::Service:
+            case Coordinator::PlanBundleKind::MoveAndService:
+            case Coordinator::PlanBundleKind::Compound:
+                break;
+        }
+        return QStringLiteral("NONE");
+    }
 
     struct ShotSource
     {
@@ -88,6 +128,14 @@ namespace
         std::vector<Coordinator::CandidateBundle> build(std::int32_t actorUnitIndex);
 
     private:
+        struct CaptureTraceFacts
+        {
+            std::int32_t propertyIndex{Coordinator::NO_PROPERTY_INDEX};
+            std::int32_t stockColumn{Coordinator::NO_STOCK_COLUMN};
+            std::int32_t existingPoints{0};
+            std::int32_t rate{0};
+        };
+
         struct TileKey
         {
             std::int32_t unitIndex{Coordinator::NO_UNIT};
@@ -118,7 +166,9 @@ namespace
         std::vector<MilliFunds> enemyShotSpan(const ShotSource & actor, const VictimOverride & damaged);
         MilliFunds targetBestShot(std::int32_t targetUnitIndex, std::int32_t hpSteps, std::int32_t excludedVictimIndex);
         std::vector<MoveOption> collectMoveOptions(const ShotSource & actor, UnitPathFindingSystem & pfs);
-        void addCandidate(Coordinator::CandidateBundle && candidate, std::vector<Coordinator::CandidateBundle> & result);
+        void addCandidate(Coordinator::CandidateBundle && candidate,
+                          std::vector<Coordinator::CandidateBundle> & result,
+                          const CaptureTraceFacts* pCapture = nullptr);
         void addPositionalCandidates(const ShotSource & actor, const std::vector<MoveOption> & options,
                                      std::vector<Coordinator::CandidateBundle> & result);
         void addFireCandidates(const ShotSource & actor, const std::vector<MoveOption> & options,
@@ -138,6 +188,8 @@ namespace
         std::map<ShotKey, MilliFunds> m_targetBestShots;
         std::vector<MilliFunds> m_actorShotsAtOrigin;
         std::vector<MilliFunds> m_enemyShotsAtOrigin;
+        std::int32_t m_generationIndex{0};
+        std::int32_t m_actorEngineUnitId{Coordinator::NO_UNIT};
     };
 
     Unit* CandidateBuilder::liveUnit(std::int32_t unitIndex)
@@ -423,12 +475,132 @@ namespace
         return candidate;
     }
 
-    void CandidateBuilder::addCandidate(Coordinator::CandidateBundle && candidate,
-                                        std::vector<Coordinator::CandidateBundle> & result)
+    void CandidateBuilder::addCandidate(
+        Coordinator::CandidateBundle && candidate,
+        std::vector<Coordinator::CandidateBundle> & result,
+        const CaptureTraceFacts* pCapture)
     {
+        if (m_context.pTrace != nullptr)
+        {
+            candidate.generationIndex = m_generationIndex;
+            ++m_generationIndex;
+        }
         candidate.valuation = Coordinator::valueBundle(candidate.bundle, candidate.actor,
                                                        Coordinator::positionFacts(candidate), m_context.valuation);
         ++m_stats.candidateCount;
+        const bool valid = candidate.valuation.valid;
+        if (m_context.pTrace != nullptr &&
+            m_context.pTrace->candidateDetailsEnabled())
+        {
+            Coordinator::TilePoint target = Coordinator::INVALID_TILE;
+            std::int32_t targetUnit = Coordinator::NO_UNIT;
+            std::int32_t targetEngineUnit =
+                Coordinator::NO_UNIT;
+            const Coordinator::BundleComponent* pComponent =
+                candidate.bundle.components.size() == 1
+                    ? &candidate.bundle.components.front()
+                    : nullptr;
+            if (pComponent != nullptr)
+            {
+                if (pComponent->kind == Coordinator::ComponentKind::Fire)
+                {
+                    targetUnit = pComponent->fire.targetUnitId;
+                    if (targetUnit >= 0 &&
+                        targetUnit < static_cast<std::int32_t>(
+                                         m_context.knowledge.units().size()))
+                    {
+                        const Coordinator::KnownUnit & known =
+                            m_context.knowledge.units()[static_cast<std::size_t>(
+                                targetUnit)];
+                        target = Coordinator::TilePoint{known.x, known.y};
+                        Unit* pTarget = liveUnit(targetUnit);
+                        if (pTarget != nullptr)
+                        {
+                            targetEngineUnit =
+                                pTarget->getUniqueID();
+                        }
+                    }
+                }
+                else if (pComponent->kind ==
+                         Coordinator::ComponentKind::Capture)
+                {
+                    target = candidate.bundle.destination;
+                }
+            }
+            const Coordinator::EconomicDelta & ledger =
+                candidate.valuation.ledger;
+            const Coordinator::ContinuationDelta & continuation =
+                candidate.valuation.continuation;
+            const Coordinator::PlanBundleKind kind =
+                Coordinator::planBundleKindOf(
+                    candidate.bundle);
+            QString fields =
+                QStringLiteral(
+                    "actor=%1 actorKnowledge=%2 generated=%3 returned=%4 kind=%5 actionId=%6 origin=%7 destination=%8 target=%9 targetUnitKnowledge=%10 path=%11 movementCost=%12 validity=%13 ledgerIncome=%14 ledgerEnemyCapital=%15 ledgerFriendlyCapital=%16 ledgerActionCost=%17 ledgerResourceCost=%18 ledgerScriptedCapital=%19 ledgerRevaluation=%20 continuationTargetRemoved=%21 continuationPartner=%22 continuationProperty=%23 continuationRepositioning=%24 continuationExposure=%25 economicValue=%26 targetUnitEngine=%27 plannable=%28 support=%29")
+                    .arg(m_actorEngineUnitId)
+                    .arg(candidate.bundle.unitId)
+                    .arg(candidate.generationIndex)
+                    .arg(valid ? static_cast<std::int32_t>(result.size()) : -1)
+                    .arg(Coordinator::traceBundleKind(kind))
+                    .arg(candidateActionId(kind))
+                    .arg(Coordinator::traceTile(candidate.bundle.origin))
+                    .arg(Coordinator::traceTile(candidate.bundle.destination))
+                    .arg(Coordinator::traceTile(target))
+                    .arg(targetUnit)
+                    .arg(Coordinator::tracePath(candidate.bundle.path))
+                    .arg(candidate.movementCost)
+                    .arg(Coordinator::traceBool(valid))
+                    .arg(ledger.income)
+                    .arg(ledger.enemyCapital)
+                    .arg(ledger.friendlyCapital)
+                    .arg(ledger.actionCost)
+                    .arg(ledger.resourceCost)
+                    .arg(ledger.scriptedCapital)
+                    .arg(ledger.revaluation)
+                    .arg(continuation.targetContinuationRemoved)
+                    .arg(continuation.partnerContinuation)
+                    .arg(continuation.propertyContinuation)
+                    .arg(continuation.repositioning)
+                    .arg(continuation.exposure)
+                    .arg(candidate.valuation.value().economicValue)
+                    .arg(targetEngineUnit)
+                    .arg(
+                        valid
+                            ? QStringLiteral("PENDING")
+                            : QStringLiteral("false"))
+                    .arg(
+                        valid
+                            ? QStringLiteral(
+                                  "DEFERRED_TO_ASSIGNMENT")
+                            : QStringLiteral(
+                                  "INVALID_VALUATION"));
+            if (pCapture != nullptr && pComponent != nullptr)
+            {
+                fields +=
+                    QStringLiteral(
+                        " property=%1 stockColumn=%2 ownerBefore=%3 ownerAfter=%4 incomeOurs=%5 incomeEnemy=%6 existingCapturePoints=%7 captureRate=%8 turnsUntilOwned=%9")
+                        .arg(pCapture->propertyIndex)
+                        .arg(pCapture->stockColumn)
+                        .arg(ownerSignName(pComponent->capture.ownerBefore))
+                        .arg(ownerSignName(pComponent->capture.ownerAfter))
+                        .arg(pComponent->capture.income.oursPerTurn)
+                        .arg(pComponent->capture.income.enemyPerTurn)
+                        .arg(pCapture->existingPoints)
+                        .arg(pCapture->rate)
+                        .arg(pComponent->capture.turnsUntilOwned);
+            }
+            if (pComponent != nullptr &&
+                pComponent->kind == Coordinator::ComponentKind::Fire)
+            {
+                fields +=
+                    QStringLiteral(
+                        " reservationTargetHpSteps=%1 reservationRequestedDamageSteps=%2")
+                        .arg(pComponent->fire.targetHpSteps)
+                        .arg(pComponent->fire.damageSteps);
+            }
+            m_context.pTrace->record(
+                QStringLiteral("CANDIDATE_GENERATED"), fields);
+        }
         if (!candidate.valuation.valid)
         {
             ++m_stats.invalidCount;
@@ -572,7 +744,15 @@ namespace
             };
             Coordinator::CandidateBundle candidate = makeCandidate(actor, option, actor.hpSteps, VictimOverride{});
             candidate.bundle.components.push_back(Coordinator::captureComponent(capture));
-            addCandidate(std::move(candidate), result);
+            const CaptureTraceFacts traceFacts{
+                .propertyIndex =
+                    m_context.propertyStock.propertyIndexAt(option.destination),
+                .stockColumn =
+                    m_context.propertyStock.columnSlotAt(option.destination),
+                .existingPoints = existingPoints,
+                .rate = rate,
+            };
+            addCandidate(std::move(candidate), result, &traceFacts);
         }
     }
 
@@ -600,6 +780,7 @@ namespace
         {
             return result;
         }
+        m_actorEngineUnitId = actor.pUnit->getUniqueID();
         m_actorShotsAtOrigin = nextShotSpan(actor, VictimOverride{}, Coordinator::NO_UNIT);
         m_enemyShotsAtOrigin = enemyShotSpan(actor, VictimOverride{});
         UnitPathFindingSystem pfs(&m_context.map, actor.pUnit, &m_context.player);

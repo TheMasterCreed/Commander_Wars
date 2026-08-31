@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -11,6 +12,7 @@
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/bundlevaluation.h"
 #include "ai/coordinator/coordinatorcommon.h"
+#include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/planstockvaluer.h"
 #include "ai/coordinator/turnplan.h"
 
@@ -66,6 +68,7 @@ namespace Coordinator
         std::vector<KnownUnitLink> unitLinks;
         std::vector<AssignmentActor> actors;
         PlanStockValuer* pStockValuer{nullptr};
+        DecisionTrace* pTrace{nullptr};
     };
 
     inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)
@@ -108,10 +111,68 @@ namespace Coordinator
 
     struct AssignmentResult
     {
+        enum class SelectionPhase : std::int8_t
+        {
+            None,
+            Greedy,
+            Settling,
+            PairRefinement,
+            Cluster,
+        };
+
+        struct CandidateCompleteValue
+        {
+            MilliFunds value{0};
+            bool known{false};
+        };
+
+        struct Selection
+        {
+            std::int32_t knowledgeUnitIndex{NO_UNIT};
+            std::int32_t engineUnitId{NO_UNIT};
+            std::int32_t actionIndex{NO_ACTION};
+            std::int32_t candidateIndex{-1};
+            std::int32_t greedyCandidateIndex{-1};
+            MilliFunds seatedValue{0};
+            bool stockCoupled{false};
+            SelectionPhase phase{SelectionPhase::None};
+            std::vector<CandidateCompleteValue> completeValues;
+        };
+
+        struct PhaseTiming
+        {
+            std::int64_t prepareNanos{0};
+            std::int64_t greedyNanos{0};
+            std::int64_t settlingNanos{0};
+            std::int64_t pairRefinementNanos{0};
+            std::int64_t clusterNanos{0};
+            std::int64_t finishPlanNanos{0};
+        };
+
         TurnPlan plan;
         std::vector<std::int32_t> executionOrder;
         AssignmentStats stats;
+        std::vector<Selection> selections;
+        PhaseTiming phaseTiming;
     };
+
+    inline QString traceSelectionPhase(AssignmentResult::SelectionPhase phase)
+    {
+        switch (phase)
+        {
+            case AssignmentResult::SelectionPhase::None:
+                return QStringLiteral("NONE");
+            case AssignmentResult::SelectionPhase::Greedy:
+                return QStringLiteral("GREEDY");
+            case AssignmentResult::SelectionPhase::Settling:
+                return QStringLiteral("SETTLING");
+            case AssignmentResult::SelectionPhase::PairRefinement:
+                return QStringLiteral("PAIR_REFINEMENT");
+            case AssignmentResult::SelectionPhase::Cluster:
+                return QStringLiteral("CLUSTER");
+        }
+        return QStringLiteral("UNKNOWN");
+    }
 
     inline KnownUnitLink linkOf(std::span<const KnownUnitLink> links, std::int32_t knowledgeUnitIndex)
     {
@@ -290,7 +351,8 @@ namespace Coordinator
 
     inline bool replanAction(TurnPlan & plan, std::int32_t actionIndex, const PlanActionIds & actionIds,
                              std::span<const KnownUnitLink> links, const std::vector<CandidateBundle> & candidates,
-                             AssignmentStats & stats)
+                             AssignmentStats & stats, DecisionTrace* pTrace = nullptr,
+                             std::int32_t* pSelectedCandidate = nullptr)
     {
         const std::vector<std::int32_t> order = plannableCandidateOrder(actionIds, links, candidates, stats);
         const std::int32_t engineUnitId = plan.action(actionIndex).unitId;
@@ -299,11 +361,37 @@ namespace Coordinator
             const CandidateBundle & candidate = candidates[static_cast<std::size_t>(slot)];
             const PlannedAction action = plannedActionFrom(actionIds, links, engineUnitId, candidate);
             const ReservationResult claim = installCandidate(plan, actionIndex, action, candidate);
+            if (pTrace != nullptr)
+            {
+                pTrace->record(
+                    QStringLiteral("REPLAN_CANDIDATE"),
+                    QStringLiteral(
+                        "actor=%1 actionIndex=%2 candidate=%3 generated=%4 kind=%5 destination=%6 claim=%7 selected=%8")
+                        .arg(engineUnitId)
+                        .arg(actionIndex)
+                        .arg(slot)
+                        .arg(candidate.generationIndex)
+                        .arg(traceBundleKind(
+                            planBundleKindOf(candidate.bundle)))
+                        .arg(traceTile(
+                            candidate.bundle.destination))
+                        .arg(traceReservationResult(claim))
+                        .arg(traceBool(
+                            claim == ReservationResult::Granted)));
+            }
             if (claim == ReservationResult::Granted)
             {
+                if (pSelectedCandidate != nullptr)
+                {
+                    *pSelectedCandidate = slot;
+                }
                 return true;
             }
             countRejection(stats, claim);
+        }
+        if (pSelectedCandidate != nullptr)
+        {
+            *pSelectedCandidate = -1;
         }
         plan.markFailed(actionIndex);
         return false;
@@ -343,7 +431,11 @@ namespace Coordinator
         std::size_t cursor{0};
         std::int32_t actionIndex{NO_ACTION};
         std::int32_t chosen{NO_CANDIDATE};
+        std::int32_t greedyChosen{NO_CANDIDATE};
         MilliFunds seatedValue{0};
+        AssignmentResult::SelectionPhase phase{
+            AssignmentResult::SelectionPhase::None};
+        std::vector<AssignmentResult::CandidateCompleteValue> completeValues;
         bool done{false};
 
         const CandidateBundle & candidate() const
@@ -356,6 +448,19 @@ namespace Coordinator
             return candidate().valuation.value().economicValue;
         }
     };
+
+    inline void invalidateCompleteValues(
+        std::vector<ActorProgress> & actors)
+    {
+        for (ActorProgress & state : actors)
+        {
+            for (AssignmentResult::CandidateCompleteValue & value :
+                 state.completeValues)
+            {
+                value.known = false;
+            }
+        }
+    }
 
     inline MilliFunds optionValue(const ActorProgress & state, std::int32_t option)
     {
@@ -734,16 +839,71 @@ namespace Coordinator
 
         static AssignmentResult assign(const AssignmentInput & input)
         {
+            using Clock = std::chrono::steady_clock;
             AssignmentResult result;
+            const bool timed = input.pTrace != nullptr;
+            Clock::time_point phaseStart;
+            if (timed)
+            {
+                phaseStart = Clock::now();
+            }
             std::vector<ActorProgress> actors = prepareActors(input, result.stats);
+            if (timed)
+            {
+                result.phaseTiming.prepareNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+                phaseStart = Clock::now();
+            }
             greedyInit(result, actors, input);
+            if (timed)
+            {
+                result.phaseTiming.greedyNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+                phaseStart = Clock::now();
+            }
             const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
             settle(result.plan, input, actors, sweepOrder, result.stats);
+            if (timed)
+            {
+                result.phaseTiming.settlingNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+                phaseStart = Clock::now();
+            }
             const std::vector<ConflictEdge> edges = conflictEdges(input, actors, sweepOrder);
             improveBySwaps(result.plan, input, actors, edges, result.stats);
+            if (timed)
+            {
+                result.phaseTiming.pairRefinementNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+                phaseStart = Clock::now();
+            }
             enumerateClusters(result.plan, input, actors, sweepOrder, edges, result.stats);
+            if (timed)
+            {
+                result.phaseTiming.clusterNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+                phaseStart = Clock::now();
+            }
             finishPlan(result);
             countAssignments(result.plan, actors, result.stats);
+            recordFinalAssignment(result, actors, input);
+            if (timed)
+            {
+                result.phaseTiming.finishPlanNanos =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - phaseStart)
+                        .count();
+            }
             return result;
         }
 
@@ -767,6 +927,11 @@ namespace Coordinator
             bool aborted{false};
             bool liveFailure{false};
             std::int32_t states{0};
+            MilliFunds incumbentLower{0};
+            MilliFunds incumbentUpper{0};
+            MilliFunds resultLower{0};
+            MilliFunds resultUpper{0};
+            bool resultKnown{false};
         };
 
         struct ClusterSearch
@@ -804,7 +969,124 @@ namespace Coordinator
                 entry.pActor = &actor;
                 entry.order = plannableCandidateOrder(input.actionIds, input.unitLinks, actor.candidates, stats);
                 entry.options = buildOptionOrder(entry);
+                if (input.pTrace != nullptr)
+                {
+                    entry.completeValues.resize(actor.candidates.size());
+                }
                 entry.done = entry.order.empty();
+                if (input.pTrace != nullptr &&
+                    input.pTrace->candidateDetailsEnabled())
+                {
+                    for (std::size_t slot = 0;
+                         slot < actor.candidates.size();
+                         ++slot)
+                    {
+                        const CandidateBundle & candidate =
+                            actor.candidates[slot];
+                        const bool plannable = isPlannableCandidate(
+                            input.actionIds,
+                            input.unitLinks,
+                            candidate);
+                        const PlanBundleKind kind =
+                            planBundleKindOf(candidate.bundle);
+                        const QString actionId =
+                            planActionIdFor(input.actionIds, kind);
+                        const BundleComponent* pComponent =
+                            singleComponentOf(
+                                candidate.bundle);
+                        const std::int32_t targetKnowledge =
+                            pComponent != nullptr &&
+                                    pComponent->kind ==
+                                        ComponentKind::Fire
+                                ? pComponent->fire.targetUnitId
+                                : NO_UNIT;
+                        const KnownUnitLink targetLink =
+                            linkOf(
+                                input.unitLinks,
+                                targetKnowledge);
+                        QString support =
+                            QStringLiteral("SUPPORTED");
+                        if (!plannable &&
+                            actionId.isEmpty())
+                        {
+                            support =
+                                QStringLiteral(
+                                    "UNSUPPORTED_ACTION_KIND");
+                        }
+                        else if (!plannable &&
+                                 pComponent == nullptr)
+                        {
+                            support =
+                                QStringLiteral(
+                                    "FIRE_COMPONENT_MISSING");
+                        }
+                        else if (!plannable)
+                        {
+                            support =
+                                QStringLiteral(
+                                    "FIRE_TARGET_UNLINKED");
+                        }
+                        input.pTrace->record(
+                            QStringLiteral("CANDIDATE_SUPPORT"),
+                            QStringLiteral(
+                                "actor=%1 actorKnowledge=%2 candidate=%3 generated=%4 kind=%5 actionId=%6 plannable=%7 destinationClaim=%8 targetKnowledge=%9 targetEngine=%10 reservationTargetHpSteps=%11 reservationRequestedDamageSteps=%12 support=%13")
+                                .arg(actor.engineUnitId)
+                                .arg(actor.knowledgeUnitIndex)
+                                .arg(slot)
+                                .arg(candidate.generationIndex)
+                                .arg(traceBundleKind(kind))
+                                .arg(actionId.isEmpty()
+                                         ? QStringLiteral("NONE")
+                                         : actionId)
+                                .arg(traceBool(plannable))
+                                .arg(traceTile(
+                                    candidate.bundle.destination))
+                                .arg(targetKnowledge)
+                                .arg(targetLink.engineUnitId)
+                                .arg(
+                                    pComponent != nullptr &&
+                                            pComponent->kind ==
+                                                ComponentKind::Fire
+                                        ? QString::number(
+                                              pComponent->fire.targetHpSteps)
+                                        : QStringLiteral("NA"))
+                                .arg(
+                                    pComponent != nullptr &&
+                                            pComponent->kind ==
+                                                ComponentKind::Fire
+                                        ? QString::number(
+                                              pComponent->fire.damageSteps)
+                                        : QStringLiteral("NA"))
+                                .arg(support));
+                    }
+                    for (std::size_t orderSlot = 0;
+                         orderSlot < entry.order.size();
+                         ++orderSlot)
+                    {
+                        const std::int32_t candidateIndex =
+                            entry.order[orderSlot];
+                        const MilliFunds value =
+                            optionValue(entry, candidateIndex);
+                        const bool tied =
+                            orderSlot > 0 &&
+                            value ==
+                                optionValue(
+                                    entry,
+                                    entry.order[orderSlot - 1]);
+                        input.pTrace->record(
+                            QStringLiteral("CANDIDATE_ORDER"),
+                            QStringLiteral(
+                                "actor=%1 order=%2 candidate=%3 generated=%4 value=%5 tieWithPrevious=%6")
+                                .arg(actor.engineUnitId)
+                                .arg(orderSlot)
+                                .arg(candidateIndex)
+                                .arg(actor.candidates[static_cast<std::size_t>(
+                                         candidateIndex)]
+                                         .generationIndex)
+                                .arg(value)
+                                .arg(traceBool(tied)));
+                    }
+                }
                 actors.push_back(std::move(entry));
             }
             return actors;
@@ -813,6 +1095,7 @@ namespace Coordinator
         static void greedyInit(AssignmentResult & result, std::vector<ActorProgress> & actors,
                                const AssignmentInput & input)
         {
+            std::int32_t selectionOrder = 0;
             while (true)
             {
                 const std::size_t slot = pickBestActor(actors);
@@ -820,6 +1103,20 @@ namespace Coordinator
                 {
                     return;
                 }
+                if (input.pTrace != nullptr)
+                {
+                    const ActorProgress & state = actors[slot];
+                    input.pTrace->record(
+                        QStringLiteral("GREEDY_PICK"),
+                        QStringLiteral(
+                            "order=%1 actor=%2 actorKnowledge=%3 candidate=%4 value=%5")
+                            .arg(selectionOrder)
+                            .arg(state.pActor->engineUnitId)
+                            .arg(state.pActor->knowledgeUnitIndex)
+                            .arg(state.order[state.cursor])
+                            .arg(state.economicValue()));
+                }
+                ++selectionOrder;
                 takeBestCandidate(result, actors[slot], input);
             }
         }
@@ -846,7 +1143,33 @@ namespace Coordinator
             {
                 entry.done = true;
                 entry.chosen = entry.order[entry.cursor];
+                entry.greedyChosen = entry.chosen;
                 entry.seatedValue = seatedOptionValue(result.plan, entry, entry.chosen);
+                entry.phase = AssignmentResult::SelectionPhase::Greedy;
+            }
+            if (input.pTrace != nullptr)
+            {
+                input.pTrace->record(
+                    QStringLiteral("GREEDY"),
+                    QStringLiteral(
+                        "actor=%1 actorKnowledge=%2 candidate=%3 generated=%4 kind=%5 value=%6 claim=%7 selected=%8 seatedValue=%9")
+                        .arg(entry.pActor->engineUnitId)
+                        .arg(entry.pActor->knowledgeUnitIndex)
+                        .arg(entry.order[entry.cursor])
+                        .arg(candidate.generationIndex)
+                        .arg(traceBundleKind(
+                            planBundleKindOf(candidate.bundle)))
+                        .arg(candidate.valuation.value().economicValue)
+                        .arg(traceReservationResult(claim))
+                        .arg(traceBool(
+                            claim == ReservationResult::Granted))
+                        .arg(
+                            claim == ReservationResult::Granted
+                                ? QString::number(entry.seatedValue)
+                                : QStringLiteral("NA")));
+            }
+            if (claim == ReservationResult::Granted)
+            {
                 return;
             }
             countRejection(result.stats, claim);
@@ -874,10 +1197,28 @@ namespace Coordinator
             return order;
         }
 
-        static bool settleStockActor(TurnPlan & plan, const AssignmentInput & input, ActorProgress & state)
+        static bool settleStockActor(
+            TurnPlan & plan,
+            const AssignmentInput & input,
+            ActorProgress & state,
+            std::int32_t sweep)
         {
             const std::int32_t previousChosen = state.chosen;
-            const MilliFunds previousValue = state.seatedValue + planStockDelta(input, plan);
+            const MilliFunds previousSeated = state.seatedValue;
+            const MilliFunds previousStockDelta =
+                planStockDelta(input, plan);
+            const MilliFunds previousValue =
+                previousSeated + previousStockDelta;
+            if (previousChosen != NO_CANDIDATE &&
+                previousChosen <
+                    static_cast<std::int32_t>(
+                        state.completeValues.size()))
+            {
+                state.completeValues[static_cast<std::size_t>(
+                    previousChosen)] =
+                    AssignmentResult::CandidateCompleteValue{
+                        previousValue, true};
+            }
             const std::vector<std::int32_t> options = incumbentFirstOptions(state);
             unseatActor(plan, state);
             std::int32_t bestOption = previousChosen;
@@ -891,21 +1232,158 @@ namespace Coordinator
                 const SeatOutcome outcome = seatOption(plan, input, state, option);
                 if (outcome.claim != ReservationResult::Granted)
                 {
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled())
+                    {
+                        const CandidateBundle* pCandidate =
+                            option == NO_CANDIDATE
+                                ? nullptr
+                                : &state.pActor->candidates[
+                                      static_cast<std::size_t>(
+                                          option)];
+                        input.pTrace->record(
+                            QStringLiteral("SETTLING_CHALLENGER"),
+                            QStringLiteral(
+                                "sweep=%1 actor=%2 previousCandidate=%3 previousSeated=%4 previousStockDelta=%5 previousComplete=%6 challenger=%7 kind=%8 destination=%9 challengerSeated=NA challengerStockDelta=NA challengerComplete=NA claim=%10 accepted=false")
+                                .arg(sweep)
+                                .arg(state.pActor->engineUnitId)
+                                .arg(previousChosen)
+                                .arg(previousSeated)
+                                .arg(previousStockDelta)
+                                .arg(previousValue)
+                                .arg(option)
+                                .arg(
+                                    pCandidate == nullptr
+                                        ? QStringLiteral("NONE")
+                                        : traceBundleKind(
+                                              planBundleKindOf(
+                                                  pCandidate->bundle)))
+                                .arg(
+                                    pCandidate == nullptr
+                                        ? traceTile(INVALID_TILE)
+                                        : traceTile(
+                                              pCandidate->bundle
+                                                  .destination))
+                                .arg(traceReservationResult(
+                                    outcome.claim)));
+                    }
                     continue;
                 }
-                const MilliFunds value = outcome.value + planStockDelta(input, plan);
+                const MilliFunds challengerStockDelta =
+                    planStockDelta(input, plan);
+                const MilliFunds value =
+                    outcome.value + challengerStockDelta;
+                if (option != NO_CANDIDATE &&
+                    option <
+                        static_cast<std::int32_t>(
+                            state.completeValues.size()))
+                {
+                    state.completeValues[static_cast<std::size_t>(
+                        option)] =
+                        AssignmentResult::CandidateCompleteValue{
+                            value, true};
+                }
                 unseatActor(plan, state);
+                const bool accepted = value > bestValue;
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled())
+                {
+                    const CandidateBundle* pCandidate =
+                        option == NO_CANDIDATE
+                            ? nullptr
+                            : &state.pActor->candidates[
+                                  static_cast<std::size_t>(option)];
+                    input.pTrace->record(
+                        QStringLiteral("SETTLING_CHALLENGER"),
+                        QStringLiteral(
+                            "sweep=%1 actor=%2 previousCandidate=%3 previousSeated=%4 previousStockDelta=%5 previousComplete=%6 challenger=%7 kind=%8 destination=%9 challengerSeated=%10 challengerStockDelta=%11 challengerComplete=%12 claim=GRANTED accepted=%13")
+                            .arg(sweep)
+                            .arg(state.pActor->engineUnitId)
+                            .arg(previousChosen)
+                            .arg(previousSeated)
+                            .arg(previousStockDelta)
+                            .arg(previousValue)
+                            .arg(option)
+                            .arg(
+                                pCandidate == nullptr
+                                    ? QStringLiteral("NONE")
+                                    : traceBundleKind(
+                                          planBundleKindOf(
+                                              pCandidate->bundle)))
+                            .arg(
+                                pCandidate == nullptr
+                                    ? traceTile(INVALID_TILE)
+                                    : traceTile(
+                                          pCandidate->bundle.destination))
+                            .arg(outcome.value)
+                            .arg(challengerStockDelta)
+                            .arg(value)
+                            .arg(traceBool(accepted)));
+                }
                 if (value > bestValue)
                 {
                     bestOption = option;
                     bestValue = value;
                 }
             }
-            if (seatOption(plan, input, state, bestOption).claim != ReservationResult::Granted)
+            const SeatOutcome winningOutcome =
+                seatOption(plan, input, state, bestOption);
+            if (winningOutcome.claim != ReservationResult::Granted)
             {
                 seatBestClaimable(plan, input, state, options);
             }
-            return state.chosen != previousChosen;
+            const bool changed = state.chosen != previousChosen;
+            if (changed)
+            {
+                state.phase =
+                    AssignmentResult::SelectionPhase::Settling;
+            }
+            if (input.pTrace != nullptr)
+            {
+                const CandidateBundle* pWinner =
+                    state.chosen == NO_CANDIDATE
+                        ? nullptr
+                        : &state.pActor->candidates[
+                              static_cast<std::size_t>(
+                                  state.chosen)];
+                bool completeKnown = false;
+                MilliFunds completeValue = 0;
+                if (state.chosen != NO_CANDIDATE &&
+                    state.chosen <
+                        static_cast<std::int32_t>(
+                            state.completeValues.size()))
+                {
+                    const AssignmentResult::CandidateCompleteValue &
+                        known =
+                            state.completeValues[
+                                static_cast<std::size_t>(
+                                    state.chosen)];
+                    completeKnown = known.known;
+                    completeValue = known.value;
+                }
+                input.pTrace->record(
+                    QStringLiteral("SETTLING_WINNER"),
+                    QStringLiteral(
+                        "sweep=%1 actor=%2 candidate=%3 kind=%4 destination=%5 completeValue=%6 completeKnown=%7 changed=%8")
+                        .arg(sweep)
+                        .arg(state.pActor->engineUnitId)
+                        .arg(state.chosen)
+                        .arg(
+                            pWinner == nullptr
+                                ? QStringLiteral("NONE")
+                                : traceBundleKind(
+                                      planBundleKindOf(
+                                          pWinner->bundle)))
+                        .arg(
+                            pWinner == nullptr
+                                ? traceTile(INVALID_TILE)
+                                : traceTile(
+                                      pWinner->bundle.destination))
+                        .arg(completeValue)
+                        .arg(traceBool(completeKnown))
+                        .arg(traceBool(changed)));
+            }
+            return changed;
         }
 
         static void settle(TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
@@ -920,17 +1398,41 @@ namespace Coordinator
                     ActorProgress & state = actors[static_cast<std::size_t>(slot)];
                     if (stockCoupled(input, state.pActor->engineUnitId))
                     {
-                        if (settleStockActor(plan, input, state))
+                        if (settleStockActor(
+                                plan, input, state, sweep))
                         {
                             moved = true;
                             ++stats.settlingMoves;
                         }
                         continue;
                     }
+                    const std::int32_t previousChosen =
+                        state.chosen;
                     const MilliFunds previousValue = state.seatedValue;
                     const std::vector<std::int32_t> options = incumbentFirstOptions(state);
                     unseatActor(plan, state);
                     seatBestClaimable(plan, input, state, options);
+                    const bool changed =
+                        state.chosen != previousChosen;
+                    if (changed)
+                    {
+                        state.phase =
+                            AssignmentResult::SelectionPhase::Settling;
+                    }
+                    if (input.pTrace != nullptr)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("SETTLING_NON_STOCK"),
+                            QStringLiteral(
+                                "sweep=%1 actor=%2 previousCandidate=%3 previousValue=%4 winner=%5 winnerValue=%6 changed=%7")
+                                .arg(sweep)
+                                .arg(state.pActor->engineUnitId)
+                                .arg(previousChosen)
+                                .arg(previousValue)
+                                .arg(state.chosen)
+                                .arg(state.seatedValue)
+                                .arg(traceBool(changed)));
+                    }
                     if (state.seatedValue > previousValue)
                     {
                         moved = true;
@@ -975,6 +1477,42 @@ namespace Coordinator
                 }
             }
             return edges;
+        }
+
+        static QString traceActorIds(
+            const std::vector<ActorProgress> & actors,
+            std::span<const std::int32_t> members)
+        {
+            QString text;
+            for (std::size_t slot = 0;
+                 slot < members.size();
+                 ++slot)
+            {
+                if (slot > 0)
+                {
+                    text += QLatin1Char(',');
+                }
+                text += QString::number(
+                    actors[static_cast<std::size_t>(
+                               members[slot])]
+                        .pActor->engineUnitId);
+            }
+            return text;
+        }
+
+        static std::vector<std::int32_t> chosenOptions(
+            const std::vector<ActorProgress> & actors,
+            std::span<const std::int32_t> members)
+        {
+            std::vector<std::int32_t> choices;
+            choices.reserve(members.size());
+            for (const std::int32_t slot : members)
+            {
+                choices.push_back(
+                    actors[static_cast<std::size_t>(slot)]
+                        .chosen);
+            }
+            return choices;
         }
 
         static std::vector<ActorSeat> recordSeats(const std::vector<ActorProgress> & actors,
@@ -1031,6 +1569,13 @@ namespace Coordinator
                         edge.left,
                         edge.right,
                     };
+                    std::vector<std::int32_t>
+                        incumbentChoices;
+                    if (input.pTrace != nullptr)
+                    {
+                        incumbentChoices =
+                            chosenOptions(actors, pair);
+                    }
                     const ExactSearchOutcome outcome =
                         runExactSearch(
                             plan,
@@ -1047,12 +1592,91 @@ namespace Coordinator
                     {
                         ++stats.swapImprovements;
                         improved = true;
+                        if (input.pTrace != nullptr)
+                        {
+                            invalidateCompleteValues(actors);
+                        }
+                    }
+                    if (input.pTrace != nullptr)
+                    {
+                        const std::vector<std::int32_t>
+                            finalChoices =
+                                chosenOptions(
+                                    actors, pair);
+                        if (outcome.improved)
+                        {
+                            for (std::size_t depth = 0;
+                             depth < pair.size();
+                             ++depth)
+                            {
+                                if (incumbentChoices[depth] !=
+                                    finalChoices[depth])
+                                {
+                                    actors[static_cast<std::size_t>(
+                                               pair[depth])]
+                                        .phase =
+                                        AssignmentResult::SelectionPhase::
+                                            PairRefinement;
+                                }
+                            }
+                        }
+                        input.pTrace->record(
+                            QStringLiteral("PAIR_RESULT"),
+                            QStringLiteral(
+                                "sweep=%1 actors=%2 incumbent=%3 final=%4 states=%5 accepted=%6 aborted=%7 liveFailure=%8 requestedPricing=%9 effectivePricing=%10 incumbentLower=%11 incumbentUpper=%12 winnerLower=%13 winnerUpper=%14 winnerKnown=%15 winnerExact=%16")
+                                .arg(sweep)
+                                .arg(traceActorIds(actors, pair))
+                                .arg(traceIndices(
+                                    incumbentChoices))
+                                .arg(traceIndices(finalChoices))
+                                .arg(outcome.states)
+                                .arg(traceBool(
+                                    outcome.improved))
+                                .arg(traceBool(
+                                    outcome.aborted))
+                                .arg(traceBool(
+                                    outcome.liveFailure))
+                                .arg(
+                                    liveIntervals
+                                        ? QStringLiteral(
+                                              "LIVE_INTERVAL")
+                                        : QStringLiteral(
+                                              "LEGACY_SCALAR"))
+                                .arg(
+                                    outcome.liveFailure
+                                        ? QStringLiteral(
+                                              "LEGACY_SCALAR_FALLBACK")
+                                        : liveIntervals
+                                              ? QStringLiteral(
+                                                    "LIVE_INTERVAL")
+                                              : QStringLiteral(
+                                                    "LEGACY_SCALAR"))
+                                .arg(outcome.incumbentLower)
+                                .arg(outcome.incumbentUpper)
+                                .arg(outcome.resultLower)
+                                .arg(outcome.resultUpper)
+                                .arg(traceBool(
+                                    outcome.resultKnown))
+                                .arg(traceBool(
+                                    outcome.resultKnown &&
+                                    outcome.resultLower ==
+                                        outcome.resultUpper)));
                     }
                 }
                 const bool refined =
                     liveIntervals &&
                     input.pStockValuer->refineLiveAtBoundary(
                         AssignPhase::BetweenSwapSweeps);
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled())
+                {
+                    input.pTrace->record(
+                        QStringLiteral("PAIR_REFINEMENT_BOUNDARY"),
+                        QStringLiteral(
+                            "sweep=%1 phase=BETWEEN_SWAP_SWEEPS refined=%2")
+                            .arg(sweep)
+                            .arg(traceBool(refined)));
+                }
                 if (!improved && !refined)
                 {
                     return;
@@ -1172,6 +1796,25 @@ namespace Coordinator
                     if (!quote.valid ||
                         !quote.lowerWitnessReplays)
                     {
+                        if (input.pTrace != nullptr &&
+                            input.pTrace->stockDetailsEnabled() &&
+                            search.members.size() == 2)
+                        {
+                            input.pTrace->record(
+                                QStringLiteral("PAIR_COMPARE"),
+                                QStringLiteral(
+                                    "actors=%1 challenger=%2 economic=%3 valid=%4 lowerWitnessReplays=%5 reason=UNREPLAYABLE accepted=false states=%6")
+                                    .arg(traceActorIds(
+                                        actors,
+                                        search.members))
+                                    .arg(traceIndices(
+                                        search.current))
+                                    .arg(economic)
+                                    .arg(traceBool(quote.valid))
+                                    .arg(traceBool(
+                                        quote.lowerWitnessReplays))
+                                    .arg(search.states));
+                        }
                         search.liveFailure = true;
                         search.aborted = true;
                         return;
@@ -1182,6 +1825,48 @@ namespace Coordinator
                     const MilliFunds upper =
                         economic +
                         quote.stockAbsolute.upper;
+                    const MilliFunds incumbentLower =
+                        search.incumbentLower;
+                    const bool pruned =
+                        upper <= incumbentLower;
+                    const bool accepted =
+                        lower > incumbentLower;
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled() &&
+                        search.members.size() == 2)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("PAIR_COMPARE"),
+                            QStringLiteral(
+                                "actors=%1 challenger=%2 economic=%3 stockLower=%4 stockUpper=%5 challengerLower=%6 challengerUpper=%7 incumbentLower=%8 exact=%9 completeValue=%10 states=%11 reason=%12 accepted=%13")
+                                .arg(traceActorIds(
+                                    actors,
+                                    search.members))
+                                .arg(traceIndices(
+                                    search.current))
+                                .arg(economic)
+                                .arg(quote.stockAbsolute.lower)
+                                .arg(quote.stockAbsolute.upper)
+                                .arg(lower)
+                                .arg(upper)
+                                .arg(incumbentLower)
+                                .arg(traceBool(lower == upper))
+                                .arg(
+                                    lower == upper
+                                        ? QString::number(lower)
+                                        : QStringLiteral("NA"))
+                                .arg(search.states)
+                                .arg(
+                                    pruned
+                                        ? QStringLiteral(
+                                              "UPPER_NOT_ABOVE_INCUMBENT")
+                                        : accepted
+                                              ? QStringLiteral(
+                                                    "LOWER_ABOVE_INCUMBENT")
+                                              : QStringLiteral(
+                                                    "INTERVAL_OVERLAP"))
+                                .arg(traceBool(accepted)));
+                    }
                     if (upper <= search.incumbentLower)
                     {
                         return;
@@ -1201,7 +1886,36 @@ namespace Coordinator
                 {
                     value += planStockDelta(input, plan);
                 }
-                if (!search.hasBest || value > search.bestTotal)
+                const bool accepted =
+                    !search.hasBest || value > search.bestTotal;
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled() &&
+                    search.members.size() == 2)
+                {
+                    input.pTrace->record(
+                        QStringLiteral("PAIR_COMPARE"),
+                        QStringLiteral(
+                            "actors=%1 challenger=%2 completeValue=%3 incumbentComplete=%4 exact=true states=%5 reason=%6 accepted=%7")
+                            .arg(traceActorIds(
+                                actors,
+                                search.members))
+                            .arg(traceIndices(search.current))
+                            .arg(value)
+                            .arg(
+                                search.hasBest
+                                    ? QString::number(
+                                          search.bestTotal)
+                                    : QStringLiteral("NONE"))
+                            .arg(search.states)
+                            .arg(
+                                accepted
+                                    ? QStringLiteral(
+                                          "COMPLETE_ABOVE_INCUMBENT")
+                                    : QStringLiteral(
+                                          "COMPLETE_NOT_ABOVE_INCUMBENT"))
+                            .arg(traceBool(accepted)));
+                }
+                if (accepted)
                 {
                     search.bestTotal = value;
                     search.legacyBest = search.current;
@@ -1245,11 +1959,50 @@ namespace Coordinator
                 if (search.hasBest &&
                     upper <= incumbentThreshold)
                 {
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled() &&
+                        search.members.size() == 2)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("PAIR_PRUNE"),
+                            QStringLiteral(
+                                "actors=%1 depth=%2 partial=%3 option=%4 upper=%5 incumbent=%6 states=%7 reason=SEARCH_UPPER_BOUND")
+                                .arg(traceActorIds(
+                                    actors,
+                                    search.members))
+                                .arg(depth)
+                                .arg(traceIndices(
+                                    std::span<const std::int32_t>(
+                                        search.current.data(),
+                                        depth)))
+                                .arg(option)
+                                .arg(upper)
+                                .arg(incumbentThreshold)
+                                .arg(search.states));
+                    }
                     return;
                 }
                 const SeatOutcome outcome = seatOption(plan, input, state, option);
                 if (outcome.claim != ReservationResult::Granted)
                 {
+                    if (input.pTrace != nullptr &&
+                        input.pTrace->stockDetailsEnabled() &&
+                        search.members.size() == 2)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("PAIR_REJECTION"),
+                            QStringLiteral(
+                                "actors=%1 depth=%2 actor=%3 option=%4 claim=%5 states=%6")
+                                .arg(traceActorIds(
+                                    actors,
+                                    search.members))
+                                .arg(depth)
+                                .arg(state.pActor->engineUnitId)
+                                .arg(option)
+                                .arg(traceReservationResult(
+                                    outcome.claim))
+                                .arg(search.states));
+                    }
                     continue;
                 }
                 search.current[depth] = option;
@@ -1385,6 +2138,8 @@ namespace Coordinator
                 pricingMode ==
                     SearchPricingMode::PairSwapInterval;
             MilliFunds incumbentTotal = seatedTotal(actors, members);
+            MilliFunds incumbentLower = incumbentTotal;
+            MilliFunds incumbentUpper = incumbentTotal;
             const TurnPlan snapshot = plan;
             const std::vector<ActorSeat> seats = recordSeats(actors, members);
             std::vector<std::int32_t> incumbentChoices;
@@ -1392,6 +2147,28 @@ namespace Coordinator
             for (const ActorSeat & seat : seats)
             {
                 incumbentChoices.push_back(seat.chosen);
+            }
+            if (input.pTrace != nullptr &&
+                input.pTrace->stockDetailsEnabled() &&
+                members.size() == 2)
+            {
+                input.pTrace->record(
+                    QStringLiteral("PAIR_BEGIN"),
+                    QStringLiteral(
+                        "actors=%1 incumbent=%2 incumbentSeated=%3 stockLive=%4 pricing=%5 candidateCap=%6 stateBudgetRemaining=%7")
+                        .arg(traceActorIds(actors, members))
+                        .arg(traceIndices(incumbentChoices))
+                        .arg(incumbentTotal)
+                        .arg(traceBool(search.stockLive))
+                        .arg(
+                            liveIntervals
+                                ? QStringLiteral("LIVE_INTERVAL")
+                                : QStringLiteral("LEGACY_SCALAR"))
+                        .arg(candidateCap)
+                        .arg(
+                            ASSIGNMENT_STATE_BUDGET -
+                            stats.swapStates -
+                            stats.enumerationStates));
             }
             if (liveIntervals)
             {
@@ -1423,13 +2200,63 @@ namespace Coordinator
                     search.bestFeasibleEconomic +
                     search.bestFeasibleQuote
                         .stockAbsolute.lower;
+                incumbentLower = search.incumbentLower;
+                incumbentUpper =
+                    search.bestFeasibleEconomic +
+                    search.bestFeasibleQuote
+                        .stockAbsolute.upper;
                 search.hasBest = true;
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled() &&
+                    members.size() == 2)
+                {
+                    input.pTrace->record(
+                        QStringLiteral("PAIR_INCUMBENT"),
+                        QStringLiteral(
+                            "actors=%1 candidates=%2 economic=%3 stockLower=%4 stockUpper=%5 incumbentLower=%6 exact=%7 lowerWitnessReplays=%8")
+                            .arg(traceActorIds(
+                                actors,
+                                members))
+                            .arg(traceIndices(
+                                incumbentChoices))
+                            .arg(search.bestFeasibleEconomic)
+                            .arg(search.bestFeasibleQuote
+                                     .stockAbsolute.lower)
+                            .arg(search.bestFeasibleQuote
+                                     .stockAbsolute.upper)
+                            .arg(search.incumbentLower)
+                            .arg(traceBool(
+                                search.bestFeasibleQuote
+                                        .stockAbsolute.lower ==
+                                    search.bestFeasibleQuote
+                                        .stockAbsolute.upper))
+                            .arg(traceBool(
+                                search.bestFeasibleQuote
+                                    .lowerWitnessReplays)));
+                }
             }
             else if (search.stockLive)
             {
                 search.propertyOriginInSearchBasis =
                     input.pStockValuer->originStock();
                 incumbentTotal += planStockDelta(input, plan);
+                incumbentLower = incumbentTotal;
+                incumbentUpper = incumbentTotal;
+                if (input.pTrace != nullptr &&
+                    input.pTrace->stockDetailsEnabled() &&
+                    members.size() == 2)
+                {
+                    input.pTrace->record(
+                        QStringLiteral("PAIR_INCUMBENT"),
+                        QStringLiteral(
+                            "actors=%1 candidates=%2 completeValue=%3 exact=true pricing=LEGACY_SCALAR")
+                            .arg(traceActorIds(
+                                actors,
+                                members))
+                            .arg(traceIndices(
+                                incumbentChoices))
+                            .arg(incumbentTotal));
+                }
             }
             unseatMembers(plan, actors, members);
             search.fixedEconomic =
@@ -1439,6 +2266,24 @@ namespace Coordinator
             outcome.states = search.states;
             outcome.aborted = search.aborted;
             outcome.liveFailure = search.liveFailure;
+            outcome.incumbentLower = incumbentLower;
+            outcome.incumbentUpper = incumbentUpper;
+            if (liveIntervals && search.hasBest)
+            {
+                outcome.resultLower =
+                    search.incumbentLower;
+                outcome.resultUpper =
+                    search.bestFeasibleEconomic +
+                    search.bestFeasibleQuote
+                        .stockAbsolute.upper;
+                outcome.resultKnown = true;
+            }
+            else if (search.hasBest)
+            {
+                outcome.resultLower = search.bestTotal;
+                outcome.resultUpper = search.bestTotal;
+                outcome.resultKnown = true;
+            }
             plan = snapshot;
             restoreSeats(actors, members, seats);
             if (liveIntervals)
@@ -1526,6 +2371,20 @@ namespace Coordinator
                     searchBudgetExhausted(stats))
                 {
                     ++stats.clustersCapped;
+                    if (input.pTrace != nullptr)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("CLUSTER"),
+                            QStringLiteral(
+                                "actors=%1 candidates=%2 reason=ACTOR_OR_GLOBAL_BUDGET accepted=false")
+                                .arg(traceActorIds(
+                                    actors,
+                                    members))
+                                .arg(traceIndices(
+                                    chosenOptions(
+                                        actors,
+                                        members))));
+                    }
                     continue;
                 }
                 const bool stockCluster =
@@ -1543,7 +2402,28 @@ namespace Coordinator
                 {
                     ++stats.clustersCapped;
                     ++stats.clustersSkippedStockBudget;
+                    if (input.pTrace != nullptr)
+                    {
+                        input.pTrace->record(
+                            QStringLiteral("CLUSTER"),
+                            QStringLiteral(
+                                "actors=%1 candidates=%2 reason=STOCK_BUDGET_POLICY accepted=false")
+                                .arg(traceActorIds(
+                                    actors,
+                                    members))
+                                .arg(traceIndices(
+                                    chosenOptions(
+                                        actors,
+                                        members))));
+                    }
                     continue;
+                }
+                std::vector<std::int32_t>
+                    incumbentChoices;
+                if (input.pTrace != nullptr)
+                {
+                    incumbentChoices =
+                        chosenOptions(actors, members);
                 }
                 const ExactSearchOutcome outcome =
                     runExactSearch(
@@ -1563,7 +2443,254 @@ namespace Coordinator
                 {
                     ++stats.clustersEnumerated;
                 }
+                if (outcome.improved &&
+                    input.pTrace != nullptr)
+                {
+                    invalidateCompleteValues(actors);
+                }
+                if (input.pTrace != nullptr)
+                {
+                    const std::vector<std::int32_t>
+                        finalChoices =
+                            chosenOptions(
+                                actors, members);
+                    if (outcome.improved)
+                    {
+                        for (std::size_t depth = 0;
+                             depth < members.size();
+                             ++depth)
+                        {
+                            if (incumbentChoices[depth] !=
+                                finalChoices[depth])
+                            {
+                                ActorProgress & state =
+                                    actors[static_cast<std::size_t>(
+                                        members[depth])];
+                                state.phase =
+                                    AssignmentResult::SelectionPhase::
+                                        Cluster;
+                            }
+                        }
+                    }
+                    input.pTrace->record(
+                        QStringLiteral("CLUSTER"),
+                        QStringLiteral(
+                            "actors=%1 incumbent=%2 final=%3 states=%4 accepted=%5 aborted=%6 incumbentLower=%7 incumbentUpper=%8 winnerLower=%9 winnerUpper=%10 winnerKnown=%11 winnerExact=%12")
+                            .arg(traceActorIds(
+                                actors,
+                                members))
+                            .arg(traceIndices(
+                                incumbentChoices))
+                            .arg(traceIndices(finalChoices))
+                            .arg(outcome.states)
+                            .arg(traceBool(outcome.improved))
+                            .arg(traceBool(outcome.aborted))
+                            .arg(outcome.incumbentLower)
+                            .arg(outcome.incumbentUpper)
+                            .arg(outcome.resultLower)
+                            .arg(outcome.resultUpper)
+                            .arg(traceBool(
+                                outcome.resultKnown))
+                            .arg(traceBool(
+                                outcome.resultKnown &&
+                                outcome.resultLower ==
+                                    outcome.resultUpper)));
+                }
             }
+        }
+
+        static void recordFinalAssignment(
+            AssignmentResult & result,
+            const std::vector<ActorProgress> & actors,
+            const AssignmentInput & input)
+        {
+            if (input.pTrace == nullptr)
+            {
+                return;
+            }
+            result.selections.reserve(actors.size());
+            for (const ActorProgress & state : actors)
+            {
+                AssignmentResult::Selection selection;
+                selection.knowledgeUnitIndex =
+                    state.pActor->knowledgeUnitIndex;
+                selection.engineUnitId =
+                    state.pActor->engineUnitId;
+                selection.actionIndex = state.actionIndex;
+                selection.candidateIndex = state.chosen;
+                selection.greedyCandidateIndex =
+                    state.greedyChosen;
+                selection.seatedValue = state.seatedValue;
+                selection.stockCoupled =
+                    stockCoupled(
+                        input,
+                        state.pActor->engineUnitId);
+                selection.phase = state.phase;
+                selection.completeValues =
+                    state.completeValues;
+                result.selections.push_back(
+                    std::move(selection));
+            }
+
+            input.pTrace->record(
+                QStringLiteral("FINAL_PLAN"),
+                QStringLiteral(
+                    "actors=%1 executionActions=%2 assigned=%3 unassigned=%4")
+                    .arg(actors.size())
+                    .arg(result.executionOrder.size())
+                    .arg(result.stats.assignedUnits)
+                    .arg(result.stats.unassignedUnits));
+
+            std::vector<bool> recorded(
+                result.selections.size(), false);
+            auto recordSelection =
+                [&](std::size_t selectionSlot,
+                    std::int32_t executionPosition)
+            {
+                const AssignmentResult::Selection & selection =
+                    result.selections[selectionSlot];
+                const ActorProgress & state =
+                    actors[selectionSlot];
+                const CandidateBundle* pCandidate =
+                    selection.candidateIndex == NO_CANDIDATE
+                        ? nullptr
+                        : &state.pActor->candidates[
+                              static_cast<std::size_t>(
+                                  selection.candidateIndex)];
+                const PlannedAction* pAction =
+                    selection.actionIndex == NO_ACTION
+                        ? nullptr
+                        : &result.plan.action(
+                              selection.actionIndex);
+                bool completeKnown = false;
+                MilliFunds completeValue = 0;
+                if (selection.candidateIndex !=
+                        NO_CANDIDATE &&
+                    selection.candidateIndex <
+                        static_cast<std::int32_t>(
+                            selection.completeValues.size()))
+                {
+                    const AssignmentResult::
+                        CandidateCompleteValue & known =
+                            selection.completeValues[
+                                static_cast<std::size_t>(
+                                    selection.candidateIndex)];
+                    completeKnown = known.known;
+                    completeValue = known.value;
+                }
+                input.pTrace->record(
+                    QStringLiteral("FINAL_ACTOR"),
+                    QStringLiteral(
+                        "execution=%1 actor=%2 actorKnowledge=%3 candidate=%4 generated=%5 kind=%6 actionId=%7 origin=%8 destination=%9 target=%10 targetUnit=%11 seatedValue=%12 stockCoupled=%13 completeValue=%14 completeKnown=%15 completeValueScope=SETTLING_TRIAL_SNAPSHOT selectionPhase=%16 actionState=%17")
+                        .arg(executionPosition)
+                        .arg(selection.engineUnitId)
+                        .arg(selection.knowledgeUnitIndex)
+                        .arg(selection.candidateIndex)
+                        .arg(
+                            pCandidate == nullptr
+                                ? -1
+                                : pCandidate
+                                      ->generationIndex)
+                        .arg(
+                            pCandidate == nullptr
+                                ? QStringLiteral("NONE")
+                                : traceBundleKind(
+                                      planBundleKindOf(
+                                          pCandidate->bundle)))
+                        .arg(
+                            pAction == nullptr ||
+                                    pAction->actionId.isEmpty()
+                                ? QStringLiteral("NONE")
+                                : pAction->actionId)
+                        .arg(
+                            pCandidate == nullptr
+                                ? traceTile(INVALID_TILE)
+                                : traceTile(
+                                      pCandidate->bundle.origin))
+                        .arg(
+                            pAction == nullptr
+                                ? traceTile(INVALID_TILE)
+                                : traceTile(
+                                      pAction->destination))
+                        .arg(
+                            pAction == nullptr
+                                ? traceTile(INVALID_TILE)
+                                : traceTile(pAction->target))
+                        .arg(
+                            pAction == nullptr
+                                ? NO_UNIT
+                                : pAction->targetUnitId)
+                        .arg(selection.seatedValue)
+                        .arg(traceBool(
+                            selection.stockCoupled))
+                        .arg(completeValue)
+                        .arg(traceBool(completeKnown))
+                        .arg(traceSelectionPhase(
+                            selection.phase))
+                        .arg(
+                            pAction == nullptr
+                                ? QStringLiteral("NONE")
+                                : tracePlanActionState(
+                                      pAction->state)));
+                recorded[selectionSlot] = true;
+            };
+
+            for (std::size_t executionPosition = 0;
+                 executionPosition <
+                 result.executionOrder.size();
+                 ++executionPosition)
+            {
+                const std::int32_t actionIndex =
+                    result.executionOrder[executionPosition];
+                for (std::size_t selectionSlot = 0;
+                     selectionSlot <
+                     result.selections.size();
+                     ++selectionSlot)
+                {
+                    if (result.selections[selectionSlot]
+                            .actionIndex == actionIndex)
+                    {
+                        recordSelection(
+                            selectionSlot,
+                            static_cast<std::int32_t>(
+                                executionPosition));
+                        break;
+                    }
+                }
+            }
+            for (std::size_t selectionSlot = 0;
+                 selectionSlot < result.selections.size();
+                 ++selectionSlot)
+            {
+                if (!recorded[selectionSlot])
+                {
+                    recordSelection(selectionSlot, -1);
+                }
+            }
+
+            const AssignmentStats & stats = result.stats;
+            input.pTrace->record(
+                QStringLiteral("FINAL_STATS"),
+                QStringLiteral(
+                    "candidates=%1 unsupportedCandidates=%2 conflicts=%3 overkillRejections=%4 staleRejections=%5 invalidActions=%6 vacateConflicts=%7 unorderedActions=%8 settlingSweeps=%9 settlingMoves=%10 swapStates=%11 swapImprovements=%12 clustersTotal=%13 clustersEnumerated=%14 clustersCapped=%15 clustersSkippedStockBudget=%16 enumerationStates=%17 replayFailures=%18")
+                    .arg(stats.candidates)
+                    .arg(stats.unsupportedCandidates)
+                    .arg(stats.conflicts)
+                    .arg(stats.overkillRejections)
+                    .arg(stats.staleRejections)
+                    .arg(stats.invalidActions)
+                    .arg(stats.vacateConflicts)
+                    .arg(stats.unorderedActions)
+                    .arg(stats.settlingSweeps)
+                    .arg(stats.settlingMoves)
+                    .arg(stats.swapStates)
+                    .arg(stats.swapImprovements)
+                    .arg(stats.clustersTotal)
+                    .arg(stats.clustersEnumerated)
+                    .arg(stats.clustersCapped)
+                    .arg(stats.clustersSkippedStockBudget)
+                    .arg(stats.enumerationStates)
+                    .arg(stats.replayFailures));
         }
 
         static void countAssignments(const TurnPlan & plan, const std::vector<ActorProgress> & actors,

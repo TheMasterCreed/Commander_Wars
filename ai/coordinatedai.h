@@ -2,6 +2,8 @@
 #define COORDINATEDAI_H
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -50,6 +52,9 @@ private:
     bool performPlannedAction(qint32 actionIndex, bool & replanAllowed);
     void failPlannedAction(qint32 actionIndex);
     bool replanFailedAction(qint32 actionIndex);
+    void recordCaptureDecisions(const Coordinator::AssignmentInput & input);
+    const Coordinator::AssignmentResult::Selection* selectionForAction(
+        qint32 actionIndex) const;
 
     Coordinator::BattlefieldKnowledge m_dayStartKnowledge;
     Coordinator::MobilityFieldCache m_mobilityFields;
@@ -61,6 +66,11 @@ private:
     qint32 m_factLayersDay{UNBUILT_DAY};
     qint32 m_planDay{UNBUILT_DAY};
     qint32 m_coPowerDay{UNBUILT_DAY};
+    std::unique_ptr<Coordinator::DecisionTrace> m_decisionTrace;
+    std::uint64_t m_planSequence{0};
+    std::int64_t m_factLayersNanos{0};
+    std::int64_t m_propertyStockBuildNanos{0};
+    std::int64_t m_coPowerCheckNanos{0};
 };
 
 #endif // COORDINATEDAI_H

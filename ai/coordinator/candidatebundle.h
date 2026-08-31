@@ -9,6 +9,7 @@ namespace Coordinator
 {
     struct CandidateBundle
     {
+        std::int32_t generationIndex{-1};
         ActionBundle bundle;
         ActorFacts actor;
         std::int32_t movementCost{0};
