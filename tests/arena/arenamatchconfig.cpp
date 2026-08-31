@@ -207,11 +207,19 @@ bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config,
         return false;
     }
     config.masterSeed = static_cast<quint32>(number);
-    if (!readInteger(root, "turnLimit", 1, std::numeric_limits<qint32>::max(), number, error))
+    if (root.contains("turnLimit") &&
+        !readInteger(root, "turnLimit", 1, std::numeric_limits<qint32>::max(), number, error))
     {
         return false;
     }
-    config.turnLimit = static_cast<qint32>(number);
+    if (root.contains("turnLimit"))
+    {
+        config.turnLimit = static_cast<qint32>(number);
+    }
+    else
+    {
+        config.turnLimit = 0;
+    }
     if (!readInteger(root, "watchdogMs", 1, MAX_WATCHDOG_MS, number, error))
     {
         return false;

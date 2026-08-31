@@ -18,6 +18,7 @@
 #include "coreengine/memorymanagement.h"
 #include "coreengine/settings.h"
 #include "game/actionperformer.h"
+#include "game/gameaction.h"
 #include "game/gamerules.h"
 #include "game/player.h"
 #include "game/victoryrule.h"
@@ -72,6 +73,7 @@ void ArenaMatchRunner::run()
     }
     GlobalUtils::seed(m_config.masterSeed);
     GlobalUtils::setUseSeed(true);
+    GameAction::pinActionSeeds(m_config.masterSeed);
     if (!loadMap() || !applyPlayerSetup() || !applyGameRules())
     {
         return;
@@ -140,14 +142,21 @@ bool ArenaMatchRunner::applyGameRules()
 {
     GameRules* pRules = m_pMap->getGameRules();
     addDefaultVictoryRules(pRules);
-    pRules->addVictoryRule(TURN_LIMIT_RULE);
-    VictoryRule* pTurnLimit = pRules->getVictoryRule(TURN_LIMIT_RULE);
-    if (pTurnLimit == nullptr)
+    if (m_config.turnLimit > 0)
     {
-        failSetup("turn limit victory rule is unavailable");
-        return false;
+        pRules->addVictoryRule(TURN_LIMIT_RULE);
+        VictoryRule* pTurnLimit = pRules->getVictoryRule(TURN_LIMIT_RULE);
+        if (pTurnLimit == nullptr)
+        {
+            failSetup("turn limit victory rule is unavailable");
+            return false;
+        }
+        pTurnLimit->setRuleValue(m_config.turnLimit, TURN_LIMIT_ITEM);
     }
-    pTurnLimit->setRuleValue(m_config.turnLimit, TURN_LIMIT_ITEM);
+    else
+    {
+        pRules->removeVictoryRule(TURN_LIMIT_RULE);
+    }
     pRules->setRandomWeather(false);
     pRules->setAiBehaviorMode(m_config.aiBehaviorMode);
     if (m_config.deterministicCounterpointSeed)

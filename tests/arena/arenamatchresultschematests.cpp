@@ -198,7 +198,7 @@ bool validResult(const QByteArray & data)
             std::numeric_limits<quint32>::max()) ||
         !integerInRange(
             root.value("turnLimit"),
-            1,
+            0,
             std::numeric_limits<qint32>::max()) ||
         !validStopPair(root) ||
         !root.value("players").isArray() ||
@@ -252,6 +252,12 @@ int main(int argc, char** argv)
     }
     const QJsonObject valid =
         QJsonDocument::fromJson(validData).object();
+    QJsonObject unlimited = valid;
+    unlimited["turnLimit"] = 0;
+    if (!validResult(encoded(unlimited)))
+    {
+        return 7;
+    }
     for (const QString & field : REQUIRED_FIELDS)
     {
         QJsonObject missing = valid;
@@ -284,6 +290,9 @@ int main(int argc, char** argv)
     QJsonObject exit = valid;
     exit["exitCode"] = 4;
     rejected.append(exit);
+    QJsonObject negativeTurnLimit = valid;
+    negativeTurnLimit["turnLimit"] = -1;
+    rejected.append(negativeTurnLimit);
     for (const QJsonObject & candidate : rejected)
     {
         if (validResult(encoded(candidate)))

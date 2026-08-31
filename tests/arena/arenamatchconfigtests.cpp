@@ -138,10 +138,21 @@ int main(int argc, char** argv)
     partialStop["stopAfterDay"] = 1;
     QJsonObject incomplete = validConfig();
     incomplete.remove("watchdogMs");
+    QJsonObject zeroTurnLimit = validConfig();
+    zeroTurnLimit["turnLimit"] = 0;
+    QJsonObject negativeTurnLimit = validConfig();
+    negativeTurnLimit["turnLimit"] = -1;
     if (!rejected(unsafePath) || !rejected(invalidController) ||
-        !rejected(partialStop) || !rejected(incomplete))
+        !rejected(partialStop) || !rejected(incomplete) ||
+        !rejected(zeroTurnLimit) || !rejected(negativeTurnLimit))
     {
         return 5;
+    }
+    QJsonObject unlimited = validConfig();
+    unlimited.remove("turnLimit");
+    if (!load(path, unlimited, config) || config.turnLimit != 0)
+    {
+        return 11;
     }
     for (const QString & invalidHeavy :
          {QStringLiteral("Heavy"), QStringLiteral("Heavy:-1"),
