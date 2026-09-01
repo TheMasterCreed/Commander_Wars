@@ -84,6 +84,11 @@ namespace Coordinator
             return false;
         }
 
+        virtual bool liveSettlingIntervals() const
+        {
+            return livePairSwapIntervals();
+        }
+
         virtual LivePlanStockQuote livePlanStock(
             const TurnPlan &,
             MilliFunds,

@@ -1067,9 +1067,22 @@ namespace Coordinator
             PlanBundleKind kind{PlanBundleKind::Wait};
             TilePoint destination{INVALID_TILE};
             MilliFunds seatedValue{0};
-            MilliFunds bookedStockDelta{0};
-            MilliFunds bookedCompleteValue{0};
+            MilliFunds fullEconomic{0};
+            MilliFunds liveStockLower{0};
+            MilliFunds liveStockUpper{0};
+            MilliFunds liveCompleteLower{0};
+            MilliFunds liveCompleteUpper{0};
+            bool liveValid{false};
+            bool lowerWitnessReplays{false};
             TurnPlan plan;
+        };
+
+        struct StockSettlingValue
+        {
+            MilliFunds economic{0};
+            MilliFunds lower{0};
+            MilliFunds upper{0};
+            LivePlanStockQuote quote;
         };
 
         struct PairExactAuditRequest
@@ -1405,9 +1418,7 @@ namespace Coordinator
             const ActorProgress & state,
             std::int32_t option,
             std::int32_t sweep,
-            MilliFunds seatedValue,
-            MilliFunds bookedStockDelta,
-            MilliFunds bookedCompleteValue,
+            const StockSettlingValue & value,
             DeferredAudits & audits)
         {
             if (input.pTrace == nullptr ||
@@ -1431,222 +1442,623 @@ namespace Coordinator
                         planBundleKindOf(candidate.bundle),
                     .destination =
                         candidate.bundle.destination,
-                    .seatedValue = seatedValue,
-                    .bookedStockDelta =
-                        bookedStockDelta,
-                    .bookedCompleteValue =
-                        bookedCompleteValue,
+                    .seatedValue = state.seatedValue,
+                    .fullEconomic = value.economic,
+                    .liveStockLower =
+                        value.quote.stockAbsolute.lower,
+                    .liveStockUpper =
+                        value.quote.stockAbsolute.upper,
+                    .liveCompleteLower = value.lower,
+                    .liveCompleteUpper = value.upper,
+                    .liveValid = value.quote.valid,
+                    .lowerWitnessReplays =
+                        value.quote.lowerWitnessReplays,
                     .plan = plan,
                 });
+        }
+
+        static void recordStockSettlingComparison(
+            const AssignmentInput & input,
+            const ActorProgress & state,
+            std::int32_t sweep,
+            std::int32_t previousChosen,
+            std::int32_t challenger,
+            const StockSettlingValue & incumbent,
+            const std::optional<StockSettlingValue> & challengerValue,
+            ReservationResult claim,
+            const QString & reason,
+            bool accepted)
+        {
+            if (input.pTrace == nullptr ||
+                !input.pTrace->stockDetailsEnabled())
+            {
+                return;
+            }
+            const CandidateBundle* pCandidate =
+                challenger == NO_CANDIDATE
+                    ? nullptr
+                    : &state.pActor->candidates[
+                          static_cast<std::size_t>(challenger)];
+            const bool incumbentValid =
+                incumbent.quote.valid &&
+                incumbent.quote.lowerWitnessReplays;
+            const bool challengerValid =
+                challengerValue.has_value() &&
+                challengerValue->quote.valid &&
+                challengerValue->quote.lowerWitnessReplays;
+            QString fields = QStringLiteral(
+                "sweep=%1 actor=%2 previousCandidate=%3 challenger=%4 kind=%5 destination=%6 claim=%7")
+                                 .arg(sweep)
+                                 .arg(state.pActor->engineUnitId)
+                                 .arg(previousChosen)
+                                 .arg(challenger)
+                                 .arg(
+                                     pCandidate == nullptr
+                                         ? QStringLiteral("NONE")
+                                         : traceBundleKind(
+                                               planBundleKindOf(
+                                                   pCandidate->bundle)))
+                                 .arg(
+                                     pCandidate == nullptr
+                                         ? traceTile(INVALID_TILE)
+                                         : traceTile(
+                                               pCandidate->bundle.destination))
+                                 .arg(traceReservationResult(claim));
+            fields += QStringLiteral(
+                " incumbentEconomic=%1 incumbentStockLower=%2 incumbentStockUpper=%3 incumbentLower=%4 incumbentUpper=%5 incumbentValid=%6 incumbentLowerWitnessReplays=%7")
+                          .arg(incumbent.economic)
+                          .arg(
+                              incumbentValid
+                                  ? QString::number(
+                                        incumbent.quote.stockAbsolute.lower)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              incumbentValid
+                                  ? QString::number(
+                                        incumbent.quote.stockAbsolute.upper)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              incumbentValid
+                                  ? QString::number(incumbent.lower)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              incumbentValid
+                                  ? QString::number(incumbent.upper)
+                                  : QStringLiteral("NA"))
+                          .arg(traceBool(incumbent.quote.valid))
+                          .arg(traceBool(
+                              incumbent.quote.lowerWitnessReplays));
+            fields += QStringLiteral(
+                " challengerEconomic=%1 challengerStockLower=%2 challengerStockUpper=%3 challengerLower=%4 challengerUpper=%5 valid=%6 lowerWitnessReplays=%7 exact=%8 reason=%9 accepted=%10")
+                          .arg(
+                              challengerValue.has_value()
+                                  ? QString::number(
+                                        challengerValue->economic)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              challengerValid
+                                  ? QString::number(
+                                        challengerValue->quote
+                                            .stockAbsolute.lower)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              challengerValid
+                                  ? QString::number(
+                                        challengerValue->quote
+                                            .stockAbsolute.upper)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              challengerValid
+                                  ? QString::number(
+                                        challengerValue->lower)
+                                  : QStringLiteral("NA"))
+                          .arg(
+                              challengerValid
+                                  ? QString::number(
+                                        challengerValue->upper)
+                                  : QStringLiteral("NA"))
+                          .arg(traceBool(
+                              challengerValue.has_value() &&
+                              challengerValue->quote.valid))
+                          .arg(traceBool(
+                              challengerValue.has_value() &&
+                              challengerValue->quote
+                                  .lowerWitnessReplays))
+                          .arg(traceBool(
+                              challengerValid &&
+                              challengerValue->lower ==
+                                  challengerValue->upper))
+                          .arg(reason)
+                          .arg(traceBool(accepted));
+            input.pTrace->record(
+                QStringLiteral("SETTLING_CHALLENGER"),
+                fields);
+        }
+
+        static void recordStockSettlingWinner(
+            const AssignmentInput & input,
+            const ActorProgress & state,
+            std::int32_t sweep,
+            const StockSettlingValue & winner,
+            const QString & reason,
+            bool changed)
+        {
+            if (input.pTrace == nullptr)
+            {
+                return;
+            }
+            const CandidateBundle* pWinner =
+                state.chosen == NO_CANDIDATE
+                    ? nullptr
+                    : &state.pActor->candidates[
+                          static_cast<std::size_t>(state.chosen)];
+            const bool valid =
+                winner.quote.valid &&
+                winner.quote.lowerWitnessReplays;
+            const bool exact =
+                valid && winner.lower == winner.upper;
+            bool completeKnown = false;
+            MilliFunds completeValue = 0;
+            if (state.chosen != NO_CANDIDATE &&
+                state.chosen >= 0 &&
+                state.chosen <
+                    static_cast<std::int32_t>(
+                        state.completeValues.size()))
+            {
+                const AssignmentResult::CandidateCompleteValue &
+                    complete =
+                        state.completeValues[
+                            static_cast<std::size_t>(
+                                state.chosen)];
+                completeKnown = complete.known;
+                completeValue = complete.value;
+            }
+            input.pTrace->record(
+                QStringLiteral("SETTLING_WINNER"),
+                QStringLiteral(
+                    "sweep=%1 actor=%2 candidate=%3 kind=%4 destination=%5 economic=%6 stockLower=%7 stockUpper=%8 lower=%9 upper=%10 valid=%11 lowerWitnessReplays=%12 exact=%13 completeValue=%14 completeKnown=%15 changed=%16 reason=%17")
+                    .arg(sweep)
+                    .arg(state.pActor->engineUnitId)
+                    .arg(state.chosen)
+                    .arg(
+                        pWinner == nullptr
+                            ? QStringLiteral("NONE")
+                            : traceBundleKind(
+                                  planBundleKindOf(
+                                      pWinner->bundle)))
+                    .arg(
+                        pWinner == nullptr
+                            ? traceTile(INVALID_TILE)
+                            : traceTile(
+                                  pWinner->bundle.destination))
+                    .arg(winner.economic)
+                    .arg(
+                        valid
+                            ? QString::number(
+                                  winner.quote.stockAbsolute.lower)
+                            : QStringLiteral("NA"))
+                    .arg(
+                        valid
+                            ? QString::number(
+                                  winner.quote.stockAbsolute.upper)
+                            : QStringLiteral("NA"))
+                    .arg(
+                        valid
+                            ? QString::number(winner.lower)
+                            : QStringLiteral("NA"))
+                    .arg(
+                        valid
+                            ? QString::number(winner.upper)
+                            : QStringLiteral("NA"))
+                    .arg(traceBool(winner.quote.valid))
+                    .arg(traceBool(
+                        winner.quote.lowerWitnessReplays))
+                    .arg(traceBool(exact))
+                    .arg(
+                        completeKnown
+                            ? QString::number(completeValue)
+                            : QStringLiteral("NA"))
+                    .arg(traceBool(completeKnown))
+                    .arg(traceBool(changed))
+                    .arg(reason));
+        }
+
+        static void recordStockSettlingReplay(
+            const AssignmentInput & input,
+            const ActorProgress & state,
+            std::int32_t sweep,
+            std::int32_t retainedOption,
+            const StockSettlingValue & retained,
+            const StockSettlingValue & replayed,
+            ReservationResult claim,
+            bool replayValid)
+        {
+            if (input.pTrace == nullptr ||
+                !input.pTrace->stockDetailsEnabled())
+            {
+                return;
+            }
+            const bool keyMatches =
+                replayed.quote.key ==
+                retained.quote.key;
+            input.pTrace->record(
+                QStringLiteral("SETTLING_REPLAY"),
+                QStringLiteral(
+                    "sweep=%1 actor=%2 retainedCandidate=%3 claim=%4 retainedLower=%5 retainedUpper=%6 replayLower=%7 replayUpper=%8 valid=%9 lowerWitnessReplays=%10 keyMatches=%11 lowerMatches=%12 upperMatches=%13 reason=%14")
+                    .arg(sweep)
+                    .arg(state.pActor->engineUnitId)
+                    .arg(retainedOption)
+                    .arg(traceReservationResult(claim))
+                    .arg(retained.lower)
+                    .arg(retained.upper)
+                    .arg(replayed.lower)
+                    .arg(replayed.upper)
+                    .arg(traceBool(replayed.quote.valid))
+                    .arg(traceBool(
+                        replayed.quote.lowerWitnessReplays))
+                    .arg(traceBool(keyMatches))
+                    .arg(traceBool(
+                        replayed.lower == retained.lower))
+                    .arg(traceBool(
+                        replayed.upper == retained.upper))
+                    .arg(
+                        replayValid
+                            ? QStringLiteral("REPLAY_VALID")
+                            : QStringLiteral("REPLAY_FAILURE")));
+        }
+
+        static void setCompleteValue(
+            ActorProgress & state,
+            std::int32_t option,
+            const StockSettlingValue & value)
+        {
+            if (option == NO_CANDIDATE ||
+                option < 0 ||
+                option >=
+                    static_cast<std::int32_t>(
+                        state.completeValues.size()))
+            {
+                return;
+            }
+            AssignmentResult::CandidateCompleteValue & complete =
+                state.completeValues[
+                    static_cast<std::size_t>(option)];
+            complete.known =
+                value.quote.valid &&
+                value.quote.lowerWitnessReplays &&
+                value.lower == value.upper;
+            complete.value =
+                complete.known ? value.lower : 0;
+        }
+
+        static StockSettlingValue quoteStockSettlingValue(
+            const TurnPlan & plan,
+            const AssignmentInput & input,
+            const std::vector<ActorProgress> & actors)
+        {
+            StockSettlingValue value;
+            value.economic =
+                seatedPlanTotal(plan, actors);
+            value.quote =
+                input.pStockValuer->livePlanStock(
+                    plan,
+                    value.economic,
+                    false);
+            value.lower =
+                value.economic +
+                value.quote.stockAbsolute.lower;
+            value.upper =
+                value.economic +
+                value.quote.stockAbsolute.upper;
+            return value;
+        }
+
+        static void restoreStockSettlingState(
+            TurnPlan & plan,
+            ActorProgress & state,
+            const TurnPlan & originalPlan,
+            const ActorSeat & originalSeat,
+            AssignmentResult::SelectionPhase originalPhase,
+            const std::vector<
+                AssignmentResult::CandidateCompleteValue> &
+                originalCompleteValues)
+        {
+            plan = originalPlan;
+            state.chosen = originalSeat.chosen;
+            state.actionIndex = originalSeat.actionIndex;
+            state.seatedValue = originalSeat.seatedValue;
+            state.phase = originalPhase;
+            state.completeValues = originalCompleteValues;
         }
 
         static bool settleStockActor(
             TurnPlan & plan,
             const AssignmentInput & input,
-            ActorProgress & state,
+            std::vector<ActorProgress> & actors,
+            std::int32_t actorSlot,
             std::int32_t sweep,
+            AssignmentStats & stats,
             DeferredAudits & audits)
         {
+            ActorProgress & state =
+                actors[static_cast<std::size_t>(actorSlot)];
+            const TurnPlan originalPlan = plan;
+            const ActorSeat originalSeat{
+                state.chosen,
+                state.actionIndex,
+                state.seatedValue,
+            };
+            const AssignmentResult::SelectionPhase originalPhase =
+                state.phase;
+            const std::vector<
+                AssignmentResult::CandidateCompleteValue>
+                originalCompleteValues =
+                    state.completeValues;
             const std::int32_t previousChosen = state.chosen;
-            const MilliFunds previousSeated = state.seatedValue;
-            const MilliFunds previousStockDelta =
-                planStockDelta(input, plan);
-            const MilliFunds previousValue =
-                previousSeated + previousStockDelta;
+            for (AssignmentResult::CandidateCompleteValue & value :
+                 state.completeValues)
+            {
+                value = AssignmentResult::CandidateCompleteValue{};
+            }
+
+            StockSettlingValue retained;
+            retained.economic =
+                seatedPlanTotal(plan, actors);
+            if (input.pStockValuer == nullptr ||
+                !input.pStockValuer->liveSettlingIntervals())
+            {
+                recordStockSettlingComparison(
+                    input,
+                    state,
+                    sweep,
+                    previousChosen,
+                    NO_CANDIDATE,
+                    retained,
+                    std::nullopt,
+                    ReservationResult::Granted,
+                    QStringLiteral(
+                        "LIVE_INTERVAL_UNAVAILABLE"),
+                    false);
+                recordStockSettlingWinner(
+                    input,
+                    state,
+                    sweep,
+                    retained,
+                    QStringLiteral(
+                        "LIVE_INTERVAL_UNAVAILABLE"),
+                    false);
+                return false;
+            }
+
+            retained =
+                quoteStockSettlingValue(
+                    plan,
+                    input,
+                    actors);
+            if (!retained.quote.valid ||
+                !retained.quote.lowerWitnessReplays)
+            {
+                recordStockSettlingComparison(
+                    input,
+                    state,
+                    sweep,
+                    previousChosen,
+                    NO_CANDIDATE,
+                    retained,
+                    std::nullopt,
+                    ReservationResult::Granted,
+                    QStringLiteral(
+                        "LIVE_INTERVAL_FAILURE"),
+                    false);
+                recordStockSettlingWinner(
+                    input,
+                    state,
+                    sweep,
+                    retained,
+                    QStringLiteral(
+                        "LIVE_INTERVAL_FAILURE"),
+                    false);
+                return false;
+            }
+            const StockSettlingValue originalIncumbent =
+                retained;
+            setCompleteValue(
+                state,
+                previousChosen,
+                retained);
             deferStockDecomposition(
                 plan,
                 input,
                 state,
                 previousChosen,
                 sweep,
-                previousSeated,
-                previousStockDelta,
-                previousValue,
+                retained,
                 audits);
-            if (previousChosen != NO_CANDIDATE &&
-                previousChosen <
-                    static_cast<std::int32_t>(
-                        state.completeValues.size()))
-            {
-                state.completeValues[static_cast<std::size_t>(
-                    previousChosen)] =
-                    AssignmentResult::CandidateCompleteValue{
-                        previousValue, true};
-            }
-            const std::vector<std::int32_t> options = incumbentFirstOptions(state);
+
+            const std::vector<std::int32_t> options =
+                incumbentFirstOptions(state);
             unseatActor(plan, state);
-            std::int32_t bestOption = previousChosen;
-            MilliFunds bestValue = previousValue;
+            std::int32_t retainedOption = previousChosen;
             for (const std::int32_t option : options)
             {
                 if (option == previousChosen)
                 {
                     continue;
                 }
-                const SeatOutcome outcome = seatOption(plan, input, state, option);
-                if (outcome.claim != ReservationResult::Granted)
+                const SeatOutcome outcome =
+                    seatOption(
+                        plan,
+                        input,
+                        state,
+                        option);
+                if (outcome.claim !=
+                    ReservationResult::Granted)
                 {
-                    if (input.pTrace != nullptr &&
-                        input.pTrace->stockDetailsEnabled())
-                    {
-                        const CandidateBundle* pCandidate =
-                            option == NO_CANDIDATE
-                                ? nullptr
-                                : &state.pActor->candidates[
-                                      static_cast<std::size_t>(
-                                          option)];
-                        input.pTrace->record(
-                            QStringLiteral("SETTLING_CHALLENGER"),
-                            QStringLiteral(
-                                "sweep=%1 actor=%2 previousCandidate=%3 previousSeated=%4 previousStockDelta=%5 previousComplete=%6 challenger=%7 kind=%8 destination=%9 challengerSeated=NA challengerStockDelta=NA challengerComplete=NA claim=%10 accepted=false")
-                                .arg(sweep)
-                                .arg(state.pActor->engineUnitId)
-                                .arg(previousChosen)
-                                .arg(previousSeated)
-                                .arg(previousStockDelta)
-                                .arg(previousValue)
-                                .arg(option)
-                                .arg(
-                                    pCandidate == nullptr
-                                        ? QStringLiteral("NONE")
-                                        : traceBundleKind(
-                                              planBundleKindOf(
-                                                  pCandidate->bundle)))
-                                .arg(
-                                    pCandidate == nullptr
-                                        ? traceTile(INVALID_TILE)
-                                        : traceTile(
-                                              pCandidate->bundle
-                                                  .destination))
-                                .arg(traceReservationResult(
-                                    outcome.claim)));
-                    }
+                    recordStockSettlingComparison(
+                        input,
+                        state,
+                        sweep,
+                        retainedOption,
+                        option,
+                        retained,
+                        std::nullopt,
+                        outcome.claim,
+                        QStringLiteral(
+                            "CLAIM_NOT_GRANTED"),
+                        false);
                     continue;
                 }
-                const MilliFunds challengerStockDelta =
-                    planStockDelta(input, plan);
-                const MilliFunds value =
-                    outcome.value + challengerStockDelta;
-                if (option != NO_CANDIDATE &&
-                    option <
-                        static_cast<std::int32_t>(
-                            state.completeValues.size()))
+
+                const StockSettlingValue challenger =
+                    quoteStockSettlingValue(
+                        plan,
+                        input,
+                        actors);
+                if (!challenger.quote.valid ||
+                    !challenger.quote
+                         .lowerWitnessReplays)
                 {
-                    state.completeValues[static_cast<std::size_t>(
-                        option)] =
-                        AssignmentResult::CandidateCompleteValue{
-                            value, true};
+                    recordStockSettlingComparison(
+                        input,
+                        state,
+                        sweep,
+                        retainedOption,
+                        option,
+                        retained,
+                        challenger,
+                        outcome.claim,
+                        QStringLiteral(
+                            "LIVE_INTERVAL_FAILURE"),
+                        false);
+                    restoreStockSettlingState(
+                        plan,
+                        state,
+                        originalPlan,
+                        originalSeat,
+                        originalPhase,
+                        originalCompleteValues);
+                    recordStockSettlingWinner(
+                        input,
+                        state,
+                        sweep,
+                        originalIncumbent,
+                        QStringLiteral(
+                            "LIVE_INTERVAL_FAILURE"),
+                        false);
+                    return false;
                 }
+                setCompleteValue(
+                    state,
+                    option,
+                    challenger);
                 deferStockDecomposition(
                     plan,
                     input,
                     state,
                     option,
                     sweep,
-                    outcome.value,
-                    challengerStockDelta,
-                    value,
+                    challenger,
                     audits);
+                const bool pruned =
+                    challenger.upper <= retained.lower;
+                const bool accepted =
+                    challenger.lower > retained.upper;
+                recordStockSettlingComparison(
+                    input,
+                    state,
+                    sweep,
+                    retainedOption,
+                    option,
+                    retained,
+                    challenger,
+                    outcome.claim,
+                    pruned
+                        ? QStringLiteral(
+                              "UPPER_NOT_ABOVE_INCUMBENT_LOWER")
+                        : accepted
+                              ? QStringLiteral(
+                                    "LOWER_ABOVE_INCUMBENT_UPPER")
+                              : QStringLiteral(
+                                    "INTERVAL_OVERLAP"),
+                    accepted);
                 unseatActor(plan, state);
-                const bool accepted = value > bestValue;
-                if (input.pTrace != nullptr &&
-                    input.pTrace->stockDetailsEnabled())
+                if (accepted)
                 {
-                    const CandidateBundle* pCandidate =
-                        option == NO_CANDIDATE
-                            ? nullptr
-                            : &state.pActor->candidates[
-                                  static_cast<std::size_t>(option)];
-                    input.pTrace->record(
-                        QStringLiteral("SETTLING_CHALLENGER"),
-                        QStringLiteral(
-                            "sweep=%1 actor=%2 previousCandidate=%3 previousSeated=%4 previousStockDelta=%5 previousComplete=%6 challenger=%7 kind=%8 destination=%9 challengerSeated=%10 challengerStockDelta=%11 challengerComplete=%12 claim=GRANTED accepted=%13")
-                            .arg(sweep)
-                            .arg(state.pActor->engineUnitId)
-                            .arg(previousChosen)
-                            .arg(previousSeated)
-                            .arg(previousStockDelta)
-                            .arg(previousValue)
-                            .arg(option)
-                            .arg(
-                                pCandidate == nullptr
-                                    ? QStringLiteral("NONE")
-                                    : traceBundleKind(
-                                          planBundleKindOf(
-                                              pCandidate->bundle)))
-                            .arg(
-                                pCandidate == nullptr
-                                    ? traceTile(INVALID_TILE)
-                                    : traceTile(
-                                          pCandidate->bundle.destination))
-                            .arg(outcome.value)
-                            .arg(challengerStockDelta)
-                            .arg(value)
-                            .arg(traceBool(accepted)));
-                }
-                if (value > bestValue)
-                {
-                    bestOption = option;
-                    bestValue = value;
+                    retainedOption = option;
+                    retained = challenger;
                 }
             }
+
             const SeatOutcome winningOutcome =
-                seatOption(plan, input, state, bestOption);
-            if (winningOutcome.claim != ReservationResult::Granted)
+                seatOption(
+                    plan,
+                    input,
+                    state,
+                    retainedOption);
+            const StockSettlingValue replayed =
+                winningOutcome.claim ==
+                        ReservationResult::Granted
+                    ? quoteStockSettlingValue(
+                          plan,
+                          input,
+                          actors)
+                    : StockSettlingValue{};
+            const bool replayValid =
+                winningOutcome.claim ==
+                    ReservationResult::Granted &&
+                replayed.quote.valid &&
+                replayed.quote.lowerWitnessReplays &&
+                replayed.quote.key ==
+                    retained.quote.key &&
+                replayed.lower == retained.lower &&
+                replayed.upper == retained.upper;
+            recordStockSettlingReplay(
+                input,
+                state,
+                sweep,
+                retainedOption,
+                retained,
+                replayed,
+                winningOutcome.claim,
+                replayValid);
+            if (!replayValid)
             {
-                seatBestClaimable(plan, input, state, options);
+                ++stats.replayFailures;
+                restoreStockSettlingState(
+                    plan,
+                    state,
+                    originalPlan,
+                    originalSeat,
+                    originalPhase,
+                    originalCompleteValues);
+                recordStockSettlingWinner(
+                    input,
+                    state,
+                    sweep,
+                    originalIncumbent,
+                    QStringLiteral("REPLAY_FAILURE"),
+                    false);
+                return false;
             }
-            const bool changed = state.chosen != previousChosen;
+
+            setCompleteValue(
+                state,
+                retainedOption,
+                replayed);
+            const bool changed =
+                state.chosen != previousChosen;
             if (changed)
             {
                 state.phase =
                     AssignmentResult::SelectionPhase::Settling;
             }
-            if (input.pTrace != nullptr)
-            {
-                const CandidateBundle* pWinner =
-                    state.chosen == NO_CANDIDATE
-                        ? nullptr
-                        : &state.pActor->candidates[
-                              static_cast<std::size_t>(
-                                  state.chosen)];
-                bool completeKnown = false;
-                MilliFunds completeValue = 0;
-                if (state.chosen != NO_CANDIDATE &&
-                    state.chosen <
-                        static_cast<std::int32_t>(
-                            state.completeValues.size()))
-                {
-                    const AssignmentResult::CandidateCompleteValue &
-                        known =
-                            state.completeValues[
-                                static_cast<std::size_t>(
-                                    state.chosen)];
-                    completeKnown = known.known;
-                    completeValue = known.value;
-                }
-                input.pTrace->record(
-                    QStringLiteral("SETTLING_WINNER"),
-                    QStringLiteral(
-                        "sweep=%1 actor=%2 candidate=%3 kind=%4 destination=%5 completeValue=%6 completeKnown=%7 changed=%8")
-                        .arg(sweep)
-                        .arg(state.pActor->engineUnitId)
-                        .arg(state.chosen)
-                        .arg(
-                            pWinner == nullptr
-                                ? QStringLiteral("NONE")
-                                : traceBundleKind(
-                                      planBundleKindOf(
-                                          pWinner->bundle)))
-                        .arg(
-                            pWinner == nullptr
-                                ? traceTile(INVALID_TILE)
-                                : traceTile(
-                                      pWinner->bundle.destination))
-                        .arg(completeValue)
-                        .arg(traceBool(completeKnown))
-                        .arg(traceBool(changed)));
-            }
+            recordStockSettlingWinner(
+                input,
+                state,
+                sweep,
+                replayed,
+                QStringLiteral("REPLAY_VALID"),
+                changed);
             return changed;
         }
 
@@ -1670,8 +2082,10 @@ namespace Coordinator
                         if (settleStockActor(
                                 plan,
                                 input,
-                                state,
+                                actors,
+                                slot,
                                 sweep,
+                                stats,
                                 audits))
                         {
                             moved = true;
@@ -2832,22 +3246,43 @@ namespace Coordinator
             const MilliFunds scalarStockDelta =
                 audit.scalarStockAbsolute -
                 audit.liveOriginStock;
-            const MilliFunds exactCompleteValue =
+            const MilliFunds legacyActorCompleteValue =
                 request.seatedValue +
                 scalarStockDelta;
+            const MilliFunds legacyFullCompleteValue =
+                request.fullEconomic +
+                audit.scalarStockAbsolute;
             const MilliFunds sequentialAdjustment =
                 audit.ours.bookedValue -
                 audit.ourOpenOptimum -
                 (audit.enemy.bookedValue -
                  audit.jointEnemyOptimum);
-            const bool observedMatchesAudit =
+            const bool liveIntervalValid =
+                request.liveValid &&
+                request.lowerWitnessReplays &&
+                request.liveStockLower <=
+                    request.liveStockUpper &&
+                request.liveCompleteLower <=
+                    request.liveCompleteUpper;
+            const bool scalarInLiveBounds =
                 audit.available &&
-                scalarStockDelta ==
-                    request.bookedStockDelta &&
-                exactCompleteValue ==
-                    request.bookedCompleteValue;
+                liveIntervalValid &&
+                audit.scalarStockAbsolute >=
+                    request.liveStockLower &&
+                audit.scalarStockAbsolute <=
+                    request.liveStockUpper &&
+                legacyFullCompleteValue >=
+                    request.liveCompleteLower &&
+                legacyFullCompleteValue <=
+                    request.liveCompleteUpper;
+            const bool liveExact =
+                liveIntervalValid &&
+                request.liveCompleteLower ==
+                    request.liveCompleteUpper;
             const bool exact =
-                observedMatchesAudit &&
+                liveExact &&
+                legacyFullCompleteValue ==
+                    request.liveCompleteLower &&
                 audit.scalarExact &&
                 audit.scalarWitnessReplays &&
                 audit.originExact &&
@@ -2855,10 +3290,24 @@ namespace Coordinator
             QString reason =
                 stockAuditReason(audit, true);
             if (reason == QStringLiteral("PROVEN") &&
-                !observedMatchesAudit)
+                !liveIntervalValid)
             {
                 reason = QStringLiteral(
-                    "OBSERVED_SCALAR_MISMATCH");
+                    "LIVE_INTERVAL_FAILURE");
+            }
+            else if (
+                reason == QStringLiteral("PROVEN") &&
+                !liveExact)
+            {
+                reason = QStringLiteral(
+                    "LIVE_INTERVAL_UNRESOLVED");
+            }
+            else if (
+                reason == QStringLiteral("PROVEN") &&
+                !exact)
+            {
+                reason = QStringLiteral(
+                    "LIVE_SCALAR_MISMATCH");
             }
             const PlanStockActionAudit* pAction =
                 matchingActionAudit(audit, request);
@@ -2911,15 +3360,23 @@ namespace Coordinator
                 .arg(traceBool(
                     audit.enemy.witnessReplays));
             fields += QStringLiteral(
-                " sequentialAdjustment=%1 scalarStockAbsolute=%2 originStock=%3 originScalarStock=%4 scalarStockDelta=%5 observedStockDelta=%6 observedCompleteValue=%7 observedMatchesAudit=%8 auditAvailable=%9 exactStockAbsolute=%10 exactStockDelta=%11 exactCompleteValue=%12 exactAvailable=%13 reason=%14")
+                " sequentialAdjustment=%1 scalarStockAbsolute=%2 originStock=%3 originScalarStock=%4 scalarStockDelta=%5 legacyActorCompleteValue=%6 legacyFullCompleteValue=%7 liveStockLower=%8 liveStockUpper=%9 liveCompleteLower=%10 liveCompleteUpper=%11 liveValid=%12 lowerWitnessReplays=%13 liveExact=%14 scalarInLiveBounds=%15 auditAvailable=%16 exactStockAbsolute=%17 exactStockDelta=%18 exactCompleteValue=%19 exactAvailable=%20 reason=%21")
                 .arg(sequentialAdjustment)
                 .arg(audit.scalarStockAbsolute)
                 .arg(audit.liveOriginStock)
                 .arg(audit.originScalarStock)
                 .arg(scalarStockDelta)
-                .arg(request.bookedStockDelta)
-                .arg(request.bookedCompleteValue)
-                .arg(traceBool(observedMatchesAudit))
+                .arg(legacyActorCompleteValue)
+                .arg(legacyFullCompleteValue)
+                .arg(request.liveStockLower)
+                .arg(request.liveStockUpper)
+                .arg(request.liveCompleteLower)
+                .arg(request.liveCompleteUpper)
+                .arg(traceBool(request.liveValid))
+                .arg(traceBool(
+                    request.lowerWitnessReplays))
+                .arg(traceBool(liveExact))
+                .arg(traceBool(scalarInLiveBounds))
                 .arg(traceBool(audit.available))
                 .arg(traceAuditValue(
                     exact,
@@ -2929,7 +3386,7 @@ namespace Coordinator
                     scalarStockDelta))
                 .arg(traceAuditValue(
                     exact,
-                    exactCompleteValue))
+                    legacyFullCompleteValue))
                 .arg(traceBool(exact))
                 .arg(reason);
             if (pAction == nullptr)

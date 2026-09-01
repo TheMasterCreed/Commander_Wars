@@ -129,6 +129,11 @@ public:
         return true;
     }
 
+    bool liveSettlingIntervals() const override
+    {
+        return false;
+    }
+
     Coordinator::LivePlanStockQuote livePlanStock(
         const TurnPlan & plan,
         MilliFunds,
@@ -308,6 +313,11 @@ public:
     bool livePairSwapIntervals() const override
     {
         return m_liveSupported;
+    }
+
+    bool liveSettlingIntervals() const override
+    {
+        return false;
     }
 
     Coordinator::LivePlanStockQuote livePlanStock(
@@ -491,6 +501,244 @@ private:
     }
 };
 
+enum class SettlingIntervalFailure
+{
+    None,
+    IncumbentWitness,
+    ChallengerQuote,
+    ChallengerWitness,
+    ReplayKey,
+    ReplayUpper,
+};
+
+struct SettlingPlanValue
+{
+    TilePoint destination{Coordinator::INVALID_TILE};
+    StockInterval interval;
+};
+
+class CertifiedSettlingValuer final : public PlanStockValuer
+{
+public:
+    CertifiedSettlingValuer(
+        std::vector<SettlingPlanValue> values,
+        SettlingIntervalFailure failure =
+            SettlingIntervalFailure::None,
+        bool liveSupported = true)
+        : m_values(std::move(values)),
+          m_failure(failure),
+          m_liveSupported(liveSupported)
+    {
+    }
+
+    MilliFunds planStock(const TurnPlan & plan) override
+    {
+        ++scalarCalls;
+        const PlannedAction* pAction =
+            attackerAction(plan);
+        return pAction != nullptr &&
+                       pAction->destination == SPARE_TILE
+                   ? 1000000
+                   : 0;
+    }
+
+    MilliFunds originStock() const override
+    {
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        return 1000000;
+    }
+
+    bool affectsStock(std::int32_t engineUnitId) const override
+    {
+        return engineUnitId == ATTACKER_UNIT;
+    }
+
+    bool livePairSwapIntervals() const override
+    {
+        return m_liveSupported;
+    }
+
+    bool liveSettlingIntervals() const override
+    {
+        return m_liveSupported;
+    }
+
+    Coordinator::LivePlanStockQuote livePlanStock(
+        const TurnPlan & plan,
+        MilliFunds economic,
+        bool) override
+    {
+        ++liveQuotes;
+        economicInputs.push_back(economic);
+        Coordinator::LivePlanStockQuote quote;
+        const MilliFunds actualEconomic =
+            economicValue(plan);
+        if (economic != actualEconomic)
+        {
+            economicBasisMismatch = true;
+            return quote;
+        }
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (!Coordinator::isLiveState(
+                    action.state))
+            {
+                continue;
+            }
+            const bool captures =
+                action.kind ==
+                    PlanBundleKind::Capture ||
+                action.kind ==
+                    PlanBundleKind::MoveAndCapture;
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::
+                    fromAction(
+                        action.unitId,
+                        action.destination.x,
+                        action.destination.y,
+                        captures));
+        }
+        std::sort(quote.key.begin(), quote.key.end());
+        const PlannedAction* pAttacker =
+            attackerAction(plan);
+        const TilePoint destination =
+            pAttacker == nullptr
+                ? Coordinator::INVALID_TILE
+                : pAttacker->destination;
+        const StockInterval interval =
+            intervalFor(destination);
+        quote.stockAbsolute = StockInterval{
+            interval.lower - economic,
+            interval.upper - economic,
+        };
+        std::int32_t destinationQuotes = 0;
+        for (const TilePoint quoted : quotedDestinations)
+        {
+            if (quoted == destination)
+            {
+                ++destinationQuotes;
+            }
+        }
+        quotedDestinations.push_back(destination);
+        if (m_failure ==
+                SettlingIntervalFailure::
+                    IncumbentWitness &&
+            liveQuotes == 1)
+        {
+            quote.valid = true;
+            return quote;
+        }
+        if (destination == SPARE_TILE &&
+            destinationQuotes == 0 &&
+            m_failure ==
+                SettlingIntervalFailure::
+                    ChallengerQuote)
+        {
+            return Coordinator::LivePlanStockQuote{};
+        }
+        if (destination == SPARE_TILE &&
+            destinationQuotes == 0 &&
+            m_failure ==
+                SettlingIntervalFailure::
+                    ChallengerWitness)
+        {
+            quote.valid = true;
+            return quote;
+        }
+        if (destination == SPARE_TILE &&
+            destinationQuotes == 1 &&
+            m_failure ==
+                SettlingIntervalFailure::ReplayKey)
+        {
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::
+                    fromAction(-1, -1, -1, false));
+        }
+        if (destination == SPARE_TILE &&
+            destinationQuotes == 1 &&
+            m_failure ==
+                SettlingIntervalFailure::ReplayUpper)
+        {
+            ++quote.stockAbsolute.upper;
+        }
+        quote.valid = true;
+        quote.lowerWitnessReplays = true;
+        return quote;
+    }
+
+    std::int32_t scalarCalls{0};
+    std::int32_t liveQuotes{0};
+    bool economicBasisMismatch{false};
+    std::vector<MilliFunds> economicInputs;
+
+private:
+    std::vector<SettlingPlanValue> m_values;
+    SettlingIntervalFailure m_failure;
+    bool m_liveSupported{true};
+    std::vector<TilePoint> quotedDestinations;
+
+    static const PlannedAction* attackerAction(
+        const TurnPlan & plan)
+    {
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (Coordinator::isLiveState(
+                    action.state) &&
+                action.unitId == ATTACKER_UNIT)
+            {
+                return &action;
+            }
+        }
+        return nullptr;
+    }
+
+    static MilliFunds economicValue(
+        const TurnPlan & plan)
+    {
+        MilliFunds total = 0;
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (Coordinator::isLiveState(
+                    action.state))
+            {
+                total +=
+                    action.marginalValue.economicValue;
+            }
+        }
+        return total;
+    }
+
+    StockInterval intervalFor(
+        TilePoint destination) const
+    {
+        for (const SettlingPlanValue & value :
+             m_values)
+        {
+            if (value.destination == destination)
+            {
+                return value.interval;
+            }
+        }
+        return StockInterval{-1000000, -1000000};
+    }
+};
+
 class DecompositionValuer final : public PlanStockValuer
 {
 public:
@@ -520,6 +768,55 @@ public:
     bool affectsStock(std::int32_t engineUnitId) const override
     {
         return engineUnitId == ATTACKER_UNIT;
+    }
+
+    bool livePairSwapIntervals() const override
+    {
+        return true;
+    }
+
+    bool liveSettlingIntervals() const override
+    {
+        return true;
+    }
+
+    Coordinator::LivePlanStockQuote livePlanStock(
+        const TurnPlan & plan,
+        MilliFunds,
+        bool) override
+    {
+        Coordinator::LivePlanStockQuote quote;
+        for (std::int32_t index = 0;
+             index < plan.actionCount();
+             ++index)
+        {
+            const PlannedAction & action =
+                plan.action(index);
+            if (!Coordinator::isLiveState(
+                    action.state))
+            {
+                continue;
+            }
+            const bool captures =
+                action.kind ==
+                    PlanBundleKind::Capture ||
+                action.kind ==
+                    PlanBundleKind::MoveAndCapture;
+            quote.key.push_back(
+                Coordinator::CanonicalPlanActionKey::
+                    fromAction(
+                        action.unitId,
+                        action.destination.x,
+                        action.destination.y,
+                        captures));
+        }
+        std::sort(quote.key.begin(), quote.key.end());
+        const MilliFunds stock = stockFor(plan);
+        quote.stockAbsolute =
+            StockInterval{stock, stock};
+        quote.valid = true;
+        quote.lowerWitnessReplays = true;
+        return quote;
     }
 
     PlanStockAudit auditPlanStock(
@@ -1349,6 +1646,586 @@ AssignmentResult assignCertifiedPair(
     return MaximumValueAssignment::assign(input);
 }
 
+AssignmentInput certifiedSettlingInput(
+    bool thirdCandidate = false,
+    MilliFunds fixedEconomic = 0)
+{
+    std::vector<CandidateBundle> candidates{
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            BEST_VALUE),
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            SPARE_TILE,
+            GOOD_VALUE),
+    };
+    if (thirdCandidate)
+    {
+        candidates.push_back(
+            valuedCandidate(
+                ATTACKER_INDEX,
+                ATTACKER_TILE,
+                FAR_TILE,
+                FAIR_VALUE));
+    }
+    AssignmentInput input =
+        inputWith({
+            actorWith(
+                ATTACKER_INDEX,
+                ATTACKER_UNIT,
+                std::move(candidates)),
+        });
+    if (fixedEconomic != 0)
+    {
+        std::vector<CandidateBundle> fixed{
+            valuedCandidate(
+                TARGET_INDEX,
+                TARGET_TILE,
+                TARGET_TILE,
+                fixedEconomic),
+        };
+        input.actors.push_back(
+            actorWith(
+                TARGET_INDEX,
+                TARGET_UNIT,
+                std::move(fixed)));
+    }
+    return input;
+}
+
+AssignmentResult assignCertifiedSettling(
+    CertifiedSettlingValuer & valuer,
+    RecordingTrace* pTrace = nullptr,
+    bool thirdCandidate = false,
+    MilliFunds fixedEconomic = 0)
+{
+    AssignmentInput input =
+        certifiedSettlingInput(
+            thirdCandidate,
+            fixedEconomic);
+    input.pStockValuer = &valuer;
+    input.pTrace = pTrace;
+    return MaximumValueAssignment::assign(input);
+}
+
+bool settlingSelected(
+    const AssignmentResult & result,
+    TilePoint destination)
+{
+    const PlannedAction* pAction =
+        actionOf(result, ATTACKER_UNIT);
+    return pAction != nullptr &&
+           pAction->destination == destination &&
+           Coordinator::isLiveState(pAction->state);
+}
+
+const AssignmentResult::Selection* selectionOf(
+    const AssignmentResult & result,
+    std::int32_t engineUnitId)
+{
+    const auto found =
+        std::find_if(
+            result.selections.begin(),
+            result.selections.end(),
+            [&](const AssignmentResult::Selection & selection)
+            {
+                return selection.engineUnitId ==
+                       engineUnitId;
+            });
+    return found == result.selections.end()
+               ? nullptr
+               : &*found;
+}
+
+void testSettlingOverlappingIntervalsRetainIncumbent()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{18, 78}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{20, 70}},
+    });
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0,
+           "overlapping settling intervals retain the incumbent");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral("challengerLower=20"),
+                   QStringLiteral("challengerUpper=70"),
+                   QStringLiteral("incumbentLower=18"),
+                   QStringLiteral("incumbentUpper=78"),
+                   QStringLiteral("reason=INTERVAL_OVERLAP"),
+                   QStringLiteral("accepted=false"),
+               }),
+           "settling overlap receipts carry both intervals");
+    expect(valuer.scalarCalls == 0,
+           "settling overlap does not consult scalar stock");
+}
+
+void testSettlingSeparatedIntervalsReplaceIncumbent()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 20}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{21, 30}},
+    });
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    expect(settlingSelected(result, SPARE_TILE) &&
+               result.stats.settlingMoves == 1,
+           "separated settling intervals certify replacement");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral("challengerLower=21"),
+                   QStringLiteral("incumbentUpper=20"),
+                   QStringLiteral(
+                       "reason=LOWER_ABOVE_INCUMBENT_UPPER"),
+                   QStringLiteral("accepted=true"),
+               }),
+           "settling replacement names the strict certificate");
+    expect(valuer.scalarCalls == 0,
+           "certified settling replacement does not consult scalar stock");
+}
+
+void testSettlingTouchingIntervalsRetainIncumbent()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 20}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{20, 30}},
+    });
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0,
+           "touching settling intervals retain the incumbent");
+}
+
+void testSettlingCollapsedStrictImprovementReplaces()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 10}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{11, 11}},
+    });
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer);
+    expect(settlingSelected(result, SPARE_TILE) &&
+               result.stats.settlingMoves == 1,
+           "strict collapsed settling values replace the incumbent");
+}
+
+void testSettlingCollapsedEqualityRetains()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 10}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{10, 10}},
+    });
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0,
+           "equal collapsed settling values retain the incumbent");
+}
+
+void testStockSettlingPreservesProductionVacateTie()
+{
+    std::vector<CandidateBundle> candidates{
+        valuedCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            ATTACKER_TILE,
+            GOOD_VALUE),
+        productionVacatingCandidate(
+            ATTACKER_INDEX,
+            ATTACKER_TILE,
+            CONTESTED_TILE,
+            GOOD_VALUE),
+    };
+    AssignmentInput input =
+        inputWith({
+            actorWith(
+                ATTACKER_INDEX,
+                ATTACKER_UNIT,
+                std::move(candidates)),
+        });
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            ATTACKER_TILE,
+            StockInterval{10, 10}},
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 10}},
+    });
+    input.pStockValuer = &valuer;
+    const AssignmentResult result =
+        MaximumValueAssignment::assign(input);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0,
+           "stock settling keeps the greedy production-vacate tie winner");
+}
+
+void testSettlingSuccessiveReplacementUpdatesBothBounds()
+{
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{0, 10}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{11, 30}},
+        SettlingPlanValue{
+            FAR_TILE,
+            StockInterval{20, 25}},
+    });
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(
+            valuer,
+            &trace,
+            true);
+    expect(settlingSelected(result, SPARE_TILE) &&
+               result.stats.settlingMoves == 1,
+           "the first certified settling winner survives a later overlap");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral("challengerLower=20"),
+                   QStringLiteral("challengerUpper=25"),
+                   QStringLiteral("incumbentLower=11"),
+                   QStringLiteral("incumbentUpper=30"),
+                   QStringLiteral("previousCandidate=1"),
+                   QStringLiteral("reason=INTERVAL_OVERLAP"),
+                   QStringLiteral("accepted=false"),
+               }),
+           "settling replacement updates both retained bounds");
+}
+
+void testSettlingUsesFullPlanEconomicBasis()
+{
+    constexpr MilliFunds FIXED_ECONOMIC = 700;
+    CertifiedSettlingValuer valuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 20}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{21, 30}},
+    });
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(
+            valuer,
+            &trace,
+            false,
+            FIXED_ECONOMIC);
+    expect(settlingSelected(result, SPARE_TILE) &&
+               !valuer.economicBasisMismatch,
+           "settling prices the complete temporary plan economic basis");
+    expect(std::find(
+               valuer.economicInputs.begin(),
+               valuer.economicInputs.end(),
+               BEST_VALUE + FIXED_ECONOMIC) !=
+               valuer.economicInputs.end() &&
+               std::find(
+                   valuer.economicInputs.begin(),
+                   valuer.economicInputs.end(),
+                   GOOD_VALUE + FIXED_ECONOMIC) !=
+                   valuer.economicInputs.end(),
+           "fixed actor economic value is present in both live quotes");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral("incumbentEconomic=1700"),
+                   QStringLiteral("challengerEconomic=1600"),
+                   QStringLiteral("challengerLower=21"),
+               }),
+           "full-plan receipt neither omits nor double-counts fixed value");
+}
+
+void testSettlingUnavailableRetainsIncumbent()
+{
+    CertifiedSettlingValuer valuer(
+        {
+            SettlingPlanValue{
+                CONTESTED_TILE,
+                StockInterval{10, 10}},
+            SettlingPlanValue{
+                SPARE_TILE,
+                StockInterval{100, 100}},
+        },
+        SettlingIntervalFailure::None,
+        false);
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    const AssignmentResult::Selection* pSelection =
+        selectionOf(result, ATTACKER_UNIT);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               valuer.liveQuotes == 0 &&
+               valuer.scalarCalls == 0,
+           "unavailable settling intervals retain the incumbent without scalar fallback");
+    expect(pSelection != nullptr &&
+               !pSelection->completeValues[0].known,
+           "unavailable settling does not invent an exact complete value");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral(
+                       "reason=LIVE_INTERVAL_UNAVAILABLE"),
+                   QStringLiteral("accepted=false"),
+               }),
+           "unavailable settling support is reported");
+}
+
+void testSettlingIncumbentWitnessFailureRetains()
+{
+    CertifiedSettlingValuer valuer(
+        {
+            SettlingPlanValue{
+                CONTESTED_TILE,
+                StockInterval{10, 10}},
+            SettlingPlanValue{
+                SPARE_TILE,
+                StockInterval{100, 100}},
+        },
+        SettlingIntervalFailure::
+            IncumbentWitness);
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0 &&
+               valuer.scalarCalls == 0,
+           "incumbent witness failure retains the original settling seat");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_CHALLENGER"),
+               QStringList{
+                   QStringLiteral("incumbentValid=true"),
+                   QStringLiteral(
+                       "incumbentLowerWitnessReplays=false"),
+                   QStringLiteral(
+                       "reason=LIVE_INTERVAL_FAILURE"),
+               }),
+           "incumbent witness failure is explicit");
+}
+
+void testSettlingChallengerFailuresRetainOriginal()
+{
+    const std::vector<SettlingIntervalFailure> failures{
+        SettlingIntervalFailure::ChallengerQuote,
+        SettlingIntervalFailure::ChallengerWitness,
+    };
+    for (const SettlingIntervalFailure failure : failures)
+    {
+        CertifiedSettlingValuer valuer(
+            {
+                SettlingPlanValue{
+                    CONTESTED_TILE,
+                    StockInterval{10, 10}},
+                SettlingPlanValue{
+                    SPARE_TILE,
+                    StockInterval{100, 100}},
+            },
+            failure);
+        RecordingTrace trace;
+        const AssignmentResult result =
+            assignCertifiedSettling(
+                valuer,
+                &trace);
+        expect(settlingSelected(
+                   result,
+                   CONTESTED_TILE) &&
+                   result.stats.settlingMoves == 0 &&
+                   valuer.scalarCalls == 0,
+               "challenger quote failure restores the original settling seat");
+        expect(trace.containsFields(
+                   QStringLiteral(
+                       "SETTLING_CHALLENGER"),
+                   QStringList{
+                       QStringLiteral("challenger=1"),
+                       QStringLiteral(
+                           "reason=LIVE_INTERVAL_FAILURE"),
+                       QStringLiteral("accepted=false"),
+                   }),
+               "challenger quote failure is explicit");
+    }
+}
+
+void testSettlingReplayKeyMismatchRestoresOriginal()
+{
+    CertifiedSettlingValuer valuer(
+        {
+            SettlingPlanValue{
+                CONTESTED_TILE,
+                StockInterval{10, 10}},
+            SettlingPlanValue{
+                SPARE_TILE,
+                StockInterval{11, 11}},
+        },
+        SettlingIntervalFailure::ReplayKey);
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0 &&
+               result.stats.replayFailures == 1,
+           "settling replay key mismatch restores the original plan");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_REPLAY"),
+               QStringList{
+                   QStringLiteral("keyMatches=false"),
+                   QStringLiteral("lowerMatches=true"),
+                   QStringLiteral("upperMatches=true"),
+                   QStringLiteral("reason=REPLAY_FAILURE"),
+               }),
+           "settling replay key mismatch is reported");
+}
+
+void testSettlingReplayUpperMismatchRestoresOriginal()
+{
+    CertifiedSettlingValuer valuer(
+        {
+            SettlingPlanValue{
+                CONTESTED_TILE,
+                StockInterval{10, 10}},
+            SettlingPlanValue{
+                SPARE_TILE,
+                StockInterval{11, 11}},
+        },
+        SettlingIntervalFailure::ReplayUpper);
+    RecordingTrace trace;
+    const AssignmentResult result =
+        assignCertifiedSettling(valuer, &trace);
+    expect(settlingSelected(
+               result,
+               CONTESTED_TILE) &&
+               result.stats.settlingMoves == 0 &&
+               result.stats.replayFailures == 1,
+           "settling replay upper mismatch restores the original plan");
+    expect(trace.containsFields(
+               QStringLiteral("SETTLING_REPLAY"),
+               QStringList{
+                   QStringLiteral("keyMatches=true"),
+                   QStringLiteral("lowerMatches=true"),
+                   QStringLiteral("upperMatches=false"),
+                   QStringLiteral("reason=REPLAY_FAILURE"),
+               }),
+           "settling replay validates lower and upper separately");
+}
+
+void testSettlingCompleteValuesRespectExactness()
+{
+    CertifiedSettlingValuer unresolvedValuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 20}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{0, 5}},
+    });
+    RecordingTrace unresolvedTrace;
+    const AssignmentResult unresolved =
+        assignCertifiedSettling(
+            unresolvedValuer,
+            &unresolvedTrace);
+    const AssignmentResult::Selection* pUnresolved =
+        selectionOf(unresolved, ATTACKER_UNIT);
+    expect(pUnresolved != nullptr &&
+               !pUnresolved->completeValues[0].known,
+           "an unresolved settling interval is not marked exact");
+
+    CertifiedSettlingValuer exactValuer({
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 10}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{0, 0}},
+    });
+    RecordingTrace exactTrace;
+    const AssignmentResult exact =
+        assignCertifiedSettling(
+            exactValuer,
+            &exactTrace);
+    const AssignmentResult::Selection* pExact =
+        selectionOf(exact, ATTACKER_UNIT);
+    expect(pExact != nullptr &&
+               pExact->completeValues[0].known &&
+               pExact->completeValues[0].value == 10,
+           "a collapsed settling interval may be marked exact");
+}
+
+void testCertifiedSettlingIsDeterministic()
+{
+    const std::vector<SettlingPlanValue> values{
+        SettlingPlanValue{
+            CONTESTED_TILE,
+            StockInterval{10, 20}},
+        SettlingPlanValue{
+            SPARE_TILE,
+            StockInterval{21, 30}},
+    };
+    CertifiedSettlingValuer firstValuer(values);
+    CertifiedSettlingValuer replayValuer(values);
+    RecordingTrace firstTrace;
+    RecordingTrace replayTrace;
+    const AssignmentResult first =
+        assignCertifiedSettling(
+            firstValuer,
+            &firstTrace);
+    const AssignmentResult replay =
+        assignCertifiedSettling(
+            replayValuer,
+            &replayTrace);
+    expect(samePlan(first, replay) &&
+               first.executionOrder ==
+                   replay.executionOrder &&
+               statsSnapshot(first.stats) ==
+                   statsSnapshot(replay.stats),
+           "certified settling repeats plan, order, and statistics");
+    expect(firstTrace.records == replayTrace.records,
+           "certified settling repeats its proof receipts");
+}
+
 void testOverlappingIntervalsRetainIncumbent()
 {
     CertifiedPairValuer valuer(
@@ -2109,15 +2986,17 @@ void testStockDecompositionIsDeferredAndNeutral()
                        "kind=MOVE_AND_CAPTURE")),
            "both seated sides of the capture comparison are recorded");
     expect(firstTrace.containsFields(
-               QStringLiteral(
-                   "STOCK_DECOMPOSITION"),
-               QStringList{
-                   QStringLiteral("kind=POSITIONAL"),
                    QStringLiteral(
-                       "observedStockDelta=29000"),
-                   QStringLiteral(
-                       "observedMatchesAudit=true"),
-               }) &&
+                       "STOCK_DECOMPOSITION"),
+                   QStringList{
+                       QStringLiteral("kind=POSITIONAL"),
+                       QStringLiteral(
+                           "scalarStockDelta=29000"),
+                       QStringLiteral(
+                           "liveStockLower=29000"),
+                       QStringLiteral(
+                           "scalarInLiveBounds=true"),
+                   }) &&
                firstTrace.containsFields(
                    QStringLiteral(
                        "STOCK_DECOMPOSITION"),
@@ -2125,11 +3004,13 @@ void testStockDecompositionIsDeferredAndNeutral()
                        QStringLiteral(
                            "kind=MOVE_AND_CAPTURE"),
                        QStringLiteral(
-                           "observedStockDelta=24000"),
+                           "scalarStockDelta=24000"),
                        QStringLiteral(
-                           "observedMatchesAudit=true"),
+                           "liveStockLower=24000"),
+                       QStringLiteral(
+                           "scalarInLiveBounds=true"),
                    }),
-           "each decomposition receipt binds kind, scalar value, and validity");
+           "each decomposition receipt binds kind, live interval, scalar audit, and validity");
     expect(firstTrace.records ==
                replayTrace.records,
            "stock decomposition records replay deterministically");
@@ -2273,6 +3154,21 @@ int main()
     testActorResourcesExposeTileAndTargetConflicts();
     testSettlingDropsALosingFallback();
     testPairSearchResolvesADestinationConflict();
+    testSettlingOverlappingIntervalsRetainIncumbent();
+    testSettlingSeparatedIntervalsReplaceIncumbent();
+    testSettlingTouchingIntervalsRetainIncumbent();
+    testSettlingCollapsedStrictImprovementReplaces();
+    testSettlingCollapsedEqualityRetains();
+    testStockSettlingPreservesProductionVacateTie();
+    testSettlingSuccessiveReplacementUpdatesBothBounds();
+    testSettlingUsesFullPlanEconomicBasis();
+    testSettlingUnavailableRetainsIncumbent();
+    testSettlingIncumbentWitnessFailureRetains();
+    testSettlingChallengerFailuresRetainOriginal();
+    testSettlingReplayKeyMismatchRestoresOriginal();
+    testSettlingReplayUpperMismatchRestoresOriginal();
+    testSettlingCompleteValuesRespectExactness();
+    testCertifiedSettlingIsDeterministic();
     testOverlappingIntervalsRetainIncumbent();
     testBeanRegressionRetainsIncumbent();
     testSeparatedIntervalsReplaceIncumbent();
