@@ -449,6 +449,14 @@ namespace Coordinator
                                const SequentialRowWitness &) = default;
     };
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct SequentialRowCatalogAudit
+    {
+        std::int32_t row{NO_STOCK_ROW};
+        std::vector<SequentialDetail::RowOption> options;
+    };
+#endif
+
     struct SequentialTierResult
     {
         MilliFunds floorValue{0};

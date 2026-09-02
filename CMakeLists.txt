@@ -825,6 +825,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/bundlevaluation.h
     ai/coordinator/candidatebundle.h
     ai/coordinator/planstockvaluer.h
+    ai/coordinator/relativestockcomparison.h
+    ai/coordinator/relativestocksession.h
     ai/coordinator/turnplan.h
     ai/coordinator/mobilityfield.h
     ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
@@ -1470,6 +1472,24 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiBundleAssignmentTests)
 
+    add_executable(CoordinatorAiRelativeStockComparisonTests
+        tests/coordinator_ai/relativestockcomparisontests.cpp
+    )
+    target_include_directories(CoordinatorAiRelativeStockComparisonTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiRelativeStockComparisonTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiRelativeStockComparisonTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiRelativeStockComparisonTests
+        COMMAND CoordinatorAiRelativeStockComparisonTests
+    )
+    cow_set_arena_test_path(CoordinatorAiRelativeStockComparisonTests)
+
     add_executable(CoordinatorAiAssignmentBoundProof
         tests/coordinator_ai/assignmentboundproof.cpp
     )
@@ -1541,6 +1561,45 @@ if (BUILD_TESTING)
         COMMAND CoordinatorAiSequentialContinuationTests
     )
     cow_set_arena_test_path(CoordinatorAiSequentialContinuationTests)
+
+    add_executable(CoordinatorAiPackingCertificateTests
+        tests/coordinator_ai/packingcertificatetests.cpp
+    )
+    target_include_directories(CoordinatorAiPackingCertificateTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(CoordinatorAiPackingCertificateTests PRIVATE
+        COW_COORDINATED_REFINEMENT_TESTING
+    )
+    target_link_libraries(CoordinatorAiPackingCertificateTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiPackingCertificateTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiPackingCertificateTests
+        COMMAND CoordinatorAiPackingCertificateTests
+    )
+    cow_set_arena_test_path(CoordinatorAiPackingCertificateTests)
+
+    add_executable(CoordinatorAiPackingDualTests
+        tests/coordinator_ai/packingdualtests.cpp
+    )
+    target_include_directories(CoordinatorAiPackingDualTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(CoordinatorAiPackingDualTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiPackingDualTests PROPERTIES
+        AUTOMOC OFF
+        AUTOUIC OFF
+        AUTORCC OFF
+    )
+    add_test(
+        NAME CoordinatorAiPackingDualTests
+        COMMAND CoordinatorAiPackingDualTests
+    )
+    cow_set_arena_test_path(CoordinatorAiPackingDualTests)
 
     add_executable(CoordinatorAiContinuationIntervalTests
         tests/coordinator_ai/continuationintervaltests.cpp

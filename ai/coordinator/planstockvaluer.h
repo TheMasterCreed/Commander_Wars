@@ -10,6 +10,7 @@
 namespace Coordinator
 {
     class TurnPlan;
+    class RelativeStockSession;
 
     struct LivePlanStockQuote
     {
@@ -100,6 +101,11 @@ namespace Coordinator
         virtual bool refineLiveAtBoundary(AssignPhase)
         {
             return false;
+        }
+
+        virtual RelativeStockSession* relativeStockSession()
+        {
+            return nullptr;
         }
 
         virtual PlanStockAudit auditPlanStock(const TurnPlan &)

@@ -53,6 +53,7 @@ namespace
         RefinementWork::OurAdmission,
         RefinementWork::EnemyEntry,
         RefinementWork::SearchSlice,
+        RefinementWork::PackingDualCertificate,
     };
 
     int failures = 0;

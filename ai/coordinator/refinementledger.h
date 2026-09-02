@@ -15,9 +15,10 @@ namespace Coordinator
         OurAdmission,
         EnemyEntry,
         SearchSlice,
+        PackingDualCertificate,
     };
 
-    constexpr std::size_t REFINEMENT_WORK_CLASSES = 4;
+    constexpr std::size_t REFINEMENT_WORK_CLASSES = 5;
 
     using GrantId = std::int32_t;
     constexpr GrantId NO_GRANT = -1;
