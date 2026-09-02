@@ -165,6 +165,13 @@ namespace Coordinator
             return m_nodeCount;
         }
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::int32_t horizonTurns() const
+        {
+            return m_horizonTurns;
+        }
+#endif
+
     private:
         std::size_t cellOf(std::int32_t node, std::int32_t turn) const
         {
@@ -276,6 +283,19 @@ namespace Coordinator
             virtual void store(std::int32_t rowIndex,
                                std::span<const RowOption> options,
                                std::int64_t statesSpent) = 0;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            virtual bool onceCharge(
+                std::int32_t,
+                std::int64_t statesSpent,
+                std::int64_t & chargedStates) const
+            {
+                chargedStates = statesSpent;
+                return false;
+            }
+            virtual void recordCharge(std::int32_t)
+            {
+            }
+#endif
         };
 
         inline void recordOption(RowOptionMap & options,
@@ -450,6 +470,18 @@ namespace Coordinator
     };
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct SequentialRowPhaseAudit
+    {
+        std::int32_t row{NO_STOCK_ROW};
+        std::int64_t cacheQuotedStates{0};
+        std::int64_t cacheChargedStates{0};
+        std::int64_t constructionStates{0};
+        std::int64_t uniqueOptions{0};
+        bool cacheLookup{false};
+        bool cacheHit{false};
+        bool complete{false};
+    };
+
     struct SequentialRowCatalogAudit
     {
         std::int32_t row{NO_STOCK_ROW};
@@ -470,9 +502,30 @@ namespace Coordinator
         std::int64_t rowsSearched{0};
         std::int64_t cacheHits{0};
         std::int64_t cacheFallbacks{0};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::int64_t rowCacheLookups{0};
+        std::int64_t rowCacheQuotedStates{0};
+        std::int64_t rowCacheChargedStates{0};
+        std::int64_t rowConstructionStates{0};
+        std::int64_t totalUniqueRowOptions{0};
+        std::int64_t packingStates{0};
+        std::int64_t packingLeaves{0};
+        std::int64_t packingPrunes{0};
+        std::int64_t packingIncumbentImprovements{0};
+        std::int64_t unexploredPackingBranches{0};
+        MilliFunds maximumUnexploredPackingBound{0};
+#endif
         bool continuationSeen{false};
         bool certificate{false};
         bool searchCompleted{false};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        bool rowOptionDomainsComplete{false};
+        bool packingAttempted{false};
+        bool packingResidualUpperValid{false};
+        std::vector<SequentialRowPhaseAudit> rowPhases;
+        std::vector<PropertyStockColumn> nodeColumns;
+        std::vector<SequentialRowCatalogAudit> rowCatalogs;
+#endif
         std::vector<SequentialRowWitness> witness;
     };
 
@@ -591,6 +644,13 @@ namespace Coordinator
             MilliFunds relaxedValue{0};
             std::vector<const RowOption*>* pCurrentChoices{nullptr};
             std::vector<const RowOption*>* pBestChoices{nullptr};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            std::int64_t leaves{0};
+            std::int64_t prunes{0};
+            std::int64_t incumbentImprovements{0};
+            std::int64_t unexploredBranches{0};
+            MilliFunds maximumUnexploredBound{0};
+#endif
             bool exact{false};
         };
 
@@ -598,15 +658,31 @@ namespace Coordinator
                                    std::size_t depth,
                                    MilliFunds value)
         {
-            if (pack.exact || pack.pBudget->truncated)
+            if (pack.exact)
             {
+                return;
+            }
+            if (pack.pBudget->truncated)
+            {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                ++pack.unexploredBranches;
+                pack.maximumUnexploredBound =
+                    std::max(pack.maximumUnexploredBound,
+                             value + pack.suffixBound[depth]);
+#endif
                 return;
             }
             if (depth == pack.rows.size())
             {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                ++pack.leaves;
+#endif
                 if (value > pack.incumbent)
                 {
                     pack.incumbent = value;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                    ++pack.incumbentImprovements;
+#endif
                     if (pack.pCurrentChoices != nullptr)
                     {
                         *pack.pBestChoices = *pack.pCurrentChoices;
@@ -620,6 +696,9 @@ namespace Coordinator
             }
             if (value + pack.suffixBound[depth] <= pack.incumbent)
             {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                ++pack.prunes;
+#endif
                 return;
             }
             for (const RowOption & option : pack.rows[depth].options)
@@ -627,6 +706,9 @@ namespace Coordinator
                 if (value + option.value + pack.suffixBound[depth + 1] <=
                     pack.incumbent)
                 {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                    ++pack.prunes;
+#endif
                     break;
                 }
                 bool free = true;
@@ -644,6 +726,14 @@ namespace Coordinator
                 }
                 if (!pack.pBudget->spend())
                 {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                    ++pack.unexploredBranches;
+                    pack.maximumUnexploredBound =
+                        std::max(
+                            pack.maximumUnexploredBound,
+                            value + option.value +
+                                pack.suffixBound[depth + 1]);
+#endif
                     return;
                 }
                 for (const std::int32_t node : option.nodes)
@@ -779,6 +869,14 @@ namespace Coordinator
         result.floorValue = floorValue;
         result.relaxedValue = floorValue;
         result.bookedValue = floorValue;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (captureWitness)
+        {
+            result.nodeColumns.assign(instance.nodeColumns.begin(),
+                                      instance.nodeColumns.end());
+            result.rowCatalogs.reserve(instance.rows.size());
+        }
+#endif
         const std::int32_t nodeCount = instance.nodeCount();
         const std::int32_t rowCount =
             static_cast<std::int32_t>(instance.rows.size());
@@ -1047,17 +1145,42 @@ namespace Coordinator
         std::vector<std::vector<RowOption>> ownedOptions;
         ownedOptions.reserve(static_cast<std::size_t>(rowCount));
         std::vector<PackedRow> packedRows;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.rowPhases.reserve(static_cast<std::size_t>(rowCount));
+        result.rowOptionDomainsComplete = true;
+#endif
         for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
         {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            SequentialRowPhaseAudit phase{
+                .row = rowIndex,
+                .cacheLookup = pRowSource != nullptr,
+            };
+            if (phase.cacheLookup)
+            {
+                ++result.rowCacheLookups;
+            }
+#endif
             std::span<const RowOption> options;
             std::int64_t cachedCost = 0;
             const bool cached =
                 pRowSource != nullptr &&
                 pRowSource->lookup(rowIndex, options, cachedCost);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            phase.cacheQuotedStates = cached ? cachedCost : 0;
+            result.rowCacheQuotedStates += phase.cacheQuotedStates;
+#endif
             if (cached && budget.states + cachedCost < budget.stateCap)
             {
                 budget.states += cachedCost;
                 ++result.cacheHits;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                phase.cacheHit = true;
+                phase.cacheChargedStates = cachedCost;
+                phase.complete = true;
+                result.rowCacheChargedStates += cachedCost;
+                pRowSource->recordCharge(rowIndex);
+#endif
             }
             else
             {
@@ -1073,13 +1196,50 @@ namespace Coordinator
                     budget,
                     result.itinerariesEnumerated));
                 options = std::span<const RowOption>(ownedOptions.back());
-                if (!cached && pRowSource != nullptr && !budget.truncated)
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                phase.constructionStates =
+                    budget.states - statesBefore;
+                result.rowConstructionStates +=
+                    phase.constructionStates;
+                phase.complete = !budget.truncated;
+                if (pRowSource != nullptr && phase.complete)
                 {
-                    pRowSource->store(rowIndex,
-                                      options,
-                                      budget.states - statesBefore);
+                    if (!cached)
+                    {
+                        pRowSource->store(rowIndex,
+                                          options,
+                                          budget.states - statesBefore);
+                    }
+                    pRowSource->recordCharge(rowIndex);
                 }
+#else
+                if (!cached && pRowSource != nullptr &&
+                    !budget.truncated)
+                {
+                    pRowSource->store(
+                        rowIndex,
+                        options,
+                        budget.states - statesBefore);
+                }
+#endif
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            phase.uniqueOptions =
+                static_cast<std::int64_t>(options.size());
+            result.totalUniqueRowOptions += phase.uniqueOptions;
+            result.rowOptionDomainsComplete =
+                result.rowOptionDomainsComplete && phase.complete;
+            result.rowPhases.push_back(phase);
+            if (captureWitness)
+            {
+                result.rowCatalogs.push_back(
+                    SequentialRowCatalogAudit{
+                        .row = rowIndex,
+                        .options = std::vector<RowOption>(
+                            options.begin(), options.end()),
+                    });
+            }
+#endif
             if (options.empty())
             {
                 continue;
@@ -1126,8 +1286,26 @@ namespace Coordinator
             pack.pCurrentChoices = &*currentChoices;
             pack.pBestChoices = &*bestChoices;
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        const std::int64_t statesBeforePacking = budget.states;
+        result.packingAttempted = true;
+#endif
         packOptionRows(pack, 0, 0);
         result.searchStates = budget.states;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.packingStates =
+            budget.states - statesBeforePacking;
+        result.packingLeaves = pack.leaves;
+        result.packingPrunes = pack.prunes;
+        result.packingIncumbentImprovements =
+            pack.incumbentImprovements;
+        result.unexploredPackingBranches =
+            pack.unexploredBranches;
+        result.maximumUnexploredPackingBound =
+            pack.maximumUnexploredBound;
+        result.packingResidualUpperValid =
+            result.rowOptionDomainsComplete;
+#endif
         result.searchCompleted = pack.exact || !budget.truncated;
         result.searchValue = pack.incumbent;
         result.certificate = pack.exact;

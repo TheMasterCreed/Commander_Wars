@@ -42,9 +42,11 @@ namespace
     constexpr MilliFunds HOSTILE_PAIRED_STOCK = -30;
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, const char* description)
     {
+        ++checks;
         if (!condition)
         {
             std::printf("FAILED: %s\n", description);
@@ -378,5 +380,6 @@ int main()
     testHostileJointStockRepelsCaptures();
     testSeatingOrderInvariance();
     testSequentialContinuationComposesWithJointStock();
+    std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

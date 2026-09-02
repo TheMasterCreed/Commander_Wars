@@ -3,12 +3,15 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
 #include <span>
 #include <string_view>
 #include <vector>
 
-#include "ai/coordinator/propertystocksequential.h"
+#include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/sequentialthreshold.h"
 
 namespace
 {
@@ -20,11 +23,16 @@ namespace
     using Coordinator::PropertyStockColumn;
     using Coordinator::replaySequentialWitness;
     using Coordinator::SequentialClassTable;
+    using Coordinator::SequentialCacheAccounting;
     using Coordinator::SequentialInstance;
     using Coordinator::SequentialRow;
+    using Coordinator::SequentialThresholdResult;
+    using Coordinator::SequentialThresholdStatus;
+    using Coordinator::SequentialThresholdStop;
     using Coordinator::SequentialTierResult;
     using Coordinator::TilePoint;
     using Coordinator::solveSequentialPacking;
+    using Coordinator::proveSequentialBelow;
     using Coordinator::SequentialDetail::CachedRowEnumeration;
     using Coordinator::SequentialDetail::continuationGain;
     using Coordinator::SequentialDetail::EnumerationBudget;
@@ -38,9 +46,11 @@ namespace
     constexpr std::int32_t NODE_COUNT = 3;
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, std::string_view message)
     {
+        ++checks;
         if (!condition)
         {
             std::cerr << "FAILED: " << message << '\n';
@@ -140,6 +150,89 @@ namespace
         std::map<std::int32_t, CachedRowEnumeration> entries;
         std::int32_t lookups{0};
         std::int32_t stores{0};
+    };
+
+    class IdentityRowSource final : public SequentialRowOptionSource
+    {
+    public:
+        explicit IdentityRowSource(std::int32_t rowCount)
+        {
+            setGeneration(rowCount, 0);
+        }
+
+        void setGeneration(
+            std::int32_t rowCount,
+            std::int32_t generation)
+        {
+            keys.clear();
+            for (std::int32_t row = 0; row < rowCount; ++row)
+            {
+                keys.push_back({generation, row});
+            }
+        }
+
+        bool lookup(
+            std::int32_t rowIndex,
+            std::span<const RowOption> & options,
+            std::int64_t & statesSpent) override
+        {
+            const auto known = entries.find(
+                keys[static_cast<std::size_t>(rowIndex)]);
+            if (known == entries.end())
+            {
+                return false;
+            }
+            options = known->second.options;
+            statesSpent = known->second.statesSpent;
+            return true;
+        }
+
+        void store(
+            std::int32_t rowIndex,
+            std::span<const RowOption> options,
+            std::int64_t statesSpent) override
+        {
+            entries.emplace(
+                keys[static_cast<std::size_t>(rowIndex)],
+                CachedRowEnumeration{
+                    .options = std::vector<RowOption>(
+                        options.begin(), options.end()),
+                    .statesSpent = statesSpent,
+                });
+        }
+
+        bool onceCharge(
+            std::int32_t rowIndex,
+            std::int64_t statesSpent,
+            std::int64_t & chargedStates) const override
+        {
+            const auto & key =
+                keys[static_cast<std::size_t>(rowIndex)];
+            chargedStates =
+                paid.contains(key) ? 0 : statesSpent;
+            return true;
+        }
+
+        void recordCharge(std::int32_t rowIndex) override
+        {
+            paid.insert(
+                keys[static_cast<std::size_t>(rowIndex)]);
+        }
+
+        std::int64_t quotedStates() const
+        {
+            std::int64_t result = 0;
+            for (const auto & entry : entries)
+            {
+                result += entry.second.statesSpent;
+            }
+            return result;
+        }
+
+        std::vector<std::vector<std::int64_t>> keys;
+        std::map<std::vector<std::int64_t>, CachedRowEnumeration>
+            entries;
+        std::set<std::vector<std::int64_t>> paid;
     };
 
     void testClassTableAndFirstLegBounds()
@@ -542,6 +635,35 @@ namespace
         }
     }
 
+    void testCappedRetainedFloor()
+    {
+        SequentialFixture fixture;
+        constexpr MilliFunds ROW_FLOOR = 10000;
+        fixture.instance.rows = {
+            SequentialRow{.classIndex = 0, .weight = {ROW_FLOOR, 0, 0}, .ownedTurn = {1, 1, 1}},
+            SequentialRow{.classIndex = 0, .weight = {0, ROW_FLOOR, 0}, .ownedTurn = {1, 1, 1}},
+            SequentialRow{.classIndex = 0, .weight = {0, 0, ROW_FLOOR}, .ownedTurn = {1, 1, 1}},
+        };
+        const MilliFunds floor = assignmentFloor(fixture.instance);
+        const auto result = solveSequentialPacking(fixture.instance, floor, 1, nullptr, true);
+        expect(result.continuationSeen && !result.searchCompleted && result.searchStates == 1,
+               "a capped continuation search remains incomplete");
+        expect(result.bookedValue == floor && result.relaxedValue > floor && result.witness.empty(),
+               "retaining the supplied floor does not emit a new packing witness");
+        std::vector<Coordinator::SequentialRowWitness> floorWitness;
+        for (std::int32_t row = 0; row < NODE_COUNT; ++row)
+        {
+            const WitnessStep step{row, 1};
+            floorWitness.push_back(Coordinator::SequentialDetail::ownedWitness(
+                fixture.instance, fixture.instance.rows[static_cast<std::size_t>(row)], row,
+                std::span<const WitnessStep>(&step, 1)));
+        }
+        expect(replaySequentialWitness(fixture.instance, floorWitness, floor),
+               "the retained floor has an independent replayable witness");
+        expect(!replaySequentialWitness(fixture.instance, result.witness, floor),
+               "an absent new witness cannot substitute for the retained witness");
+    }
+
     void testRowCacheTransparencyAndBudgetFallback()
     {
         SequentialFixture fixture;
@@ -595,6 +717,439 @@ namespace
                    warmCapped.searchStates == coldCapped.searchStates,
                "cache budget fallback is replay transparent");
     }
+
+    void configureThresholdFixture(SequentialFixture & fixture)
+    {
+        fixture.instance.rows = {
+            SequentialRow{
+                .classIndex = 0,
+                .weight = {100, 0, 0},
+                .ownedTurn = {1, 1, 1},
+            },
+            SequentialRow{
+                .classIndex = 0,
+                .weight = {0, 90, 0},
+                .ownedTurn = {1, 1, 1},
+            },
+            SequentialRow{
+                .classIndex = 0,
+                .weight = {0, 0, 80},
+                .ownedTurn = {1, 1, 1},
+            },
+        };
+    }
+
+    MilliFunds populateThresholdCache(
+        SequentialFixture & fixture,
+        IdentityRowSource & source)
+    {
+        const MilliFunds floor = assignmentFloor(fixture.instance);
+        const auto exact = solveSequentialPacking(
+            fixture.instance, floor, 100000, &source, true);
+        expect(exact.searchCompleted &&
+                   exact.witness.size() > 0 &&
+                   replaySequentialWitness(
+                       fixture.instance,
+                       exact.witness,
+                       exact.bookedValue),
+               "threshold fixture cache is complete and replayable");
+        return exact.bookedValue;
+    }
+
+    void testTruncatedResidualUpper()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        const std::int64_t cacheWork = source.quotedStates();
+        bool found = false;
+        for (std::int64_t extra = 1;
+             extra <= 100 && !found;
+             ++extra)
+        {
+            const auto result = proveSequentialBelow(
+                fixture.instance,
+                assignmentFloor(fixture.instance),
+                exact,
+                cacheWork + extra,
+                &source);
+            found =
+                result.status ==
+                    SequentialThresholdStatus::
+                        UnresolvedAtBudget &&
+                result.rowOptionDomainsComplete &&
+                result.residualUpper <
+                    result.originalRelaxedUpper &&
+                result.residualUpper >= exact;
+        }
+        expect(
+            found,
+            "TRUNCATED_SEARCH_RETURNS_RESIDUAL_UPPER");
+    }
+
+    void testThresholdProvenBeforeExactness()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        const auto relaxedProof = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            std::numeric_limits<MilliFunds>::max(),
+            0,
+            &source,
+            SequentialCacheAccounting::OncePerIdentity);
+        bool found = false;
+        for (std::int64_t work = 1;
+             work <= 100 && !found;
+             ++work)
+        {
+            const auto result = proveSequentialBelow(
+                fixture.instance,
+                assignmentFloor(fixture.instance),
+                exact + 1,
+                work,
+                &source,
+                SequentialCacheAccounting::OncePerIdentity);
+            found =
+                result.status ==
+                    SequentialThresholdStatus::
+                        ProvenBelowThreshold &&
+                result.thresholdProven &&
+                !result.searchCompleted &&
+                result.residualUpper < exact + 1;
+        }
+        expect(
+            relaxedProof.status ==
+                SequentialThresholdStatus::
+                    ProvenBelowThreshold &&
+                relaxedProof.thresholdProven &&
+                !relaxedProof.searchCompleted &&
+                relaxedProof.workUsed == 0 &&
+                found,
+            "THRESHOLD_PROVEN_BEFORE_EXACTNESS");
+    }
+
+    SequentialThresholdResult thresholdCounterexample(
+        SequentialFixture & fixture,
+        IdentityRowSource & source,
+        MilliFunds exact)
+    {
+        return proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            100000,
+            &source,
+            SequentialCacheAccounting::OncePerIdentity);
+    }
+
+    void testThresholdCounterexample()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        const auto result =
+            thresholdCounterexample(fixture, source, exact);
+        expect(
+            result.status ==
+                SequentialThresholdStatus::
+                    CounterexampleWitness &&
+                result.feasibleLower >= exact &&
+                result.witnessReplays &&
+                replaySequentialWitness(
+                    fixture.instance,
+                    result.witness,
+                    result.feasibleLower),
+            "THRESHOLD_COUNTEREXAMPLE");
+    }
+
+    void testIncompleteRowCatalogFailsClosed()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        const MilliFunds floor =
+            assignmentFloor(fixture.instance);
+        const auto result = proveSequentialBelow(
+            fixture.instance,
+            floor,
+            floor + 1,
+            1);
+        expect(
+            result.status ==
+                SequentialThresholdStatus::
+                    UnresolvedAtBudget &&
+                result.stop ==
+                    SequentialThresholdStop::
+                        RowOptionResidualBoundMissing &&
+                !result.rowOptionDomainsComplete &&
+                result.residualUpper ==
+                    result.originalRelaxedUpper,
+            "INCOMPLETE_ROW_CATALOG_FAILS_CLOSED");
+    }
+
+    void testResidualUpperSoundness()
+    {
+        bool sound = true;
+        for (std::int32_t mask = 0;
+             mask < 16 && sound;
+             ++mask)
+        {
+            SequentialFixture fixture;
+            configureThresholdFixture(fixture);
+            fixture.instance.rows[0].weight[0] += mask & 3;
+            fixture.instance.rows[1].weight[1] +=
+                (mask >> 2) & 3;
+            IdentityRowSource source(
+                static_cast<std::int32_t>(
+                    fixture.instance.rows.size()));
+            const MilliFunds exact =
+                populateThresholdCache(fixture, source);
+            for (std::int64_t work = 0;
+                 work <= 16;
+                 ++work)
+            {
+                const auto result = proveSequentialBelow(
+                    fixture.instance,
+                    assignmentFloor(fixture.instance),
+                    exact,
+                    work,
+                    &source,
+                    SequentialCacheAccounting::
+                        OncePerIdentity);
+                sound =
+                    result.status !=
+                        SequentialThresholdStatus::Invalid &&
+                    result.feasibleLower <= exact &&
+                    result.residualUpper >= exact &&
+                    result.witnessReplays &&
+                    replaySequentialWitness(
+                        fixture.instance,
+                        result.witness,
+                        result.feasibleLower);
+                if (!sound)
+                {
+                    break;
+                }
+            }
+        }
+        expect(sound, "RESIDUAL_UPPER_SOUNDNESS");
+    }
+
+    void testMonotoneAnytimeBounds()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        MilliFunds previousLower =
+            std::numeric_limits<MilliFunds>::min();
+        MilliFunds previousUpper =
+            std::numeric_limits<MilliFunds>::max();
+        bool monotone = true;
+        for (std::int64_t work = 0;
+             work <= 100;
+             ++work)
+        {
+            const auto result = proveSequentialBelow(
+                fixture.instance,
+                assignmentFloor(fixture.instance),
+                exact,
+                work,
+                &source,
+                SequentialCacheAccounting::OncePerIdentity);
+            monotone =
+                monotone &&
+                result.feasibleLower >= previousLower &&
+                result.residualUpper <= previousUpper;
+            previousLower = result.feasibleLower;
+            previousUpper = result.residualUpper;
+        }
+        expect(monotone, "MONOTONE_ANYTIME_BOUNDS");
+    }
+
+    void testDeterministicBestBoundOrder()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource firstSource(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        IdentityRowSource secondSource(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, firstSource);
+        populateThresholdCache(fixture, secondSource);
+        const auto first = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            8,
+            &firstSource,
+            SequentialCacheAccounting::OncePerIdentity);
+        const auto second = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            8,
+            &secondSource,
+            SequentialCacheAccounting::OncePerIdentity);
+        expect(
+            first.status == second.status &&
+                first.feasibleLower == second.feasibleLower &&
+                first.residualUpper == second.residualUpper &&
+                first.statesUsed == second.statesUsed &&
+                first.expansionOrderHash ==
+                    second.expansionOrderHash &&
+                first.witness == second.witness,
+            "DETERMINISTIC_BEST_BOUND_ORDER");
+    }
+
+    void testCacheIdentityAndOnceCharge()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        const std::int64_t quoted = source.quotedStates();
+        const auto once = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            1,
+            &source,
+            SequentialCacheAccounting::OncePerIdentity);
+        source.paid.clear();
+        const auto recharge = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            quoted + 1,
+            &source,
+            SequentialCacheAccounting::
+                RechargeEveryLookup);
+        source.setGeneration(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()),
+            1);
+        const auto incompatible = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            1,
+            &source,
+            SequentialCacheAccounting::OncePerIdentity);
+        expect(
+            once.cacheQuotedStates == quoted &&
+                once.cacheChargedStates == 0 &&
+                recharge.cacheChargedStates == quoted &&
+                incompatible.stop ==
+                    SequentialThresholdStop::
+                        RowOptionResidualBoundMissing &&
+                incompatible.rowConstructionStates > 0,
+            "CACHE_IDENTITY_AND_ONCE_CHARGE");
+    }
+
+    void testNoActionKindSemantics()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        const std::array<std::string_view, 4> labels{
+            "WAIT", "MOVE", "FIRE", "CAPTURE"
+        };
+        std::optional<SequentialThresholdResult> baseline;
+        bool identical = true;
+        for (const auto label : labels)
+        {
+            (void)label;
+            const auto result = proveSequentialBelow(
+                fixture.instance,
+                assignmentFloor(fixture.instance),
+                exact,
+                8,
+                &source,
+                SequentialCacheAccounting::OncePerIdentity);
+            if (!baseline)
+            {
+                baseline = result;
+            }
+            else
+            {
+                identical =
+                    identical &&
+                    result.status == baseline->status &&
+                    result.feasibleLower ==
+                        baseline->feasibleLower &&
+                    result.residualUpper ==
+                        baseline->residualUpper &&
+                    result.expansionOrderHash ==
+                        baseline->expansionOrderHash;
+            }
+        }
+        expect(identical, "NO_ACTION_KIND_SEMANTICS");
+    }
+
+    void testShared160000Accounting()
+    {
+        SequentialFixture fixture;
+        configureThresholdFixture(fixture);
+        IdentityRowSource source(
+            static_cast<std::int32_t>(
+                fixture.instance.rows.size()));
+        const MilliFunds exact =
+            populateThresholdCache(fixture, source);
+        source.paid.clear();
+        constexpr std::int64_t total = 160000;
+        constexpr std::int64_t tariff = 10014;
+        Coordinator::RefinementLedger ledger;
+        ledger.open(total);
+        const auto grant = ledger.draw(
+            total, Coordinator::RefinementWork::SearchSlice);
+        const auto result = proveSequentialBelow(
+            fixture.instance,
+            assignmentFloor(fixture.instance),
+            exact,
+            total - tariff,
+            &source,
+            SequentialCacheAccounting::OncePerIdentity,
+            Coordinator::SequentialThresholdOptions{
+                .pairPartitionUpper = true,
+                .nodePriceDual = true,
+            });
+        const bool refunded = ledger.refund(
+            grant,
+            total - tariff - result.workUsed);
+        expect(
+            refunded &&
+                ledger.stats().spent() ==
+                    tariff + result.workUsed &&
+                ledger.stats().spent() <= total,
+            "SHARED_160000_ACCOUNTING");
+    }
 }
 
 int main()
@@ -606,6 +1161,18 @@ int main()
     testWitnessRecoveryAndExactPacking();
     testCapturedNodeAndFloorCompatibility();
     testExhaustiveCeilingEquivalence();
+    testCappedRetainedFloor();
     testRowCacheTransparencyAndBudgetFallback();
+    testTruncatedResidualUpper();
+    testThresholdProvenBeforeExactness();
+    testThresholdCounterexample();
+    testIncompleteRowCatalogFailsClosed();
+    testResidualUpperSoundness();
+    testMonotoneAnytimeBounds();
+    testDeterministicBestBoundOrder();
+    testCacheIdentityAndOnceCharge();
+    testNoActionKindSemantics();
+    testShared160000Accounting();
+    std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

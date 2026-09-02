@@ -186,9 +186,11 @@ namespace
     constexpr std::int32_t ATTACKER_SLOT = 0;
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, const char* description)
     {
+        ++checks;
         if (!condition)
         {
             std::printf("FAILED: %s\n", description);
@@ -311,6 +313,7 @@ int main()
     testMovedShotDistanceMatchesTheAttackField(DIRECT_MIN_RANGE, DIRECT_MAX_RANGE, "direct reach matches the field");
     testMovedShotDistanceMatchesTheAttackField(INDIRECT_MIN_RANGE, INDIRECT_MAX_RANGE,
                                                "indirect reach matches the field");
+    std::printf("%d checks, %d failures\n", checks, failures);
     if (failures == 0)
     {
         return 0;

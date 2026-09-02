@@ -57,9 +57,11 @@ namespace
     };
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, std::string_view message)
     {
+        ++checks;
         if (!condition)
         {
             std::cerr << "FAILED: " << message << '\n';
@@ -712,5 +714,6 @@ int main()
     testRefinementLedgerConservation();
     testRefinementLedgerRejectsAtomically();
     testRefinementLedgerExhaustionAndOverflow();
+    std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

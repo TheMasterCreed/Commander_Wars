@@ -26,9 +26,11 @@ namespace
     constexpr qint32 EMPTY_REPAIR_MASK = 0;
 
     int failureCount = 0;
+    int checkCount = 0;
 
     void expect(bool condition, std::string_view message)
     {
+        ++checkCount;
         if (!condition)
         {
             std::cerr << message << '\n';
@@ -86,5 +88,6 @@ int main()
     testCaptureTurns();
     testRepairTypes();
     testDefaults();
+    std::cout << checkCount << " checks, " << failureCount << " failures\n";
     return failureCount;
 }

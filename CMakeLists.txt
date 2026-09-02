@@ -826,7 +826,9 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/candidatebundle.h
     ai/coordinator/planstockvaluer.h
     ai/coordinator/relativestockcomparison.h
-    ai/coordinator/relativestocksession.h
+    ai/coordinator/relativestockaudit.h
+    ai/coordinator/relativestockrefinement.h
+    ai/coordinator/relativestocksession.h ai/coordinator/relativestocksession.cpp
     ai/coordinator/turnplan.h
     ai/coordinator/mobilityfield.h
     ai/coordinator/mobilityfieldcache.h ai/coordinator/mobilityfieldcache.cpp
@@ -1490,6 +1492,38 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiRelativeStockComparisonTests)
 
+    add_executable(CoordinatorAiRelativeStockRefinementTests
+        tests/coordinator_ai/relativestockrefinementtests.cpp
+        tests/coordinator_ai/relativestocktestfixture.h
+    )
+    target_include_directories(CoordinatorAiRelativeStockRefinementTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(CoordinatorAiRelativeStockRefinementTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
+    target_link_libraries(CoordinatorAiRelativeStockRefinementTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiRelativeStockRefinementTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiRelativeStockRefinementTests COMMAND CoordinatorAiRelativeStockRefinementTests)
+    cow_set_arena_test_path(CoordinatorAiRelativeStockRefinementTests)
+
+    add_executable(CoordinatorAiRelativeStockAssignmentTests
+        tests/coordinator_ai/relativestockassignmenttests.cpp
+        tests/coordinator_ai/relativestocktestfixture.h
+    )
+    target_include_directories(CoordinatorAiRelativeStockAssignmentTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiRelativeStockAssignmentTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiRelativeStockAssignmentTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiRelativeStockAssignmentTests COMMAND CoordinatorAiRelativeStockAssignmentTests)
+    cow_set_arena_test_path(CoordinatorAiRelativeStockAssignmentTests)
+
+    add_executable(CoordinatorAiSupportAuditTests
+        tests/coordinator_ai/supportaudittests.cpp
+        tests/arena/relativestocksupportaudit.h
+    )
+    target_include_directories(CoordinatorAiSupportAuditTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(CoordinatorAiSupportAuditTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
+    target_link_libraries(CoordinatorAiSupportAuditTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiSupportAuditTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiSupportAuditTests COMMAND CoordinatorAiSupportAuditTests)
+    cow_set_arena_test_path(CoordinatorAiSupportAuditTests)
+
     add_executable(CoordinatorAiAssignmentBoundProof
         tests/coordinator_ai/assignmentboundproof.cpp
     )
@@ -1550,6 +1584,7 @@ if (BUILD_TESTING)
     target_include_directories(CoordinatorAiSequentialContinuationTests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    target_compile_definitions(CoordinatorAiSequentialContinuationTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_link_libraries(CoordinatorAiSequentialContinuationTests PRIVATE Qt6::Core)
     set_target_properties(CoordinatorAiSequentialContinuationTests PROPERTIES
         AUTOMOC OFF
@@ -1787,6 +1822,13 @@ if (BUILD_TESTING)
         tests/arena/arenamatchconfig.h
         tests/arena/arenamatchrunner.cpp
         tests/arena/arenamatchrunner.h
+        tests/arena/arenaactionprefix.cpp
+        tests/arena/arenaactionprefix.h
+        tests/arena/relativestockprobe.cpp
+        tests/arena/relativestockprobe.h
+        tests/arena/relativestockreceipts.h
+        tests/arena/relativestocksupportaudit.cpp
+        tests/arena/relativestocksupportaudit.h
         tests/arena/arenatestsupport.cpp
         tests/arena/arenatestsupport.h
         tests/arena/actionseedprobe.cpp
@@ -1810,6 +1852,7 @@ if (BUILD_TESTING)
         tests/coordinator_ai/damageoracletests.cpp
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_ACTION_SEED_TESTING)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     set_property(SOURCE coreengine/interpreter.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS COW_AI_ARENA_TESTING
     )

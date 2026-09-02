@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include <QMetaObject>
 #include <QObject>
 #include <QStringList>
@@ -11,9 +13,11 @@
 #include "game/gamemap.h"
 #include "menue/gamemenue.h"
 #include "tests/arena/arenamatchconfig.h"
+#include "tests/arena/arenaactionprefix.h"
 
 class AiArenaTestSupport;
 class GameRules;
+class ArenaRelativeStockProbe;
 
 class ArenaMatchRunner final : public QObject
 {
@@ -63,5 +67,7 @@ private:
     QStringList m_actionPayloadBase64;
     QVariantList m_seedTrace;
     QVariantList m_actionTargets;
+    std::shared_ptr<ArenaRelativeStockProbe> m_relativeStockProbe;
+    std::unique_ptr<ArenaActionPrefix> m_actionPrefix;
     bool m_finished{false};
 };

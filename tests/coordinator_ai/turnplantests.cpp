@@ -164,9 +164,11 @@ namespace
     constexpr std::int32_t UNKNOWN_ACTION_INDEX = 99;
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, const char* description)
     {
+        ++checks;
         if (!condition)
         {
             std::printf("FAILED: %s\n", description);
@@ -897,6 +899,161 @@ namespace
         expect(plan.serviceClaimant(SERVICE_PARTNER_UNIT) == NO_ACTION, "a failed action releases its service slot");
         expect(plan.claimService(rival, SERVICE_PARTNER_UNIT) == ReservationResult::Granted, "the rival can take the free slot");
     }
+
+    bool sameEdges(const TurnPlan & left, const TurnPlan & right)
+    {
+        if (left.edgeCount() != right.edgeCount())
+        {
+            return false;
+        }
+        for (std::int32_t index = 0; index < left.edgeCount(); ++index)
+        {
+            const auto & a = left.edge(index);
+            const auto & b = right.edge(index);
+            if (a.from != b.from || a.to != b.to || a.kind != b.kind)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool sameConflicts(const std::vector<VacateConflict> & left, const std::vector<VacateConflict> & right)
+    {
+        if (left.size() != right.size())
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < left.size(); ++index)
+        {
+            if (left[index].moverAction != right[index].moverAction ||
+                left[index].occupantUnit != right[index].occupantUnit ||
+                left[index].occupantAction != right[index].occupantAction)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void testClearVacatePreservesOtherDependenciesAndClaims()
+    {
+        TurnPlan plan;
+        addChainActionsHeadFirst(plan);
+        const auto capture = plan.addAction(captureAction(CAPTURE_UNIT, CAPTURE_START, CAPTURE_BUILDING, EQUAL_VALUE));
+        const auto shooter = plan.addAction(fireAction(REAR_UNIT, REAR_TILE, WALL_TILE, WALL_UNIT, EQUAL_VALUE));
+        const auto service = plan.addAction(moveAction(SERVICE_UNIT, ESCORT_TILE, ESCORT_GOAL, EQUAL_VALUE));
+        for (std::int32_t index = 0; index < plan.actionCount(); ++index)
+        {
+            expect(plan.claimDestination(index, plan.action(index).destination) == ReservationResult::Granted,
+                   "all preservation fixture destinations are claimed");
+        }
+        expect(plan.claimCapture(capture, CAPTURE_BUILDING) == ReservationResult::Granted, "capture claim is present");
+        expect(plan.claimService(service, SERVICE_PARTNER_UNIT) == ReservationResult::Granted, "service claim is present");
+        expect(claimDamage(plan, shooter, WALL_UNIT, WALL_HP_STEPS, WALL_HP_STEPS) == ReservationResult::Granted,
+               "damage claim is present");
+        expect(plan.addWallbreakEdge(shooter, capture), "Wallbreak is present before clearing");
+        expect(plan.addEdge(0, shooter, PlanEdgeKind::Screen), "Screen is present before clearing");
+        expect(plan.addEdge(capture, service, PlanEdgeKind::Coverage), "Coverage is present before clearing");
+        expect(plan.addEdge(service, 2, PlanEdgeKind::Service), "Service is present before clearing");
+        expect(plan.addVacateEdges(chainOccupancy()).empty(), "current chain adds its Vacate dependencies");
+        expect(plan.commit(service), "committed state is represented in the preservation fixture");
+        const auto before = plan;
+        plan.clearEdgesOfKind(PlanEdgeKind::Vacate);
+        expect(plan.edgeCount() == 4, "clearing removes both incoming and outgoing Vacate edges only");
+        for (std::int32_t index = 0; index < plan.edgeCount(); ++index)
+        {
+            expect(plan.edge(index).from == before.edge(index).from &&
+                       plan.edge(index).to == before.edge(index).to &&
+                       plan.edge(index).kind == before.edge(index).kind,
+                   "each non-Vacate edge retains its endpoints, kind and order");
+        }
+        for (std::int32_t index = 0; index < plan.actionCount(); ++index)
+        {
+            expect(plan.action(index) == before.action(index), "clearing preserves every action and action state");
+            expect(plan.destinationClaimant(plan.action(index).destination) ==
+                       before.destinationClaimant(before.action(index).destination),
+                   "clearing preserves all destination claims");
+        }
+        expect(plan.captureClaimant(CAPTURE_BUILDING) == capture &&
+                   plan.serviceClaimant(SERVICE_PARTNER_UNIT) == service &&
+                   plan.plannedDamageOn(WALL_UNIT) == WALL_HP_STEPS &&
+                   plan.remainingHpStepsOn(WALL_UNIT) == WALL_HP_STEPS && plan.targetIsLethal(WALL_UNIT),
+               "capture, service and damage claim contents survive clearing");
+        const auto cleared = plan;
+        plan.clearEdgesOfKind(PlanEdgeKind::Vacate);
+        expect(sameEdges(plan, cleared), "clearing an already-cleared graph is idempotent");
+        expect(plan.rebuildVacateEdges(chainOccupancy()).empty() && plan.edgeCount() == before.edgeCount(),
+               "rebuilding restores current Vacate dependencies alongside all semantic dependencies");
+        for (std::int32_t index = 0; index < cleared.edgeCount(); ++index)
+        {
+            expect(plan.edge(index).kind == cleared.edge(index).kind, "rebuilding preserves non-Vacate edge kinds");
+        }
+    }
+
+    void testVacateRebuildIsIdempotent()
+    {
+        TurnPlan chain;
+        addChainActionsHeadFirst(chain);
+        expect(chain.addEdge(2, 0, PlanEdgeKind::Vacate), "fixture seeds an obsolete opposite dependency");
+        const auto conflicts = chain.rebuildVacateEdges(chainOccupancy());
+        const auto rebuilt = chain;
+        const auto order = chain.executionOrder();
+        expect(conflicts.empty() && chain.edgeCount() == 2 && order.cycleMembers.empty() &&
+                   order.blockedByCycle.empty(), "fresh derivation removes an obsolete false cycle");
+        for (int repeat = 0; repeat < 3; ++repeat)
+        {
+            expect(sameConflicts(conflicts, chain.rebuildVacateEdges(chainOccupancy())) &&
+                       sameEdges(rebuilt, chain) && chain.executionOrder().order == order.order,
+                   "repeated rebuilding preserves the exact edge set, conflicts and execution order");
+        }
+        TurnPlan blocked;
+        const auto occupant = blocked.addAction(fireAction(INDIRECT_UNIT, INDIRECT_POST, FOCUS_TARGET_TILE,
+                                                         FOCUS_TARGET_UNIT, EQUAL_VALUE));
+        const auto mover = blocked.addAction(moveAction(INFANTRY_UNIT, INFANTRY_TILE, INDIRECT_POST, EQUAL_VALUE));
+        const std::vector<OccupancyEntry> occupancy{{INDIRECT_UNIT, INDIRECT_POST}, {INFANTRY_UNIT, INFANTRY_TILE}};
+        expect(blocked.addEdge(occupant, mover, PlanEdgeKind::Vacate), "conflict fixture seeds an obsolete edge");
+        const auto first = blocked.rebuildVacateEdges(occupancy);
+        const auto conflictPlan = blocked;
+        expect(first.size() == 1 && blocked.edgeCount() == 0, "a staying occupant yields a current conflict, not an edge");
+        for (int repeat = 0; repeat < 3; ++repeat)
+        {
+            expect(sameConflicts(first, blocked.rebuildVacateEdges(occupancy)) && sameEdges(blocked, conflictPlan) &&
+                       blocked.action(occupant) == conflictPlan.action(occupant) &&
+                       blocked.action(mover) == conflictPlan.action(mover) &&
+                       blocked.executionOrder().order == conflictPlan.executionOrder().order,
+                   "conflict rebuilding is deterministic, observational and duplicate-free");
+        }
+    }
+
+    void testClearingBeforeFailurePreservesNonMember()
+    {
+        TurnPlan plan;
+        addChainActionsHeadFirst(plan);
+        plan.addVacateEdges(chainOccupancy());
+        for (std::int32_t index = 0; index < plan.actionCount(); ++index)
+        {
+            plan.claimDestination(index, plan.action(index).destination);
+        }
+        const auto before = plan;
+        auto trial = plan;
+        trial.clearEdgesOfKind(PlanEdgeKind::Vacate);
+        expect(trial.markFailed(0).empty(), "temporary unseating cannot follow an inherited Vacate edge");
+        for (const std::int32_t nonMember : {1, 2})
+        {
+            expect(trial.action(nonMember) == before.action(nonMember) &&
+                       trial.destinationClaimant(before.action(nonMember).destination) == nonMember,
+                   "non-member actions, states and claims remain identical after clearing then unseating");
+        }
+        expect(trial.replan(0, before.action(0)).accepted &&
+                   trial.claimDestination(0, CHAIN_HEAD_GOAL) == ReservationResult::Granted,
+               "the member can be reseated without reviving or changing any non-member");
+        expect(trial.rebuildVacateEdges(chainOccupancy()).empty() &&
+                   trial.executionOrder().order == before.executionOrder().order,
+               "fresh current dependencies reproduce the valid order");
+        expect(sameEdges(plan, before) && plan.action(0) == before.action(0),
+               "trial mutation never changes the original plan");
+    }
 }
 
 int main()
@@ -932,6 +1089,10 @@ int main()
     testBlockedActionCanBeReplanned();
     testMarkFailedRefusesACommittedActionAndRepeatsAreIdempotent();
     testServiceSlotIsExclusivePerPartner();
+    testClearVacatePreservesOtherDependenciesAndClaims();
+    testVacateRebuildIsIdempotent();
+    testClearingBeforeFailurePreservesNonMember();
+    std::printf("%d checks, %d failures\n", checks, failures);
     if (failures == 0)
     {
         return 0;

@@ -345,6 +345,20 @@ void CoordinatedAi::buildTurnPlan()
     input.pStockValuer = &stockValuer;
     input.pTrace = m_decisionTrace.get();
     input.measureTimings = timed;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    input.relativeStockWorkLimit = m_testRefinementWorkLimit;
+    if (m_testRefinementScheduleDay < 0 || traceIdentity.day == m_testRefinementScheduleDay)
+    {
+        input.relativeStockSchedule = m_testRefinementSchedule;
+    }
+    input.pRelativeStockObserver = m_testRefinementObserver.get();
+    if (m_testRefinementObserver)
+    {
+        m_testRefinementObserver->beginPlan({
+            traceIdentity.day, traceIdentity.playerId, traceIdentity.planSequence, traceIdentity.horizonTurns,
+        });
+    }
+#endif
     Coordinator::DamageOracle oracle(*m_pMap);
     oracle.clear();
     Coordinator::BundleBuildStats buildStats;
@@ -467,6 +481,12 @@ void CoordinatedAi::buildTurnPlan()
     {
         continuationStart = Clock::now();
     }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (m_testRefinementObserver && m_testRefinementObserver->frontierReceiptsEnabled())
+    {
+        m_testRefinementObserver->model(input, m_propertyStock);
+    }
+#endif
     Coordinator::ContinuationPricingCatalog catalog =
         stockValuer.continuationPricingCatalog(input);
     Coordinator::RefinementLedger ledger;
@@ -533,6 +553,22 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(stats.clustersSkippedStockBudget)
                 .arg(stats.enumerationStates)
                 .arg(m_planSequence);
+        phaseTimingFields += QStringLiteral(
+            " stockPairEnumerationNanos=%1 stockPairRelativeNanos=%2 stockPairReplayNanos=%3 stockJointEnumerationNanos=%4 stockJointRelativeNanos=%5 stockJointReplayNanos=%6 stockPairStates=%7 stockPairEnemyStates=%8 stockPairWork=%9 stockPairImprovements=%10 stockPairUnresolved=%11 stockPairBudgetExhaustions=%12 stockJointStates=%13 stockJointEnemyStates=%14 stockJointWork=%15 stockJointImprovements=%16 stockJointUnresolved=%17 stockJointBudgetExhaustions=%18 stockJointSkipped=%19 ledgerTotal=%20 ledgerSpent=%21 ledgerRemaining=%22")
+            .arg(assignmentTiming.stockPairs.enumerationNanos).arg(assignmentTiming.stockPairs.refinementNanos)
+            .arg(assignmentTiming.stockPairs.replayNanos).arg(assignmentTiming.stockJoints.enumerationNanos)
+            .arg(assignmentTiming.stockJoints.refinementNanos).arg(assignmentTiming.stockJoints.replayNanos)
+            .arg(stats.stockPairs.statesUsed).arg(stats.stockPairs.enemyStatesUsed).arg(stats.stockPairs.workUsed)
+            .arg(stats.stockPairs.improvements).arg(stats.stockPairs.unresolved).arg(stats.stockPairs.budgetExhaustions)
+            .arg(stats.stockJoints.statesUsed).arg(stats.stockJoints.enemyStatesUsed).arg(stats.stockJoints.workUsed)
+            .arg(stats.stockJoints.improvements).arg(stats.stockJoints.unresolved).arg(stats.stockJoints.budgetExhaustions)
+            .arg(stats.stockJoints.skippedDomains).arg(ledger.stats().total).arg(ledger.stats().spent()).arg(ledger.balance());
+        phaseTimingFields += QStringLiteral(
+            " mixedPairDomains=%1 mixedPairCalls=%2 mixedPairKeys=%3 mixedPairStates=%4 mixedPairEnemyStates=%5 mixedPairWork=%6 mixedPairBudgetExhaustions=%7 mixedPairFailures=%8 allPairWork=%9")
+            .arg(stats.mixedPairs.domains).arg(stats.mixedPairs.calls).arg(stats.mixedPairs.keysRefined)
+            .arg(stats.mixedPairs.statesUsed).arg(stats.mixedPairs.enemyStatesUsed).arg(stats.mixedPairs.workUsed)
+            .arg(stats.mixedPairs.budgetExhaustions).arg(stats.mixedPairs.failures)
+            .arg(stats.stockPairs.workUsed + stats.mixedPairs.workUsed);
     }
     if (m_decisionTrace != nullptr)
     {

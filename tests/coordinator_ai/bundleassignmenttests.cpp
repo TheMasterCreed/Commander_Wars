@@ -68,9 +68,11 @@ constexpr std::int32_t TARGET_HP_STEPS = 3;
 constexpr std::int32_t LETHAL_DAMAGE_STEPS = 3;
 
 int failures = 0;
+int checks = 0;
 
 void expect(bool condition, const char* description)
 {
+    ++checks;
     if (!condition)
     {
         std::printf("FAILED: %s\n", description);
@@ -198,14 +200,14 @@ public:
         return quote;
     }
 
-    bool refineLiveAtBoundary(AssignPhase phase) override
+    Coordinator::LiveRefinementResult refineLiveAtBoundary(AssignPhase phase, std::int64_t) override
     {
         liveAfterAudit = liveAfterAudit || auditSeen;
         ++refinementBoundaries;
         wrongRefinementPhase =
             wrongRefinementPhase ||
             phase != AssignPhase::BetweenSwapSweeps;
-        return false;
+        return {};
     }
 
     PlanStockAudit auditPlanStock(
@@ -391,9 +393,9 @@ public:
         return quote;
     }
 
-    bool refineLiveAtBoundary(AssignPhase) override
+    Coordinator::LiveRefinementResult refineLiveAtBoundary(AssignPhase, std::int64_t) override
     {
-        return false;
+        return {};
     }
 
     PlanStockAudit auditPlanStock(
@@ -3194,5 +3196,6 @@ int main()
     testCapsAndSharedBudgetBoundTheSearch();
     testStockDecompositionIsDeferredAndNeutral();
     testDecisionTraceIsNeutralAndDeterministic();
+    std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

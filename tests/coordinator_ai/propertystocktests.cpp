@@ -36,9 +36,11 @@ namespace
     constexpr std::uint64_t RANDOM_INCREMENT = 1442695040888963407ULL;
 
     int failures = 0;
+    int checks = 0;
 
     void expect(bool condition, std::string_view message)
     {
+        ++checks;
         if (!condition)
         {
             std::printf("FAILED: %.*s\n", static_cast<int>(message.size()), message.data());
@@ -328,5 +330,6 @@ int main()
     testInjectivityAndPositionalDelta();
     testActivationScheduleUsesTurnBoundaries();
     testReadSetOnlyBoundsWork();
+    std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -5,6 +5,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+#include <set>
+#endif
 #include <span>
 #include <vector>
 
@@ -15,6 +18,10 @@
 #include "ai/coordinator/propertystockfield.h"
 #include "ai/coordinator/propertystocksequential.h"
 #include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/relativestocksession.h"
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+#include "ai/coordinator/sequentialthreshold.h"
+#endif
 
 class GameMap;
 
@@ -58,6 +65,18 @@ namespace Coordinator
         bool valid{false};
     };
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct DiagnosticSequentialThresholdProof
+    {
+        SequentialThresholdResult proof;
+        std::int64_t tariff{0};
+        std::int64_t stateCap{0};
+        std::int64_t workUsed{0};
+        bool witnessReplays{false};
+        bool valid{false};
+    };
+#endif
+
     class JointPlanStockValuer final : public PlanStockValuer
     {
     public:
@@ -71,7 +90,8 @@ namespace Coordinator
             const TurnPlan & plan,
             MilliFunds economicValue,
             bool pricingLeaf) override;
-        bool refineLiveAtBoundary(AssignPhase phase) override;
+        LiveRefinementResult refineLiveAtBoundary(AssignPhase phase, std::int64_t maximumWork) override;
+        RelativeStockSession* relativeStockSession() override;
         PlanStockAudit auditPlanStock(const TurnPlan & plan) override;
         MilliFunds planStockFloor(const TurnPlan & plan);
         ContinuationPricingCatalog continuationPricingCatalog(
@@ -79,8 +99,63 @@ namespace Coordinator
         bool prepareContinuationPricing(
             ContinuationPricingCatalog catalog,
             RefinementLedger & ledger);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        bool prepareDiagnosticContinuationPricing(
+            ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit);
+        const SequentialTierResult & diagnosticLastOurRefinement() const
+        {
+            return m_diagnosticLastOurRefinement;
+        }
+        DiagnosticSequentialThresholdProof
+        diagnosticProveOurBelow(
+            const ContinuationKey & key,
+            MilliFunds threshold,
+            std::int64_t maximumWork,
+            SequentialCacheAccounting cacheAccounting,
+            SequentialThresholdOptions options = {});
+#endif
 
     private:
+        bool prepareContinuationPricing(
+            ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget);
+
+        enum class RefinementSchedule : std::int8_t
+        {
+            Rung,
+            Relative,
+        };
+
+        class RelativeSession final : public RelativeStockSession
+        {
+        public:
+            RelativeSession(JointPlanStockValuer & owner, const PropertyStockField & snapshot,
+                            const PropertyStockInstance & enemyModel);
+            RelativeStockQuote quote(const TurnPlan & plan, MilliFunds economic) override;
+            RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) override;
+            RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t stateCap) override;
+            RelativeStockRefinedTerm refineEnemy(
+                const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) override;
+            bool supportsVerifiedDual() const override
+            {
+                return true;
+            }
+            RelativeStockDualTightening
+            tightenOurUpperWithVerifiedDual(
+                const RelativeStockQuote & quote,
+                std::int64_t maximumWork) override;
+            bool replayOurWitness(const RelativeStockQuote & quote) override;
+            bool replayEnemyWitness(const RelativeStockQuote & quote) override;
+            std::int64_t remainingWork() const override;
+            std::int64_t ourRerunWork() const override;
+            std::int64_t enemyRerunWork(const std::vector<std::int32_t> & capturedColumns) const override;
+
+        private:
+            GrantId grant(std::int64_t tariff, std::int64_t stateCap, RefinementWork work);
+            bool verifiedUpperMatches(
+                const RelativeStockQuote & quote) const override;
+            JointPlanStockValuer & m_owner;
+        };
+
         struct EnemySequentialSolve
         {
             SequentialTierResult tier;
@@ -93,6 +168,15 @@ namespace Coordinator
             std::vector<std::int32_t> capturedColumns;
             SequentialTierResult tier;
             bool witnessReplays{false};
+        };
+
+        struct OurSequentialProblem
+        {
+            MilliFunds owned{0};
+            MilliFunds floorValue{0};
+            std::vector<std::int32_t> capturedColumns;
+            std::vector<std::vector<std::int64_t>> rowKeys;
+            SequentialInstance instance;
         };
 
         struct RefinedWitness
@@ -133,20 +217,39 @@ namespace Coordinator
         LivePlanStockQuote liveQuote(
             const CheapInitialPrice & initial,
             MilliFunds economicValue) const;
-        bool refineLiveKey(const ContinuationKey & key);
+        LiveRefinementResult refineLiveKey(const ContinuationKey & key, std::int64_t maximumWork);
         bool refineOur(ContinuationEntry & entry,
                        GrantId grant,
-                       std::int64_t stateCap);
+                       std::int64_t stateCap,
+                       RefinementSchedule schedule = RefinementSchedule::Rung);
         bool refineEnemy(
             EnemySetBounds & enemy,
             const std::vector<std::int32_t> & capturedColumns,
             GrantId grant,
-            std::int64_t stateCap);
+            std::int64_t stateCap,
+            RefinementSchedule schedule = RefinementSchedule::Rung);
         MilliFunds sequentialJointStock(std::span<const PlanRowAction> actions) const;
         OurSequentialSolve solveOurSequential(
             std::span<const PlanRowAction> actions,
             std::int64_t stateCap,
-            bool captureWitness) const;
+            bool captureWitness,
+            const RefinedWitness* pReplay = nullptr) const;
+        OurSequentialProblem buildOurSequentialProblem(
+            std::span<const PlanRowAction> actions) const;
+        const PackingDualFieldIdentity &
+        packingDualFieldIdentity() const;
+        PackingDualProblemIdentity packingDualProblemIdentity(
+            const RelativeStockQuote & quote,
+            const OurSequentialProblem & problem) const;
+        RelativeStockDualTightening
+        tightenOurUpperWithVerifiedDual(
+            const RelativeStockQuote & quote,
+            std::uint64_t sessionIdentity,
+            std::int64_t maximumWork);
+        bool verifiedUpperMatches(
+            const RelativeStockQuote & quote,
+            std::uint64_t sessionIdentity) const;
+        PropertyStockField & continuationField() const;
         void ensureOurSequentialState() const;
         std::int32_t ourClassIndexFor(const PropertyStockRow & row) const;
         std::vector<std::int32_t> nodeArrivalsFor(
@@ -167,7 +270,8 @@ namespace Coordinator
         EnemySequentialSolve solveEnemySequential(
             const std::vector<std::int32_t> & capturedColumns,
             std::int64_t stateCap,
-            bool captureWitness) const;
+            bool captureWitness,
+            const RefinedWitness* pReplay = nullptr) const;
 
         PropertyStockField & m_field;
         std::map<std::int32_t, std::int32_t> m_knowledgeOf;
@@ -185,7 +289,13 @@ namespace Coordinator
         mutable std::map<std::vector<std::int64_t>,
                          SequentialDetail::CachedRowEnumeration>
             m_rowOptionCache;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        mutable std::set<std::vector<std::int64_t>>
+            m_rowOptionPaidKeys;
+        SequentialTierResult m_diagnosticLastOurRefinement;
+#endif
         std::unique_ptr<PropertyStockField> m_pricingField;
+        std::optional<RelativeSession> m_relativeSession;
         CheapPricingModel m_cheapModel;
         mutable CheapUpperState m_cheapState;
         ContinuationPricingState m_pricingState{
@@ -199,6 +309,17 @@ namespace Coordinator
             m_refinedOurWitnesses;
         std::map<std::vector<std::int32_t>, RefinedWitness>
             m_refinedEnemyWitnesses;
+        struct VerifiedOurUpper
+        {
+            std::uint64_t id{0};
+            std::shared_ptr<const PackingDualCertificate>
+                certificate;
+        };
+        std::map<ContinuationKey, VerifiedOurUpper>
+            m_verifiedOurUppers;
+        std::uint64_t m_nextCertificateId{1};
+        mutable std::optional<PackingDualFieldIdentity>
+            m_packingDualFieldIdentity;
         mutable bool m_pricingFailure{false};
         bool m_refinementClosed{false};
     };

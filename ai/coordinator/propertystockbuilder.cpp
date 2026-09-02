@@ -82,6 +82,9 @@ namespace
                  Coordinator::SequentialDetail::CachedRowEnumeration>*
             pCache{nullptr};
         const std::vector<std::vector<std::int64_t>>* pKeys{nullptr};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::set<std::vector<std::int64_t>>* pPaidKeys{nullptr};
+#endif
 
         bool lookup(
             std::int32_t rowIndex,
@@ -112,6 +115,33 @@ namespace
                 (*pKeys)[static_cast<std::size_t>(rowIndex)],
                 std::move(entry));
         }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        bool onceCharge(
+            std::int32_t rowIndex,
+            std::int64_t statesSpent,
+            std::int64_t & chargedStates) const override
+        {
+            if (pPaidKeys == nullptr)
+            {
+                return false;
+            }
+            const auto & key =
+                (*pKeys)[static_cast<std::size_t>(rowIndex)];
+            chargedStates =
+                pPaidKeys->contains(key) ? 0 : statesSpent;
+            return true;
+        }
+
+        void recordCharge(std::int32_t rowIndex) override
+        {
+            if (pPaidKeys != nullptr)
+            {
+                pPaidKeys->insert(
+                    (*pKeys)[static_cast<std::size_t>(rowIndex)]);
+            }
+        }
+#endif
     };
 
     std::int32_t tileSlot(std::int32_t width, std::int32_t height, std::int32_t x, std::int32_t y)
@@ -618,6 +648,30 @@ namespace Coordinator
         ContinuationPricingCatalog catalog,
         RefinementLedger & ledger)
     {
+        return prepareContinuationPricing(std::move(catalog), ledger, LIVE_PAIR_REFINEMENT_BUDGET);
+    }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    bool JointPlanStockValuer::prepareDiagnosticContinuationPricing(
+        ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit)
+    {
+        if (m_pricingState != ContinuationPricingState::Unprepared || diagnosticWorkLimit <= 0)
+        {
+            return false;
+        }
+        catalog.refinementBudget = diagnosticWorkLimit;
+        catalog.ledgerTotal = catalog.mandatoryTariff;
+        if (!catalog.valid || !addWork(catalog.ledgerTotal, diagnosticWorkLimit) || !ledger.open(catalog.ledgerTotal))
+        {
+            return false;
+        }
+        return prepareContinuationPricing(std::move(catalog), ledger, diagnosticWorkLimit);
+    }
+#endif
+
+    bool JointPlanStockValuer::prepareContinuationPricing(
+        ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget)
+    {
         const ContinuationKey catalogKey =
             canonicalPlanKey(catalog.actions);
         if (m_pricingState == ContinuationPricingState::Prepared)
@@ -635,7 +689,7 @@ namespace Coordinator
         std::int64_t expectedTotal = expectedMandatory;
         const bool expectedValid =
             expectedMandatory >= 0 &&
-            addWork(expectedTotal, LIVE_PAIR_REFINEMENT_BUDGET);
+            addWork(expectedTotal, refinementBudget);
         const auto less = [](const PlanRowAction & lhs,
                              const PlanRowAction & rhs)
         {
@@ -659,8 +713,7 @@ namespace Coordinator
         const RefinementLedgerStats & stats = ledger.stats();
         if (!catalog.valid || !expectedValid ||
             catalog.mandatoryTariff != expectedMandatory ||
-            catalog.refinementBudget !=
-                LIVE_PAIR_REFINEMENT_BUDGET ||
+            catalog.refinementBudget != refinementBudget ||
             catalog.ledgerTotal != expectedTotal ||
             stats.total != expectedTotal ||
             stats.granted != 0 ||
@@ -689,6 +742,9 @@ namespace Coordinator
             m_pricingState = ContinuationPricingState::Failed;
             return false;
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        m_rowOptionPaidKeys.clear();
+#endif
         m_preparedCatalogKey = std::move(catalogKey);
         m_pricingState = ContinuationPricingState::Prepared;
         m_pRefinementLedger = &ledger;
@@ -1671,7 +1727,7 @@ namespace Coordinator
             return;
         }
         const std::vector<PropertyStockColumn> & columns =
-            m_field.m_ours.columns;
+            continuationField().m_ours.columns;
         m_ourNodeOfColumn.assign(columns.size(), NO_SEQUENTIAL_NODE);
         for (std::size_t slot = 0; slot < columns.size(); ++slot)
         {
@@ -1718,6 +1774,7 @@ namespace Coordinator
     std::int32_t JointPlanStockValuer::ourClassIndexFor(
         const PropertyStockRow & row) const
     {
+        PropertyStockField & field = continuationField();
         const SequentialClassKey key{
             row.gridIdentity,
             row.movementPoints,
@@ -1731,7 +1788,7 @@ namespace Coordinator
             }
         }
         const std::vector<std::int32_t> arrivals =
-            nodeArrivalsFor(m_field,
+            nodeArrivalsFor(field,
                             row.gridIdentity,
                             row.movementPoints,
                             m_ourNodeSlots);
@@ -1741,8 +1798,8 @@ namespace Coordinator
             std::span<const std::int32_t>(arrivals),
             captureTurnsFor(0,
                             row.captureRate,
-                            m_field.m_capturePointsToCapture),
-            m_field.m_horizonTurns);
+                            field.m_capturePointsToCapture),
+            field.m_horizonTurns);
         m_ourClassKeys.push_back(key);
         m_ourClassTables.push_back(std::move(table));
         return static_cast<std::int32_t>(m_ourClassKeys.size()) - 1;
@@ -1820,15 +1877,17 @@ namespace Coordinator
     JointPlanStockValuer::solveEnemySequential(
         const std::vector<std::int32_t> & capturedColumns,
         std::int64_t stateCap,
-        bool captureWitness) const
+        bool captureWitness,
+        const RefinedWitness* pReplay) const
     {
+        PropertyStockField & field = continuationField();
         EnemySequentialSolve solved;
         const MilliFunds enemyFloor =
-            m_field.jointEnemyOptimum(capturedColumns);
-        PropertyStockInstance flipped = m_field.m_theirs;
+            field.jointEnemyOptimum(capturedColumns);
+        PropertyStockInstance flipped = field.m_theirs;
         for (const std::int32_t column : capturedColumns)
         {
-            m_field.flipColumnForEnemy(flipped, column);
+            field.flipColumnForEnemy(flipped, column);
         }
 
         std::vector<std::int32_t> nodeSlots;
@@ -1872,7 +1931,7 @@ namespace Coordinator
                 continue;
             }
             const std::vector<std::int32_t> arrivals =
-                nodeArrivalsFor(m_field,
+                nodeArrivalsFor(field,
                                 row.gridIdentity,
                                 row.movementPoints,
                                 nodeSlots);
@@ -1882,8 +1941,8 @@ namespace Coordinator
                 std::span<const std::int32_t>(arrivals),
                 captureTurnsFor(0,
                                 row.captureRate,
-                                m_field.m_capturePointsToCapture),
-                m_field.m_horizonTurns);
+                                field.m_capturePointsToCapture),
+                field.m_horizonTurns);
             classKeys.push_back(key);
             classTables.push_back(std::move(table));
             classIndices[rowIndex] =
@@ -1891,7 +1950,7 @@ namespace Coordinator
         }
 
         SequentialInstance instance;
-        instance.horizonTurns = m_field.m_horizonTurns;
+        instance.horizonTurns = field.m_horizonTurns;
         instance.nodeColumns =
             std::span<const PropertyStockColumn>(nodeColumns);
         instance.classes =
@@ -1903,13 +1962,18 @@ namespace Coordinator
              ++rowIndex)
         {
             instance.rows.push_back(sequentialRowFor(
-                m_field,
+                field,
                 flipped,
                 flipped.rows[rowIndex],
                 static_cast<std::int32_t>(rowIndex),
                 nullptr,
                 nodeSlots,
                 classIndices[rowIndex]));
+        }
+        if (pReplay != nullptr)
+        {
+            solved.witnessReplays = replaySequentialWitness(instance, pReplay->rows, pReplay->value);
+            return solved;
         }
         solved.tier = solveSequentialPacking(
             instance,
@@ -1946,52 +2010,51 @@ namespace Coordinator
         return solved.tier.bookedValue;
     }
 
-    JointPlanStockValuer::OurSequentialSolve
-    JointPlanStockValuer::solveOurSequential(
-        std::span<const PlanRowAction> actions,
-        std::int64_t stateCap,
-        bool captureWitness) const
+    JointPlanStockValuer::OurSequentialProblem
+    JointPlanStockValuer::buildOurSequentialProblem(
+        std::span<const PlanRowAction> actions) const
     {
-        OurSequentialSolve solved;
+        PropertyStockField & field = continuationField();
+        OurSequentialProblem problem;
         const PropertyStockField::JointActionFacts facts =
-            m_field.jointActionFacts(actions);
-        solved.capturedColumns = facts.capturedColumns;
-        solved.owned = m_field.m_ownedBaseline;
+            field.jointActionFacts(actions);
+        problem.capturedColumns = facts.capturedColumns;
+        problem.owned = field.m_ownedBaseline;
         for (const std::int32_t column : facts.capturedColumns)
         {
-            solved.owned += ownershipFlipSwing(
-                m_field.m_ours.columns[static_cast<std::size_t>(column)],
-                m_field.m_horizonTurns);
+            problem.owned += ownershipFlipSwing(
+                field.m_ours.columns[static_cast<std::size_t>(column)],
+                field.m_horizonTurns);
         }
-        const MilliFunds floorOur = m_field.ourOpenOptimum(facts);
+        problem.floorValue = field.ourOpenOptimum(facts);
 
         ensureOurSequentialState();
         std::vector<std::int32_t> classIndices(
-            m_field.m_ours.rows.size(),
+            field.m_ours.rows.size(),
             NO_SEQUENTIAL_CLASS);
         for (std::size_t rowIndex = 0;
-             rowIndex < m_field.m_ours.rows.size();
+             rowIndex < field.m_ours.rows.size();
              ++rowIndex)
         {
             classIndices[rowIndex] =
-                ourClassIndexFor(m_field.m_ours.rows[rowIndex]);
+                ourClassIndexFor(field.m_ours.rows[rowIndex]);
         }
 
-        SequentialInstance instance;
-        instance.horizonTurns = m_field.m_horizonTurns;
-        instance.nodeColumns =
+        problem.instance.horizonTurns = field.m_horizonTurns;
+        problem.instance.nodeColumns =
             std::span<const PropertyStockColumn>(m_ourNodeColumns);
-        instance.classes =
+        problem.instance.classes =
             std::span<const SequentialClassTable>(m_ourClassTables);
-        instance.capturedNodes.assign(m_ourNodeSlots.size(), false);
+        problem.instance.capturedNodes.assign(
+            m_ourNodeSlots.size(), false);
         for (const std::int32_t column : facts.capturedColumns)
         {
             const std::int32_t node =
                 m_ourNodeOfColumn[static_cast<std::size_t>(column)];
             if (node != NO_SEQUENTIAL_NODE)
             {
-                instance.capturedNodes[static_cast<std::size_t>(node)] =
-                    true;
+                problem.instance.capturedNodes[
+                    static_cast<std::size_t>(node)] = true;
             }
         }
 
@@ -1999,11 +2062,10 @@ namespace Coordinator
             facts.capturedColumns.begin(),
             facts.capturedColumns.end());
         std::sort(sortedCaptured.begin(), sortedCaptured.end());
-        std::vector<std::vector<std::int64_t>> rowKeys;
-        rowKeys.reserve(m_field.m_ours.rows.size());
-        instance.rows.reserve(m_field.m_ours.rows.size());
+        problem.rowKeys.reserve(field.m_ours.rows.size());
+        problem.instance.rows.reserve(field.m_ours.rows.size());
         for (std::size_t rowIndex = 0;
-             rowIndex < m_field.m_ours.rows.size();
+             rowIndex < field.m_ours.rows.size();
              ++rowIndex)
         {
             const PropertyStockActor* pMover = nullptr;
@@ -2034,35 +2096,592 @@ namespace Coordinator
             rowKey.insert(rowKey.end(),
                           sortedCaptured.begin(),
                           sortedCaptured.end());
-            rowKeys.push_back(std::move(rowKey));
-            instance.rows.push_back(sequentialRowFor(
-                m_field,
-                m_field.m_ours,
-                m_field.m_ours.rows[rowIndex],
+            problem.rowKeys.push_back(std::move(rowKey));
+            problem.instance.rows.push_back(sequentialRowFor(
+                field,
+                field.m_ours,
+                field.m_ours.rows[rowIndex],
                 static_cast<std::int32_t>(rowIndex),
                 pMover,
                 m_ourNodeSlots,
                 classIndices[rowIndex]));
         }
+        return problem;
+    }
 
+    const PackingDualFieldIdentity &
+    JointPlanStockValuer::packingDualFieldIdentity() const
+    {
+        if (!m_packingDualFieldIdentity.has_value())
+        {
+            const PropertyStockField & field =
+                continuationField();
+            m_packingDualFieldIdentity.emplace(
+                PackingDualFieldIdentity{
+                    .horizonTurns = field.m_horizonTurns,
+                    .width = field.m_width,
+                    .height = field.m_height,
+                    .capturePointsToCapture =
+                        field.m_capturePointsToCapture,
+                    .ownedBaseline = field.m_ownedBaseline,
+                    .ourRows = field.m_ours.rows,
+                    .ourColumns = field.m_ours.columns,
+                    .ourWeights = field.m_ours.weights,
+                    .enemyRows = field.m_theirs.rows,
+                    .enemyColumns = field.m_theirs.columns,
+                    .enemyWeights = field.m_theirs.weights,
+                    .columnTiles = field.m_columnTiles,
+                    .columnCapturers = field.m_columnCapturer,
+                    .columnCapturePoints =
+                        field.m_columnCapturePoints,
+                    .enemyArrivals = field.m_enemyArrivals,
+                    .mobilityGrids = field.m_grids,
+                });
+        }
+        return *m_packingDualFieldIdentity;
+    }
+
+    PackingDualProblemIdentity
+    JointPlanStockValuer::packingDualProblemIdentity(
+        const RelativeStockQuote & quote,
+        const OurSequentialProblem & problem) const
+    {
+        PackingDualProblemIdentity identity;
+        identity.immutableField =
+            packingDualFieldIdentity();
+        identity.key = quote.key;
+        identity.capturedColumns =
+            problem.capturedColumns;
+        identity.rowDomains = problem.rowKeys;
+        identity.nodeColumns.assign(
+            problem.instance.nodeColumns.begin(),
+            problem.instance.nodeColumns.end());
+        identity.usedNodes =
+            PackingDualNodeMask(
+                problem.instance.nodeCount());
+        for (std::int32_t node = 0;
+             node < problem.instance.nodeCount();
+             ++node)
+        {
+            if (problem.instance.capturedNodes[
+                    static_cast<std::size_t>(node)])
+            {
+                identity.usedNodes.set(node);
+            }
+        }
+        identity.economic = quote.economic;
+        identity.owned = problem.owned;
+        identity.incumbentFloor =
+            problem.floorValue;
+        identity.fixedValue = 0;
+        return identity;
+    }
+
+    RelativeStockDualTightening
+    JointPlanStockValuer::
+        tightenOurUpperWithVerifiedDual(
+            const RelativeStockQuote & quote,
+            std::uint64_t sessionIdentity,
+            std::int64_t maximumWork)
+    {
+        RelativeStockDualTightening result;
+        result.intervalBefore = quote.ours;
+        result.intervalAfter = quote.ours;
+        const auto failGlobal = [&]()
+        {
+            result.globalFailure = true;
+            m_pricingFailure = true;
+        };
+        if (!livePairSwapIntervals() ||
+            sessionIdentity == 0 ||
+            maximumWork < 0 ||
+            m_pRefinementLedger == nullptr)
+        {
+            failGlobal();
+            return result;
+        }
+        ContinuationEntry* pEntry =
+            m_continuationStore.find(quote.key);
+        if (pEntry == nullptr ||
+            pEntry->capturedColumns !=
+                quote.capturedColumns ||
+            pEntry->ours.lower != quote.ours.lower ||
+            pEntry->ours.upper != quote.ours.upper ||
+            pEntry->searchCompleted !=
+                quote.ourSearchCompleted)
+        {
+            failGlobal();
+            return result;
+        }
+
+        OurSequentialProblem problem =
+            buildOurSequentialProblem(
+                planActions(quote.key));
+        PackingDualProblemIdentity identity =
+            packingDualProblemIdentity(
+                quote,
+                problem);
+        identity.session = sessionIdentity;
+        if (problem.capturedColumns !=
+                quote.capturedColumns ||
+            problem.owned != quote.owned ||
+            identity.usedNodes.nodeCount() !=
+                problem.instance.nodeCount())
+        {
+            failGlobal();
+            return result;
+        }
+
+        const auto known =
+            m_verifiedOurUppers.find(quote.key);
+        if (known != m_verifiedOurUppers.end())
+        {
+            const auto & certificate =
+                known->second.certificate;
+            if (certificate == nullptr ||
+                certificate->identity != identity ||
+                known->second.id == 0)
+            {
+                failGlobal();
+                return result;
+            }
+            result.certificate = certificate;
+            result.certificateId = known->second.id;
+            result.certifiedUpper =
+                certificate->dualObjective;
+            if (result.certifiedUpper <
+                    identity.incumbentFloor ||
+                pEntry->ours.lower >
+                    result.certifiedUpper ||
+                pEntry->ours.upper >
+                    result.certifiedUpper)
+            {
+                failGlobal();
+                return result;
+            }
+            result.intervalAfter = pEntry->ours;
+            result.catalogComplete = true;
+            result.certificateValid = true;
+            result.optimizerCompleted = true;
+            result.verifierCompleted = true;
+            result.reused = true;
+            return result;
+        }
+
+        std::vector<PackingDualRowSource> sources;
+        sources.reserve(problem.rowKeys.size());
+        std::int64_t expectedCatalogWork = 0;
+        std::int64_t expectedOptionRecords = 0;
+        std::int64_t expectedIncidences = 0;
+        for (std::size_t row = 0;
+             row < problem.rowKeys.size();
+             ++row)
+        {
+            const auto cached =
+                m_rowOptionCache.find(
+                    problem.rowKeys[row]);
+            if (cached == m_rowOptionCache.end())
+            {
+                result.locallyBudgetExhausted = true;
+                return result;
+            }
+            for (const auto & option :
+                 cached->second.options)
+            {
+                if (!addWork(
+                        expectedCatalogWork,
+                        std::max<std::int64_t>(
+                            1,
+                            static_cast<std::int64_t>(
+                                option.nodes.size()))) ||
+                    !addWork(expectedOptionRecords, 1) ||
+                    !addWork(
+                        expectedIncidences,
+                        static_cast<std::int64_t>(
+                            option.nodes.size())))
+                {
+                    failGlobal();
+                    return result;
+                }
+            }
+            sources.push_back(PackingDualRowSource{
+                .row = static_cast<std::int32_t>(row),
+                .domain =
+                    std::span<const std::int64_t>(
+                        problem.rowKeys[row]),
+                .options =
+                    std::span<const
+                        SequentialDetail::RowOption>(
+                            cached->second.options),
+            });
+        }
+
+        std::int64_t verifierWork =
+            static_cast<std::int64_t>(
+                identity.nodeColumns.size());
+        std::int64_t minimumWork = ourRerunTariff();
+        if (minimumWork < 0 ||
+            !addWork(verifierWork, expectedOptionRecords) ||
+            !addWork(verifierWork, expectedIncidences) ||
+            !addWork(minimumWork, expectedCatalogWork) ||
+            !addWork(minimumWork, verifierWork))
+        {
+            failGlobal();
+            return result;
+        }
+        const std::int64_t allowance =
+            std::min(
+                maximumWork,
+                m_pRefinementLedger->balance());
+        if (allowance <= minimumWork)
+        {
+            result.locallyBudgetExhausted = true;
+            return result;
+        }
+        const std::int64_t balanceBefore =
+            m_pRefinementLedger->balance();
+        const GrantId grant =
+            m_pRefinementLedger->draw(
+                allowance,
+                RefinementWork::
+                    PackingDualCertificate);
+        if (grant == NO_GRANT)
+        {
+            result.locallyBudgetExhausted = true;
+            return result;
+        }
+        result.tariffWork = ourRerunTariff();
+        const auto finishGrant =
+            [&](std::int64_t spent) -> bool
+        {
+            return spent >= 0 &&
+                spent <= allowance &&
+                m_pRefinementLedger->refund(
+                    grant,
+                    allowance - spent);
+        };
+        const auto finishWork =
+            [&](std::initializer_list<std::int64_t> parts)
+        {
+            std::int64_t spent = 0;
+            for (const std::int64_t part : parts)
+            {
+                if (!addWork(spent, part))
+                {
+                    return false;
+                }
+            }
+            if (!finishGrant(spent))
+            {
+                return false;
+            }
+            result.totalWork =
+                balanceBefore -
+                m_pRefinementLedger->balance();
+            return result.totalWork == spent;
+        };
+
+        const PackingDualCatalog catalog =
+            buildPackingDualCatalog(
+                sources,
+                identity,
+                expectedCatalogWork);
+        result.catalogWork =
+            catalog.constructionWork;
+        result.catalogComplete =
+            catalog.complete;
+        if (!catalog.complete ||
+            catalog.constructionWork !=
+                expectedCatalogWork ||
+            catalog.optionRecords !=
+                expectedOptionRecords ||
+            catalog.nodeIncidences !=
+                expectedIncidences ||
+            packingDualVerifierWork(catalog) !=
+                verifierWork)
+        {
+            finishWork({
+                result.tariffWork,
+                result.catalogWork,
+            });
+            failGlobal();
+            return result;
+        }
+
+        const std::int64_t optimizerLimit =
+            allowance -
+            result.tariffWork -
+            result.catalogWork -
+            verifierWork;
+        const PackingDualOptimizerResult optimizer =
+            optimizePackingDualPrices(
+                catalog,
+                identity,
+                optimizerLimit);
+        result.optimizerWork = optimizer.workUsed;
+        result.optimizerCompleted =
+            optimizer.completed;
+        if (!optimizer.completed)
+        {
+            if (!finishWork({
+                    result.tariffWork,
+                    result.catalogWork,
+                    result.optimizerWork,
+                }))
+            {
+                failGlobal();
+            }
+            result.locallyBudgetExhausted =
+                !result.globalFailure;
+            return result;
+        }
+
+        const PackingDualVerification verified =
+            verifyPackingDualCertificate(
+                catalog,
+                sources,
+                identity,
+                optimizer.nodePrices,
+                verifierWork);
+        result.verifierWork = verified.workUsed;
+        result.verifierCompleted =
+            verified.completed;
+        result.certificateValid =
+            verified.valid;
+        if (!finishWork({
+                result.tariffWork,
+                result.catalogWork,
+                result.optimizerWork,
+                result.verifierWork,
+            }))
+        {
+            failGlobal();
+        }
+        if (result.globalFailure ||
+            !verified.completed ||
+            !verified.valid ||
+            result.verifierWork != verifierWork)
+        {
+            result.certificateValid = false;
+            failGlobal();
+            return result;
+        }
+
+        result.certifiedUpper =
+            verified.certificate.dualObjective;
+        if (result.certifiedUpper <
+                identity.incumbentFloor ||
+            result.certifiedUpper <
+                pEntry->ours.lower)
+        {
+            result.certificateValid = false;
+            failGlobal();
+            return result;
+        }
+        result.certificate =
+            std::make_shared<const
+                PackingDualCertificate>(
+                    verified.certificate);
+        if (m_nextCertificateId == 0 ||
+            m_nextCertificateId ==
+                std::numeric_limits<std::uint64_t>::max())
+        {
+            result.certificate.reset();
+            result.certificateValid = false;
+            failGlobal();
+            return result;
+        }
+        result.certificateId =
+            m_nextCertificateId++;
+        const bool inserted =
+            m_verifiedOurUppers.emplace(
+                quote.key,
+                VerifiedOurUpper{
+                    result.certificateId,
+                    result.certificate,
+                })
+                .second;
+        if (!inserted)
+        {
+            result.certificate.reset();
+            result.certificateId = 0;
+            result.certificateValid = false;
+            failGlobal();
+            return result;
+        }
+        if (result.certifiedUpper <
+            pEntry->ours.upper)
+        {
+            pEntry->ours.upper =
+                result.certifiedUpper;
+        }
+        result.intervalAfter = pEntry->ours;
+        return result;
+    }
+
+    bool JointPlanStockValuer::verifiedUpperMatches(
+        const RelativeStockQuote & quote,
+        std::uint64_t sessionIdentity) const
+    {
+        if (quote.ourUpperCertificateId == 0)
+        {
+            return true;
+        }
+        const auto known =
+            m_verifiedOurUppers.find(quote.key);
+        if (known == m_verifiedOurUppers.end() ||
+            known->second.id !=
+                quote.ourUpperCertificateId ||
+            known->second.certificate == nullptr)
+        {
+            return false;
+        }
+        const auto & identity =
+            known->second.certificate->identity;
+        const MilliFunds certifiedUpper =
+            known->second.certificate->dualObjective;
+        const ContinuationEntry* pEntry =
+            m_continuationStore.find(quote.key);
+        return identity.session == sessionIdentity &&
+            identity.immutableField ==
+                packingDualFieldIdentity() &&
+            identity.key == quote.key &&
+            identity.capturedColumns ==
+                quote.capturedColumns &&
+            identity.economic == quote.economic &&
+            identity.owned == quote.owned &&
+            certifiedUpper >=
+                identity.incumbentFloor &&
+            pEntry != nullptr &&
+            pEntry->ours.lower == quote.ours.lower &&
+            pEntry->ours.upper == quote.ours.upper &&
+            pEntry->searchCompleted ==
+                quote.ourSearchCompleted &&
+            quote.ours.lower <= certifiedUpper &&
+            quote.ours.upper <= certifiedUpper;
+    }
+
+    JointPlanStockValuer::OurSequentialSolve
+    JointPlanStockValuer::solveOurSequential(
+        std::span<const PlanRowAction> actions,
+        std::int64_t stateCap,
+        bool captureWitness,
+        const RefinedWitness* pReplay) const
+    {
+        OurSequentialProblem problem =
+            buildOurSequentialProblem(actions);
+        OurSequentialSolve solved;
+        solved.capturedColumns = problem.capturedColumns;
+        solved.owned = problem.owned;
+
+        if (pReplay != nullptr)
+        {
+            solved.witnessReplays = replaySequentialWitness(
+                problem.instance,
+                pReplay->rows,
+                pReplay->value);
+            return solved;
+        }
         ValuerRowOptionSource rowSource;
         rowSource.pCache = &m_rowOptionCache;
-        rowSource.pKeys = &rowKeys;
+        rowSource.pKeys = &problem.rowKeys;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        rowSource.pPaidKeys =
+            m_pRefinementLedger != nullptr
+                ? &m_rowOptionPaidKeys
+                : nullptr;
+#endif
         solved.tier = solveSequentialPacking(
-            instance,
-            floorOur,
+            problem.instance,
+            problem.floorValue,
             stateCap,
             &rowSource,
             captureWitness);
         if (captureWitness)
         {
             solved.witnessReplays = replaySequentialWitness(
-                instance,
+                problem.instance,
                 solved.tier.witness,
                 solved.tier.bookedValue);
         }
         return solved;
     }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    DiagnosticSequentialThresholdProof
+    JointPlanStockValuer::diagnosticProveOurBelow(
+        const ContinuationKey & key,
+        MilliFunds threshold,
+        std::int64_t maximumWork,
+        SequentialCacheAccounting cacheAccounting,
+        SequentialThresholdOptions options)
+    {
+        DiagnosticSequentialThresholdProof result;
+        result.tariff = ourRerunTariff();
+        CheapInitialPrice initial;
+        if (!livePairSwapIntervals() ||
+            !priceCheap(key, initial) ||
+            maximumWork <= result.tariff ||
+            result.tariff < 0 ||
+            m_pRefinementLedger == nullptr)
+        {
+            return result;
+        }
+        const std::int64_t available =
+            std::min(maximumWork, m_pRefinementLedger->balance());
+        if (available <= result.tariff)
+        {
+            return result;
+        }
+        result.stateCap = available - result.tariff;
+        const GrantId grant = m_pRefinementLedger->draw(
+            available, RefinementWork::SearchSlice);
+        if (grant == NO_GRANT)
+        {
+            return result;
+        }
+        const std::int64_t balanceBefore =
+            m_pRefinementLedger->balance() + available;
+        OurSequentialProblem problem =
+            buildOurSequentialProblem(planActions(key));
+        ValuerRowOptionSource rowSource;
+        rowSource.pCache = &m_rowOptionCache;
+        rowSource.pKeys = &problem.rowKeys;
+        rowSource.pPaidKeys = &m_rowOptionPaidKeys;
+        result.proof = proveSequentialBelow(
+            problem.instance,
+            problem.floorValue,
+            threshold,
+            result.stateCap,
+            &rowSource,
+            cacheAccounting,
+            options);
+        if (result.proof.workUsed < 0 ||
+            result.proof.workUsed > result.stateCap ||
+            !m_pRefinementLedger->refund(
+                grant,
+                result.stateCap - result.proof.workUsed))
+        {
+            return result;
+        }
+        result.workUsed =
+            balanceBefore - m_pRefinementLedger->balance();
+        result.witnessReplays = replaySequentialWitness(
+            problem.instance,
+            result.proof.witness,
+            result.proof.feasibleLower);
+        result.proof.witnessReplays =
+            result.proof.witnessReplays &&
+            result.witnessReplays;
+        result.valid =
+            result.proof.status !=
+                SequentialThresholdStatus::Invalid &&
+            result.witnessReplays &&
+            result.workUsed ==
+                result.tariff + result.proof.workUsed;
+        return result;
+    }
+#endif
 
     MilliFunds JointPlanStockValuer::sequentialJointStock(
         std::span<const PlanRowAction> actions) const
@@ -2079,15 +2698,15 @@ namespace Coordinator
     bool JointPlanStockValuer::refineOur(
         ContinuationEntry & entry,
         GrantId grant,
-        std::int64_t stateCap)
+        std::int64_t stateCap,
+        RefinementSchedule schedule)
     {
         std::int64_t expectedCap = 0;
         if (m_pRefinementLedger == nullptr ||
             grant == NO_GRANT ||
-            !livePairRefinementSliceCap(
-                entry.sliceRung,
-                expectedCap) ||
-            expectedCap != stateCap)
+            stateCap <= 0 ||
+            (schedule == RefinementSchedule::Rung &&
+             (!livePairRefinementSliceCap(entry.sliceRung, expectedCap) || expectedCap != stateCap)))
         {
             m_pricingFailure = true;
             return false;
@@ -2097,6 +2716,9 @@ namespace Coordinator
                 planActions(entry.key),
                 stateCap,
                 true);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        m_diagnosticLastOurRefinement = solved.tier;
+#endif
         if (solved.capturedColumns != entry.capturedColumns ||
             solved.tier.searchStates < 0 ||
             solved.tier.searchStates > stateCap ||
@@ -2134,7 +2756,7 @@ namespace Coordinator
             return false;
         }
         std::int32_t nextRung = entry.sliceRung;
-        if (!advanceLivePairRefinementRung(nextRung, true))
+        if (schedule == RefinementSchedule::Rung && !advanceLivePairRefinementRung(nextRung, true))
         {
             m_pricingFailure = true;
             return false;
@@ -2152,6 +2774,7 @@ namespace Coordinator
         entry.storeBacked = true;
         entry.sliceRung = nextRung;
         entry.exact = entry.ours.exact();
+        entry.searchCompleted = entry.searchCompleted || solved.tier.searchCompleted;
         return true;
     }
 
@@ -2159,15 +2782,15 @@ namespace Coordinator
         EnemySetBounds & enemy,
         const std::vector<std::int32_t> & capturedColumns,
         GrantId grant,
-        std::int64_t stateCap)
+        std::int64_t stateCap,
+        RefinementSchedule schedule)
     {
         std::int64_t expectedCap = 0;
         if (m_pRefinementLedger == nullptr ||
             grant == NO_GRANT ||
-            !livePairRefinementSliceCap(
-                enemy.sliceRung,
-                expectedCap) ||
-            expectedCap != stateCap)
+            stateCap <= 0 ||
+            (schedule == RefinementSchedule::Rung &&
+             (!livePairRefinementSliceCap(enemy.sliceRung, expectedCap) || expectedCap != stateCap)))
         {
             m_pricingFailure = true;
             return false;
@@ -2215,7 +2838,7 @@ namespace Coordinator
             return false;
         }
         std::int32_t nextRung = enemy.sliceRung;
-        if (!advanceLivePairRefinementRung(nextRung, true))
+        if (schedule == RefinementSchedule::Rung && !advanceLivePairRefinementRung(nextRung, true))
         {
             m_pricingFailure = true;
             return false;
@@ -2233,36 +2856,38 @@ namespace Coordinator
         enemy.storeBacked = true;
         enemy.sliceRung = nextRung;
         enemy.exact = enemy.bounds.exact();
+        enemy.searchCompleted = enemy.searchCompleted || solved.tier.searchCompleted;
         return true;
     }
 
-    bool JointPlanStockValuer::refineLiveKey(
-        const ContinuationKey & key)
+    LiveRefinementResult JointPlanStockValuer::refineLiveKey(
+        const ContinuationKey & key, std::int64_t maximumWork)
     {
-        if (m_pRefinementLedger == nullptr ||
-            m_refinementClosed ||
-            m_pricingFailure)
+        LiveRefinementResult result;
+        result.valid = m_pRefinementLedger != nullptr && !m_pricingFailure && maximumWork >= 0;
+        if (!result.valid || m_refinementClosed)
         {
-            return false;
+            return result;
         }
         ContinuationEntry* pEntry =
             m_continuationStore.find(key);
         if (pEntry == nullptr)
         {
-            return false;
+            return result;
         }
         EnemySetBounds* pEnemy =
             m_continuationStore.enemyFor(
                 pEntry->capturedColumns);
         if (pEnemy == nullptr)
         {
-            return false;
+            return result;
         }
 
         const std::vector<std::int32_t> capturedColumns =
             pEntry->capturedColumns;
         const ContinuationEntry entryBefore = *pEntry;
         const EnemySetBounds enemyBefore = *pEnemy;
+        const std::int64_t balanceBefore = m_pRefinementLedger->balance();
         std::optional<RefinedWitness> ourWitnessBefore;
         const auto ourWitness =
             m_refinedOurWitnesses.find(key);
@@ -2328,7 +2953,13 @@ namespace Coordinator
             {
                 m_pricingFailure = true;
                 m_refinementClosed = true;
-                return false;
+                result.valid = false;
+                return result;
+            }
+            if (request > maximumWork)
+            {
+                result.budgetExhausted = true;
+                return result;
             }
             const RefinementWork work =
                 admitOur
@@ -2339,7 +2970,8 @@ namespace Coordinator
             if (grant == NO_GRANT)
             {
                 m_refinementClosed = true;
-                return false;
+                result.budgetExhausted = true;
+                return result;
             }
             bool valid = true;
             if (admitOur)
@@ -2350,6 +2982,7 @@ namespace Coordinator
             }
             if (admitEnemy)
             {
+                const auto enemyBalance = m_pRefinementLedger->balance();
                 valid =
                     refineEnemy(
                         *pEnemy,
@@ -2357,20 +2990,27 @@ namespace Coordinator
                         grant,
                         enemyCap) &&
                     valid;
+                result.enemyStatesUsed = enemyCap - (m_pRefinementLedger->balance() - enemyBalance);
             }
+            result.workUsed = balanceBefore - m_pRefinementLedger->balance();
+            result.statesUsed = result.workUsed - (request - ourCap - enemyCap);
             if (!valid)
             {
                 restore();
                 m_pricingFailure = true;
                 m_refinementClosed = true;
-                return false;
+                result.valid = false;
+                return result;
             }
             m_contenderRegistry.markAdmitted(key);
             if (pEntry->exact && pEnemy->exact)
             {
                 m_contenderRegistry.markResolved(key);
             }
-            return true;
+            result.refined = pEntry->ours.lower > entryBefore.ours.lower || pEntry->ours.upper < entryBefore.ours.upper ||
+                pEnemy->bounds.lower > enemyBefore.bounds.lower || pEnemy->bounds.upper < enemyBefore.bounds.upper;
+            result.keysRefined = result.refined ? 1 : 0;
+            return result;
         }
 
         const bool canRefineOur = !pEntry->exact;
@@ -2378,7 +3018,7 @@ namespace Coordinator
         if (!canRefineOur && !canRefineEnemy)
         {
             m_contenderRegistry.markResolved(key);
-            return false;
+            return result;
         }
         const bool chooseOur =
             canRefineOur &&
@@ -2402,7 +3042,13 @@ namespace Coordinator
         {
             m_pricingFailure = true;
             m_refinementClosed = true;
-            return false;
+            result.valid = false;
+            return result;
+        }
+        if (request > maximumWork)
+        {
+            result.budgetExhausted = true;
+            return result;
         }
         const GrantId grant =
             m_pRefinementLedger->draw(
@@ -2411,7 +3057,8 @@ namespace Coordinator
         if (grant == NO_GRANT)
         {
             m_refinementClosed = true;
-            return false;
+            result.budgetExhausted = true;
+            return result;
         }
         const bool valid =
             chooseOur
@@ -2421,53 +3068,55 @@ namespace Coordinator
                       capturedColumns,
                       grant,
                       stateCap);
+        result.workUsed = balanceBefore - m_pRefinementLedger->balance();
+        result.statesUsed = result.workUsed - tariff;
+        result.enemyStatesUsed = chooseOur ? 0 : result.statesUsed;
         if (!valid)
         {
             restore();
             m_pricingFailure = true;
             m_refinementClosed = true;
-            return false;
+            result.valid = false;
+            return result;
         }
         if (pEntry->exact && pEnemy->exact)
         {
             m_contenderRegistry.markResolved(key);
         }
-        return true;
+        result.refined = pEntry->ours.lower > entryBefore.ours.lower || pEntry->ours.upper < entryBefore.ours.upper ||
+            pEnemy->bounds.lower > enemyBefore.bounds.lower || pEnemy->bounds.upper < enemyBefore.bounds.upper;
+        result.keysRefined = result.refined ? 1 : 0;
+        return result;
     }
 
-    bool JointPlanStockValuer::refineLiveAtBoundary(
-        AssignPhase phase)
+    LiveRefinementResult JointPlanStockValuer::refineLiveAtBoundary(
+        AssignPhase phase, std::int64_t maximumWork)
     {
+        LiveRefinementResult result;
+        result.valid = !m_pricingFailure && maximumWork >= 0;
         if (!livePairSwapIntervals() ||
             phase != AssignPhase::BetweenSwapSweeps ||
-            m_refinementClosed)
+            m_refinementClosed || !result.valid)
         {
-            return false;
+            return result;
         }
-        bool refined = false;
-        while (!m_refinementClosed && !m_pricingFailure)
+        const std::vector<ContinuationKey> order = m_contenderRegistry.refinementOrder();
+        for (const ContinuationKey & key : order)
         {
-            bool roundRefined = false;
-            const std::vector<ContinuationKey> order =
-                m_contenderRegistry.refinementOrder();
-            for (const ContinuationKey & key : order)
-            {
-                if (refineLiveKey(key))
-                {
-                    refined = true;
-                    roundRefined = true;
-                }
-                if (m_refinementClosed || m_pricingFailure)
-                {
-                    break;
-                }
-            }
-            if (!roundRefined)
+            const auto step = refineLiveKey(key, maximumWork - result.workUsed);
+            result.refined = result.refined || step.refined;
+            result.keysRefined += step.keysRefined;
+            result.statesUsed += step.statesUsed;
+            result.enemyStatesUsed += step.enemyStatesUsed;
+            result.workUsed += step.workUsed;
+            result.budgetExhausted = result.budgetExhausted || step.budgetExhausted;
+            result.valid = result.valid && step.valid;
+            if (m_refinementClosed || !result.valid || step.workUsed > 0)
             {
                 break;
             }
         }
-        return refined;
+        return result;
     }
 
     MilliFunds JointPlanStockValuer::stockCeiling() const

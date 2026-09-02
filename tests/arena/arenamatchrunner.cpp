@@ -2,17 +2,21 @@
 
 #include <utility>
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDataStream>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QJSValue>
 #include <QVariantMap>
 
 #include "3rd_party/oxygine-framework/oxygine/actor/Stage.h"
 #include "ai/coreai.h"
+#include "ai/coordinatedai.h"
 #include "ai/dummyai.h"
 #include "coreengine/gameconsole.h"
+#include "coreengine/filesupport.h"
 #include "coreengine/globalutils.h"
 #include "coreengine/interpreter.h"
 #include "coreengine/memorymanagement.h"
@@ -27,6 +31,7 @@
 #include "resource_management/cospritemanager.h"
 #include "resource_management/gamerulemanager.h"
 #include "tests/arena/arenatestsupport.h"
+#include "tests/arena/relativestockprobe.h"
 
 namespace
 {
@@ -46,6 +51,21 @@ QString fileSha256(const QString & path)
     }
     return QString::fromLatin1(QCryptographicHash::hash(file.readAll(),
                                                         QCryptographicHash::Sha256).toHex());
+}
+
+void quiesceAiTurnQueue(GameMap* pMap, ActionPerformer* pPerformer)
+{
+    for (qint32 i = 0; i < pMap->getPlayerCount(); ++i)
+    {
+        auto* pAi = dynamic_cast<CoreAI*>(pMap->getPlayer(i)->getBaseGameInput());
+        if (pAi == nullptr)
+        {
+            continue;
+        }
+        QObject::disconnect(pPerformer, &ActionPerformer::sigActionPerformed,
+                            pAi, &CoreAI::nextAction);
+        QCoreApplication::removePostedEvents(pAi, QEvent::MetaCall);
+    }
 }
 }
 
@@ -98,6 +118,16 @@ bool ArenaMatchRunner::loadConfig()
         failSetup(error);
         return false;
     }
+    if (!m_config.actionPrefixFile.isEmpty())
+    {
+        m_actionPrefix = std::make_unique<ArenaActionPrefix>();
+        const auto path = QDir(Settings::getInstance()->getUserPath()).filePath(m_config.actionPrefixFile);
+        if (!m_actionPrefix->load(path, error) || m_actionPrefix->initialSeed() != m_config.masterSeed)
+        {
+            failSetup(error.isEmpty() ? "masterSeed must match the recorded initial action seed" : error);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -115,15 +145,45 @@ bool ArenaMatchRunner::loadMap()
 
 bool ArenaMatchRunner::applyPlayerSetup()
 {
+    if (!m_config.coordinatedRefinementReceiptFile.isEmpty())
+    {
+        m_relativeStockProbe = std::make_shared<ArenaRelativeStockProbe>(
+            m_config.coordinatedFrontierReceipts, m_config.coordinatedFrontierDay);
+        if (!m_config.coordinatedValuationFile.isEmpty())
+        {
+            QString error;
+            const auto path = QDir(Settings::getInstance()->getUserPath()).filePath(m_config.coordinatedValuationFile);
+            if (!m_relativeStockProbe->loadValuations(path, error))
+            {
+                failSetup(error);
+                return false;
+            }
+        }
+    }
+    QStringList buildList;
+    if (!m_config.buildListFile.isEmpty())
+    {
+        const auto path = QDir(Settings::getInstance()->getUserPath()).filePath(m_config.buildListFile);
+        buildList = Filesupport::readList(path, "").items;
+        if (buildList.isEmpty())
+        {
+            failSetup("build list is unavailable or empty");
+            return false;
+        }
+    }
     for (qint32 i = 0; i < m_pMap->getPlayerCount(); ++i)
     {
         const ArenaMatchPlayerConfig & playerConfig = m_config.players.at(i);
-        if (!COSpriteManager::getInstance()->exists(playerConfig.coId))
+        if (!playerConfig.coId.isEmpty() && !COSpriteManager::getInstance()->exists(playerConfig.coId))
         {
             failSetup("unknown co " + playerConfig.coId);
             return false;
         }
         Player* pPlayer = m_pMap->getPlayer(i);
+        if (!buildList.isEmpty())
+        {
+            pPlayer->setBuildList(buildList);
+        }
         pPlayer->setControlType(playerConfig.aiType);
         pPlayer->setBaseGameInput(BaseGameInputIF::createAi(m_pMap.get(), playerConfig.aiType));
         BaseGameInputIF* pInput = pPlayer->getBaseGameInput();
@@ -131,6 +191,11 @@ bool ArenaMatchRunner::applyPlayerSetup()
         {
             failSetup("player " + QString::number(i) + " did not receive a local ai");
             return false;
+        }
+        if (auto* pCoordinated = dynamic_cast<CoordinatedAi*>(pInput))
+        {
+            pCoordinated->setRefinementTestControls(m_config.coordinatedRefinementWorkLimit, m_relativeStockProbe,
+                m_config.coordinatedRefinementSchedule, m_config.coordinatedScheduleDay);
         }
         pPlayer->setCO(playerConfig.coId, PRIMARY_CO);
         pPlayer->setCO({}, SECONDARY_CO);
@@ -141,7 +206,40 @@ bool ArenaMatchRunner::applyPlayerSetup()
 bool ArenaMatchRunner::applyGameRules()
 {
     GameRules* pRules = m_pMap->getGameRules();
-    addDefaultVictoryRules(pRules);
+    if (m_config.rulesetFile.isEmpty())
+    {
+        addDefaultVictoryRules(pRules);
+        pRules->setRandomWeather(false);
+        pRules->setAiBehaviorMode(m_config.aiBehaviorMode);
+    }
+    else
+    {
+        QFile file(QDir(Settings::getInstance()->getUserPath()).filePath(m_config.rulesetFile));
+        if (!file.open(QIODevice::ReadOnly))
+        {
+            failSetup("saved ruleset cannot be read");
+            return false;
+        }
+        QDataStream stream(&file);
+        stream.setVersion(QDataStream::Qt_6_5);
+        pRules->deserializeObject(stream);
+        if (stream.status() != QDataStream::Ok || pRules->getAiBehaviorMode() != m_config.aiBehaviorMode)
+        {
+            failSetup("saved ruleset is invalid or aiBehaviorMode differs");
+            return false;
+        }
+        if (m_actionPrefix && pRules->getFogMode() != GameEnums::Fog_Off)
+        {
+            failSetup("partial-path action prefix requires fog off");
+            return false;
+        }
+        auto* turnLimit = pRules->getVictoryRule(TURN_LIMIT_RULE);
+        if (m_config.turnLimit == 0 && turnLimit != nullptr && turnLimit->getRuleValue(TURN_LIMIT_ITEM) > 0)
+        {
+            failSetup("saved ruleset contains an active turn limit");
+            return false;
+        }
+    }
     if (m_config.turnLimit > 0)
     {
         pRules->addVictoryRule(TURN_LIMIT_RULE);
@@ -157,8 +255,6 @@ bool ArenaMatchRunner::applyGameRules()
     {
         pRules->removeVictoryRule(TURN_LIMIT_RULE);
     }
-    pRules->setRandomWeather(false);
-    pRules->setAiBehaviorMode(m_config.aiBehaviorMode);
     if (m_config.deterministicCounterpointSeed)
     {
         const QJSValue result = Interpreter::getInstance()->doString(
@@ -217,8 +313,11 @@ void ArenaMatchRunner::spliceActionHandling()
                             &ActionPerformer::performAction);
         m_connections.append(connect(pAi, &CoreAI::sigPerformAction, this,
                                      &ArenaMatchRunner::onAiAction, Qt::DirectConnection));
-        m_connections.append(connect(pAi, &CoreAI::sigPerformAction, pPerformer,
-                                     &ActionPerformer::performAction, Qt::DirectConnection));
+        if (!m_actionPrefix)
+        {
+            m_connections.append(connect(pAi, &CoreAI::sigPerformAction, pPerformer,
+                                         &ActionPerformer::performAction, Qt::DirectConnection));
+        }
     }
     m_connections.append(connect(pPerformer, &ActionPerformer::sigActionPerformed,
                                  this, &ArenaMatchRunner::onActionPerformed,
@@ -243,6 +342,16 @@ void ArenaMatchRunner::onAiAction(spGameAction pAction)
     {
         return;
     }
+    if (m_actionPrefix)
+    {
+        QString error;
+        if (!m_actionPrefix->apply(pAction, *m_pMap, error))
+        {
+            m_finished = true;
+            failSetup(error);
+            return;
+        }
+    }
     m_stopBoundary.observeAction(m_pMap->getCurrentDay(),
                                  m_pMap->getCurrentPlayer()->getPlayerID());
     QByteArray payload;
@@ -257,11 +366,19 @@ void ArenaMatchRunner::onAiAction(spGameAction pAction)
     m_actionPayloadBase64.append(QString::fromLatin1(payload.toBase64()));
     m_seedTrace.append(QVariant::fromValue<qulonglong>(pAction->getSeed()));
     m_actionTargets.append(QVariantMap{{"x", target.x()}, {"y", target.y()}});
+    if (m_actionPrefix)
+    {
+        m_pMenue->getActionPerformer()->performAction(pAction);
+    }
 }
 
 void ArenaMatchRunner::onActionPerformed()
 {
     Player* pCurrent = m_pMap->getCurrentPlayer();
+    if (m_actionPrefix && !m_finished)
+    {
+        m_actionPrefix->observeBoundary(*m_pMap);
+    }
     if (!m_finished && pCurrent != nullptr &&
         m_stopBoundary.shouldStop(m_pMap->getCurrentDay(), pCurrent->getPlayerID()))
     {
@@ -287,6 +404,10 @@ void ArenaMatchRunner::onWatchdog()
 
 void ArenaMatchRunner::finishMatch(Outcome outcome)
 {
+    if (outcome == Outcome::Complete && m_actionPrefix && !m_actionPrefix->complete())
+    {
+        outcome = Outcome::BoundaryMissed;
+    }
     m_finished = true;
     m_watchdog.stop();
     for (const auto & connection : std::as_const(m_connections))
@@ -294,6 +415,7 @@ void ArenaMatchRunner::finishMatch(Outcome outcome)
         QObject::disconnect(connection);
     }
     m_connections.clear();
+    quiesceAiTurnQueue(m_pMap.get(), m_pMenue->getActionPerformer());
 
     QVariantList players;
     for (qint32 i = 0; i < m_pMap->getPlayerCount(); ++i)
@@ -323,13 +445,19 @@ void ArenaMatchRunner::finishMatch(Outcome outcome)
         {"exitCode", exitCode},
         {"pass", outcome == Outcome::Complete},
     };
+    if (m_actionPrefix)
+    {
+        result.insert("actionPrefix", m_actionPrefix->result());
+    }
     AiArenaTestSupport* pSupport = support();
     if (pSupport == nullptr)
     {
         CONSOLE_PRINT(SETUP_PREFIX + "arena support is unavailable", GameConsole::eERROR);
         return;
     }
-    if (!pSupport->writeJsonResult(m_config.resultFileName, result))
+    if ((m_relativeStockProbe &&
+         !pSupport->writeJsonResult(m_config.coordinatedRefinementReceiptFile, m_relativeStockProbe->result())) ||
+        !pSupport->writeJsonResult(m_config.resultFileName, result))
     {
         pSupport->finish(ArenaExitCode::SetupError);
         return;

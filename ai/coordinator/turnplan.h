@@ -13,6 +13,10 @@
 #include "ai/coordinator/economicledger.h"
 #include "ai/coordinator/terminalvalue.h"
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+class ArenaRelativeStockSupportAudit;
+#endif
+
 namespace Coordinator
 {
     enum class PlanActionState : std::int8_t
@@ -68,6 +72,8 @@ namespace Coordinator
         TerminalValue marginalValue{};
         std::int32_t plannedDamageSteps{0};
         PlanActionState state{PlanActionState::Pending};
+
+        friend bool operator==(const PlannedAction &, const PlannedAction &) = default;
     };
 
     struct PlanEdge
@@ -143,6 +149,10 @@ namespace Coordinator
 
     class TurnPlan
     {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        friend class ::ArenaRelativeStockSupportAudit;
+#endif
+
     public:
         TurnPlan() = default;
 
@@ -358,6 +368,17 @@ namespace Coordinator
         const PlanEdge & edge(std::int32_t index) const
         {
             return m_edges[static_cast<std::size_t>(index)];
+        }
+
+        void clearEdgesOfKind(PlanEdgeKind kind)
+        {
+            std::erase_if(m_edges, [kind](const PlanEdge & edge) { return edge.kind == kind; });
+        }
+
+        std::vector<VacateConflict> rebuildVacateEdges(std::span<const OccupancyEntry> occupancy)
+        {
+            clearEdgesOfKind(PlanEdgeKind::Vacate);
+            return addVacateEdges(occupancy);
         }
 
         // an occupant that plans to stay is a conflict, not an edge

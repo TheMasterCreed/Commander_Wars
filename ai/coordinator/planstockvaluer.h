@@ -20,6 +20,31 @@ namespace Coordinator
         bool lowerWitnessReplays{false};
     };
 
+    struct LiveRefinementResult
+    {
+        std::int32_t keysRefined{0};
+        std::int64_t statesUsed{0};
+        std::int64_t enemyStatesUsed{0};
+        std::int64_t workUsed{0};
+        bool refined{false};
+        bool budgetExhausted{false};
+        bool valid{true};
+    };
+
+    struct LiveRefinementStats
+    {
+        std::int32_t domains{0};
+        std::int32_t calls{0};
+        std::int32_t keysRefined{0};
+        std::int64_t statesUsed{0};
+        std::int64_t enemyStatesUsed{0};
+        std::int64_t workUsed{0};
+        std::int32_t budgetExhaustions{0};
+        std::int32_t failures{0};
+
+        friend bool operator==(const LiveRefinementStats &, const LiveRefinementStats &) = default;
+    };
+
     struct SequentialStockAudit
     {
         MilliFunds floorValue{0};
@@ -98,9 +123,9 @@ namespace Coordinator
             return LivePlanStockQuote{};
         }
 
-        virtual bool refineLiveAtBoundary(AssignPhase)
+        virtual LiveRefinementResult refineLiveAtBoundary(AssignPhase, std::int64_t)
         {
-            return false;
+            return {};
         }
 
         virtual RelativeStockSession* relativeStockSession()

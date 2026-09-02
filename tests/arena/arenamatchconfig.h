@@ -5,6 +5,7 @@
 #include <QVector>
 
 #include "game/GameEnums.h"
+#include "ai/coordinator/relativestockrefinement.h"
 
 struct ArenaMatchPlayerConfig
 {
@@ -34,6 +35,16 @@ struct ArenaMatchConfig
     qint32 stopAfterDay{-1};
     qint32 stopAfterPlayer{-1};
     bool deterministicCounterpointSeed{false};
+    qint64 coordinatedRefinementWorkLimit{-1};
+    Coordinator::RelativeStockSchedule coordinatedRefinementSchedule{Coordinator::RelativeStockSchedule::Current};
+    qint32 coordinatedScheduleDay{-1};
+    QString coordinatedRefinementReceiptFile;
+    bool coordinatedFrontierReceipts{false};
+    qint32 coordinatedFrontierDay{-1};
+    QString coordinatedValuationFile;
+    QString rulesetFile;
+    QString buildListFile;
+    QString actionPrefixFile;
 };
 
 class ArenaStopBoundary

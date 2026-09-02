@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "ai/normalai.h"
@@ -25,6 +26,18 @@ class CoordinatedAi final : public NormalAi
 public:
     explicit CoordinatedAi(GameMap* pMap);
     ~CoordinatedAi() override = default;
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    void setRefinementTestControls(std::int64_t workLimit, std::shared_ptr<Coordinator::RelativeStockObserver> observer,
+                                  Coordinator::RelativeStockSchedule schedule = Coordinator::RelativeStockSchedule::Current,
+                                  qint32 scheduleDay = -1)
+    {
+        m_testRefinementWorkLimit = workLimit < 0 ? Coordinator::DEFAULT_RELATIVE_STOCK_WORK_LIMIT : workLimit;
+        m_testRefinementObserver = std::move(observer);
+        m_testRefinementSchedule = schedule;
+        m_testRefinementScheduleDay = scheduleDay;
+    }
+#endif
 
 public slots:
     void process() override;
@@ -73,6 +86,12 @@ private:
     std::int64_t m_factLayersNanos{0};
     std::int64_t m_propertyStockBuildNanos{0};
     std::int64_t m_coPowerCheckNanos{0};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    std::int64_t m_testRefinementWorkLimit{Coordinator::DEFAULT_RELATIVE_STOCK_WORK_LIMIT};
+    std::shared_ptr<Coordinator::RelativeStockObserver> m_testRefinementObserver;
+    Coordinator::RelativeStockSchedule m_testRefinementSchedule{Coordinator::RelativeStockSchedule::Current};
+    qint32 m_testRefinementScheduleDay{-1};
+#endif
 };
 
 #endif // COORDINATEDAI_H

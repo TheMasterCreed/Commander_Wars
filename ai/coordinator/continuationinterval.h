@@ -185,6 +185,7 @@ namespace Coordinator
         std::int32_t sliceRung{0};
         bool exact{false};
         bool storeBacked{false};
+        bool searchCompleted{false};
     };
 
     struct ContinuationEntry
@@ -196,6 +197,7 @@ namespace Coordinator
         std::int32_t sliceRung{0};
         bool exact{false};
         bool storeBacked{false};
+        bool searchCompleted{false};
         std::vector<RowWitness> witness;
         std::vector<RowWitness> initialWitness;
     };

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -15,7 +16,12 @@
 #include "ai/coordinator/coordinatorcommon.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/planstockvaluer.h"
+#include "ai/coordinator/relativestockaudit.h"
 #include "ai/coordinator/turnplan.h"
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+class ArenaRelativeStockSupportAudit;
+#endif
 
 namespace Coordinator
 {
@@ -71,6 +77,9 @@ namespace Coordinator
         PlanStockValuer* pStockValuer{nullptr};
         DecisionTrace* pTrace{nullptr};
         bool measureTimings{false};
+        std::int64_t relativeStockWorkLimit{DEFAULT_RELATIVE_STOCK_WORK_LIMIT};
+        RelativeStockSchedule relativeStockSchedule{RelativeStockSchedule::Current};
+        RelativeStockObserver* pRelativeStockObserver{nullptr};
     };
 
     inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)
@@ -109,6 +118,11 @@ namespace Coordinator
         std::int32_t enumerationStates{0};
         std::int32_t swapStates{0};
         std::int32_t replayFailures{0};
+        RelativeStockStats stockPairs;
+        LiveRefinementStats mixedPairs;
+        RelativeStockStats stockJoints;
+
+        friend bool operator==(const AssignmentStats &, const AssignmentStats &) = default;
     };
 
     struct AssignmentResult
@@ -149,6 +163,8 @@ namespace Coordinator
             std::int64_t pairRefinementNanos{0};
             std::int64_t clusterNanos{0};
             std::int64_t finishPlanNanos{0};
+            RelativeStockTiming stockPairs;
+            RelativeStockTiming stockJoints;
         };
 
         TurnPlan plan;
@@ -733,6 +749,36 @@ namespace Coordinator
         }
     };
 
+    inline bool canonicalActorSupportFirst(
+        const std::vector<ActorProgress> & actors,
+        std::span<const std::int32_t> left,
+        std::span<const std::int32_t> right)
+    {
+        return std::lexicographical_compare(
+            left.begin(),
+            left.end(),
+            right.begin(),
+            right.end(),
+            ActorIdOrder{&actors});
+    }
+
+    inline bool canonicalCandidateTupleFirst(
+        std::span<const std::int32_t> actorOrder,
+        std::span<const std::int32_t> left,
+        std::span<const std::int32_t> right)
+    {
+        for (const std::int32_t slot : actorOrder)
+        {
+            const auto index =
+                static_cast<std::size_t>(slot);
+            if (left[index] != right[index])
+            {
+                return left[index] < right[index];
+            }
+        }
+        return false;
+    }
+
     struct ActorResources
     {
         std::vector<TilePoint> destinations;
@@ -845,11 +891,18 @@ namespace Coordinator
 
     struct MaximumValueAssignment
     {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        friend class ::ArenaRelativeStockSupportAudit;
+#endif
+
         static constexpr std::int32_t SETTLING_SWEEP_CAP = 8;
         static constexpr std::int32_t SWAP_SWEEP_CAP = 4;
         static constexpr std::int32_t CLUSTER_ACTOR_CAP = 6;
         static constexpr std::int32_t CLUSTER_CANDIDATE_CAP = 12;
         static constexpr std::int32_t CLUSTER_STATE_CAP = 20000;
+        static constexpr std::size_t RELATIVE_JOINT_MIN_ACTORS = 3;
+        static constexpr std::size_t RELATIVE_JOINT_MAX_ACTORS = 4;
+        static constexpr std::int64_t RELATIVE_JOINT_PRODUCT_CAP = 50000;
 
         static AssignmentResult assign(const AssignmentInput & input)
         {
@@ -899,13 +952,16 @@ namespace Coordinator
                 phaseStart = Clock::now();
             }
             const std::vector<ConflictEdge> edges = conflictEdges(input, actors, sweepOrder);
+            const RelativeAssignmentBudget relativeBudget = relativeAssignmentBudget(result.plan, input, actors, edges);
             improveBySwaps(
                 result.plan,
                 input,
                 actors,
                 edges,
                 result.stats,
-                audits);
+                audits,
+                relativeBudget,
+                result.phaseTiming.stockPairs);
             if (timed)
             {
                 result.phaseTiming.pairRefinementNanos =
@@ -914,7 +970,8 @@ namespace Coordinator
                         .count();
                 phaseStart = Clock::now();
             }
-            enumerateClusters(result.plan, input, actors, sweepOrder, edges, result.stats);
+            enumerateClusters(result.plan, input, actors, sweepOrder, edges, result.stats,
+                              relativeBudget, result.phaseTiming.stockJoints);
             if (timed)
             {
                 result.phaseTiming.clusterNanos =
@@ -934,6 +991,14 @@ namespace Coordinator
                         .count();
             }
             recordDeferredAudits(input, audits);
+            if (input.pRelativeStockObserver != nullptr)
+            {
+                const auto remaining = relativeBudget.session == nullptr ? 0 : relativeBudget.session->remainingWork();
+                input.pRelativeStockObserver->finishPlan(result, {
+                    relativeBudget.initialBalance, relativeBudget.totalLimit, relativeBudget.pairLimit,
+                    relativeBudget.initialBalance - remaining, remaining,
+                });
+            }
             return result;
         }
 
@@ -958,6 +1023,61 @@ namespace Coordinator
             std::int32_t chosen{NO_CANDIDATE};
             std::int32_t actionIndex{NO_ACTION};
             MilliFunds seatedValue{0};
+        };
+
+        struct RelativeAssignmentBudget
+        {
+            RelativeStockSession* session{nullptr};
+            std::int64_t initialBalance{0};
+            std::int64_t totalLimit{0};
+            std::int64_t pairLimit{0};
+
+            std::int64_t remaining(RelativeStockPhase phase) const
+            {
+                if (session == nullptr)
+                {
+                    return 0;
+                }
+                const auto spent = initialBalance - session->remainingWork();
+                const auto limit = phase == RelativeStockPhase::Pair ? pairLimit : totalLimit;
+                return std::max<std::int64_t>(0, limit - spent);
+            }
+        };
+
+        struct RelativeContender
+        {
+            std::vector<std::int32_t> members;
+            std::vector<std::int32_t> tuple;
+            RelativeStockQuote quote;
+            RelativeStockComparison comparison;
+            RelativeStockRefinementCursor cursor;
+            bool visited{false};
+        };
+
+        struct RelativeDomain
+        {
+            std::vector<std::int32_t> members;
+            std::vector<std::vector<std::int32_t>> options;
+            std::int64_t product{1};
+            std::int64_t maximumStates{0};
+            std::int64_t states{0};
+            std::int64_t claimable{0};
+            RelativeStockDomainStatus status{RelativeStockDomainStatus::Complete};
+        };
+
+        struct RelativeFrontier
+        {
+            std::vector<RelativeContender> contenders;
+            bool valid{true};
+        };
+
+        struct RelativeTrial
+        {
+            TurnPlan plan;
+            std::vector<ActorSeat> seats;
+            std::vector<std::int32_t> order;
+            MilliFunds economic{0};
+            bool valid{false};
         };
 
         struct ExactSearchOutcome
@@ -2236,22 +2356,832 @@ namespace Coordinator
             }
         }
 
+        static std::vector<std::int32_t> allChoices(const std::vector<ActorProgress> & actors)
+        {
+            std::vector<std::int32_t> tuple;
+            tuple.reserve(actors.size());
+            for (const auto & actor : actors)
+            {
+                tuple.push_back(actor.chosen);
+            }
+            return tuple;
+        }
+
+        static bool completeRelativePlan(const TurnPlan & plan, const std::vector<ActorProgress> & actors,
+                                         std::vector<std::int32_t> & order)
+        {
+            for (const auto & actor : actors)
+            {
+                if (actor.chosen == NO_CANDIDATE || !plan.hasAction(actor.actionIndex) ||
+                    !isLiveState(plan.action(actor.actionIndex).state) ||
+                    plan.action(actor.actionIndex).unitId != actor.pActor->engineUnitId)
+                {
+                    return false;
+                }
+            }
+            auto ordered = plan;
+            if (!ordered.rebuildVacateEdges(planOccupancy(ordered)).empty())
+            {
+                return false;
+            }
+            auto result = ordered.executionOrder();
+            if (!result.cycleMembers.empty() || !result.blockedByCycle.empty() || result.order.size() != actors.size())
+            {
+                return false;
+            }
+            order = std::move(result.order);
+            return true;
+        }
+
+        static bool bothStock(const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+                              const ConflictEdge & edge)
+        {
+            return stockCoupled(input, actors[static_cast<std::size_t>(edge.left)].pActor->engineUnitId) &&
+                stockCoupled(input, actors[static_cast<std::size_t>(edge.right)].pActor->engineUnitId);
+        }
+
+        static RelativeDomain relativeDomain(
+            const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & members, RelativeStockPhase phase, std::int64_t remainingStates)
+        {
+            RelativeDomain domain;
+            domain.members = members;
+            const bool joint = phase == RelativeStockPhase::Joint;
+            if ((joint && (members.size() < RELATIVE_JOINT_MIN_ACTORS ||
+                           members.size() > RELATIVE_JOINT_MAX_ACTORS)) ||
+                (!joint && members.size() != 2))
+            {
+                domain.status = RelativeStockDomainStatus::UnsupportedActors;
+                return domain;
+            }
+            const auto productLimit = joint ? RELATIVE_JOINT_PRODUCT_CAP : CLUSTER_STATE_CAP;
+            for (const auto slot : members)
+            {
+                const auto & actor = actors[static_cast<std::size_t>(slot)];
+                if (!stockCoupled(input, actor.pActor->engineUnitId))
+                {
+                    domain.status = RelativeStockDomainStatus::UnsupportedActors;
+                    return domain;
+                }
+                auto options = incumbentFirstOptions(actor);
+                const auto count = static_cast<std::int64_t>(options.size());
+                if (count == 0 || count > productLimit / domain.product)
+                {
+                    domain.status = RelativeStockDomainStatus::ProductLimit;
+                    domain.product = productLimit + 1;
+                    return domain;
+                }
+                domain.product *= count;
+                domain.maximumStates += domain.product;
+                domain.options.push_back(std::move(options));
+            }
+            if (domain.maximumStates > remainingStates || (!joint && domain.maximumStates > CLUSTER_STATE_CAP))
+            {
+                domain.status = RelativeStockDomainStatus::EnumerationBudget;
+            }
+            return domain;
+        }
+
+        static RelativeAssignmentBudget relativeAssignmentBudget(
+            const TurnPlan & plan, const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            const std::vector<ConflictEdge> & edges)
+        {
+            RelativeAssignmentBudget budget;
+            budget.session = input.pStockValuer == nullptr ? nullptr : input.pStockValuer->relativeStockSession();
+            if (budget.session == nullptr)
+            {
+                return budget;
+            }
+            budget.initialBalance = budget.session->remainingWork();
+            budget.totalLimit = std::clamp<std::int64_t>(input.relativeStockWorkLimit, 0,
+                std::min(budget.initialBalance, LIVE_PAIR_REFINEMENT_BUDGET));
+            budget.pairLimit = budget.totalLimit;
+            std::vector<std::int32_t> order;
+            if (!completeRelativePlan(plan, actors, order))
+            {
+                return budget;
+            }
+            const auto adjacency = buildAdjacency(actors.size(), edges);
+            std::vector<bool> visited(actors.size(), false);
+            for (const auto root : actorSweepOrder(actors))
+            {
+                if (visited[static_cast<std::size_t>(root)])
+                {
+                    continue;
+                }
+                const auto members = collectComponent(root, actors, adjacency, visited);
+                if (relativeDomain(input, actors, members, RelativeStockPhase::Joint,
+                                   ASSIGNMENT_STATE_BUDGET).status == RelativeStockDomainStatus::Complete)
+                {
+                    budget.pairLimit = budget.totalLimit / 2;
+                    break;
+                }
+            }
+            return budget;
+        }
+
+        static RelativeTrial relativeTrial(
+            const TurnPlan & base, const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & members, const std::vector<std::int32_t> & tuple)
+        {
+            RelativeTrial trial;
+            if (tuple.size() != actors.size() ||
+                std::find(tuple.begin(), tuple.end(), NO_CANDIDATE) != tuple.end())
+            {
+                return trial;
+            }
+            trial.plan = base;
+            trial.plan.clearEdgesOfKind(PlanEdgeKind::Vacate);
+            std::vector<ActorProgress> changed;
+            changed.reserve(members.size());
+            for (const auto slot : members)
+            {
+                const auto & original = actors[static_cast<std::size_t>(slot)];
+                ActorProgress actor;
+                actor.pActor = original.pActor;
+                actor.actionIndex = original.actionIndex;
+                actor.chosen = original.chosen;
+                actor.seatedValue = original.seatedValue;
+                unseatActor(trial.plan, actor);
+                changed.push_back(std::move(actor));
+            }
+            for (std::size_t index = 0; index < members.size(); ++index)
+            {
+                const auto slot = static_cast<std::size_t>(members[index]);
+                if (seatOption(trial.plan, input, changed[index], tuple[slot]).claim != ReservationResult::Granted)
+                {
+                    return trial;
+                }
+                trial.seats.push_back({changed[index].chosen, changed[index].actionIndex, changed[index].seatedValue});
+            }
+            for (std::size_t slot = 0; slot < actors.size(); ++slot)
+            {
+                const auto member = std::find(members.begin(), members.end(), static_cast<std::int32_t>(slot));
+                if (member == members.end() &&
+                    (tuple[slot] != actors[slot].chosen ||
+                     trial.plan.action(actors[slot].actionIndex) != base.action(actors[slot].actionIndex)))
+                {
+                    return trial;
+                }
+                const auto value = member == members.end() ? actors[slot].seatedValue :
+                    trial.seats[static_cast<std::size_t>(member - members.begin())].seatedValue;
+                if (!RelativeStockDetail::checkedAdd(trial.economic, value))
+                {
+                    return trial;
+                }
+            }
+            trial.valid = completeRelativePlan(trial.plan, actors, trial.order);
+            return trial;
+        }
+
+        static bool replayRelativeClaims(
+            RelativeTrial & trial, const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & tuple)
+        {
+            auto replayed = trial.plan;
+            MilliFunds economic = 0;
+            for (std::size_t slot = 0; slot < actors.size(); ++slot)
+            {
+                const auto & actor = actors[slot];
+                const auto & candidate = actor.pActor->candidates[static_cast<std::size_t>(tuple[slot])];
+                auto expected = plannedActionFrom(input.actionIds, input.unitLinks, actor.pActor->engineUnitId, candidate);
+                const auto & action = trial.plan.action(actor.actionIndex);
+                expected.actionIndex = action.actionIndex;
+                expected.plannedDamageSteps = action.plannedDamageSteps;
+                expected.state = action.state;
+                if (expected != action || claimFor(replayed, actor.actionIndex, candidate) != ReservationResult::Granted ||
+                    !RelativeStockDetail::checkedAdd(economic, seatedOptionValue(replayed, actor, tuple[slot])))
+                {
+                    return false;
+                }
+            }
+            for (std::int32_t index = 0; index < replayed.actionCount(); ++index)
+            {
+                if (replayed.action(index) != trial.plan.action(index))
+                {
+                    return false;
+                }
+            }
+            std::vector<std::int32_t> order;
+            return economic == trial.economic && completeRelativePlan(replayed, actors, order) && order == trial.order;
+        }
+
+        static void enumerateRelativeChoices(
+            const TurnPlan & plan, const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            RelativeDomain & domain, std::size_t depth, std::vector<std::int32_t> & tuple,
+            RelativeStockSession & session, const RelativeStockQuote & incumbent, RelativeFrontier & frontier)
+        {
+            if (depth == domain.members.size())
+            {
+                auto trial = relativeTrial(plan, input, actors, domain.members, tuple);
+                if (!trial.valid)
+                {
+                    return;
+                }
+                ++domain.claimable;
+                if (tuple == allChoices(actors))
+                {
+                    return;
+                }
+                auto quote = session.quote(trial.plan, trial.economic);
+                const auto comparison = session.compare(incumbent, quote);
+                if (!comparison.valid())
+                {
+                    domain.status = RelativeStockDomainStatus::InvalidQuote;
+                    frontier.valid = false;
+                    return;
+                }
+                if (comparison.deltaUpper > 0)
+                {
+                    frontier.contenders.push_back({domain.members, tuple, std::move(quote), comparison});
+                }
+                return;
+            }
+            const auto slot = static_cast<std::size_t>(domain.members[depth]);
+            for (const auto option : domain.options[depth])
+            {
+                ++domain.states;
+                tuple[slot] = option;
+                enumerateRelativeChoices(plan, input, actors, domain, depth + 1, tuple, session, incumbent, frontier);
+                if (!frontier.valid)
+                {
+                    return;
+                }
+            }
+            tuple[slot] = actors[slot].chosen;
+        }
+
+        static QString relativePhaseName(RelativeStockPhase phase)
+        {
+            return phase == RelativeStockPhase::Pair ? QStringLiteral("PAIR") : QStringLiteral("JOINT");
+        }
+
+        static void recordRelativeDomain(
+            const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            const RelativeDomain & domain, RelativeStockPhase phase, std::int64_t contenders)
+        {
+            if (input.pTrace == nullptr && input.pRelativeStockObserver == nullptr)
+            {
+                return;
+            }
+            RelativeStockDomainAudit audit;
+            audit.phase = phase;
+            audit.status = domain.status;
+            audit.product = domain.product;
+            audit.states = domain.states;
+            audit.claimable = domain.claimable;
+            audit.contenders = contenders;
+            for (const auto slot : domain.members)
+            {
+                audit.actors.push_back(actors[static_cast<std::size_t>(slot)].pActor->engineUnitId);
+            }
+            if (input.pRelativeStockObserver != nullptr)
+            {
+                input.pRelativeStockObserver->domain(audit);
+            }
+            if (input.pTrace != nullptr)
+            {
+                input.pTrace->record(QStringLiteral("STOCK_RELATIVE_DOMAIN"),
+                    QStringLiteral("phase=%1 actors=%2 product=%3 states=%4 claimable=%5 contenders=%6 status=%7")
+                        .arg(relativePhaseName(phase)).arg(traceIndices(audit.actors)).arg(domain.product)
+                        .arg(domain.states).arg(domain.claimable).arg(contenders).arg(static_cast<int>(domain.status)));
+            }
+        }
+
+        static void appendRelativeDomain(
+            const TurnPlan & plan, const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            RelativeDomain domain, RelativeStockPhase phase, RelativeStockSession & session,
+            const RelativeStockQuote & incumbent, RelativeFrontier & frontier, AssignmentStats & stats)
+        {
+            auto & counters = phase == RelativeStockPhase::Pair ? stats.stockPairs : stats.stockJoints;
+            ++counters.domains;
+            counters.candidateProduct += domain.product;
+            const auto previous = frontier.contenders.size();
+            if (domain.status == RelativeStockDomainStatus::Complete)
+            {
+                auto tuple = allChoices(actors);
+                enumerateRelativeChoices(plan, input, actors, domain, 0, tuple, session, incumbent, frontier);
+            }
+            if (domain.status != RelativeStockDomainStatus::Complete)
+            {
+                ++counters.skippedDomains;
+            }
+            counters.enumerationStates += domain.states;
+            counters.claimableLeaves += domain.claimable;
+            if (phase == RelativeStockPhase::Pair)
+            {
+                stats.swapStates += static_cast<std::int32_t>(domain.states);
+            }
+            else
+            {
+                stats.enumerationStates += static_cast<std::int32_t>(domain.states);
+            }
+            recordRelativeDomain(input, actors, domain, phase,
+                                 static_cast<std::int64_t>(frontier.contenders.size() - previous));
+        }
+
+        struct RelativeStepRecorder
+        {
+            const AssignmentInput & input;
+            RelativeStockPhase phase;
+
+            void operator()(const RelativeStockStep & step, const RelativeStockQuote & incumbent,
+                            const RelativeStockQuote & challenger) const
+            {
+                if (input.pRelativeStockObserver != nullptr)
+                {
+                    input.pRelativeStockObserver->step(phase, step, incumbent, challenger);
+                }
+                if (input.pTrace != nullptr && input.pTrace->stockDetailsEnabled())
+                {
+                    input.pTrace->record(QStringLiteral("STOCK_RELATIVE_STEP"),
+                        QStringLiteral("phase=%1 target=%2 cap=%3 states=%4 work=%5 beforeLower=%6 beforeUpper=%7 lower=%8 upper=%9 completed=%10 witness=%11 adopted=%12 deltaLower=%13 deltaUpper=%14 commonEnemy=%15 verifiedDual=%16 certifiedUpper=%17 catalogWork=%18 optimizerWork=%19 verifierWork=%20 tariffWork=%21 certificate=%22 localExhaustion=%23 globalFailure=%24")
+                            .arg(relativePhaseName(phase)).arg(static_cast<int>(step.target)).arg(step.requestedCap)
+                            .arg(step.refined.statesUsed).arg(step.refined.workUsed).arg(step.before.lower)
+                            .arg(step.before.upper).arg(step.refined.interval.lower).arg(step.refined.interval.upper)
+                            .arg(traceBool(step.refined.searchCompleted)).arg(traceBool(step.refined.lowerWitnessReplays))
+                            .arg(traceBool(step.adopted)).arg(step.comparison.deltaLower).arg(step.comparison.deltaUpper)
+                            .arg(traceBool(step.comparison.commonEnemyCancelled))
+                            .arg(traceBool(step.verifiedDual)).arg(step.dual.certifiedUpper)
+                            .arg(step.dual.catalogWork).arg(step.dual.optimizerWork)
+                            .arg(step.dual.verifierWork).arg(step.dual.tariffWork)
+                            .arg(step.dual.certificateId)
+                            .arg(traceBool(step.dual.locallyBudgetExhausted))
+                            .arg(traceBool(step.dual.globalFailure)));
+                }
+            }
+        };
+
+        static QString relativeQuoteFields(const QString & prefix, const RelativeStockQuote & quote)
+        {
+            return QStringLiteral(
+                " %1Economic=%2 %1Owned=%3 %1OurLower=%4 %1OurUpper=%5 %1EnemyLower=%6 %1EnemyUpper=%7 %1Captured=%8 %1OurWitness=%9 %1EnemyWitness=%10 %1OurCompleted=%11 %1EnemyCompleted=%12 %1AbsoluteExact=%13 %1OurUpperCertificate=%14")
+                .arg(prefix).arg(quote.economic).arg(quote.owned).arg(quote.ours.lower).arg(quote.ours.upper)
+                .arg(quote.enemy.lower).arg(quote.enemy.upper).arg(traceIndices(quote.capturedColumns))
+                .arg(traceBool(quote.ourLowerWitnessReplays)).arg(traceBool(quote.enemyLowerWitnessReplays))
+                .arg(traceBool(quote.ourSearchCompleted)).arg(traceBool(quote.enemySearchCompleted))
+                .arg(traceBool(quote.absoluteExact()))
+                .arg(static_cast<qulonglong>(
+                    quote.ourUpperCertificateId));
+        }
+
+        static void recordRelativeComparison(
+            const AssignmentInput & input, RelativeStockPhase phase, const RelativeContender & contender,
+            const RelativeStockQuote & incumbent, const RelativeStockQuote & challenger,
+            const RelativeStockRefinementResult & result, bool accepted)
+        {
+            if (input.pRelativeStockObserver != nullptr)
+            {
+                input.pRelativeStockObserver->comparison(phase, contender.tuple, incumbent, challenger, result, accepted);
+            }
+            if (input.pTrace == nullptr)
+            {
+                return;
+            }
+            const auto & comparison = result.comparison;
+            QString fields = QStringLiteral(
+                "phase=%1 candidates=%2 deltaLower=%3 deltaUpper=%4 commonEnemy=%5 accepted=%6 states=%7 enemyStates=%8 work=%9 stop=%10")
+                .arg(relativePhaseName(phase)).arg(traceIndices(contender.tuple)).arg(comparison.deltaLower)
+                .arg(comparison.deltaUpper).arg(traceBool(comparison.commonEnemyCancelled)).arg(traceBool(accepted))
+                .arg(result.statesUsed).arg(result.enemyStatesUsed).arg(result.workUsed).arg(static_cast<int>(result.stop));
+            if (input.pTrace->stockDetailsEnabled())
+            {
+                fields += relativeQuoteFields(QStringLiteral("incumbent"), incumbent);
+                fields += relativeQuoteFields(QStringLiteral("challenger"), challenger);
+            }
+            input.pTrace->record(QStringLiteral("STOCK_RELATIVE_RESULT"), fields);
+        }
+
+        static bool refreshRelativeFrontier(
+            RelativeFrontier & frontier,
+            RelativeStockSession & session,
+            const RelativeStockQuote & incumbent,
+            const std::vector<ActorProgress> & actors)
+        {
+            for (auto & contender : frontier.contenders)
+            {
+                contender.quote = session.quote(
+                    contender.quote.key,
+                    contender.quote.economic);
+                contender.comparison =
+                    session.compare(
+                        incumbent,
+                        contender.quote);
+                if (!contender.comparison.valid())
+                {
+                    return false;
+                }
+            }
+            const auto canonicalActorOrder =
+                actorSweepOrder(actors);
+            std::stable_sort(frontier.contenders.begin(), frontier.contenders.end(),
+                [&actors, &canonicalActorOrder](const RelativeContender & left, const RelativeContender & right)
+            {
+                if (left.comparison.improves() !=
+                    right.comparison.improves())
+                {
+                    return left.comparison.improves();
+                }
+                if (left.comparison.improves())
+                {
+                    if (left.comparison.deltaLower !=
+                        right.comparison.deltaLower)
+                    {
+                        return left.comparison.deltaLower >
+                            right.comparison.deltaLower;
+                    }
+                    if (left.comparison.deltaUpper !=
+                        right.comparison.deltaUpper)
+                    {
+                        return left.comparison.deltaUpper >
+                            right.comparison.deltaUpper;
+                    }
+                    if (left.members != right.members)
+                    {
+                        return canonicalActorSupportFirst(
+                            actors,
+                            left.members,
+                            right.members);
+                    }
+                    return canonicalCandidateTupleFirst(
+                        canonicalActorOrder,
+                        left.tuple,
+                        right.tuple);
+                }
+                if (left.visited != right.visited)
+                {
+                    return !left.visited;
+                }
+                return relativeStockUpperFirst(left.comparison, left.tuple, right.comparison, right.tuple);
+            });
+            return true;
+        }
+
+        static bool installRelativeContender(
+            TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+            RelativeStockSession & session, const RelativeContender & contender,
+            const RelativeStockQuote & incumbent, const RelativeStockQuote & challenger,
+            RelativeStockPhase phase, AssignmentStats & stats)
+        {
+            auto trial = relativeTrial(plan, input, actors, contender.members, contender.tuple);
+            RelativeTrial incumbentTrial;
+            incumbentTrial.plan = plan;
+            incumbentTrial.economic = seatedPlanTotal(plan, actors);
+            incumbentTrial.valid = completeRelativePlan(incumbentTrial.plan, actors, incumbentTrial.order);
+            if (!trial.valid || !incumbentTrial.valid ||
+                !replayRelativeClaims(trial, input, actors, contender.tuple) ||
+                !replayRelativeClaims(incumbentTrial, input, actors, allChoices(actors)) ||
+                !replayRelativeStockProof(session, incumbent, challenger,
+                    session.quote(plan, incumbentTrial.economic), session.quote(trial.plan, trial.economic)))
+            {
+                ++stats.replayFailures;
+                return false;
+            }
+            plan = std::move(trial.plan);
+            for (std::size_t index = 0; index < contender.members.size(); ++index)
+            {
+                auto & actor = actors[static_cast<std::size_t>(contender.members[index])];
+                if (actor.chosen != trial.seats[index].chosen)
+                {
+                    actor.phase = phase == RelativeStockPhase::Pair ? AssignmentResult::SelectionPhase::PairRefinement :
+                        AssignmentResult::SelectionPhase::Cluster;
+                }
+                actor.chosen = trial.seats[index].chosen;
+                actor.actionIndex = trial.seats[index].actionIndex;
+                actor.seatedValue = trial.seats[index].seatedValue;
+            }
+            invalidateCompleteValues(actors);
+            return true;
+        }
+
+        static std::size_t selectRelativeContender(
+            const RelativeFrontier & frontier, RelativeStockSchedule schedule,
+            const std::map<std::vector<std::int32_t>, std::int32_t> & domainSteps)
+        {
+            if (schedule == RelativeStockSchedule::Current)
+            {
+                return 0;
+            }
+            std::size_t selected = frontier.contenders.size();
+            const auto steps = [&](const RelativeContender & contender)
+            {
+                const auto found = domainSteps.find(contender.members);
+                return found == domainSteps.end() ? 0 : found->second;
+            };
+            for (std::size_t index = 0; index < frontier.contenders.size(); ++index)
+            {
+                const auto & contender = frontier.contenders[index];
+                if (contender.visited || contender.comparison.deltaUpper <= 0)
+                {
+                    continue;
+                }
+                if (contender.comparison.improves())
+                {
+                    return index;
+                }
+                if (selected == frontier.contenders.size() ||
+                    (schedule == RelativeStockSchedule::FairDomains &&
+                     steps(contender) < steps(frontier.contenders[selected])))
+                {
+                    selected = index;
+                }
+            }
+            return selected;
+        }
+
+        static void recordRelativeContender(
+            const AssignmentInput & input, const std::vector<ActorProgress> & actors,
+            RelativeStockPhase phase, const RelativeContender & contender,
+            const RelativeStockQuote & incumbent, std::int64_t rank, bool selected)
+        {
+            RelativeStockFrontierAudit audit;
+            audit.phase = phase;
+            audit.rank = rank;
+            audit.tuple = contender.tuple;
+            audit.incumbent = incumbent;
+            audit.challenger = contender.quote;
+            audit.comparison = contender.comparison;
+            audit.selected = selected;
+            for (const auto member : contender.members)
+            {
+                audit.actors.push_back(actors[static_cast<std::size_t>(member)].pActor->engineUnitId);
+            }
+            for (std::size_t slot = 0; slot < actors.size(); ++slot)
+            {
+                const auto & actor = *actors[slot].pActor;
+                const auto option = contender.tuple[slot];
+                const auto & candidate = actor.candidates[static_cast<std::size_t>(option)];
+                const auto kind = planBundleKindOf(candidate.bundle);
+                audit.actions.push_back({actor.engineUnitId, option, kind,
+                                         candidate.bundle.destination, isCaptureKind(kind)});
+            }
+            input.pRelativeStockObserver->contender(audit);
+        }
+
+        static bool improveRelativeFrontier(
+            TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+            RelativeFrontier & frontier, const RelativeAssignmentBudget & budget, RelativeStockPhase phase,
+            AssignmentStats & stats, RelativeStockTiming & timing, RelativeStockSlice slice)
+        {
+            using Clock = std::chrono::steady_clock;
+            auto & counters = phase == RelativeStockPhase::Pair ? stats.stockPairs : stats.stockJoints;
+            auto & session = *budget.session;
+            const auto started = Clock::now();
+            const auto replayBefore = timing.replayNanos;
+            bool accepted = false;
+            bool recordedFrontier = false;
+            bool proofWorkExhausted = false;
+            const bool boundedStep = input.relativeStockSchedule == RelativeStockSchedule::Requeue ||
+                input.relativeStockSchedule == RelativeStockSchedule::FairDomains;
+            std::map<std::vector<std::int32_t>, std::int32_t> domainSteps;
+            const bool recordFrontier = input.pRelativeStockObserver != nullptr &&
+                input.pRelativeStockObserver->frontierReceiptsEnabled();
+            while (frontier.valid)
+            {
+                auto incumbent = session.quote(plan, seatedPlanTotal(plan, actors));
+                if (!refreshRelativeFrontier(
+                        frontier,
+                        session,
+                        incumbent,
+                        actors))
+                {
+                    break;
+                }
+                if (recordFrontier && !recordedFrontier)
+                {
+                    input.pRelativeStockObserver->beginFrontier(
+                        phase, static_cast<std::int64_t>(frontier.contenders.size()), budget.remaining(phase));
+                    for (std::size_t rank = 0; rank < frontier.contenders.size(); ++rank)
+                    {
+                        recordRelativeContender(input, actors, phase, frontier.contenders[rank], incumbent,
+                                                static_cast<std::int64_t>(rank), false);
+                    }
+                    recordedFrontier = true;
+                }
+                const auto selected = selectRelativeContender(frontier, input.relativeStockSchedule, domainSteps);
+                if (selected >= frontier.contenders.size() || frontier.contenders[selected].visited ||
+                    frontier.contenders[selected].comparison.deltaUpper <= 0)
+                {
+                    break;
+                }
+                auto & contender = frontier.contenders[selected];
+                if (proofWorkExhausted && !contender.comparison.improves())
+                {
+                    break;
+                }
+                if (budget.remaining(phase) == 0 && !contender.comparison.improves())
+                {
+                    ++counters.budgetExhaustions;
+                    break;
+                }
+                contender.visited = true;
+                if (recordFrontier)
+                {
+                    recordRelativeContender(input, actors, phase, contender, incumbent,
+                                            static_cast<std::int64_t>(selected), true);
+                }
+                auto challenger = contender.quote;
+                const auto result = refineRelativeStock(session, incumbent, challenger,
+                    {.workLimit = budget.remaining(phase),
+                     .slice = boundedStep ? RelativeStockSlice::Doubling : slice,
+                     .maximumSteps = boundedStep ? 1 : 0},
+                    contender.cursor, RelativeStepRecorder{input, phase});
+                contender.visited = result.stop != RelativeStockStop::StepLimit;
+                contender.quote = challenger;
+                contender.comparison = result.comparison;
+                if (result.workUsed > 0)
+                {
+                    ++domainSteps[contender.members];
+                }
+                ++counters.comparisons;
+                counters.statesUsed += result.statesUsed;
+                counters.enemyStatesUsed += result.enemyStatesUsed;
+                counters.workUsed += result.workUsed;
+                if (result.budgetExhausted)
+                {
+                    ++counters.budgetExhaustions;
+                }
+                RelativeContender recordedContender =
+                    contender;
+                RelativeStockQuote recordedChallenger =
+                    challenger;
+                RelativeStockRefinementResult recordedResult =
+                    result;
+                if (result.comparison.valid() &&
+                    result.stop !=
+                        RelativeStockStop::InvalidComparison &&
+                    result.stop !=
+                        RelativeStockStop::InvalidRefinement)
+                {
+                    if (!refreshRelativeFrontier(
+                            frontier,
+                            session,
+                            incumbent,
+                            actors))
+                    {
+                        break;
+                    }
+                    const auto winner = std::find_if(
+                        frontier.contenders.begin(),
+                        frontier.contenders.end(),
+                        [](const RelativeContender & candidate)
+                    {
+                        return candidate.comparison.improves();
+                    });
+                    if (winner !=
+                        frontier.contenders.end())
+                    {
+                        recordedContender = *winner;
+                        recordedChallenger =
+                            winner->quote;
+                        recordedResult.comparison =
+                            winner->comparison;
+                        const auto replayStarted =
+                            Clock::now();
+                        accepted =
+                            installRelativeContender(
+                                plan,
+                                input,
+                                actors,
+                                session,
+                                *winner,
+                                incumbent,
+                                winner->quote,
+                                phase,
+                                stats);
+                        timing.replayNanos +=
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                    Clock::now() -
+                                    replayStarted)
+                                .count();
+                        if (accepted)
+                        {
+                            ++counters.improvements;
+                        }
+                    }
+                }
+                recordRelativeComparison(
+                    input,
+                    phase,
+                    recordedContender,
+                    incumbent,
+                    recordedChallenger,
+                    recordedResult,
+                    accepted);
+                proofWorkExhausted = result.stop == RelativeStockStop::WorkBudget;
+                if (accepted || result.stop == RelativeStockStop::InvalidComparison ||
+                    result.stop == RelativeStockStop::InvalidRefinement ||
+                    (proofWorkExhausted && input.relativeStockSchedule == RelativeStockSchedule::Current) ||
+                    result.comparison.improves())
+                {
+                    break;
+                }
+            }
+            counters.unresolved = 0;
+            const auto current = session.quote(plan, seatedPlanTotal(plan, actors));
+            for (const auto & contender : frontier.contenders)
+            {
+                const auto comparison = session.compare(current, session.quote(contender.quote.key, contender.quote.economic));
+                if (!comparison.valid() || comparison.deltaUpper > 0)
+                {
+                    ++counters.unresolved;
+                }
+            }
+            timing.refinementNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - started).count() - (timing.replayNanos - replayBefore);
+            return accepted;
+        }
+
+        static bool improveRelativePairs(
+            TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+            const std::vector<ConflictEdge> & edges, const RelativeAssignmentBudget & budget,
+            AssignmentStats & stats, RelativeStockTiming & timing, RelativeStockSlice slice)
+        {
+            using Clock = std::chrono::steady_clock;
+            std::vector<std::int32_t> order;
+            if (!completeRelativePlan(plan, actors, order))
+            {
+                return false;
+            }
+            const auto started = Clock::now();
+            const auto incumbent = budget.session->quote(plan, seatedPlanTotal(plan, actors));
+            RelativeFrontier frontier;
+            for (const auto & edge : edges)
+            {
+                if (!bothStock(input, actors, edge))
+                {
+                    continue;
+                }
+                auto domain = relativeDomain(input, actors, {edge.left, edge.right}, RelativeStockPhase::Pair,
+                    ASSIGNMENT_STATE_BUDGET - stats.swapStates - stats.enumerationStates);
+                appendRelativeDomain(plan, input, actors, std::move(domain), RelativeStockPhase::Pair,
+                                     *budget.session, incumbent, frontier, stats);
+                if (!frontier.valid)
+                {
+                    break;
+                }
+            }
+            timing.enumerationNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
+            return frontier.valid && improveRelativeFrontier(plan, input, actors, frontier, budget,
+                                                             RelativeStockPhase::Pair, stats, timing, slice);
+        }
+
+        static LiveRefinementResult refineLegacyPairs(
+            const AssignmentInput & input, const RelativeAssignmentBudget & budget, AssignmentStats & stats)
+        {
+            const auto maximumWork = budget.session != nullptr ? budget.remaining(RelativeStockPhase::Pair) :
+                std::max<std::int64_t>(0, std::clamp<std::int64_t>(
+                    input.relativeStockWorkLimit, 0, LIVE_PAIR_REFINEMENT_BUDGET) - stats.mixedPairs.workUsed);
+            const auto before = budget.session != nullptr ? budget.session->remainingWork() : 0;
+            auto result = input.pStockValuer->refineLiveAtBoundary(AssignPhase::BetweenSwapSweeps, maximumWork);
+            result.valid = result.valid && result.workUsed >= 0 && result.workUsed <= maximumWork &&
+                result.statesUsed >= 0 && result.statesUsed <= result.workUsed &&
+                result.enemyStatesUsed >= 0 && result.enemyStatesUsed <= result.statesUsed &&
+                (budget.session == nullptr || before - budget.session->remainingWork() == result.workUsed);
+            auto & counters = stats.mixedPairs;
+            ++counters.calls;
+            counters.keysRefined += result.keysRefined;
+            counters.statesUsed += result.statesUsed;
+            counters.enemyStatesUsed += result.enemyStatesUsed;
+            counters.workUsed += result.workUsed;
+            counters.budgetExhaustions += result.budgetExhausted ? 1 : 0;
+            counters.failures += result.valid ? 0 : 1;
+            if (input.pRelativeStockObserver != nullptr)
+            {
+                input.pRelativeStockObserver->mixedBoundary(maximumWork, result);
+            }
+            if (input.pTrace != nullptr && input.pTrace->stockDetailsEnabled())
+            {
+                input.pTrace->record(QStringLiteral("MIXED_REFINEMENT_BOUNDARY"),
+                    QStringLiteral("allowance=%1 keys=%2 states=%3 enemyStates=%4 work=%5 refined=%6 budgetExhausted=%7 valid=%8")
+                        .arg(maximumWork).arg(result.keysRefined).arg(result.statesUsed).arg(result.enemyStatesUsed)
+                        .arg(result.workUsed).arg(traceBool(result.refined)).arg(traceBool(result.budgetExhausted))
+                        .arg(traceBool(result.valid)));
+            }
+            return result;
+        }
+
         static void improveBySwaps(
             TurnPlan & plan,
             const AssignmentInput & input,
             std::vector<ActorProgress> & actors,
             const std::vector<ConflictEdge> & edges,
             AssignmentStats & stats,
-            DeferredAudits & audits)
+            DeferredAudits & audits,
+            const RelativeAssignmentBudget & relativeBudget,
+            RelativeStockTiming & relativeTiming)
         {
-            const bool liveIntervals =
-                input.pStockValuer != nullptr &&
-                input.pStockValuer->livePairSwapIntervals();
             for (std::int32_t sweep = 0; sweep < SWAP_SWEEP_CAP; ++sweep)
             {
                 bool improved = false;
+                bool legacyLiveEncountered = false;
                 for (const ConflictEdge & edge : edges)
                 {
+                    if (relativeBudget.session != nullptr && bothStock(input, actors, edge))
+                    {
+                        continue;
+                    }
                     if (searchBudgetExhausted(stats))
                     {
                         return;
@@ -2277,6 +3207,11 @@ namespace Coordinator
                             stats,
                             SearchPricingMode::PairSwapInterval);
                     stats.swapStates += outcome.states;
+                    if (outcome.pairPricing == PairPricingResult::LiveInterval)
+                    {
+                        legacyLiveEncountered = true;
+                        ++stats.mixedPairs.domains;
+                    }
                     if (outcome.improved)
                     {
                         ++stats.swapImprovements;
@@ -2375,10 +3310,24 @@ namespace Coordinator
                                     outcome)));
                     }
                 }
-                const bool refined =
-                    liveIntervals &&
-                    input.pStockValuer->refineLiveAtBoundary(
-                        AssignPhase::BetweenSwapSweeps);
+                bool refined = false;
+                if (legacyLiveEncountered)
+                {
+                    const auto boundary = refineLegacyPairs(input, relativeBudget, stats);
+                    if (!boundary.valid)
+                    {
+                        return;
+                    }
+                    refined = boundary.refined;
+                }
+                if (relativeBudget.session != nullptr)
+                {
+                    const auto slice = legacyLiveEncountered ? RelativeStockSlice::Doubling : RelativeStockSlice::Direct;
+                    const bool relativeImproved = improveRelativePairs(
+                        plan, input, actors, edges, relativeBudget, stats, relativeTiming, slice);
+                    improved = improved || relativeImproved;
+                    stats.swapImprovements += relativeImproved ? 1 : 0;
+                }
                 if (input.pTrace != nullptr &&
                     input.pTrace->stockDetailsEnabled())
                 {
@@ -3586,11 +4535,56 @@ namespace Coordinator
             }
         }
 
+        static bool runRelativeStockCluster(
+            TurnPlan & plan, const AssignmentInput & input, std::vector<ActorProgress> & actors,
+            const std::vector<std::int32_t> & members, const RelativeAssignmentBudget & budget,
+            AssignmentStats & stats, RelativeStockTiming & timing)
+        {
+            if (budget.session == nullptr)
+            {
+                return false;
+            }
+            using Clock = std::chrono::steady_clock;
+            const auto started = Clock::now();
+            auto domain = relativeDomain(input, actors, members, RelativeStockPhase::Joint,
+                ASSIGNMENT_STATE_BUDGET - stats.swapStates - stats.enumerationStates);
+            if (domain.status == RelativeStockDomainStatus::Complete && budget.remaining(RelativeStockPhase::Joint) == 0)
+            {
+                domain.status = RelativeStockDomainStatus::RefinementBudget;
+                ++stats.stockJoints.budgetExhaustions;
+            }
+            std::vector<std::int32_t> order;
+            if (domain.status == RelativeStockDomainStatus::Complete && !completeRelativePlan(plan, actors, order))
+            {
+                domain.status = RelativeStockDomainStatus::IncompletePlan;
+            }
+            RelativeFrontier frontier;
+            const auto incumbent = budget.session->quote(plan, seatedPlanTotal(plan, actors));
+            if (domain.status == RelativeStockDomainStatus::Complete && !incumbent.valid)
+            {
+                domain.status = RelativeStockDomainStatus::InvalidQuote;
+            }
+            const bool supported = domain.status == RelativeStockDomainStatus::Complete;
+            appendRelativeDomain(plan, input, actors, std::move(domain), RelativeStockPhase::Joint,
+                                 *budget.session, incumbent, frontier, stats);
+            timing.enumerationNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
+            if (!supported || !frontier.valid)
+            {
+                return false;
+            }
+            ++stats.clustersEnumerated;
+            improveRelativeFrontier(plan, input, actors, frontier, budget, RelativeStockPhase::Joint,
+                                    stats, timing, RelativeStockSlice::Direct);
+            return true;
+        }
+
         static void enumerateClusters(TurnPlan & plan, const AssignmentInput & input,
                                       std::vector<ActorProgress> & actors,
                                       const std::vector<std::int32_t> & sweepOrder,
                                       const std::vector<ConflictEdge> & edges,
-                                      AssignmentStats & stats)
+                                      AssignmentStats & stats,
+                                      const RelativeAssignmentBudget & relativeBudget,
+                                      RelativeStockTiming & relativeTiming)
         {
             const std::vector<std::vector<std::int32_t>> adjacency =
                 buildAdjacency(actors.size(), edges);
@@ -3641,6 +4635,10 @@ namespace Coordinator
                         });
                 if (stockCluster)
                 {
+                    if (runRelativeStockCluster(plan, input, actors, members, relativeBudget, stats, relativeTiming))
+                    {
+                        continue;
+                    }
                     ++stats.clustersCapped;
                     ++stats.clustersSkippedStockBudget;
                     if (input.pTrace != nullptr)
@@ -3952,7 +4950,7 @@ namespace Coordinator
 
         static void finishPlan(AssignmentResult & result)
         {
-            for (const VacateConflict & conflict : result.plan.addVacateEdges(planOccupancy(result.plan)))
+            for (const VacateConflict & conflict : result.plan.rebuildVacateEdges(planOccupancy(result.plan)))
             {
                 ++result.stats.vacateConflicts;
                 result.plan.markFailed(conflict.moverAction);

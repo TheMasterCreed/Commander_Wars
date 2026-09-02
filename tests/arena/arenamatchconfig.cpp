@@ -12,6 +12,7 @@
 #include <QJsonObject>
 
 #include "resource_management/gamemanager.h"
+#include "ai/coordinator/continuationinterval.h"
 
 namespace
 {
@@ -186,7 +187,7 @@ bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config,
         {
             return reject(error, "players entry has an unsupported aiType");
         }
-        if (!entry.value("co").isString() || entry.value("co").toString().isEmpty())
+        if (!entry.value("co").isString())
         {
             return reject(error, "players entry has no co");
         }
@@ -232,6 +233,90 @@ bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config,
         return reject(error, "resultFileName is not a plain file name");
     }
     config.resultFileName = resultValue.toString();
+
+    if (root.contains("coordinatedRefinementWorkLimit"))
+    {
+        if (!readInteger(root, "coordinatedRefinementWorkLimit", 0,
+                         Coordinator::LIVE_PAIR_REFINEMENT_BUDGET, number, error))
+        {
+            return false;
+        }
+        config.coordinatedRefinementWorkLimit = static_cast<qint64>(number);
+    }
+    if (root.contains("coordinatedRefinementReceiptFile"))
+    {
+        const auto receipt = root.value("coordinatedRefinementReceiptFile");
+        if (!receipt.isString() || !plainFileName(receipt.toString()) ||
+            receipt.toString().compare(config.resultFileName, Qt::CaseInsensitive) == 0)
+        {
+            return reject(error, "coordinatedRefinementReceiptFile is not a distinct plain file name");
+        }
+        config.coordinatedRefinementReceiptFile = receipt.toString();
+    }
+    if (root.contains("coordinatedRefinementSchedule"))
+    {
+        const auto value = root.value("coordinatedRefinementSchedule");
+        const QHash<QString, Coordinator::RelativeStockSchedule> schedules{
+            {"current", Coordinator::RelativeStockSchedule::Current},
+            {"certified-first", Coordinator::RelativeStockSchedule::CertifiedFirst},
+            {"requeue", Coordinator::RelativeStockSchedule::Requeue},
+            {"fair-domains", Coordinator::RelativeStockSchedule::FairDomains},
+        };
+        const auto found = schedules.constFind(value.toString());
+        if (!value.isString() || found == schedules.cend())
+        {
+            return reject(error, "unknown coordinatedRefinementSchedule");
+        }
+        config.coordinatedRefinementSchedule = *found;
+    }
+    if (root.contains("coordinatedScheduleDay"))
+    {
+        if (!readInteger(root, "coordinatedScheduleDay", 1, std::numeric_limits<qint32>::max(), number, error))
+        {
+            return false;
+        }
+        config.coordinatedScheduleDay = static_cast<qint32>(number);
+    }
+    if (root.contains("coordinatedFrontierReceipts"))
+    {
+        const auto enabled = root.value("coordinatedFrontierReceipts");
+        if (!enabled.isBool() || (enabled.toBool() && config.coordinatedRefinementReceiptFile.isEmpty()))
+        {
+            return reject(error, "coordinatedFrontierReceipts requires a boolean and a receipt file");
+        }
+        config.coordinatedFrontierReceipts = enabled.toBool();
+    }
+    if (root.contains("coordinatedFrontierDay"))
+    {
+        if (!config.coordinatedFrontierReceipts ||
+            !readInteger(root, "coordinatedFrontierDay", 1, std::numeric_limits<qint32>::max(), number, error))
+        {
+            return reject(error, "coordinatedFrontierDay requires frontier receipts and a positive day");
+        }
+        config.coordinatedFrontierDay = static_cast<qint32>(number);
+    }
+    const std::pair<QString, QString*> inputs[] = {
+        {"rulesetFile", &config.rulesetFile},
+        {"buildListFile", &config.buildListFile},
+        {"actionPrefixFile", &config.actionPrefixFile},
+        {"coordinatedValuationFile", &config.coordinatedValuationFile},
+    };
+    for (const auto & [key, destination] : inputs)
+    {
+        if (root.contains(key))
+        {
+            const auto value = root.value(key);
+            if (!value.isString() || !plainFileName(value.toString()))
+            {
+                return reject(error, key + " is not a plain file name");
+            }
+            *destination = value.toString();
+        }
+    }
+    if (!config.coordinatedValuationFile.isEmpty() && !config.coordinatedFrontierReceipts)
+    {
+        return reject(error, "coordinatedValuationFile requires frontier receipts");
+    }
 
     const QJsonValue stopDay = root.value("stopAfterDay");
     const QJsonValue stopPlayer = root.value("stopAfterPlayer");
