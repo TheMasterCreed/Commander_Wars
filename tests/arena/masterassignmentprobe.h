@@ -1,0 +1,16 @@
+#pragma once
+
+namespace Coordinator
+{
+    struct AssignmentInput;
+    struct AssignmentResult;
+    struct DecisionTraceIdentity;
+}
+
+namespace ArenaMasterAssignmentProbe
+{
+    bool enabled();
+    void record(const Coordinator::AssignmentInput & input,
+                const Coordinator::AssignmentResult & incumbent,
+                const Coordinator::DecisionTraceIdentity & identity);
+}

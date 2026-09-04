@@ -7,6 +7,8 @@
 
 namespace Coordinator
 {
+    constexpr std::int32_t NO_CANDIDATE = -1;
+
     struct CandidateBundle
     {
         std::int32_t generationIndex{-1};

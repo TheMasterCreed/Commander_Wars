@@ -87,12 +87,6 @@ namespace Coordinator
         return bestShotBefore - bestShotAfter;
     }
 
-    // Ledger arithmetic, so a next shot and a booked kill price the same hp identically.
-    constexpr MilliFunds bookDamage(MilliFunds replacementCost, std::int32_t damageSteps)
-    {
-        return DEFAULT_CAPITAL_POLICY.bookValue(replacementCost, damageSteps);
-    }
-
     constexpr std::int32_t absoluteOffset(std::int32_t offset)
     {
         if (offset < 0)

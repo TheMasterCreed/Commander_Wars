@@ -21,6 +21,12 @@ namespace Coordinator
 
     inline constexpr ReplacementCostPolicy DEFAULT_CAPITAL_POLICY{};
 
+    // Ledger arithmetic, so a next shot and a booked kill price the same hp identically.
+    constexpr MilliFunds bookDamage(MilliFunds replacementCost, std::int32_t damageSteps)
+    {
+        return DEFAULT_CAPITAL_POLICY.bookValue(replacementCost, damageSteps);
+    }
+
     struct ActorFacts
     {
         MilliFunds replacementCost{0};

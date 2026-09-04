@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "ai/coordinator/continuationinterval.h"
 #include "ai/coordinator/coordinatorcommon.h"
 #include "ai/coordinator/economicledger.h"
+#include "ai/coordinator/propertystock.h"
 
 namespace Coordinator
 {
@@ -104,6 +106,16 @@ namespace Coordinator
         virtual MilliFunds originStock() const = 0;
         virtual MilliFunds stockCeiling() const = 0;
         virtual bool affectsStock(std::int32_t engineUnitId) const = 0;
+
+        virtual std::int32_t stockRow(std::int32_t) const
+        {
+            return NO_STOCK_ROW;
+        }
+
+        virtual std::optional<ContinuationKey> continuationKey(const TurnPlan &) const
+        {
+            return std::nullopt;
+        }
 
         virtual bool livePairSwapIntervals() const
         {

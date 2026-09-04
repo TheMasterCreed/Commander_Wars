@@ -844,6 +844,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/decisiontrace.h ai/coordinator/decisiontrace.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
+    ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
+    ai/coordinator/assignmentvaluation.h ai/coordinator/planidentity.h
     ai/coordinator/engineactionbuilder.h ai/coordinator/engineactionbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
     ai/airandom.h ai/airandom.cpp
@@ -1474,6 +1476,25 @@ if (BUILD_TESTING)
     )
     cow_set_arena_test_path(CoordinatorAiBundleAssignmentTests)
 
+    add_executable(CoordinatorAiMasterAssignmentProblemTests
+        tests/coordinator_ai/masterassignmentproblemtests.cpp
+        ai/coordinator/masterassignmentproblem.cpp
+    )
+    target_include_directories(CoordinatorAiMasterAssignmentProblemTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiMasterAssignmentProblemTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiMasterAssignmentProblemTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiMasterAssignmentProblemTests COMMAND CoordinatorAiMasterAssignmentProblemTests)
+    cow_set_arena_test_path(CoordinatorAiMasterAssignmentProblemTests)
+
+    add_executable(CoordinatorAiAssignmentValuationTests
+        tests/coordinator_ai/assignmentvaluationtests.cpp
+    )
+    target_include_directories(CoordinatorAiAssignmentValuationTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiAssignmentValuationTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiAssignmentValuationTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiAssignmentValuationTests COMMAND CoordinatorAiAssignmentValuationTests)
+    cow_set_arena_test_path(CoordinatorAiAssignmentValuationTests)
+
     add_executable(CoordinatorAiRelativeStockComparisonTests
         tests/coordinator_ai/relativestockcomparisontests.cpp
     )
@@ -1825,6 +1846,8 @@ if (BUILD_TESTING)
         tests/arena/arenaactionprefix.cpp
         tests/arena/arenaactionprefix.h
         tests/arena/relativestockprobe.cpp
+        tests/arena/masterassignmentprobe.h
+        tests/arena/masterassignmentprobe.cpp
         tests/arena/relativestockprobe.h
         tests/arena/relativestockreceipts.h
         tests/arena/relativestocksupportaudit.cpp

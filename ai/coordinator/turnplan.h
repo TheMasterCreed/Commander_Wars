@@ -81,6 +81,8 @@ namespace Coordinator
         std::int32_t from{NO_ACTION};
         std::int32_t to{NO_ACTION};
         PlanEdgeKind kind{PlanEdgeKind::Vacate};
+
+        friend bool operator==(const PlanEdge &, const PlanEdge &) = default;
     };
 
     struct OccupancyEntry
@@ -111,6 +113,25 @@ namespace Coordinator
     {
         ReservationResult result{ReservationResult::Invalid};
         std::vector<std::int32_t> blocked;
+    };
+
+    struct ActionDamageReservation
+    {
+        std::int32_t targetUnitId{NO_UNIT};
+        std::int32_t targetHpSteps{0};
+        std::int32_t damageSteps{0};
+
+        friend bool operator==(const ActionDamageReservation &, const ActionDamageReservation &) = default;
+    };
+
+    struct ActionReservations
+    {
+        std::vector<TilePoint> destinations;
+        std::vector<TilePoint> captures;
+        std::vector<std::int32_t> services;
+        std::vector<ActionDamageReservation> damage;
+
+        friend bool operator==(const ActionReservations &, const ActionReservations &) = default;
     };
 
     struct PlanChange
@@ -155,6 +176,20 @@ namespace Coordinator
 
     public:
         TurnPlan() = default;
+
+        bool equivalentState(const TurnPlan & other) const
+        {
+            return m_actions == other.m_actions &&
+                   m_edges == other.m_edges &&
+                   std::is_permutation(m_destinationClaims.begin(), m_destinationClaims.end(),
+                                       other.m_destinationClaims.begin(), other.m_destinationClaims.end()) &&
+                   std::is_permutation(m_captureClaims.begin(), m_captureClaims.end(),
+                                       other.m_captureClaims.begin(), other.m_captureClaims.end()) &&
+                   std::is_permutation(m_serviceClaims.begin(), m_serviceClaims.end(),
+                                       other.m_serviceClaims.begin(), other.m_serviceClaims.end()) &&
+                   std::is_permutation(m_damageClaims.begin(), m_damageClaims.end(),
+                                       other.m_damageClaims.begin(), other.m_damageClaims.end());
+        }
 
         // NO_ACTION on a duplicate unit or an inconsistent path
         std::int32_t addAction(PlannedAction action)
@@ -202,6 +237,57 @@ namespace Coordinator
         const PlannedAction & action(std::int32_t index) const
         {
             return m_actions[static_cast<std::size_t>(index)];
+        }
+
+        ActionReservations actionReservations(std::int32_t index) const
+        {
+            ActionReservations result;
+            if (!hasAction(index))
+            {
+                return result;
+            }
+            for (const TileClaim & claim : m_destinationClaims)
+            {
+                if (claim.actionIndex == index)
+                {
+                    result.destinations.push_back(claim.tile);
+                }
+            }
+            for (const TileClaim & claim : m_captureClaims)
+            {
+                if (claim.actionIndex == index)
+                {
+                    result.captures.push_back(claim.tile);
+                }
+            }
+            for (const ServiceClaim & claim : m_serviceClaims)
+            {
+                if (claim.actionIndex == index)
+                {
+                    result.services.push_back(claim.partnerUnitId);
+                }
+            }
+            for (const DamageClaim & claim : m_damageClaims)
+            {
+                if (holdsContribution(claim, index))
+                {
+                    result.damage.push_back(ActionDamageReservation{
+                        claim.targetUnitId, claim.remainingHpSteps, contributionOf(claim, index)});
+                }
+            }
+            const auto tileLess = [](TilePoint left, TilePoint right)
+            {
+                return left.x < right.x || (left.x == right.x && left.y < right.y);
+            };
+            std::sort(result.destinations.begin(), result.destinations.end(), tileLess);
+            std::sort(result.captures.begin(), result.captures.end(), tileLess);
+            std::sort(result.services.begin(), result.services.end());
+            std::sort(result.damage.begin(), result.damage.end(),
+                      [](const ActionDamageReservation & left, const ActionDamageReservation & right)
+            {
+                return left.targetUnitId < right.targetUnitId;
+            });
+            return result;
         }
 
         // only a pending action can be committed
@@ -502,18 +588,24 @@ namespace Coordinator
         {
             TilePoint tile{INVALID_TILE};
             std::int32_t actionIndex{NO_ACTION};
+
+            friend bool operator==(const TileClaim &, const TileClaim &) = default;
         };
 
         struct ServiceClaim
         {
             std::int32_t partnerUnitId{NO_UNIT};
             std::int32_t actionIndex{NO_ACTION};
+
+            friend bool operator==(const ServiceClaim &, const ServiceClaim &) = default;
         };
 
         struct DamageContribution
         {
             std::int32_t actionIndex{NO_ACTION};
             std::int32_t hpSteps{0};
+
+            friend bool operator==(const DamageContribution &, const DamageContribution &) = default;
         };
 
         struct DamageClaim
@@ -522,6 +614,15 @@ namespace Coordinator
             std::int32_t remainingHpSteps{0};
             std::int32_t plannedHpSteps{0};
             std::vector<DamageContribution> contributions;
+
+            friend bool operator==(const DamageClaim & left, const DamageClaim & right)
+            {
+                return left.targetUnitId == right.targetUnitId &&
+                       left.remainingHpSteps == right.remainingHpSteps &&
+                       left.plannedHpSteps == right.plannedHpSteps &&
+                       std::is_permutation(left.contributions.begin(), left.contributions.end(),
+                                           right.contributions.begin(), right.contributions.end());
+            }
         };
 
         struct SearchFrame

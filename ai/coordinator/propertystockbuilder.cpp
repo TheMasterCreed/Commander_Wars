@@ -3129,6 +3129,17 @@ namespace Coordinator
         return rowOf(engineUnitId) != NO_STOCK_ROW;
     }
 
+    std::int32_t JointPlanStockValuer::stockRow(
+        std::int32_t engineUnitId) const
+    {
+        return rowOf(engineUnitId);
+    }
+
+    std::optional<ContinuationKey> JointPlanStockValuer::continuationKey(const TurnPlan & plan) const
+    {
+        return canonicalPlanKey(planActions(plan));
+    }
+
     PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,
                                                std::span<const PropertyFacts> properties,
                                                MobilityFieldCache & mobility, std::int32_t horizonTurns)

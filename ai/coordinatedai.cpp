@@ -17,6 +17,10 @@
 #include "game/player.h"
 #include "game/unit.h"
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+#include "tests/arena/masterassignmentprobe.h"
+#endif
+
 namespace
 {
 bool sameExecutionIntent(
@@ -346,6 +350,9 @@ void CoordinatedAi::buildTurnPlan()
     input.pTrace = m_decisionTrace.get();
     input.measureTimings = timed;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+    input.retainSelections = ArenaMasterAssignmentProbe::enabled();
+#endif
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
     input.relativeStockWorkLimit = m_testRefinementWorkLimit;
     if (m_testRefinementScheduleDay < 0 || traceIdentity.day == m_testRefinementScheduleDay)
     {
@@ -504,6 +511,9 @@ void CoordinatedAi::buildTurnPlan()
                   Clock::now() - continuationStart)
                   .count();
     m_assignment = Coordinator::MaximumValueAssignment::assign(input);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    ArenaMasterAssignmentProbe::record(input, m_assignment, traceIdentity);
+#endif
     recordCaptureDecisions(input);
     recordProductionBlocks(input);
     const std::int64_t turnPlanNanos =

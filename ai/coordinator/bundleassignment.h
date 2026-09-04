@@ -11,11 +11,13 @@
 
 #include <QString>
 
+#include "ai/coordinator/assignmentvaluation.h"
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/bundlevaluation.h"
 #include "ai/coordinator/coordinatorcommon.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/planstockvaluer.h"
+#include "ai/coordinator/planidentity.h"
 #include "ai/coordinator/relativestockaudit.h"
 #include "ai/coordinator/turnplan.h"
 
@@ -25,15 +27,6 @@ class ArenaRelativeStockSupportAudit;
 
 namespace Coordinator
 {
-    struct PlanActionIds
-    {
-        QString wait;
-        QString fire;
-        QString capture;
-    };
-
-    PlanActionIds engineActionIds();
-
     // Empty for a kind no single engine action performs.
     inline QString planActionIdFor(const PlanActionIds & actionIds, PlanBundleKind kind)
     {
@@ -56,12 +49,6 @@ namespace Coordinator
         return QString();
     }
 
-    struct KnownUnitLink
-    {
-        std::int32_t engineUnitId{NO_UNIT};
-        TilePoint tile{INVALID_TILE};
-    };
-
     struct AssignmentActor
     {
         std::int32_t knowledgeUnitIndex{NO_UNIT};
@@ -80,6 +67,7 @@ namespace Coordinator
         std::int64_t relativeStockWorkLimit{DEFAULT_RELATIVE_STOCK_WORK_LIMIT};
         RelativeStockSchedule relativeStockSchedule{RelativeStockSchedule::Current};
         RelativeStockObserver* pRelativeStockObserver{nullptr};
+        bool retainSelections{false};
     };
 
     inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)
@@ -264,7 +252,8 @@ namespace Coordinator
         return target.engineUnitId != NO_UNIT && target.tile != INVALID_TILE;
     }
 
-    inline ReservationResult claimFor(TurnPlan & plan, std::int32_t actionIndex, const CandidateBundle & candidate)
+    inline ReservationResult claimFor(TurnPlan & plan, std::int32_t actionIndex, const CandidateBundle & candidate,
+                                      std::optional<std::int32_t> replayDamage = std::nullopt)
     {
         const PlannedAction & action = plan.action(actionIndex);
         const ReservationResult destination = plan.claimDestination(actionIndex, action.destination);
@@ -280,9 +269,14 @@ namespace Coordinator
         switch (pComponent->kind)
         {
             case ComponentKind::Fire:
+                if (replayDamage &&
+                    (*replayDamage < 0 || *replayDamage > pComponent->fire.damageSteps))
+                {
+                    return ReservationResult::Invalid;
+                }
                 return plan
                     .claimAttack(actionIndex, action.targetUnitId, pComponent->fire.targetHpSteps,
-                                 pComponent->fire.damageSteps)
+                                  replayDamage.value_or(pComponent->fire.damageSteps))
                     .result;
             case ComponentKind::Capture:
                 return plan.claimCapture(actionIndex, action.destination);
@@ -444,7 +438,6 @@ namespace Coordinator
         return occupancy;
     }
 
-    constexpr std::int32_t NO_CANDIDATE = -1;
     constexpr std::int32_t NO_CANDIDATE_CAP = -1;
     constexpr std::int32_t ASSIGNMENT_STATE_BUDGET = 200000;
 
@@ -524,34 +517,6 @@ namespace Coordinator
             }
         }
         return true;
-    }
-
-    inline MilliFunds proRatedCredit(MilliFunds credit, std::int32_t granted, std::int32_t dealt)
-    {
-        return divideRoundHalfAwayFromZero(credit * granted, dealt);
-    }
-
-    inline MilliFunds grantedFireValue(const FireFacts & fire, MilliFunds staticValue, std::int32_t granted)
-    {
-        const std::int32_t dealt = std::min(fire.damageSteps, fire.targetHpSteps);
-        if (granted == dealt)
-        {
-            return staticValue;
-        }
-        MilliFunds staticSurvivingShot = fire.targetBestShotAfter;
-        if (dealt >= fire.targetHpSteps)
-        {
-            staticSurvivingShot = 0;
-        }
-        const MilliFunds staticCredit = fire.targetBestShotBefore - staticSurvivingShot;
-        const MilliFunds staticCapital = bookDamage(fire.targetReplacementCost, dealt);
-        const MilliFunds grantedCapital = bookDamage(fire.targetReplacementCost, granted);
-        if (staticCredit < 0)
-        {
-            return staticValue - staticCapital + grantedCapital;
-        }
-        return staticValue - staticCapital + grantedCapital - staticCredit +
-               proRatedCredit(staticCredit, granted, dealt);
     }
 
     inline MilliFunds seatedOptionValue(const TurnPlan & plan, const ActorProgress & state, std::int32_t option)
@@ -4743,7 +4708,7 @@ namespace Coordinator
             const std::vector<ActorProgress> & actors,
             const AssignmentInput & input)
         {
-            if (input.pTrace == nullptr)
+            if (input.pTrace == nullptr && !input.retainSelections)
             {
                 return;
             }
@@ -4769,6 +4734,10 @@ namespace Coordinator
                     state.completeValues;
                 result.selections.push_back(
                     std::move(selection));
+            }
+            if (input.pTrace == nullptr)
+            {
+                return;
             }
 
             input.pTrace->record(

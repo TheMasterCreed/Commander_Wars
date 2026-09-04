@@ -8,6 +8,8 @@
 
 namespace
 {
+    using Coordinator::ActionDamageReservation;
+    using Coordinator::ActionReservations;
     using Coordinator::AttackClaim;
     using Coordinator::ConflictOutcome;
     using Coordinator::INVALID_TILE;
@@ -893,11 +895,115 @@ namespace
         const std::int32_t service = plan.addAction(moveAction(SERVICE_UNIT, ESCORT_TILE, ESCORT_GOAL, EQUAL_VALUE));
         const std::int32_t rival = plan.addAction(moveAction(RIVAL_SERVICE_UNIT, FRONT_TILE, WALL_TILE, EQUAL_VALUE));
         expect(plan.claimService(service, SERVICE_PARTNER_UNIT) == ReservationResult::Granted, "the first service slot is granted");
+        const auto serviceSnapshot = plan.actionReservations(service);
+        expect(serviceSnapshot.services == std::vector<std::int32_t>{SERVICE_PARTNER_UNIT},
+               "service reservations expose the actual claimed partner");
+        expect(serviceSnapshot.destinations.empty() && serviceSnapshot.captures.empty() && serviceSnapshot.damage.empty(),
+               "a service reservation does not invent unclaimed action metadata");
         expect(plan.claimService(rival, SERVICE_PARTNER_UNIT) == ReservationResult::Conflict, "a second service action conflicts");
         expect(plan.serviceClaimant(SERVICE_PARTNER_UNIT) == service, "the first service action keeps the slot");
+        expect(plan.actionReservations(service) == serviceSnapshot && plan.actionReservations(rival) == ActionReservations{},
+               "a refused service claim changes neither action's reservations");
         plan.markFailed(service);
         expect(plan.serviceClaimant(SERVICE_PARTNER_UNIT) == NO_ACTION, "a failed action releases its service slot");
+        expect(plan.actionReservations(service) == ActionReservations{},
+               "an abandoned action snapshot records the released service claim");
         expect(plan.claimService(rival, SERVICE_PARTNER_UNIT) == ReservationResult::Granted, "the rival can take the free slot");
+        expect(plan.actionReservations(rival) == serviceSnapshot,
+               "the replacement service claimant exposes the same resource without the old owner");
+    }
+
+    void testActionReservationSnapshotTracksOnlyItsDamageShare()
+    {
+        TurnPlan plan;
+        const auto first = plan.addAction(
+            fireAction(FIRST_SHOOTER_UNIT, REAR_TILE, FOCUS_TARGET_TILE, FOCUS_TARGET_UNIT, EQUAL_VALUE));
+        const auto second = plan.addAction(
+            fireAction(SECOND_SHOOTER_UNIT, FRONT_TILE, FOCUS_TARGET_TILE, FOCUS_TARGET_UNIT, EQUAL_VALUE));
+        expect(claimDamage(plan, first, FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, SHOT_HP_STEPS) == ReservationResult::Granted,
+               "the first actor reserves three target hp steps");
+        const auto firstSnapshot = plan.actionReservations(first);
+        expect(firstSnapshot.damage == std::vector<ActionDamageReservation>{
+                   {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, SHOT_HP_STEPS}},
+               "the reservation includes target identity, remaining hp and the actor's exact share");
+        expect(claimDamage(plan, second, FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, SHOT_HP_STEPS) == ReservationResult::Granted,
+               "another actor books the remaining target hp step");
+        expect(plan.plannedDamageOn(FOCUS_TARGET_UNIT) == FOCUS_TARGET_HP_STEPS &&
+                   plan.actionReservations(first) == firstSnapshot,
+               "a changed target total leaves the first actor's reservation identical");
+        expect(plan.actionReservations(second).damage == std::vector<ActionDamageReservation>{
+                   {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, LETHAL_REMAINDER_HP_STEPS}},
+               "the second snapshot exposes its clipped share rather than its requested damage");
+        expect(claimDamage(plan, first, FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS) == ReservationResult::Granted,
+               "the first actor can replace its own damage share");
+        expect(plan.actionReservations(first) != firstSnapshot &&
+                   plan.actionReservations(first).damage == std::vector<ActionDamageReservation>{
+                       {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS}},
+               "changing the actor's own share changes its snapshot");
+        expect(firstSnapshot.damage.front().damageSteps == SHOT_HP_STEPS,
+               "an owned snapshot retains its earlier share after the plan changes");
+        expect(claimDamage(plan, first, FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, NO_HP_STEPS_LEFT) == ReservationResult::Granted,
+               "an existing actor can reserve a zero share");
+        expect(plan.actionReservations(first).damage == std::vector<ActionDamageReservation>{
+                   {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, NO_HP_STEPS_LEFT}},
+               "an explicit zero contribution remains distinct from no damage reservation");
+        plan.markFailed(first);
+        expect(plan.actionReservations(first) == ActionReservations{} &&
+                   plan.actionReservations(second).damage == std::vector<ActionDamageReservation>{
+                       {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, LETHAL_REMAINDER_HP_STEPS}},
+               "releasing one actor removes only its own reservation");
+    }
+
+    void testActionReservationsAreCanonicalAndObservational()
+    {
+        TurnPlan forward;
+        const auto first = forward.addAction(moveAction(REPLAN_UNIT, REPLAN_TILE, REPLAN_SECOND_GOAL, EQUAL_VALUE));
+        auto reverse = forward;
+        const std::vector<TilePoint> tiles{CHAIN_HEAD_TILE, REPLAN_SECOND_GOAL, REPLAN_TILE};
+        const std::vector<std::int32_t> partners{FOCUS_TARGET_UNIT, WALL_UNIT, SERVICE_PARTNER_UNIT};
+        const std::vector<std::int32_t> targets{FOCUS_TARGET_UNIT, WALL_UNIT, FULL_TARGET_UNIT};
+        for (std::size_t index = 0; index < tiles.size(); ++index)
+        {
+            const auto reversed = tiles.size() - index - 1;
+            expect(forward.claimDestination(first, tiles[index]) == ReservationResult::Granted &&
+                       reverse.claimDestination(first, tiles[reversed]) == ReservationResult::Granted,
+                   "the same destination claims are inserted in opposite orders");
+            expect(forward.claimCapture(first, tiles[index]) == ReservationResult::Granted &&
+                       reverse.claimCapture(first, tiles[reversed]) == ReservationResult::Granted,
+                   "the same capture claims are inserted in opposite orders");
+            expect(forward.claimService(first, partners[index]) == ReservationResult::Granted &&
+                       reverse.claimService(first, partners[reversed]) == ReservationResult::Granted,
+                   "the same service claims are inserted in opposite orders");
+            expect(claimDamage(forward, first, targets[index], FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS) == ReservationResult::Granted &&
+                       claimDamage(reverse, first, targets[reversed], FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS) == ReservationResult::Granted,
+                   "the same damage claims are inserted in opposite orders");
+        }
+        const auto untouched = forward;
+        const auto snapshot = forward.actionReservations(first);
+        expect(snapshot == reverse.actionReservations(first), "claim insertion order does not change the canonical snapshot");
+        expect(snapshot.destinations == tiles && snapshot.captures == tiles,
+               "tile reservations are ordered by x then y");
+        expect(snapshot.services == partners && snapshot.damage == std::vector<ActionDamageReservation>{
+                   {FOCUS_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS},
+                   {WALL_UNIT, FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS},
+                   {FULL_TARGET_UNIT, FOCUS_TARGET_HP_STEPS, PARTIAL_HP_STEPS}},
+               "unit-keyed reservations are ordered by target identity");
+        expect(forward.equivalentState(untouched) && forward.equivalentState(reverse),
+               "snapshot extraction neither mutates claims nor makes insertion order semantic");
+    }
+
+    void testActionReservationsForInvalidAndUnclaimedActionsAreEmpty()
+    {
+        TurnPlan plan;
+        const auto untouched = plan;
+        expect(plan.actionReservations(NO_ACTION) == ActionReservations{} &&
+                   plan.actionReservations(0) == ActionReservations{} &&
+                   plan.actionReservations(UNKNOWN_ACTION_INDEX) == ActionReservations{},
+               "invalid indices return empty reservations without requiring an action");
+        expect(plan.equivalentState(untouched), "invalid reservation queries do not mutate the plan");
+        const auto action = plan.addAction(captureAction(CAPTURE_UNIT, CAPTURE_START, CAPTURE_BUILDING, EQUAL_VALUE));
+        expect(plan.actionReservations(action) == ActionReservations{},
+               "a capture action alone does not imply a booked capture or destination");
     }
 
     bool sameEdges(const TurnPlan & left, const TurnPlan & right)
@@ -1089,6 +1195,9 @@ int main()
     testBlockedActionCanBeReplanned();
     testMarkFailedRefusesACommittedActionAndRepeatsAreIdempotent();
     testServiceSlotIsExclusivePerPartner();
+    testActionReservationSnapshotTracksOnlyItsDamageShare();
+    testActionReservationsAreCanonicalAndObservational();
+    testActionReservationsForInvalidAndUnclaimedActionsAreEmpty();
     testClearVacatePreservesOtherDependenciesAndClaims();
     testVacateRebuildIsIdempotent();
     testClearingBeforeFailurePreservesNonMember();

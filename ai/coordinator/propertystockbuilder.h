@@ -85,6 +85,8 @@ namespace Coordinator
         MilliFunds originStock() const override;
         MilliFunds stockCeiling() const override;
         bool affectsStock(std::int32_t engineUnitId) const override;
+        std::int32_t stockRow(std::int32_t engineUnitId) const override;
+        std::optional<ContinuationKey> continuationKey(const TurnPlan & plan) const override;
         bool livePairSwapIntervals() const override;
         LivePlanStockQuote livePlanStock(
             const TurnPlan & plan,
