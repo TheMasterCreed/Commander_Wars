@@ -27,7 +27,7 @@ namespace Coordinator
                           std::size_t units, RefinementWork category)
     {
         const auto work = masterWorkProduct(count, units);
-        return work && ledger.draw(*work, category) != NO_GRANT;
+        return work && ledger.consume(*work, category);
     }
 
     std::optional<MasterAssignmentState> masterRootState(

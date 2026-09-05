@@ -2,6 +2,7 @@
 
 #include "ai/coordinator/masterassignmentstate.h"
 #include "ai/coordinator/relativestocksession.h"
+#include "ai/coordinator/masterassignmentprofile.h"
 
 namespace Coordinator
 {
@@ -68,9 +69,11 @@ namespace Coordinator
     class MasterAssignmentEvaluator final
     {
     public:
-        MasterAssignmentEvaluator(const MasterAssignmentProblem & problem, RefinementLedger & ledger);
         MasterAssignmentEvaluator(const MasterAssignmentProblem & problem, RefinementLedger & ledger,
-                                  RelativeStockSession & session, MasterValuationTariffs tariffs);
+                                  MasterAssignmentProfile* profile = nullptr);
+        MasterAssignmentEvaluator(const MasterAssignmentProblem & problem, RefinementLedger & ledger,
+                                  RelativeStockSession & session, MasterValuationTariffs tariffs,
+                                  MasterAssignmentProfile* profile = nullptr);
 
         MasterAssignmentEvaluation evaluate(const MasterAssignmentState & state);
         bool refresh(MasterAssignmentEvaluation & evaluation);
@@ -92,5 +95,6 @@ namespace Coordinator
         RefinementLedger & m_ledger;
         RelativeStockSession* m_session{nullptr};
         MasterValuationTariffs m_tariffs;
+        MasterAssignmentProfile* m_profile;
     };
 }

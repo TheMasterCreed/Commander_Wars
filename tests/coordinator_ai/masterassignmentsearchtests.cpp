@@ -226,6 +226,8 @@ namespace
         const auto result = solve(problem, 1000000);
         check(problem, exact, result, 1000000);
         require(result.improvement.has_value(), "joint vacate chain has strict proof");
+        expect(result.stats.incumbentCompletions > 0 && result.stats.infeasible > 0,
+               "failed incumbent completions do not discard a feasible three-actor branch");
         expect(result.improvement->challenger.state.choices == std::vector<std::int32_t>({1, 1, 1}),
                "all three actors must change for the positive plan");
         for (const auto & tuple : exact.tuples)
@@ -366,6 +368,20 @@ namespace
         exportSearchCase(QStringLiteral("master-search-improvement-before-optimal"), problem, request(), exact,
                          {searchRecord(prefix), searchRecord(complete)});
     }
+
+    void completionWitnessMemo()
+    {
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 7, 1));
+        fixture.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 9, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        const auto exact = MasterAssignmentOracle::enumerate(problem, request());
+        const auto result = solve(problem, 1000000);
+        check(problem, exact, result, 1000000);
+        expect(result.globalOptimal && result.lower == 16 && result.stats.evaluationCacheHits > 0,
+               "an earlier completion witness is reused when best-upper traversal reaches that exact tuple");
+    }
 }
 
 int main(int argc, char** argv)
@@ -379,6 +395,7 @@ int main(int argc, char** argv)
     unsupportedAndOverflow();
     scopedIdentitiesAndLargeResources();
     improvementBeforeGlobalProof();
+    completionWitnessMemo();
     std::printf("Master assignment search: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;
 }

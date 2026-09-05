@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 
 #include "ai/coordinator/masterassignmentsearch.h"
 #include "ai/coordinator/propertystockfield.h"
@@ -174,6 +175,7 @@ namespace MasterAssignmentTest
 
         RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) override
         {
+            m_quotedKeys.insert(key);
             const auto found = m_cases.find(key);
             if (found == m_cases.end())
             {
@@ -251,6 +253,7 @@ namespace MasterAssignmentTest
 
         std::shared_ptr<const RelativeStockProofSnapshot> captureProof(const RelativeStockQuote & expected) override
         {
+            ++proofCaptures;
             if (!owns(expected) || !expected.ourLowerWitnessReplays || !expected.enemyLowerWitnessReplays ||
                 !sameRelativeStockQuote(expected, quote(expected.key, expected.economic)))
             {
@@ -326,6 +329,11 @@ namespace MasterAssignmentTest
 
         RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t cap) override
         {
+            if (!firstFriendlyRefinement)
+            {
+                firstFriendlyRefinement = key;
+                distinctQuotesBeforeFirstRefinement = m_quotedKeys.size();
+            }
             auto & entry = m_cases.at(key);
             if (m_deferFriendly)
             {
@@ -372,6 +380,7 @@ namespace MasterAssignmentTest
             result.intervalBefore = quote.ours;
             result.intervalAfter = quote.ours;
             ++certificateCalls;
+            maximumCertificateAllowance = std::max(maximumCertificateAllowance, maximumWork);
             if (!owns(quote) || maximumWork <= 0)
             {
                 result.globalFailure = true;
@@ -394,7 +403,7 @@ namespace MasterAssignmentTest
             };
             const auto tariff = static_cast<std::int64_t>((model.rows.size() + 1) *
                 (model.nodeColumns.size() + 1));
-            if (tariff > maximumWork)
+            if (tariff >= maximumWork)
             {
                 result.locallyBudgetExhausted = true;
                 return finalize();
@@ -480,9 +489,14 @@ namespace MasterAssignmentTest
         }
 
         std::uint64_t certificateCalls{0};
+        std::int64_t maximumCertificateAllowance{0};
+        std::uint64_t proofCaptures{0};
         std::uint64_t verifiedCertificates{0};
+        std::optional<ContinuationKey> firstFriendlyRefinement;
+        std::size_t distinctQuotesBeforeFirstRefinement{0};
 
     private:
+        std::set<ContinuationKey> m_quotedKeys;
         bool verifiedUpperMatches(const RelativeStockQuote & quote) const override
         {
             const auto found = m_certificates.find(quote.key);
@@ -494,6 +508,8 @@ namespace MasterAssignmentTest
                 found->second.proof->identity.session == sessionIdentity() &&
                 found->second.proof->identity.key == quote.key &&
                 found->second.proof->identity.capturedColumns == quote.capturedColumns &&
+                found->second.proof->identity.economic == quote.economic &&
+                found->second.proof->identity.owned == quote.owned &&
                 quote.ours.upper <= found->second.proof->dualObjective;
         }
 
@@ -509,7 +525,8 @@ namespace MasterAssignmentTest
             {
                 return {.budgetExhausted = true};
             }
-            const auto tier = solveSequentialPacking(model.instance(), 0, cap, nullptr, true);
+            const auto tier = solveSequentialPacking(model.instance(), 0, cap, nullptr, true,
+                SequentialWitnessPolicy::BookedValue);
             require(m_ledger.refund(grant, cap - tier.searchStates), "unused native work refunded");
             if (tier.bookedValue >= bounds.lower &&
                 replaySequentialWitness(model.instance(), tier.witness, tier.bookedValue))

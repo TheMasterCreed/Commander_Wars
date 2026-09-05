@@ -17,6 +17,12 @@ namespace Coordinator
     constexpr std::int32_t NO_SEQUENTIAL_CLASS = -1;
     constexpr std::int64_t SEQUENTIAL_SEARCH_STATE_CAP = 100000;
 
+    enum class SequentialWitnessPolicy : std::int8_t
+    {
+        ImprovementOnly,
+        BookedValue,
+    };
+
     struct SequentialClassKey
     {
         std::int32_t gridIdentity{NO_STOCK_ROW};
@@ -639,6 +645,14 @@ namespace Coordinator
             MilliFunds bestValue{0};
         };
 
+        enum class IncumbentWitnessSource : std::int8_t
+        {
+            Untracked,
+            Missing,
+            Repair,
+            Packing,
+        };
+
         struct PackSearch
         {
             std::span<const PackedRow> rows;
@@ -649,6 +663,7 @@ namespace Coordinator
             MilliFunds relaxedValue{0};
             std::vector<const RowOption*>* pCurrentChoices{nullptr};
             std::vector<const RowOption*>* pBestChoices{nullptr};
+            IncumbentWitnessSource witnessSource{IncumbentWitnessSource::Untracked};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
             std::int64_t leaves{0};
             std::int64_t prunes{0};
@@ -658,6 +673,12 @@ namespace Coordinator
 #endif
             bool exact{false};
         };
+
+        inline bool canImproveOrWitness(const PackSearch & pack, MilliFunds upper)
+        {
+            return upper > pack.incumbent ||
+                (upper == pack.incumbent && pack.witnessSource == IncumbentWitnessSource::Missing);
+        }
 
         inline void packOptionRows(PackSearch & pack,
                                    std::size_t depth,
@@ -682,15 +703,19 @@ namespace Coordinator
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
                 ++pack.leaves;
 #endif
-                if (value > pack.incumbent)
+                if (canImproveOrWitness(pack, value))
                 {
-                    pack.incumbent = value;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-                    ++pack.incumbentImprovements;
+                    if (value > pack.incumbent)
+                    {
+                        ++pack.incumbentImprovements;
+                    }
 #endif
+                    pack.incumbent = value;
                     if (pack.pCurrentChoices != nullptr)
                     {
                         *pack.pBestChoices = *pack.pCurrentChoices;
+                        pack.witnessSource = IncumbentWitnessSource::Packing;
                     }
                     if (pack.incumbent == pack.relaxedValue)
                     {
@@ -699,7 +724,7 @@ namespace Coordinator
                 }
                 return;
             }
-            if (value + pack.suffixBound[depth] <= pack.incumbent)
+            if (!canImproveOrWitness(pack, value + pack.suffixBound[depth]))
             {
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
                 ++pack.prunes;
@@ -708,8 +733,7 @@ namespace Coordinator
             }
             for (const RowOption & option : pack.rows[depth].options)
             {
-                if (value + option.value + pack.suffixBound[depth + 1] <=
-                    pack.incumbent)
+                if (!canImproveOrWitness(pack, value + option.value + pack.suffixBound[depth + 1]))
                 {
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
                     ++pack.prunes;
@@ -866,9 +890,11 @@ namespace Coordinator
         MilliFunds floorValue,
         std::int64_t stateCap,
         SequentialDetail::SequentialRowOptionSource* pRowSource = nullptr,
-        bool captureWitness = false)
+        bool captureWitness = false,
+        SequentialWitnessPolicy witnessPolicy = SequentialWitnessPolicy::ImprovementOnly)
     {
         using namespace SequentialDetail;
+        const bool retainBookedWitness = captureWitness && witnessPolicy == SequentialWitnessPolicy::BookedValue;
 
         SequentialTierResult result;
         result.floorValue = floorValue;
@@ -915,7 +941,7 @@ namespace Coordinator
                 }
             }
         }
-        if (!result.continuationSeen)
+        if (!result.continuationSeen && !retainBookedWitness)
         {
             return result;
         }
@@ -941,7 +967,10 @@ namespace Coordinator
         {
             result.relaxedValue =
                 std::max(result.relaxedValue, floorValue);
-            return result;
+            if (!retainBookedWitness)
+            {
+                return result;
+            }
         }
 
         std::vector<RelaxedMatch> matches;
@@ -1282,6 +1311,11 @@ namespace Coordinator
         pack.pBudget = &budget;
         pack.incumbent = std::max(floorValue, repairTotal);
         pack.relaxedValue = result.relaxedValue;
+        if (retainBookedWitness)
+        {
+            pack.witnessSource = repairTotal >= floorValue
+                ? IncumbentWitnessSource::Repair : IncumbentWitnessSource::Missing;
+        }
         std::optional<std::vector<const RowOption*>> currentChoices;
         std::optional<std::vector<const RowOption*>> bestChoices;
         if (captureWitness)
@@ -1317,7 +1351,8 @@ namespace Coordinator
         result.bookedValue =
             std::max({floorValue, repairTotal, pack.incumbent});
         if (captureWitness &&
-            pack.incumbent > std::max(floorValue, repairTotal))
+            (pack.incumbent > std::max(floorValue, repairTotal) ||
+             (retainBookedWitness && pack.witnessSource == IncumbentWitnessSource::Packing)))
         {
             for (std::size_t packed = 0;
                  packed < packedRows.size();
@@ -1339,7 +1374,8 @@ namespace Coordinator
             }
             sortOwnedWitness(result.witness);
         }
-        else if (captureWitness && repairTotal > floorValue)
+        else if (captureWitness && (repairTotal > floorValue ||
+                 (retainBookedWitness && repairTotal == floorValue)))
         {
             sortOwnedWitness(*repairWitness);
             result.witness = std::move(*repairWitness);

@@ -13,6 +13,7 @@
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/masterassignmentfuture.h"
+#include "ai/coordinator/masterassignmentprofile.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coreai.h"
 
@@ -671,8 +672,9 @@ namespace Coordinator
 #endif
 
     bool JointPlanStockValuer::prepareMasterContinuationPricing(
-        ContinuationPricingCatalog catalog, RefinementLedger & ledger)
+        ContinuationPricingCatalog catalog, RefinementLedger & ledger, MasterAssignmentProfile* profile)
     {
+        m_masterProfile = profile;
         catalog.refinementBudget = 0;
         catalog.ledgerTotal = catalog.mandatoryTariff;
         return prepareContinuationPricing(std::move(catalog), ledger, 0, PricingBudgetPolicy::Shared);
@@ -2027,7 +2029,8 @@ namespace Coordinator
             enemyFloor,
             stateCap,
             nullptr,
-            captureWitness);
+            captureWitness,
+            m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly);
         if (captureWitness)
         {
             solved.witnessReplays = replaySequentialWitness(
@@ -2428,11 +2431,11 @@ namespace Coordinator
             return result.totalWork == spent;
         };
 
-        const PackingDualCatalog catalog =
-            buildPackingDualCatalog(
-                sources,
-                identity,
-                expectedCatalogWork);
+        PackingDualCatalog catalog;
+        {
+            MasterProfileScope timing(m_masterProfile, MasterPhase::Catalog);
+            catalog = buildPackingDualCatalog(sources, identity, expectedCatalogWork);
+        }
         result.catalogWork =
             catalog.constructionWork;
         result.catalogComplete =
@@ -2460,11 +2463,11 @@ namespace Coordinator
             result.tariffWork -
             result.catalogWork -
             verifierWork;
-        const PackingDualOptimizerResult optimizer =
-            optimizePackingDualPrices(
-                catalog,
-                identity,
-                optimizerLimit);
+        PackingDualOptimizerResult optimizer;
+        {
+            MasterProfileScope timing(m_masterProfile, MasterPhase::DualOptimization);
+            optimizer = optimizePackingDualPrices(catalog, identity, optimizerLimit);
+        }
         result.optimizerWork = optimizer.workUsed;
         result.optimizerCompleted =
             optimizer.completed;
@@ -2483,13 +2486,11 @@ namespace Coordinator
             return result;
         }
 
-        const PackingDualVerification verified =
-            verifyPackingDualCertificate(
-                catalog,
-                sources,
-                identity,
-                optimizer.nodePrices,
-                verifierWork);
+        PackingDualVerification verified;
+        {
+            MasterProfileScope timing(m_masterProfile, MasterPhase::CertificateVerification);
+            verified = verifyPackingDualCertificate(catalog, sources, identity, optimizer.nodePrices, verifierWork);
+        }
         result.verifierWork = verified.workUsed;
         result.verifierCompleted =
             verified.completed;
@@ -2643,7 +2644,8 @@ namespace Coordinator
             problem.floorValue,
             stateCap,
             &rowSource,
-            captureWitness);
+            captureWitness,
+            m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly);
         if (captureWitness)
         {
             solved.witnessReplays = replaySequentialWitness(

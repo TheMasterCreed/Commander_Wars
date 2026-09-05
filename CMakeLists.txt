@@ -851,6 +851,11 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/masterassignmentevaluator.h ai/coordinator/masterassignmentevaluator.cpp
     ai/coordinator/masterassignmentsearch.h ai/coordinator/masterassignmentsearch.cpp
     ai/coordinator/masterassignmentstock.h ai/coordinator/masterassignmentstock.cpp
+    ai/coordinator/masterassignmentprofile.h
+    ai/coordinator/masterassignmentcapture.h ai/coordinator/masterassignmentcapture.cpp
+    ai/coordinator/masterassignmenttrace.h ai/coordinator/masterassignmenttrace.cpp
+    ai/coordinator/masterassignmentshadow.h ai/coordinator/masterassignmentshadow.cpp
+    ai/coordinator/masterassignmentshadowconfig.cpp
     ai/coordinator/assignmentvaluation.h ai/coordinator/planidentity.h
     ai/coordinator/engineactionbuilder.h ai/coordinator/engineactionbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
@@ -1516,6 +1521,7 @@ if (BUILD_TESTING)
         ai/coordinator/masterassignmentfuture.cpp
         ai/coordinator/masterassignmentevaluator.cpp
         ai/coordinator/masterassignmentsearch.cpp
+        ai/coordinator/masterassignmenttrace.cpp
     )
     add_executable(CoordinatorAiMasterAssignmentBoundsTests
         tests/coordinator_ai/masterassignmentboundstests.cpp
@@ -1541,6 +1547,8 @@ if (BUILD_TESTING)
 
     add_executable(CoordinatorAiMasterAssignmentIntegrationTests
         tests/coordinator_ai/masterintegrationtests.cpp
+        ai/coordinator/masterassignmentcapture.cpp
+        ai/coordinator/masterassignmentshadowconfig.cpp
         ${MASTER_ASSIGNMENT_SEARCH_SRCS}
         ${MASTER_ASSIGNMENT_ORACLE_SRCS}
     )

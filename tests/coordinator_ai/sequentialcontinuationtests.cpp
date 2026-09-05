@@ -662,6 +662,33 @@ namespace
                "the retained floor has an independent replayable witness");
         expect(!replaySequentialWitness(fixture.instance, result.witness, floor),
                "an absent new witness cannot substitute for the retained witness");
+        const auto legacy = solveSequentialPacking(fixture.instance, floor, 100000, nullptr, true);
+        const auto retained = solveSequentialPacking(fixture.instance, floor, 100000, nullptr, true,
+            Coordinator::SequentialWitnessPolicy::BookedValue);
+        expect(legacy.searchCompleted && legacy.bookedValue == floor && legacy.repairValue < floor &&
+                   legacy.witness.empty(),
+               "legacy equality pruning retains its original scalar-only floor result");
+        expect(retained.searchCompleted && retained.bookedValue == floor &&
+                   replaySequentialWitness(fixture.instance, retained.witness, floor),
+               "booked-value policy finds the missing equal-floor witness");
+        for (std::int64_t cap = 1; cap <= retained.searchStates; ++cap)
+        {
+            const auto bounded = solveSequentialPacking(fixture.instance, floor, cap, nullptr, true,
+                Coordinator::SequentialWitnessPolicy::BookedValue);
+            expect(bounded.searchStates <= cap && bounded.bookedValue == floor && bounded.relaxedValue >= floor,
+                   "equal-floor witness recovery respects every native work boundary");
+            expect(!bounded.searchCompleted ||
+                       replaySequentialWitness(fixture.instance, bounded.witness, bounded.bookedValue),
+                   "a completed booked-value search owns a valid witness");
+        }
+        for (auto & row : fixture.instance.rows)
+        {
+            row.ownedTurn.assign(NODE_COUNT, NO_CAPTURE_TURNS);
+        }
+        const auto direct = solveSequentialPacking(fixture.instance, floor, 100000, nullptr, true,
+            Coordinator::SequentialWitnessPolicy::BookedValue);
+        expect(direct.bookedValue == floor && replaySequentialWitness(fixture.instance, direct.witness, floor),
+               "booked-value policy also witnesses a no-continuation floor");
     }
 
     void testRowCacheTransparencyAndBudgetFallback()

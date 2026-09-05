@@ -22,7 +22,7 @@ namespace Coordinator
         MasterAssignmentStockContext & operator=(const MasterAssignmentStockContext &) = delete;
 
         MasterStockSetupStatus prepare(const PropertyStockField & source, const AssignmentInput & input,
-                                       RefinementLedger & ledger);
+                                       RefinementLedger & ledger, MasterAssignmentProfile* profile = nullptr);
         RelativeStockSession* session();
         MasterValuationTariffs tariffs() const;
         MasterStockSetupStatus status() const;

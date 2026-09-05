@@ -6,21 +6,23 @@
 namespace Coordinator
 {
     MasterAssignmentEvaluator::MasterAssignmentEvaluator(
-        const MasterAssignmentProblem & problem, RefinementLedger & ledger)
+        const MasterAssignmentProblem & problem, RefinementLedger & ledger, MasterAssignmentProfile* profile)
         : m_problem(problem),
           m_problemIdentity(problem.identity()),
-          m_ledger(ledger)
+          m_ledger(ledger),
+          m_profile(profile)
     {
     }
 
     MasterAssignmentEvaluator::MasterAssignmentEvaluator(
         const MasterAssignmentProblem & problem, RefinementLedger & ledger,
-        RelativeStockSession & session, MasterValuationTariffs tariffs)
+        RelativeStockSession & session, MasterValuationTariffs tariffs, MasterAssignmentProfile* profile)
         : m_problem(problem),
           m_problemIdentity(problem.identity()),
           m_ledger(ledger),
           m_session(&session),
-          m_tariffs(tariffs)
+          m_tariffs(tariffs),
+          m_profile(profile)
     {
     }
 
@@ -83,6 +85,7 @@ namespace Coordinator
 
     MasterAssignmentEvaluation MasterAssignmentEvaluator::evaluate(const MasterAssignmentState & state)
     {
+        MasterProfileScope timing(m_profile, MasterPhase::LeafReplay);
         MasterAssignmentEvaluation result;
         if (!m_problemIdentity.sameLiveProblem(m_problem.identity()))
         {
@@ -130,6 +133,7 @@ namespace Coordinator
 
     bool MasterAssignmentEvaluator::price(MasterAssignmentEvaluation & evaluation)
     {
+        MasterProfileScope timing(m_profile, MasterPhase::Quote);
         if (!evaluation.replay || !evaluation.replay->complete() ||
             !m_problemIdentity.sameLiveProblem(m_problem.identity()) ||
             !evaluation.state.identity.sameLiveProblem(m_problemIdentity))
@@ -158,23 +162,30 @@ namespace Coordinator
             evaluation.objectiveStatus = MasterObjectiveStatus::BudgetExhausted;
             return false;
         }
-        auto quote = m_session->quote(evaluation.replay->continuationKey, economic);
+        // Continuation-keyed certificates exclude the separate seated economic term.
+        auto quote = m_session->quote(evaluation.replay->continuationKey, 0);
         if (!m_session->owns(quote) || quote.key != evaluation.replay->continuationKey ||
-            quote.economic != economic || !m_session->compare(quote, quote).valid())
+            quote.economic != 0 || !m_session->compare(quote, quote).valid())
         {
             evaluation.objectiveStatus = MasterObjectiveStatus::InvalidIdentity;
             return false;
         }
-        if (m_ledger.draw(m_tariffs.witness, RefinementWork::MasterWitness) == NO_GRANT)
+        auto proof = evaluation.proof;
+        if (!proof || !evaluation.lowerReplayed || !evaluation.upperVerified ||
+            !sameRelativeStockQuote(proof->quote, quote))
         {
-            evaluation.objectiveStatus = MasterObjectiveStatus::BudgetExhausted;
-            return false;
-        }
-        auto proof = m_session->captureProof(quote);
-        if (!proof || !sameRelativeStockQuote(proof->quote, quote) || !m_session->replayLowerProof(*proof))
-        {
-            evaluation.objectiveStatus = MasterObjectiveStatus::WitnessFailure;
-            return false;
+            if (m_ledger.draw(m_tariffs.witness, RefinementWork::MasterWitness) == NO_GRANT)
+            {
+                evaluation.objectiveStatus = MasterObjectiveStatus::BudgetExhausted;
+                return false;
+            }
+            MasterProfileScope witnessTiming(m_profile, MasterPhase::LowerWitness);
+            proof = m_session->captureProof(quote);
+            if (!proof || !sameRelativeStockQuote(proof->quote, quote) || !m_session->replayLowerProof(*proof))
+            {
+                evaluation.objectiveStatus = MasterObjectiveStatus::WitnessFailure;
+                return false;
+            }
         }
         StockInterval value{economic, economic};
         if (!RelativeStockDetail::checkedAdd(value.lower, quote.owned) ||
@@ -204,9 +215,15 @@ namespace Coordinator
     MasterRefinementStatus MasterAssignmentEvaluator::refine(
         MasterAssignmentEvaluation & evaluation, MasterRefinementTerm term, std::int64_t allowance)
     {
+        MasterProfileScope timing(m_profile, MasterPhase::ContinuationRefinement);
         const auto* quote = evaluation.quote();
         if (m_session == nullptr || quote == nullptr || allowance <= 0 ||
             m_ledger.balance() != m_session->remainingWork())
+        {
+            return MasterRefinementStatus::Unavailable;
+        }
+        if ((term == MasterRefinementTerm::Friendly && quote->ours.exact()) ||
+            (term == MasterRefinementTerm::Enemy && quote->enemy.exact()))
         {
             return MasterRefinementStatus::Unavailable;
         }
@@ -279,15 +296,19 @@ namespace Coordinator
         {
             return {};
         }
+        RelativeStockComparison result;
         if (m_session != nullptr)
         {
-            return m_session->compare(*incumbent.quote(), *challenger.quote());
+            result = m_session->compare(*incumbent.quote(), *challenger.quote());
+            if (!result.valid())
+            {
+                return result;
+            }
         }
-        RelativeStockComparison result;
-        result.deltaLower = challenger.objective->lower;
-        result.deltaUpper = challenger.objective->upper;
-        if (!RelativeStockDetail::checkedSubtract(result.deltaLower, incumbent.objective->upper) ||
-            !RelativeStockDetail::checkedSubtract(result.deltaUpper, incumbent.objective->lower))
+        result.economicDelta = challenger.replay->seatedEconomicTotal;
+        if (!RelativeStockDetail::checkedSubtract(result.economicDelta, incumbent.replay->seatedEconomicTotal) ||
+            !RelativeStockDetail::checkedAdd(result.deltaLower, result.economicDelta) ||
+            !RelativeStockDetail::checkedAdd(result.deltaUpper, result.economicDelta))
         {
             result.reason = RelativeStockReason::ArithmeticOverflow;
             return result;

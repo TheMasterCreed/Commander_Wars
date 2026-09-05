@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <limits>
+#include <map>
 #include <queue>
 #include <tuple>
 
@@ -58,6 +59,7 @@ namespace
         std::optional<MilliFunds> upper;
         MasterRefinementTerm next{MasterRefinementTerm::Friendly};
         std::int64_t slice{0};
+        std::int64_t dualSlice{0};
         bool schedulable{true};
     };
 
@@ -76,13 +78,14 @@ namespace
               m_evaluator(evaluator),
               m_ledger(ledger),
               m_options(options),
-              m_bounds(problem)
+              m_bounds(problem, options.profile)
         {
             m_result.schedule = options.schedule;
         }
 
         MasterAssignmentSearchResult run(const CheapPricingModel* stock)
         {
+            MasterProfileScope timing(m_options.profile, MasterPhase::Search);
             if (!initialize(stock))
             {
                 return finish();
@@ -119,9 +122,16 @@ namespace
                         break;
                     }
                 }
-                else if (!expandActive())
+                else
                 {
-                    break;
+                    if (m_options.schedule.incumbentCompletions && !completeWithIncumbent(*m_active))
+                    {
+                        break;
+                    }
+                    if (!prune(*m_active) && !expandActive())
+                    {
+                        break;
+                    }
                 }
                 m_active.reset();
                 ++m_nodesSinceRefinement;
@@ -134,6 +144,9 @@ namespace
         {
             if (m_options.schedule.currentDualRounds < 0 || m_options.schedule.continuationSlice <= 0 ||
                 m_options.schedule.futureDualAllowance <= 0 || m_options.schedule.nodesPerRefinement == 0 ||
+                m_options.schedule.incumbentRefinementStride == 0 ||
+                (m_options.schedule.futureBounds != MasterFutureBoundScope::RootOnly &&
+                 m_options.schedule.futureBounds != MasterFutureBoundScope::EveryNode) ||
                 m_evaluator.hasContinuation() != (stock != nullptr) || !m_evaluator.matches(m_problem, m_ledger))
             {
                 m_result.invalidInput = true;
@@ -154,9 +167,12 @@ namespace
             m_active = std::make_shared<SearchNode>();
             m_active->state = std::move(*root);
             recordResidentRegions();
-            m_incumbent = std::make_shared<MasterAssignmentEvaluation>(m_evaluator.evaluate({
-                m_problem.identity(), std::vector<std::int32_t>(m_problem.incumbentChoices().begin(),
-                                                               m_problem.incumbentChoices().end())}));
+            {
+                MasterProfileScope timing(m_options.profile, MasterPhase::InitialIncumbent);
+                m_incumbent = std::make_shared<MasterAssignmentEvaluation>(m_evaluator.evaluate({
+                    m_problem.identity(), std::vector<std::int32_t>(m_problem.incumbentChoices().begin(),
+                                                                   m_problem.incumbentChoices().end())}));
+            }
             m_result.incumbent = m_incumbent;
             ++m_result.stats.evaluated;
             recordEvaluation(*m_incumbent);
@@ -165,6 +181,11 @@ namespace
                 m_ledger.stats().refusals != 0)
             {
                 m_result.budgetExhausted = true;
+                return false;
+            }
+            if (m_incumbent->status == MasterEvaluationStatus::Feasible && m_incumbent->quote() &&
+                !m_incumbent->exact && !defer(m_incumbent, std::nullopt))
+            {
                 return false;
             }
             const auto prepared = m_bounds.prepare(stock, m_ledger, m_evaluator.futureCatalog());
@@ -196,6 +217,7 @@ namespace
 
         bool expandActive()
         {
+            MasterProfileScope timing(m_options.profile, MasterPhase::Expansion);
             ++m_result.stats.expanded;
             while (m_active->cursor < m_active->branchChoices.size())
             {
@@ -219,6 +241,37 @@ namespace
                 ++m_active->cursor;
             }
             return true;
+        }
+
+        bool completeWithIncumbent(const SearchNode & node)
+        {
+            MasterProfileScope timing(m_options.profile, MasterPhase::LeafReplay);
+            if (!chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 3, RefinementWork::MasterReplay))
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            SearchNode completion;
+            completion.state = node.state;
+            completion.upper = node.upper;
+            for (std::size_t actor = 0; actor < completion.state.choices.size(); ++actor)
+            {
+                auto & choice = completion.state.choices[actor];
+                if (choice == MASTER_UNASSIGNED)
+                {
+                    choice = m_problem.incumbentChoices()[actor];
+                }
+                if (choice == NO_CANDIDATE && m_problem.canChangeActor(static_cast<std::int32_t>(actor)))
+                {
+                    return true;
+                }
+            }
+            if (completion.state.choices == m_incumbent->state.choices)
+            {
+                return true;
+            }
+            ++m_result.stats.incumbentCompletions;
+            return evaluateLeaf(completion);
         }
 
         bool prepareConflicts()
@@ -305,6 +358,7 @@ namespace
 
         NodeStatus chooseBranch(SearchNode & node)
         {
+            MasterProfileScope timing(m_options.profile, MasterPhase::Expansion);
             if (!chargeMasterWork(m_ledger, node.state.choices.size() + 1, 1,
                                   RefinementWork::MasterExpansion))
             {
@@ -419,12 +473,15 @@ namespace
                 }
                 return branch;
             }
-            if (m_bounds.ready())
+            if (m_bounds.ready() && !node.state.complete())
             {
                 for (const auto family : {MasterBoundFamily::Immediate, MasterBoundFamily::EndpointCoupled,
                                           MasterBoundFamily::CombinedCurrentFuture})
                 {
-                    if (family == MasterBoundFamily::CombinedCurrentFuture && m_evaluator.futureCatalog() == nullptr)
+                    if (family == MasterBoundFamily::CombinedCurrentFuture &&
+                        (m_evaluator.futureCatalog() == nullptr ||
+                         (m_options.schedule.futureBounds == MasterFutureBoundScope::RootOnly &&
+                          m_result.stats.expanded != 0)))
                     {
                         continue;
                     }
@@ -500,7 +557,7 @@ namespace
                 (evaluation == m_incumbent && evaluation->objective->lower == *m_result.lower))
             {
                 m_result.lower = evaluation->objective->lower;
-                m_result.best = evaluation;
+                m_best = evaluation;
             }
         }
 
@@ -527,7 +584,7 @@ namespace
             }
         }
 
-        bool compare(const std::shared_ptr<MasterAssignmentEvaluation> & evaluation)
+        bool compare(std::shared_ptr<MasterAssignmentEvaluation> evaluation)
         {
             if (evaluation == m_incumbent || !m_incumbent ||
                 m_incumbent->status != MasterEvaluationStatus::Feasible ||
@@ -562,20 +619,38 @@ namespace
             return true;
         }
 
+        std::shared_ptr<MasterAssignmentEvaluation> evaluationFor(const MasterAssignmentState & state)
+        {
+            if (state.choices == m_incumbent->state.choices)
+            {
+                return m_incumbent;
+            }
+            if (!chargeMasterWork(m_ledger, state.choices.size() + 1,
+                                  4 * std::bit_width(m_evaluations.size() + 1) + 3, RefinementWork::MasterReplay))
+            {
+                m_result.budgetExhausted = true;
+                return {};
+            }
+            const auto found = m_evaluations.find(state.choices);
+            if (found != m_evaluations.end())
+            {
+                ++m_result.stats.evaluationCacheHits;
+                return found->second;
+            }
+            auto evaluation = std::make_shared<MasterAssignmentEvaluation>(m_evaluator.evaluate(state));
+            ++m_result.stats.evaluated;
+            recordEvaluation(*evaluation);
+            if (evaluation->status != MasterEvaluationStatus::BudgetExhausted)
+            {
+                m_evaluations.emplace(state.choices, evaluation);
+            }
+            return evaluation;
+        }
+
         bool evaluateLeaf(const SearchNode & node)
         {
-            std::shared_ptr<MasterAssignmentEvaluation> evaluation;
-            if (node.state.choices == m_incumbent->state.choices)
-            {
-                evaluation = m_incumbent;
-            }
-            else
-            {
-                evaluation = std::make_shared<MasterAssignmentEvaluation>(m_evaluator.evaluate(node.state));
-                ++m_result.stats.evaluated;
-                recordEvaluation(*evaluation);
-            }
-            if (evaluation->status == MasterEvaluationStatus::BudgetExhausted)
+            const auto evaluation = evaluationFor(node.state);
+            if (!evaluation || evaluation->status == MasterEvaluationStatus::BudgetExhausted)
             {
                 m_result.budgetExhausted = true;
                 return false;
@@ -585,17 +660,35 @@ namespace
                 return true;
             }
             consider(evaluation);
-            DeferredLeaf leaf{evaluation, node.upper, MasterRefinementTerm::Friendly,
-                              m_options.schedule.continuationSlice};
+            return defer(evaluation, node.upper) && compare(evaluation);
+        }
+
+        bool defer(const std::shared_ptr<MasterAssignmentEvaluation> & evaluation, std::optional<MilliFunds> upper)
+        {
+            if (!chargeMasterWork(m_ledger, m_leaves.size() + 1, 1, RefinementWork::MasterExpansion))
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
             if (evaluation->objective && evaluation->upperVerified)
             {
-                leaf.upper = minimum(leaf.upper, evaluation->objective->upper);
+                upper = minimum(upper, evaluation->objective->upper);
             }
+            for (auto & existing : m_leaves)
+            {
+                if (existing.evaluation == evaluation)
+                {
+                    existing.upper = minimum(existing.upper, upper);
+                    return true;
+                }
+            }
+            DeferredLeaf leaf{evaluation, upper, MasterRefinementTerm::Friendly,
+                              m_options.schedule.continuationSlice, m_options.schedule.futureDualAllowance};
             leaf.schedulable = evaluation->status == MasterEvaluationStatus::Feasible &&
                                evaluation->quote() != nullptr && !evaluation->exact;
             m_leaves.push_back(std::move(leaf));
             recordResidentRegions();
-            return compare(evaluation);
+            return true;
         }
 
         bool hasRefinement()
@@ -620,17 +713,27 @@ namespace
                 return false;
             }
             DeferredLeaf* selected = nullptr;
+            DeferredLeaf* incumbent = nullptr;
             for (auto & leaf : m_leaves)
             {
                 if (!leaf.schedulable || (leaf.upper && m_result.lower && *leaf.upper <= *m_result.lower))
                 {
                     continue;
                 }
+                if (leaf.evaluation == m_incumbent)
+                {
+                    incumbent = &leaf;
+                }
                 if (selected == nullptr || (!leaf.upper && selected->upper) ||
                     (leaf.upper && selected->upper && *leaf.upper > *selected->upper))
                 {
                     selected = &leaf;
                 }
+            }
+            if (incumbent != nullptr &&
+                m_result.stats.refinements % m_options.schedule.incumbentRefinementStride == 0)
+            {
+                selected = incumbent;
             }
             if (selected == nullptr)
             {
@@ -649,13 +752,17 @@ namespace
                 return true;
             }
             const auto status = m_evaluator.refine(*leaf.evaluation, leaf.next,
-                leaf.next == MasterRefinementTerm::FutureDual ? m_options.schedule.futureDualAllowance : leaf.slice);
+                leaf.next == MasterRefinementTerm::FutureDual ? leaf.dualSlice : leaf.slice);
             if (status == MasterRefinementStatus::BudgetExhausted)
             {
                 m_result.budgetExhausted = true;
                 return false;
             }
             ++m_result.stats.refinements;
+            if (leaf.evaluation == m_incumbent)
+            {
+                ++m_result.stats.incumbentRefinements;
+            }
             if (status == MasterRefinementStatus::Invalid)
             {
                 ++m_result.stats.proofFailures;
@@ -669,10 +776,12 @@ namespace
             {
                 leaf.next = MasterRefinementTerm::FutureDual;
             }
-            else if (leaf.slice <= std::numeric_limits<std::int64_t>::max() / 2)
+            else if (leaf.slice <= std::numeric_limits<std::int64_t>::max() / 2 &&
+                     leaf.dualSlice <= std::numeric_limits<std::int64_t>::max() / 2)
             {
                 leaf.next = MasterRefinementTerm::Friendly;
                 leaf.slice *= 2;
+                leaf.dualSlice *= 2;
             }
             else
             {
@@ -684,6 +793,10 @@ namespace
             }
             leaf.schedulable = leaf.schedulable && !leaf.evaluation->exact;
             consider(leaf.evaluation);
+            if (leaf.evaluation == m_incumbent && m_best && m_best != m_incumbent)
+            {
+                return compare(m_best);
+            }
             return compare(leaf.evaluation);
         }
 
@@ -721,12 +834,23 @@ namespace
                 account(node->state, node->upper, false);
                 m_frontier.pop();
             }
+            bool incumbentAccounted = false;
             for (const auto & leaf : m_leaves)
             {
-                account(leaf.evaluation->state, leaf.upper,
+                auto upper = leaf.upper;
+                if (leaf.evaluation == m_incumbent)
+                {
+                    incumbentAccounted = true;
+                    upper = minimum(upper, minimum(m_rootUpper, m_incumbentUpper));
+                    if (m_incumbent->objective && m_incumbent->upperVerified)
+                    {
+                        upper = minimum(upper, m_incumbent->objective->upper);
+                    }
+                }
+                account(leaf.evaluation->state, upper,
                         leaf.evaluation->status == MasterEvaluationStatus::Unsupported);
             }
-            if (m_incumbent && m_incumbent->state.identity.sameLiveProblem(m_problem.identity()) &&
+            if (!incumbentAccounted && m_incumbent && m_incumbent->state.identity.sameLiveProblem(m_problem.identity()) &&
                 m_incumbent->state.choices.size() == m_problem.actors().size() &&
                 m_incumbent->status != MasterEvaluationStatus::Infeasible)
             {
@@ -759,11 +883,15 @@ namespace
                 }
                 m_result.globalOptimal = *m_result.lower == *m_result.upper;
             }
-            m_result.incumbentPreserved = !m_result.best || m_result.best == m_incumbent;
+            m_result.best = m_best;
+            m_result.incumbentPreserved = !m_best || m_best == m_incumbent;
             m_result.canonicalRepresentative = m_result.globalOptimal && m_result.incumbentPreserved;
             m_result.noFeasibleAssignment = !m_result.lower && !m_unknownResidual &&
                                              m_result.stats.residualRegions == 0 && !m_result.invalidInput;
             m_result.stats.work = m_ledger.stats();
+            m_result.stats.futurePricingCache = m_bounds.futureCacheStats();
+            m_result.stats.retainedGrants = m_ledger.retainedGrantCount();
+            m_result.stats.refundableStorageBytes = m_ledger.refundableStorageBytes();
             return std::move(m_result);
         }
 
@@ -774,9 +902,11 @@ namespace
         MasterAssignmentBounds m_bounds;
         MasterAssignmentSearchResult m_result;
         std::shared_ptr<MasterAssignmentEvaluation> m_incumbent;
+        std::shared_ptr<MasterAssignmentEvaluation> m_best;
         std::shared_ptr<SearchNode> m_active;
         std::priority_queue<std::shared_ptr<SearchNode>, std::vector<std::shared_ptr<SearchNode>>, NodeOrder> m_frontier;
         std::vector<DeferredLeaf> m_leaves;
+        std::map<std::vector<std::int32_t>, std::shared_ptr<MasterAssignmentEvaluation>> m_evaluations;
         std::vector<std::uint64_t> m_conflictDegree;
         std::optional<MilliFunds> m_rootUpper;
         std::optional<MilliFunds> m_incumbentUpper;

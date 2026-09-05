@@ -82,6 +82,7 @@ namespace
         std::int64_t balance{0};
         std::int64_t granted{0};
         std::int64_t refunded{0};
+        std::int64_t consumed{0};
         std::array<std::int64_t, Coordinator::REFINEMENT_WORK_CLASSES> grantedByWork{};
         std::array<std::int64_t, Coordinator::REFINEMENT_WORK_CLASSES> refundedByWork{};
 
@@ -96,6 +97,7 @@ namespace
             ledger.balance(),
             stats.granted,
             stats.refunded,
+            stats.consumed,
             stats.grantedByWork,
             stats.refundedByWork,
         };
@@ -710,6 +712,43 @@ namespace
         expect(coreOf(ledger) == before, "overflow refusal preserves accounting");
         expectConserved(ledger, "overflow refusal preserves conservation");
     }
+
+    void testNonRefundableConsumption()
+    {
+        constexpr std::int64_t visits = 100000;
+        RefinementLedger ledger;
+        expect(ledger.open(visits + 64), "direct-work ledger opens");
+        bool consumed = true;
+        for (std::int64_t visit = 0; visit < visits; ++visit)
+        {
+            consumed = ledger.consume(1, RefinementWork::MasterBoundScan) && consumed;
+        }
+        expect(consumed && ledger.stats().consumed == visits &&
+               ledger.retainedGrantCount() == 0 && ledger.refundableStorageBytes() == 0,
+               "per-cell non-refundable work does not allocate grant records");
+        expectConserved(ledger, "direct consumption preserves all accounting");
+        const auto grant = ledger.draw(25, RefinementWork::SearchSlice);
+        expect(grant == 0 && ledger.retainedGrantCount() == 1 && ledger.refund(grant, 5),
+               "direct work preserves normal grant identity and partial refund semantics");
+        expect(ledger.stats().spent() == visits + 20 && ledger.stats().consumed == visits &&
+               ledger.balance() == 44, "only the refundable portion can return to the budget");
+        expect(ledger.consume(44, RefinementWork::MasterReplay) && ledger.exhausted(),
+               "direct work can consume the exact remaining allowance");
+        const auto before = coreOf(ledger);
+        expect(!ledger.consume(1, RefinementWork::MasterReplay) &&
+               !ledger.consume(-1, RefinementWork::MasterReplay) &&
+               !ledger.consume(0, RefinementWork::Count) && !ledger.refund(grant, 21),
+               "direct work cannot overspend, use invalid classes, or be refunded through another grant");
+        expect(coreOf(ledger) == before, "rejected direct work is atomic");
+        expectConserved(ledger, "mixed accounting remains conserved after rejection");
+        expect(ledger.open(10) && ledger.stats().consumed == 0 && ledger.retainedGrantCount() == 0,
+               "reopening resets direct work and refundable records together");
+        constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+        expect(ledger.open(maximum) && ledger.consume(maximum, RefinementWork::MasterBoundScan),
+               "maximum direct consumption is checked without allocating records");
+        expect(!ledger.consume(1, RefinementWork::MasterBoundScan), "direct cumulative overflow fails closed");
+        expectConserved(ledger, "maximum direct consumption remains conserved");
+    }
 }
 
 int main()
@@ -726,6 +765,7 @@ int main()
     testRefinementLedgerConservation();
     testRefinementLedgerRejectsAtomically();
     testRefinementLedgerExhaustionAndOverflow();
+    testNonRefundableConsumption();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

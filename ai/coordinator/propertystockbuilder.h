@@ -27,6 +27,7 @@ class GameMap;
 
 namespace Coordinator
 {
+    class MasterAssignmentProfile;
     class BattlefieldKnowledge;
     class MobilityFieldCache;
     class TurnPlan;
@@ -101,7 +102,8 @@ namespace Coordinator
         bool prepareContinuationPricing(
             ContinuationPricingCatalog catalog,
             RefinementLedger & ledger);
-        bool prepareMasterContinuationPricing(ContinuationPricingCatalog catalog, RefinementLedger & ledger);
+        bool prepareMasterContinuationPricing(ContinuationPricingCatalog catalog, RefinementLedger & ledger,
+                                              MasterAssignmentProfile* profile = nullptr);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         bool prepareDiagnosticContinuationPricing(
             ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit);
@@ -314,6 +316,7 @@ namespace Coordinator
         CheapPricingModel m_cheapModel;
         std::shared_ptr<const MasterFutureCatalog> m_masterFutureCatalog;
         std::int64_t m_masterOurSearchStates{0};
+        MasterAssignmentProfile* m_masterProfile{nullptr};
         mutable CheapUpperState m_cheapState;
         ContinuationPricingState m_pricingState{
             ContinuationPricingState::Unprepared

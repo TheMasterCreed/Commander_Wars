@@ -1,7 +1,10 @@
 #include <array>
 
 #include <QCoreApplication>
+#include <QDir>
 
+#include "ai/coordinator/masterassignmentcapture.h"
+#include "ai/coordinator/masterassignmentshadow.h"
 #include "tests/coordinator_ai/masterassignmentstockfixture.h"
 #include "tests/coordinator_ai/masterassignmenttestexport.h"
 
@@ -89,6 +92,47 @@ namespace
             NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
             partialStockBounds(problem, reference, session, ledger);
         }
+        {
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "incoming contender refinement ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            const auto result = searchMasterAssignment(problem, evaluator, ledger,
+                {.schedule = {.nodesPerRefinement = 1}});
+            expect(session.firstFriendlyRefinement == problem.incumbentContinuationKey() &&
+                   session.distinctQuotesBeforeFirstRefinement == 1,
+                   "incoming uncertainty is refined before any challenger tuple is evaluated");
+            expect(result.incumbent && result.incumbent->lowerReplayed &&
+                   result.incumbent->objective->lower <= *exact.exactOptimum &&
+                   result.stats.proofFailures == 0, "incoming refinement retains its verified witness");
+            expect(result.stats.incumbentRefinements >= 2,
+                   "unresolved incoming continuation receives repeated refinement despite challenger leaves");
+        }
+        {
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "future cache ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+            MasterAssignmentBounds bounds(problem);
+            require(bounds.prepare(session.pricingModel(), ledger, session.futureCatalog()) == MasterBoundStatus::Valid,
+                    "future cache binds a complete immutable model");
+            const auto root = masterRootState(problem, ledger);
+            require(root.has_value(), "future cache root");
+            const auto initial = bounds.bound(*root, MasterBoundFamily::CombinedCurrentFuture, ledger);
+            require(initial.valid(), "future cache starts with a valid full-domain bound");
+            const auto builds = bounds.futureCacheStats().recomputations;
+            expect(bounds.verify(*initial.certificate, ledger).valid() &&
+                   bounds.verify(*initial.certificate, ledger).valid() &&
+                   bounds.futureCacheStats().recomputations == builds && bounds.futureCacheStats().hits >= 2,
+                   "identical future prices reuse only the completed recurrence while verifying actor alternatives");
+            auto invalid = *initial.certificate;
+            invalid.prices.back() = -1;
+            const auto beforeInvalid = bounds.futureCacheStats().recomputations;
+            expect(!bounds.verify(invalid, ledger).valid() && !bounds.verify(invalid, ledger).valid() &&
+                   bounds.futureCacheStats().recomputations == beforeInvalid + 2,
+                   "invalid future-price results are never cached");
+            expect(bounds.verify(*initial.certificate, ledger).valid(),
+                   "failed cache refresh cannot replace a previous verified pricing result");
+        }
         std::optional<MilliFunds> priorLower;
         std::optional<MilliFunds> priorUpper;
         QJsonArray searches;
@@ -151,10 +195,12 @@ namespace
             require(ledger.open(1000000), "certificate integration ledger");
             NativeStockSession session(field, enemy, reference.continuation.cases, ledger, QuoteFault::None, true, true);
             MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
-            const auto result = searchMasterAssignment(problem, evaluator, ledger, {.retainDiagnostics = true});
+            const auto result = searchMasterAssignment(problem, evaluator, ledger,
+                {.schedule = {.futureDualAllowance = 1}, .retainDiagnostics = true});
             expect(session.certificateCalls > 0 && session.verifiedCertificates > 0 &&
+                   session.maximumCertificateAllowance > 1 &&
                    result.stats.work.grantedByWork[static_cast<std::size_t>(RefinementWork::PackingDualCertificate)] > 0,
-                   "actual search exercises complete catalog, native node dual optimizer, and verifier");
+                   "growing certificate slices reach a verified full catalog after the initial slice is too small");
             expect(result.lower && *result.lower <= *exact.exactOptimum &&
                    result.upper && *result.upper >= *exact.exactOptimum,
                    "native future-certificate search remains inside oracle bounds");
@@ -187,11 +233,30 @@ namespace
                 std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end())});
             require(evaluated.proof != nullptr, "initial evaluation owns lower proof");
             const auto recorded = evaluated.proof;
+            const auto captures = session.proofCaptures;
+            const auto witnessWork = ledger.stats().grantedByWork[
+                static_cast<std::size_t>(RefinementWork::MasterWitness)];
+            expect(evaluator.refresh(evaluated) && evaluator.refresh(evaluated) &&
+                   evaluated.proof == recorded && session.proofCaptures == captures &&
+                   ledger.stats().grantedByWork[static_cast<std::size_t>(RefinementWork::MasterWitness)] == witnessWork,
+                   "an unchanged authenticated quote reuses its owned replayed proof without another witness charge");
             require(evaluator.refine(evaluated, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated &&
                     evaluator.refine(evaluated, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
                     "mutable session replaces continuation witnesses");
             expect(!sameRelativeStockQuote(recorded->quote, *evaluated.quote()) &&
-                   session.replayLowerProof(*recorded), "prior lower witness remains replayable after cache refinement");
+                   evaluated.proof != recorded && session.proofCaptures > captures &&
+                   session.replayLowerProof(*recorded), "changed quote replaces proof while the prior witness remains replayable");
+            const auto beforeExact = ledger.stats().spent();
+            expect(evaluated.exact &&
+                   evaluator.refine(evaluated, MasterRefinementTerm::Friendly, 1000000) == MasterRefinementStatus::Unavailable &&
+                   evaluator.refine(evaluated, MasterRefinementTerm::Enemy, 1000000) == MasterRefinementStatus::Unavailable &&
+                   ledger.stats().spent() == beforeExact,
+                   "exact continuation terms need no larger rerun or budget reservation");
+            const auto beforeCertificate = evaluated.proof;
+            require(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 4096) == MasterRefinementStatus::Updated,
+                    "fresh registered certificate refreshes an evaluated proof");
+            expect(evaluated.proof != beforeCertificate && evaluated.quote()->ourUpperCertificateId != 0,
+                   "a changed certificate identity cannot reuse the old authenticated proof");
             auto corrupted = *recorded;
             ++corrupted.quote.ours.lower;
             expect(!session.replayLowerProof(corrupted), "owned witness does not certify a changed lower value");
@@ -388,9 +453,18 @@ namespace
         auto right = evaluator.evaluate({problem.identity(), {1}});
         for (auto* value : {&left, &right})
         {
-            require(evaluator.refine(*value, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated &&
-                    evaluator.refine(*value, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
-                    "distinct enemy lower witnesses refine and replay");
+            if (!value->quote()->ours.exact())
+            {
+                require(evaluator.refine(*value, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated,
+                        "remaining friendly uncertainty refines");
+            }
+            if (!value->quote()->enemy.exact())
+            {
+                require(evaluator.refine(*value, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
+                        "remaining enemy uncertainty refines");
+            }
+            expect(value->exact && value->proof && session.replayLowerProof(*value->proof),
+                   "distinct enemy signatures retain exact replayed witnesses");
         }
         const auto comparison = evaluator.compare(left, right);
         const auto delta = exact.tuples[1].objective.total - exact.tuples[0].objective.total;
@@ -398,6 +472,63 @@ namespace
                comparison.deltaLower <= delta && comparison.deltaUpper >= delta,
                "distinct signatures cannot use common-enemy cancellation");
         exportSearchCase(QStringLiteral("master-different-enemy"), problem, input, exact, {searchRecord(result)});
+    }
+
+    void sharedStockCertificateWithDifferentEconomics()
+    {
+        Fixture fixture(1);
+        fixture.input.actors[0].candidates = {
+            moveCandidate(0, {0, 0}, {0, 0}, -5, 0),
+            moveCandidate(0, {0, 0}, {0, 0}, 12, 1)};
+        fixture.seat();
+        fixture.selections[0].stockRow = 0;
+        const auto problem = fixture.extract();
+        auto input = request();
+        input.continuation.mode = MasterAssignmentOracle::ContinuationMode::Sequential;
+        input.continuation.cases.push_back(continuationCase(problem.incumbentContinuationKey()));
+        const auto exact = MasterAssignmentOracle::enumerate(problem, input);
+        require(exact.exactOptimum.has_value(), "same-continuation economic reference");
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "shared stock-certificate ledger");
+        NativeStockSession session(field, enemy, input.continuation.cases, ledger);
+        MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+        auto incumbent = evaluator.evaluate({problem.identity(), {0}});
+        if (!incumbent.quote()->ours.exact())
+        {
+            require(evaluator.refine(incumbent, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated,
+                    "incoming friendly interval completes");
+        }
+        if (!incumbent.quote()->enemy.exact())
+        {
+            require(evaluator.refine(incumbent, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
+                    "incoming enemy interval completes");
+        }
+        require(evaluator.refine(incumbent, MasterRefinementTerm::FutureDual, 4096) == MasterRefinementStatus::Updated,
+                "incoming stock witness and registered certificate");
+        const auto certificate = incumbent.quote()->ourUpperCertificateId;
+        auto challenger = evaluator.evaluate({problem.identity(), {1}});
+        require(challenger.lowerReplayed && challenger.upperVerified && challenger.quote() != nullptr,
+                "another immediate value must not invalidate the same stock continuation certificate");
+        expect(certificate != 0 && challenger.quote()->ourUpperCertificateId == certificate &&
+               incumbent.quote()->economic == 0 && challenger.quote()->economic == 0,
+               "continuation certificates retain one stock-only economic context");
+        const auto comparison = evaluator.compare(incumbent, challenger);
+        expect(comparison.improves() && comparison.deltaLower == 17 && comparison.deltaUpper == 17 &&
+               comparison.economicDelta == 17 && challenger.objective->lower == exact.exactOptimum,
+               "unchanged seated economics enter the full objective and strict margin exactly once");
+        const auto reverse = evaluator.compare(challenger, incumbent);
+        expect(reverse.valid() && !reverse.improves() && reverse.deltaLower == -17 && reverse.deltaUpper == -17,
+               "signed economic offsets preserve the inverse comparison");
+        const auto invalidContext = session.quote(problem.incumbentContinuationKey(), 1);
+        expect(!session.compare(invalidContext, invalidContext).valid(),
+               "native certificate authentication still rejects a different economic context");
+        const auto result = searchMasterAssignment(problem, evaluator, ledger, {.retainDiagnostics = true});
+        expect(result.globalOptimal && result.lower == exact.exactOptimum && result.stats.proofFailures == 0,
+               "the complete search retains all same-continuation action alternatives");
+        exportSearchCase(QStringLiteral("master-shared-stock-different-economics"), problem, input, exact,
+                         {searchRecord(result)});
     }
 
     void tenStockActors()
@@ -433,16 +564,118 @@ namespace
                "all ten stock-coupled rows participate in the same exact search domain");
         exportSearchCase(QStringLiteral("master-ten-stock-actors"), problem, input, exact, {searchRecord(result)});
     }
+
+    void shadowControlsAndCapture()
+    {
+        const auto output = QDir::tempPath() + QStringLiteral("/master-shadow-test.jsonl");
+        const auto disabled = parseMasterShadowConfig({}, "invalid", {});
+        expect(!disabled.enabled() && disabled.error == MasterShadowConfigError::None,
+               "default disabled mode ignores inactive diagnostic settings");
+        expect(parseMasterShadowConfig("stockControl", "160000", output).error ==
+               MasterShadowConfigError::UnknownMode, "Phase 3 cannot activate gameplay control");
+        expect(parseMasterShadowConfig("shadow", "-1", output).error ==
+               MasterShadowConfigError::InvalidAllowance, "negative work fails closed");
+        expect(parseMasterShadowConfig("shadow", "9223372036854775808", output).error ==
+               MasterShadowConfigError::InvalidAllowance, "overflowed work fails closed");
+        expect(parseMasterShadowConfig("shadow", {}, "relative.jsonl").error ==
+               MasterShadowConfigError::MissingAbsoluteOutput, "diagnostics require an explicit absolute destination");
+        const auto enabled = parseMasterShadowConfig("shadow", {}, output);
+        expect(enabled.enabled() && enabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE,
+               "explicit shadow starts at the configurable initial allowance");
+
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 10, 1));
+        fixture.seat();
+        AssignmentResult incumbent;
+        incumbent.plan = fixture.plan;
+        incumbent.executionOrder = fixture.plan.executionOrder().order;
+        for (const auto & selected : fixture.selections)
+        {
+            incumbent.selections.push_back({
+                .knowledgeUnitIndex = selected.engineUnitId - 100,
+                .engineUnitId = selected.engineUnitId,
+                .actionIndex = selected.actionIndex,
+                .candidateIndex = selected.candidateIndex,
+                .seatedValue = selected.engineUnitId - 99,
+                .stockCoupled = true});
+        }
+        RefinementLedger inactive;
+        require(inactive.open(999), "disabled sentinel ledger");
+        prepareMasterShadow(disabled, fixture.input, inactive);
+        expect(!fixture.input.retainSelections && inactive.stats().total == 999 && inactive.stats().spent() == 0,
+               "disabled mode does not modify selection retention or the ledger");
+        RefinementLedger complete;
+        prepareMasterShadow(enabled, fixture.input, complete);
+        require(fixture.input.retainSelections && complete.stats().spent() > 0,
+                "selection metadata is prepaid before legacy assignment records it");
+        const auto captured = captureMasterAssignment(fixture.input, incumbent, 91, complete);
+        require(captured.extraction.valid(), "budgeted real assignment interface extracts");
+        const auto required = complete.stats().spent();
+        for (std::int64_t allowance = 0; allowance <= required; ++allowance)
+        {
+            auto config = enabled;
+            config.allowance = allowance;
+            auto input = fixture.input;
+            input.retainSelections = false;
+            RefinementLedger ledger;
+            prepareMasterShadow(config, input, ledger);
+            const auto result = captureMasterAssignment(input, incumbent, 91, ledger);
+            expect(ledger.stats().spent() <= allowance, "capture preparation never overspends");
+            expect(result.extraction.valid() || result.budgetExhausted, "interrupted capture is not a model mismatch");
+            if (result.extraction.valid())
+            {
+                const auto replay = replayMasterAssignment(*result.extraction.problem,
+                    result.extraction.problem->incumbentChoices());
+                expect(replay.complete() && replay.plan.equivalentState(incumbent.plan),
+                       "budgeted extraction retains the complete incumbent");
+            }
+        }
+        expect(incumbent.plan.equivalentState(fixture.plan) &&
+               incumbent.executionOrder == fixture.plan.executionOrder().order,
+               "every extraction interruption leaves the original plan untouched");
+    }
+
+    void observationalProfile()
+    {
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 10, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        RefinementLedger plainLedger;
+        RefinementLedger timedLedger;
+        require(plainLedger.open(100000) && timedLedger.open(100000), "profiling ledgers");
+        MasterAssignmentProfile profile;
+        MasterAssignmentEvaluator plainEvaluator(problem, plainLedger);
+        MasterAssignmentEvaluator timedEvaluator(problem, timedLedger, &profile);
+        const auto plain = searchMasterAssignment(problem, plainEvaluator, plainLedger, {.retainDiagnostics = true});
+        const auto timed = searchMasterAssignment(problem, timedEvaluator, timedLedger,
+            {.retainDiagnostics = true, .profile = &profile});
+        expect(masterSearchRecord(plain) == masterSearchRecord(timed),
+               "wall-time instrumentation cannot alter the search schedule, proof, or result");
+        std::int64_t exclusive = 0;
+        for (const auto & sample : profile.samples)
+        {
+            expect(sample.exclusiveNanos >= 0 && sample.inclusiveNanos >= sample.exclusiveNanos,
+                   "nested profiling separates inclusive and exclusive elapsed time");
+            exclusive += sample.exclusiveNanos;
+        }
+        const auto & total = profile.samples[static_cast<std::size_t>(MasterPhase::Search)];
+        expect(total.calls == 1 && exclusive == total.inclusiveNanos,
+               "exclusive phase times account for the complete measured search");
+    }
 }
 
 int main(int argc, char** argv)
 {
     QCoreApplication application(argc, argv);
+    sharedStockCertificateWithDifferentEconomics();
     nativeStockSearch();
     futurePricingBoundaries();
     signedAndWideFutureDomains();
     differentEnemySignatures();
     tenStockActors();
+    shadowControlsAndCapture();
+    observationalProfile();
     std::printf("Master assignment integration: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;
 }

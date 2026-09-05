@@ -3,6 +3,7 @@
 #include "ai/coordinator/continuationpricing.h"
 #include "ai/coordinator/masterassignmentstate.h"
 #include "ai/coordinator/masterassignmentfuture.h"
+#include "ai/coordinator/masterassignmentprofile.h"
 
 namespace Coordinator
 {
@@ -44,10 +45,16 @@ namespace Coordinator
         }
     };
 
+    struct MasterFutureCacheStats
+    {
+        std::uint64_t hits{0};
+        std::uint64_t recomputations{0};
+    };
+
     class MasterAssignmentBounds final
     {
     public:
-        explicit MasterAssignmentBounds(const MasterAssignmentProblem & problem);
+        explicit MasterAssignmentBounds(const MasterAssignmentProblem & problem, MasterAssignmentProfile* profile = nullptr);
 
         MasterBoundStatus prepare(const CheapPricingModel* stock, RefinementLedger & ledger,
                                   const MasterFutureCatalog* future = nullptr);
@@ -60,6 +67,7 @@ namespace Coordinator
 
         std::optional<MilliFunds> contribution(std::size_t actor, std::int32_t candidate) const;
         bool ready() const;
+        MasterFutureCacheStats futureCacheStats() const;
 
     private:
         struct Option
@@ -107,9 +115,13 @@ namespace Coordinator
         MasterBoundStatus scanActors(const MasterBoundCertificate & certificate,
                                      const MasterFuturePricing & future, RefinementLedger & ledger,
                                      RefinementWork category, bool collectDemand, ScanResult & result) const;
+        MasterFutureStatus futurePrices(std::span<const MilliFunds> prices, RefinementLedger & ledger,
+                                        RefinementWork category,
+                                        std::shared_ptr<const MasterFuturePricing> & result) const;
         bool matches(const MasterBoundCertificate & certificate) const;
 
         const MasterAssignmentProblem & m_problem;
+        MasterAssignmentProfile* m_profile;
         MasterAssignmentIdentity m_problemIdentity;
         std::shared_ptr<const std::uint8_t> m_basis;
         std::vector<std::vector<Option>> m_options;
@@ -120,5 +132,8 @@ namespace Coordinator
         MilliFunds m_stockConstant{0};
         MilliFunds m_globalStockUpper{0};
         bool m_ready{false};
+        mutable std::vector<MilliFunds> m_cachedFuturePrices;
+        mutable std::shared_ptr<const MasterFuturePricing> m_cachedFuturePricing;
+        mutable MasterFutureCacheStats m_futureCacheStats;
     };
 }

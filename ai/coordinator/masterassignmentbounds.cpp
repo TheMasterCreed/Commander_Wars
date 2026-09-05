@@ -68,8 +68,9 @@ namespace
 
 namespace Coordinator
 {
-    MasterAssignmentBounds::MasterAssignmentBounds(const MasterAssignmentProblem & problem)
+    MasterAssignmentBounds::MasterAssignmentBounds(const MasterAssignmentProblem & problem, MasterAssignmentProfile* profile)
         : m_problem(problem),
+          m_profile(profile),
           m_problemIdentity(problem.identity())
     {
     }
@@ -160,6 +161,7 @@ namespace Coordinator
     MasterBoundStatus MasterAssignmentBounds::prepare(
         const CheapPricingModel* stock, RefinementLedger & ledger, const MasterFutureCatalog* futureCatalog)
     {
+        MasterProfileScope timing(m_profile, MasterPhase::BoundPreparation);
         if (m_ready || !m_problemIdentity.sameLiveProblem(m_problem.identity()) ||
             (stock != nullptr && !stock->installed()))
         {
@@ -289,6 +291,38 @@ namespace Coordinator
         return m_ready && m_problemIdentity.sameLiveProblem(m_problem.identity());
     }
 
+    MasterFutureCacheStats MasterAssignmentBounds::futureCacheStats() const
+    {
+        return m_futureCacheStats;
+    }
+
+    MasterFutureStatus MasterAssignmentBounds::futurePrices(
+        std::span<const MilliFunds> prices, RefinementLedger & ledger, RefinementWork category,
+        std::shared_ptr<const MasterFuturePricing> & result) const
+    {
+        if (!chargeMasterWork(ledger, prices.size() + 1, 2, category))
+        {
+            return MasterFutureStatus::BudgetExhausted;
+        }
+        if (m_cachedFuturePricing &&
+            std::equal(prices.begin(), prices.end(), m_cachedFuturePrices.begin(), m_cachedFuturePrices.end()))
+        {
+            ++m_futureCacheStats.hits;
+            result = m_cachedFuturePricing;
+            return MasterFutureStatus::Valid;
+        }
+        ++m_futureCacheStats.recomputations;
+        auto computed = priceMasterFuture(*m_future, prices, ledger, category);
+        if (computed.status != MasterFutureStatus::Valid)
+        {
+            return computed.status;
+        }
+        m_cachedFuturePrices.assign(prices.begin(), prices.end());
+        m_cachedFuturePricing = std::make_shared<const MasterFuturePricing>(std::move(computed));
+        result = m_cachedFuturePricing;
+        return MasterFutureStatus::Valid;
+    }
+
     std::optional<MilliFunds> MasterAssignmentBounds::contribution(
         std::size_t actor, std::int32_t candidate) const
     {
@@ -333,7 +367,7 @@ namespace Coordinator
             result.status = MasterBoundStatus::InvalidCertificate;
             return result;
         }
-        MasterFuturePricing future;
+        std::shared_ptr<const MasterFuturePricing> priced;
         if (pricedFuture)
         {
             if (m_future == nullptr)
@@ -341,13 +375,15 @@ namespace Coordinator
                 return result;
             }
             const auto prices = std::span<const MilliFunds>(certificate.prices).subspan(m_problem.resources().size());
-            future = priceMasterFuture(*m_future, prices, ledger, category);
-            if (future.status != MasterFutureStatus::Valid)
+            const auto status = futurePrices(prices, ledger, category, priced);
+            if (status != MasterFutureStatus::Valid)
             {
-                result.status = boundStatus(future.status);
+                result.status = boundStatus(status);
                 return result;
             }
         }
+        const MasterFuturePricing empty;
+        const auto & future = priced ? *priced : empty;
         result.upper = combined ? m_stockConstant : m_globalStockUpper;
         result.demand.assign(m_resources.size(), 0);
         if (pricedFuture)
@@ -495,6 +531,7 @@ namespace Coordinator
     MasterBoundResult MasterAssignmentBounds::bound(
         const MasterAssignmentState & state, MasterBoundFamily family, RefinementLedger & ledger) const
     {
+        MasterProfileScope timing(m_profile, MasterPhase::BoundScan);
         if (!chargeMasterWork(ledger, state.choices.size() + m_resources.size() + 1,
                               1, RefinementWork::MasterBoundScan))
         {
@@ -513,6 +550,7 @@ namespace Coordinator
     MasterBoundResult MasterAssignmentBounds::verify(
         const MasterBoundCertificate & certificate, RefinementLedger & ledger) const
     {
+        MasterProfileScope timing(m_profile, MasterPhase::CertificateVerification);
         const auto result = scan(certificate, ledger, RefinementWork::MasterDualVerification, false);
         if (result.status != MasterBoundStatus::Valid)
         {
@@ -528,6 +566,7 @@ namespace Coordinator
     MasterBoundResult MasterAssignmentBounds::tighten(
         const MasterBoundCertificate & initial, std::int32_t rounds, RefinementLedger & ledger) const
     {
+        MasterProfileScope timing(m_profile, MasterPhase::DualOptimization);
         auto best = verify(initial, ledger);
         if (!best.valid() || initial.family == MasterBoundFamily::Immediate || rounds < 0)
         {

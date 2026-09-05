@@ -7,18 +7,28 @@ namespace Coordinator
 {
     constexpr std::int64_t MASTER_ASSIGNMENT_INITIAL_ALLOWANCE = 160000;
 
+    enum class MasterFutureBoundScope : std::int8_t
+    {
+        RootOnly,
+        EveryNode,
+    };
+
     struct MasterAssignmentSchedule
     {
         std::int32_t currentDualRounds{4};
         std::int64_t continuationSlice{128};
         std::int64_t futureDualAllowance{4096};
         std::uint64_t nodesPerRefinement{8};
+        std::uint64_t incumbentRefinementStride{2};
+        MasterFutureBoundScope futureBounds{MasterFutureBoundScope::RootOnly};
+        bool incumbentCompletions{true};
     };
 
     struct MasterAssignmentSearchOptions
     {
         MasterAssignmentSchedule schedule;
         bool retainDiagnostics{false};
+        MasterAssignmentProfile* profile{nullptr};
     };
 
     struct MasterPruneReceipt
@@ -54,10 +64,16 @@ namespace Coordinator
         std::uint64_t arithmeticFailures{0};
         std::uint64_t proofFailures{0};
         std::uint64_t refinements{0};
+        std::uint64_t incumbentRefinements{0};
+        std::uint64_t incumbentCompletions{0};
+        std::uint64_t evaluationCacheHits{0};
         std::uint64_t peakFrontier{0};
         std::uint64_t peakResidentRegions{0};
         std::uint64_t residualRegions{0};
         std::optional<std::int64_t> firstImprovementWork;
+        MasterFutureCacheStats futurePricingCache;
+        std::size_t retainedGrants{0};
+        std::size_t refundableStorageBytes{0};
         RefinementLedgerStats work;
     };
 

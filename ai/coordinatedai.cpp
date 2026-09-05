@@ -10,6 +10,7 @@
 #include "ai/coordinator/engineactionbuilder.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/masterassignmentshadow.h"
 
 #include "coreengine/qmlvector.h"
 
@@ -510,7 +511,12 @@ void CoordinatedAi::buildTurnPlan()
                   std::chrono::nanoseconds>(
                   Clock::now() - continuationStart)
                   .count();
+    const auto masterShadow = Coordinator::readMasterShadowConfig();
+    Coordinator::RefinementLedger masterLedger;
+    Coordinator::prepareMasterShadow(masterShadow, input, masterLedger);
     m_assignment = Coordinator::MaximumValueAssignment::assign(input);
+    const auto masterShadowNanos = Coordinator::observeMasterAssignment(
+        masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     ArenaMasterAssignmentProbe::record(input, m_assignment, traceIdentity);
 #endif
@@ -579,6 +585,11 @@ void CoordinatedAi::buildTurnPlan()
             .arg(stats.mixedPairs.statesUsed).arg(stats.mixedPairs.enemyStatesUsed).arg(stats.mixedPairs.workUsed)
             .arg(stats.mixedPairs.budgetExhaustions).arg(stats.mixedPairs.failures)
             .arg(stats.stockPairs.workUsed + stats.mixedPairs.workUsed);
+        if (masterShadow.enabled())
+        {
+            phaseTimingFields += QStringLiteral(" masterShadowNanos=%1 masterShadowWork=%2 masterShadowAllowance=%3")
+                .arg(masterShadowNanos).arg(masterLedger.stats().spent()).arg(masterShadow.allowance);
+        }
     }
     if (m_decisionTrace != nullptr)
     {

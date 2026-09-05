@@ -98,8 +98,10 @@ namespace Coordinator
     }
 
     MasterStockSetupStatus MasterAssignmentStockContext::prepare(
-        const PropertyStockField & source, const AssignmentInput & input, RefinementLedger & ledger)
+        const PropertyStockField & source, const AssignmentInput & input, RefinementLedger & ledger,
+        MasterAssignmentProfile* profile)
     {
+        MasterProfileScope timing(profile, MasterPhase::Catalog);
         if (m_status != MasterStockSetupStatus::Unprepared)
         {
             return MasterStockSetupStatus::Invalid;
@@ -155,7 +157,7 @@ namespace Coordinator
             m_status = MasterStockSetupStatus::Invalid;
             return m_status;
         }
-        if (!m_valuer->prepareMasterContinuationPricing(std::move(catalog), ledger))
+        if (!m_valuer->prepareMasterContinuationPricing(std::move(catalog), ledger, profile))
         {
             m_status = ledger.stats().refusals == 0
                 ? MasterStockSetupStatus::Invalid : MasterStockSetupStatus::BudgetExhausted;
