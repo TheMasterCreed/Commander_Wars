@@ -1,4 +1,5 @@
 #include "tests/arena/masterassignmentprobe.h"
+#include "tests/arena/masterassignmentoracleprobe.h"
 
 #include <QCryptographicHash>
 #include <QElapsedTimer>
@@ -209,6 +210,7 @@ namespace ArenaMasterAssignmentProbe
             result.insert("actorCount", static_cast<qint64>(problem.actors().size()));
             result.insert("mutableActorCount", mutableActors);
             result.insert("fixedActorCount", static_cast<qint64>(problem.actors().size()) - mutableActors);
+            ArenaMasterAssignmentOracleProbe::record(problem, identity);
         }
         QFile output(QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)));
         const auto line = QJsonDocument(result).toJson(QJsonDocument::Compact) + '\n';

@@ -1486,6 +1486,23 @@ if (BUILD_TESTING)
     add_test(NAME CoordinatorAiMasterAssignmentProblemTests COMMAND CoordinatorAiMasterAssignmentProblemTests)
     cow_set_arena_test_path(CoordinatorAiMasterAssignmentProblemTests)
 
+    set(MASTER_ASSIGNMENT_ORACLE_SRCS
+        tests/coordinator_ai/masterassignmentoracle.cpp
+        tests/coordinator_ai/masterassignmentreference.cpp
+        tests/coordinator_ai/masterassignmentoraclestock.cpp
+        tests/coordinator_ai/masterassignmentoraclejson.cpp
+    )
+    add_executable(CoordinatorAiMasterAssignmentOracleTests
+        tests/coordinator_ai/masterassignmentoracletests.cpp
+        ai/coordinator/masterassignmentproblem.cpp
+        ${MASTER_ASSIGNMENT_ORACLE_SRCS}
+    )
+    target_include_directories(CoordinatorAiMasterAssignmentOracleTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiMasterAssignmentOracleTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiMasterAssignmentOracleTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiMasterAssignmentOracleTests COMMAND CoordinatorAiMasterAssignmentOracleTests)
+    cow_set_arena_test_path(CoordinatorAiMasterAssignmentOracleTests)
+
     add_executable(CoordinatorAiAssignmentValuationTests
         tests/coordinator_ai/assignmentvaluationtests.cpp
     )
@@ -1848,6 +1865,9 @@ if (BUILD_TESTING)
         tests/arena/relativestockprobe.cpp
         tests/arena/masterassignmentprobe.h
         tests/arena/masterassignmentprobe.cpp
+        tests/arena/masterassignmentoracleprobe.cpp
+        tests/arena/masterassignmentoracleprobe.h
+        ${MASTER_ASSIGNMENT_ORACLE_SRCS}
         tests/arena/relativestockprobe.h
         tests/arena/relativestockreceipts.h
         tests/arena/relativestocksupportaudit.cpp
