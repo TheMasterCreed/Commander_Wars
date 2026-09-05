@@ -9,6 +9,8 @@
 namespace Coordinator
 {
     class TurnPlan;
+    class CheapPricingModel;
+    struct MasterFutureCatalog;
 
     struct RelativeStockRefinedTerm
     {
@@ -48,6 +50,22 @@ namespace Coordinator
         }
     };
 
+    enum class RelativeStockWitnessKind : std::int8_t
+    {
+        Cheap,
+        Sequential,
+    };
+
+    struct RelativeStockProofSnapshot
+    {
+        RelativeStockQuote quote;
+        RelativeStockWitnessKind ourKind{RelativeStockWitnessKind::Cheap};
+        std::vector<RowWitness> cheapOurWitness;
+        std::vector<SequentialRowWitness> ourWitness;
+        std::vector<SequentialRowWitness> enemyWitness;
+        std::shared_ptr<const PackingDualCertificate> ourUpperCertificate;
+    };
+
     class RelativeStockSession
     {
     public:
@@ -59,12 +77,24 @@ namespace Coordinator
 
         virtual RelativeStockQuote quote(const TurnPlan & plan, MilliFunds economic) = 0;
         virtual RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) = 0;
+        virtual const CheapPricingModel* pricingModel() const
+        {
+            return nullptr;
+        }
+        virtual const MasterFutureCatalog* futureCatalog() const
+        {
+            return nullptr;
+        }
         virtual RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t stateCap) = 0;
         virtual RelativeStockRefinedTerm refineEnemy(
             const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) = 0;
         virtual bool supportsVerifiedDual() const
         {
             return false;
+        }
+        virtual std::int64_t certificatePreparationWork() const
+        {
+            return 0;
         }
         virtual RelativeStockDualTightening
         tightenOurUpperWithVerifiedDual(
@@ -79,6 +109,14 @@ namespace Coordinator
         }
         virtual bool replayOurWitness(const RelativeStockQuote & quote) = 0;
         virtual bool replayEnemyWitness(const RelativeStockQuote & quote) = 0;
+        virtual std::shared_ptr<const RelativeStockProofSnapshot> captureProof(const RelativeStockQuote &)
+        {
+            return {};
+        }
+        virtual bool replayLowerProof(const RelativeStockProofSnapshot &) const
+        {
+            return false;
+        }
         virtual std::int64_t remainingWork() const = 0;
         virtual std::int64_t ourRerunWork() const = 0;
         virtual std::int64_t enemyRerunWork(const std::vector<std::int32_t> & capturedColumns) const = 0;

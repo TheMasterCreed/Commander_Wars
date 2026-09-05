@@ -33,6 +33,16 @@ namespace Coordinator
         return quote(canonicalPlanKey(m_owner.planActions(plan)), economic);
     }
 
+    const CheapPricingModel* JointPlanStockValuer::RelativeSession::pricingModel() const
+    {
+        return m_owner.livePairSwapIntervals() ? &m_owner.m_cheapModel : nullptr;
+    }
+
+    const MasterFutureCatalog* JointPlanStockValuer::RelativeSession::futureCatalog() const
+    {
+        return m_owner.m_masterFutureCatalog.get();
+    }
+
     RelativeStockQuote JointPlanStockValuer::RelativeSession::quote(
         const ContinuationKey & key, MilliFunds economic)
     {
@@ -155,6 +165,12 @@ namespace Coordinator
         result.valid = m_owner.refineOur(*entry, granted, stateCap, RefinementSchedule::Relative);
         result.workUsed = before - m_owner.m_pRefinementLedger->balance();
         result.statesUsed = result.workUsed - tariff;
+        if (m_owner.m_masterFutureCatalog && (result.statesUsed < 0 ||
+            !RelativeStockDetail::checkedAdd(m_owner.m_masterOurSearchStates, result.statesUsed)))
+        {
+            result.valid = false;
+            return result;
+        }
         result.interval = entry->ours;
         result.searchCompleted = entry->searchCompleted;
         const auto refreshed = quote(key, 0);
@@ -215,6 +231,16 @@ namespace Coordinator
             maximumWork);
     }
 
+    std::int64_t JointPlanStockValuer::RelativeSession::certificatePreparationWork() const
+    {
+        const auto length = std::max<std::int64_t>(m_owner.m_field.horizonTurns(), 1);
+        if (m_owner.m_masterOurSearchStates > std::numeric_limits<std::int64_t>::max() / length)
+        {
+            return -1;
+        }
+        return m_owner.m_masterOurSearchStates * length;
+    }
+
     bool JointPlanStockValuer::RelativeSession::
         verifiedUpperMatches(
             const RelativeStockQuote & quote) const
@@ -258,5 +284,100 @@ namespace Coordinator
         const auto witness = m_owner.m_refinedEnemyWitnesses.find(expected.capturedColumns);
         return witness != m_owner.m_refinedEnemyWitnesses.end() && witness->second.value == expected.enemy.lower &&
             m_owner.solveEnemySequential(expected.capturedColumns, 0, false, &witness->second).witnessReplays;
+    }
+
+    std::shared_ptr<const RelativeStockProofSnapshot> JointPlanStockValuer::RelativeSession::captureProof(
+        const RelativeStockQuote & expected)
+    {
+        if (!owns(expected) || !expected.ourLowerWitnessReplays || !expected.enemyLowerWitnessReplays ||
+            !sameRelativeStockQuote(expected, quote(expected.key, expected.economic)))
+        {
+            return {};
+        }
+        auto state = m_owner.m_cheapModel.initialState();
+        CheapInitialPrice initial;
+        if (!m_owner.m_cheapModel.price(expected.key, state, initial))
+        {
+            return {};
+        }
+        auto proof = std::make_shared<RelativeStockProofSnapshot>();
+        proof->quote = expected;
+        if (expected.ours.lower == initial.ours.lower)
+        {
+            proof->cheapOurWitness = std::move(initial.witness);
+        }
+        else
+        {
+            const auto witness = m_owner.m_refinedOurWitnesses.find(expected.key);
+            if (witness == m_owner.m_refinedOurWitnesses.end() || witness->second.value != expected.ours.lower)
+            {
+                return {};
+            }
+            proof->ourKind = RelativeStockWitnessKind::Sequential;
+            proof->ourWitness = witness->second.rows;
+        }
+        if (expected.enemy.lower != 0)
+        {
+            const auto witness = m_owner.m_refinedEnemyWitnesses.find(expected.capturedColumns);
+            if (witness == m_owner.m_refinedEnemyWitnesses.end() || witness->second.value != expected.enemy.lower)
+            {
+                return {};
+            }
+            proof->enemyWitness = witness->second.rows;
+        }
+        if (expected.ourUpperCertificateId != 0)
+        {
+            const auto certificate = m_owner.m_verifiedOurUppers.find(expected.key);
+            if (certificate == m_owner.m_verifiedOurUppers.end() || certificate->second.id != expected.ourUpperCertificateId)
+            {
+                return {};
+            }
+            proof->ourUpperCertificate = certificate->second.certificate;
+        }
+        return proof;
+    }
+
+    bool JointPlanStockValuer::RelativeSession::replayLowerProof(const RelativeStockProofSnapshot & proof) const
+    {
+        const auto & expected = proof.quote;
+        if (!owns(expected) || !expected.valid || !RelativeStockDetail::canonical(expected) ||
+            !RelativeStockDetail::coherent(expected))
+        {
+            return false;
+        }
+        auto state = m_owner.m_cheapModel.initialState();
+        CheapInitialPrice initial;
+        if (!m_owner.m_cheapModel.price(expected.key, state, initial) ||
+            initial.capturedColumns != expected.capturedColumns || initial.owned != expected.owned)
+        {
+            return false;
+        }
+        if (proof.ourKind == RelativeStockWitnessKind::Cheap)
+        {
+            if (!proof.ourWitness.empty() ||
+                !m_owner.m_cheapModel.replayWitness(state, proof.cheapOurWitness, expected.ours.lower))
+            {
+                return false;
+            }
+        }
+        else if (proof.ourKind == RelativeStockWitnessKind::Sequential)
+        {
+            const RefinedWitness witness{proof.ourWitness, expected.ours.lower, true};
+            if (!proof.cheapOurWitness.empty() ||
+                !m_owner.solveOurSequential(planActions(expected.key), 0, false, &witness).witnessReplays)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            return false;
+        }
+        if (expected.enemy.lower == 0 && proof.enemyWitness.empty())
+        {
+            return true;
+        }
+        const RefinedWitness enemy{proof.enemyWitness, expected.enemy.lower, true};
+        return m_owner.solveEnemySequential(expected.capturedColumns, 0, false, &enemy).witnessReplays;
     }
 }

@@ -48,13 +48,15 @@ namespace
         65535,
         std::numeric_limits<std::int32_t>::max(),
     };
-    constexpr std::array<RefinementWork, Coordinator::REFINEMENT_WORK_CLASSES> ALL_WORK = {
-        RefinementWork::MandatoryPrecompute,
-        RefinementWork::OurAdmission,
-        RefinementWork::EnemyEntry,
-        RefinementWork::SearchSlice,
-        RefinementWork::PackingDualCertificate,
-    };
+    constexpr auto ALL_WORK = []
+    {
+        std::array<RefinementWork, Coordinator::REFINEMENT_WORK_CLASSES> result{};
+        for (std::size_t index = 0; index < result.size(); ++index)
+        {
+            result[index] = static_cast<RefinementWork>(index);
+        }
+        return result;
+    }();
 
     int failures = 0;
     int checks = 0;
@@ -81,6 +83,7 @@ namespace
         std::int64_t granted{0};
         std::int64_t refunded{0};
         std::array<std::int64_t, Coordinator::REFINEMENT_WORK_CLASSES> grantedByWork{};
+        std::array<std::int64_t, Coordinator::REFINEMENT_WORK_CLASSES> refundedByWork{};
 
         friend bool operator==(const LedgerCore &, const LedgerCore &) = default;
     };
@@ -94,6 +97,7 @@ namespace
             stats.granted,
             stats.refunded,
             stats.grantedByWork,
+            stats.refundedByWork,
         };
     }
 
@@ -102,6 +106,12 @@ namespace
         const RefinementLedgerStats & stats = ledger.stats();
         expect(ledger.balance() + stats.spent() == stats.total, message);
         expect(ledger.outstandingGranted() == stats.spent(), message);
+        std::int64_t byCategory = 0;
+        for (std::size_t category = 0; category < Coordinator::REFINEMENT_WORK_CLASSES; ++category)
+        {
+            byCategory += stats.grantedByWork[category] - stats.refundedByWork[category];
+        }
+        expect(byCategory == stats.spent(), "net work categories reconcile with the single ledger");
     }
 
     void testCanonicalActionKey()
@@ -622,7 +632,8 @@ namespace
     void testRefinementLedgerConservation()
     {
         RefinementLedger ledger;
-        expect(ledger.open(40), "ledger opens with a nonnegative budget");
+        constexpr std::int64_t total = ALL_WORK.size() * (ALL_WORK.size() + 1) / 2;
+        expect(ledger.open(total), "ledger opens with a nonnegative budget");
         std::array<GrantId, ALL_WORK.size()> grants{};
         for (std::size_t index = 0; index < ALL_WORK.size(); ++index)
         {
@@ -637,9 +648,10 @@ namespace
         {
             const std::int64_t amount = static_cast<std::int64_t>(index) + 1;
             expect(ledger.refund(grants[index], amount), "valid refund succeeds");
+            expect(ledger.stats().refundedByWork[index] == amount, "refund retains its original work category");
             expectConserved(ledger, "refund preserves budget conservation");
         }
-        expect(ledger.balance() == 40 && ledger.stats().spent() == 0,
+        expect(ledger.balance() == total && ledger.stats().spent() == 0,
                "full refunds restore the budget");
 
         const GrantId zero = ledger.draw(0, RefinementWork::SearchSlice);

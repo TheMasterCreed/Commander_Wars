@@ -845,6 +845,12 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
+    ai/coordinator/masterassignmentstate.h ai/coordinator/masterassignmentstate.cpp
+    ai/coordinator/masterassignmentbounds.h ai/coordinator/masterassignmentbounds.cpp
+    ai/coordinator/masterassignmentfuture.h ai/coordinator/masterassignmentfuture.cpp
+    ai/coordinator/masterassignmentevaluator.h ai/coordinator/masterassignmentevaluator.cpp
+    ai/coordinator/masterassignmentsearch.h ai/coordinator/masterassignmentsearch.cpp
+    ai/coordinator/masterassignmentstock.h ai/coordinator/masterassignmentstock.cpp
     ai/coordinator/assignmentvaluation.h ai/coordinator/planidentity.h
     ai/coordinator/engineactionbuilder.h ai/coordinator/engineactionbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
@@ -1502,6 +1508,47 @@ if (BUILD_TESTING)
     set_target_properties(CoordinatorAiMasterAssignmentOracleTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
     add_test(NAME CoordinatorAiMasterAssignmentOracleTests COMMAND CoordinatorAiMasterAssignmentOracleTests)
     cow_set_arena_test_path(CoordinatorAiMasterAssignmentOracleTests)
+
+    set(MASTER_ASSIGNMENT_SEARCH_SRCS
+        ai/coordinator/masterassignmentproblem.cpp
+        ai/coordinator/masterassignmentstate.cpp
+        ai/coordinator/masterassignmentbounds.cpp
+        ai/coordinator/masterassignmentfuture.cpp
+        ai/coordinator/masterassignmentevaluator.cpp
+        ai/coordinator/masterassignmentsearch.cpp
+    )
+    add_executable(CoordinatorAiMasterAssignmentBoundsTests
+        tests/coordinator_ai/masterassignmentboundstests.cpp
+        ${MASTER_ASSIGNMENT_SEARCH_SRCS}
+        ${MASTER_ASSIGNMENT_ORACLE_SRCS}
+    )
+    target_include_directories(CoordinatorAiMasterAssignmentBoundsTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiMasterAssignmentBoundsTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiMasterAssignmentBoundsTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiMasterAssignmentBoundsTests COMMAND CoordinatorAiMasterAssignmentBoundsTests)
+    cow_set_arena_test_path(CoordinatorAiMasterAssignmentBoundsTests)
+
+    add_executable(CoordinatorAiMasterAssignmentSearchTests
+        tests/coordinator_ai/masterassignmentsearchtests.cpp
+        ${MASTER_ASSIGNMENT_SEARCH_SRCS}
+        ${MASTER_ASSIGNMENT_ORACLE_SRCS}
+    )
+    target_include_directories(CoordinatorAiMasterAssignmentSearchTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiMasterAssignmentSearchTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiMasterAssignmentSearchTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiMasterAssignmentSearchTests COMMAND CoordinatorAiMasterAssignmentSearchTests)
+    cow_set_arena_test_path(CoordinatorAiMasterAssignmentSearchTests)
+
+    add_executable(CoordinatorAiMasterAssignmentIntegrationTests
+        tests/coordinator_ai/masterintegrationtests.cpp
+        ${MASTER_ASSIGNMENT_SEARCH_SRCS}
+        ${MASTER_ASSIGNMENT_ORACLE_SRCS}
+    )
+    target_include_directories(CoordinatorAiMasterAssignmentIntegrationTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiMasterAssignmentIntegrationTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiMasterAssignmentIntegrationTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiMasterAssignmentIntegrationTests COMMAND CoordinatorAiMasterAssignmentIntegrationTests)
+    cow_set_arena_test_path(CoordinatorAiMasterAssignmentIntegrationTests)
 
     add_executable(CoordinatorAiAssignmentValuationTests
         tests/coordinator_ai/assignmentvaluationtests.cpp

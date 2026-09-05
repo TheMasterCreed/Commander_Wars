@@ -16,9 +16,19 @@ namespace Coordinator
         EnemyEntry,
         SearchSlice,
         PackingDualCertificate,
+        MasterPreparation,
+        MasterExpansion,
+        MasterBoundScan,
+        MasterDualOptimization,
+        MasterDualVerification,
+        MasterValuation,
+        MasterWitness,
+        MasterReplay,
+        Count,
     };
 
-    constexpr std::size_t REFINEMENT_WORK_CLASSES = 5;
+    constexpr std::size_t REFINEMENT_WORK_CLASSES =
+        static_cast<std::size_t>(RefinementWork::Count);
 
     using GrantId = std::int32_t;
     constexpr GrantId NO_GRANT = -1;
@@ -31,6 +41,7 @@ namespace Coordinator
         std::int64_t refusals{0};
         std::int64_t refundClamps{0};
         std::array<std::int64_t, REFINEMENT_WORK_CLASSES> grantedByWork{};
+        std::array<std::int64_t, REFINEMENT_WORK_CLASSES> refundedByWork{};
         std::array<std::int64_t, REFINEMENT_WORK_CLASSES> refusalsByWork{};
 
         std::int64_t spent() const
@@ -73,7 +84,7 @@ namespace Coordinator
                 assertConservation();
                 return NO_GRANT;
             }
-            m_grants.push_back(GrantRecord{states, 0});
+            m_grants.push_back(GrantRecord{states, 0, work});
             m_balance -= states;
             m_stats.granted += states;
             m_stats.grantedByWork[slot] += states;
@@ -98,6 +109,7 @@ namespace Coordinator
             record.refunded += states;
             m_balance += states;
             m_stats.refunded += states;
+            m_stats.refundedByWork[static_cast<std::size_t>(record.work)] += states;
             assertConservation();
             return true;
         }
@@ -165,6 +177,7 @@ namespace Coordinator
         {
             std::int64_t granted{0};
             std::int64_t refunded{0};
+            RefinementWork work{RefinementWork::MandatoryPrecompute};
         };
 
         std::int64_t m_balance{0};

@@ -142,12 +142,12 @@ namespace Coordinator
             {
                 return NO_CAPTURE_TURNS;
             }
-            const std::int32_t nextTurn = turn + arrival + m_captureTurnsFromZero - 1;
+            const std::int64_t nextTurn = static_cast<std::int64_t>(turn) + arrival + m_captureTurnsFromZero - 1;
             if (nextTurn <= turn || nextTurn >= m_horizonTurns)
             {
                 return NO_CAPTURE_TURNS;
             }
-            return nextTurn;
+            return static_cast<std::int32_t>(nextTurn);
         }
 
         MilliFunds valueAt(std::int32_t node, std::int32_t turn) const
@@ -165,12 +165,17 @@ namespace Coordinator
             return m_nodeCount;
         }
 
-#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        bool hasValidTransitions() const
+        {
+            return m_nodeCount >= 0 && m_horizonTurns >= 0 &&
+                m_interArrivals.size() == static_cast<std::uint64_t>(m_nodeCount) *
+                                          static_cast<std::uint64_t>(m_nodeCount);
+        }
+
         std::int32_t horizonTurns() const
         {
             return m_horizonTurns;
         }
-#endif
 
     private:
         std::size_t cellOf(std::int32_t node, std::int32_t turn) const

@@ -171,6 +171,26 @@ namespace Coordinator
             return m_enemyCeiling;
         }
 
+        MilliFunds ownedBaseline() const
+        {
+            return m_ownedBaseline;
+        }
+
+        std::span<const CheapRowTerms> dayRows() const
+        {
+            return m_dayRows;
+        }
+
+        const CheapActionTerms* actionTerms(const CanonicalPlanActionKey & key) const
+        {
+            return findAction(key);
+        }
+
+        std::span<const MilliFunds> capturedColumnSwings() const
+        {
+            return m_capturedColumnSwing;
+        }
+
         CheapUpperState initialState() const
         {
             CheapUpperState state;

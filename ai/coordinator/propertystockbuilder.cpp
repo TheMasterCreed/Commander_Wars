@@ -12,6 +12,7 @@
 #include "ai/coordinator/battlefieldknowledge.h"
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/bundlebuilder.h"
+#include "ai/coordinator/masterassignmentfuture.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coreai.h"
 
@@ -669,8 +670,17 @@ namespace Coordinator
     }
 #endif
 
+    bool JointPlanStockValuer::prepareMasterContinuationPricing(
+        ContinuationPricingCatalog catalog, RefinementLedger & ledger)
+    {
+        catalog.refinementBudget = 0;
+        catalog.ledgerTotal = catalog.mandatoryTariff;
+        return prepareContinuationPricing(std::move(catalog), ledger, 0, PricingBudgetPolicy::Shared);
+    }
+
     bool JointPlanStockValuer::prepareContinuationPricing(
-        ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget)
+        ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget,
+        PricingBudgetPolicy policy)
     {
         const ContinuationKey catalogKey =
             canonicalPlanKey(catalog.actions);
@@ -711,14 +721,14 @@ namespace Coordinator
                    action.row >= m_field.m_ours.rowCount();
         });
         const RefinementLedgerStats & stats = ledger.stats();
+        const bool invalidLedger = policy == PricingBudgetPolicy::Dedicated &&
+            (stats.total != expectedTotal || stats.granted != 0 ||
+             stats.refunded != 0 || ledger.balance() != expectedTotal);
         if (!catalog.valid || !expectedValid ||
             catalog.mandatoryTariff != expectedMandatory ||
             catalog.refinementBudget != refinementBudget ||
             catalog.ledgerTotal != expectedTotal ||
-            stats.total != expectedTotal ||
-            stats.granted != 0 ||
-            stats.refunded != 0 ||
-            ledger.balance() != expectedTotal ||
+            invalidLedger ||
             invalidRow ||
             !std::is_sorted(catalog.actions.begin(),
                             catalog.actions.end(),
@@ -730,14 +740,30 @@ namespace Coordinator
             m_pricingState = ContinuationPricingState::Failed;
             return false;
         }
-        if (ledger.draw(expectedMandatory,
+        auto preparationWork = expectedMandatory;
+        if (policy == PricingBudgetPolicy::Shared)
+        {
+            const auto rows = static_cast<std::int64_t>(m_field.m_ours.rows.size());
+            const auto columns = static_cast<std::int64_t>(m_field.m_ours.columns.size());
+            const auto actions = static_cast<std::int64_t>(catalog.actions.size());
+            const auto horizon = std::max<std::int64_t>(m_field.m_horizonTurns, 0);
+            if (!addProduct(preparationWork, {rows, columns, columns}) ||
+                !addProduct(preparationWork, {rows, columns, horizon, 2}) ||
+                !addProduct(preparationWork, {rows + actions, columns, 2}) ||
+                !addWork(preparationWork, columns))
+            {
+                m_pricingState = ContinuationPricingState::Failed;
+                return false;
+            }
+        }
+        if (ledger.draw(preparationWork,
                         RefinementWork::MandatoryPrecompute) ==
             NO_GRANT)
         {
             m_pricingState = ContinuationPricingState::Failed;
             return false;
         }
-        if (!buildCheapModel(catalog.actions))
+        if (!buildCheapModel(catalog.actions, policy == PricingBudgetPolicy::Shared))
         {
             m_pricingState = ContinuationPricingState::Failed;
             return false;
@@ -1196,7 +1222,7 @@ namespace Coordinator
     }
 
     bool JointPlanStockValuer::buildCheapModel(
-        std::span<const PlanRowAction> catalogActions)
+        std::span<const PlanRowAction> catalogActions, bool retainSequentialRows)
     {
         std::unique_ptr<PropertyStockField> pricingField =
             std::make_unique<PropertyStockField>(m_field);
@@ -1268,6 +1294,14 @@ namespace Coordinator
         templateInstance.classes = classTables;
         templateInstance.capturedNodes.assign(
             nodeSlots.size(), false);
+        std::shared_ptr<MasterFutureCatalog> future;
+        if (retainSequentialRows)
+        {
+            future = std::make_shared<MasterFutureCatalog>();
+            future->horizon = pricingField->m_horizonTurns;
+            future->columns = nodeColumns;
+            future->classes = classTables;
+        }
         std::vector<CheapRowTerms> dayRows;
         dayRows.reserve(pricingField->m_ours.rows.size());
         for (std::size_t rowIndex = 0;
@@ -1282,6 +1316,10 @@ namespace Coordinator
                 nullptr,
                 nodeSlots,
                 classOfRow[rowIndex]);
+            if (future)
+            {
+                future->dayRows.push_back(row);
+            }
             CheapRowTerms terms = cheapRowTerms(
                 templateInstance,
                 row,
@@ -1340,6 +1378,10 @@ namespace Coordinator
                 &mover,
                 nodeSlots,
                 classOfRow[static_cast<std::size_t>(action.row)]);
+            if (future)
+            {
+                future->actions.push_back({canonicalPlanActionKey(action), row});
+            }
             CheapRowTerms terms =
                 cheapRowTerms(templateInstance,
                               row,
@@ -1396,6 +1438,11 @@ namespace Coordinator
         m_pricingField = std::move(pricingField);
         m_cheapModel = std::move(model);
         m_cheapState = m_cheapModel.initialState();
+        if (future)
+        {
+            future->complete = true;
+            m_masterFutureCatalog = std::move(future);
+        }
         return m_cheapState.pModel == &m_cheapModel;
     }
 

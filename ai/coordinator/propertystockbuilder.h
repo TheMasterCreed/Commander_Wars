@@ -101,6 +101,7 @@ namespace Coordinator
         bool prepareContinuationPricing(
             ContinuationPricingCatalog catalog,
             RefinementLedger & ledger);
+        bool prepareMasterContinuationPricing(ContinuationPricingCatalog catalog, RefinementLedger & ledger);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         bool prepareDiagnosticContinuationPricing(
             ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit);
@@ -118,8 +119,15 @@ namespace Coordinator
 #endif
 
     private:
+        enum class PricingBudgetPolicy : std::int8_t
+        {
+            Dedicated,
+            Shared,
+        };
+
         bool prepareContinuationPricing(
-            ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget);
+            ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget,
+            PricingBudgetPolicy policy = PricingBudgetPolicy::Dedicated);
 
         enum class RefinementSchedule : std::int8_t
         {
@@ -134,6 +142,8 @@ namespace Coordinator
                             const PropertyStockInstance & enemyModel);
             RelativeStockQuote quote(const TurnPlan & plan, MilliFunds economic) override;
             RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) override;
+            const CheapPricingModel* pricingModel() const override;
+            const MasterFutureCatalog* futureCatalog() const override;
             RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t stateCap) override;
             RelativeStockRefinedTerm refineEnemy(
                 const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) override;
@@ -141,12 +151,15 @@ namespace Coordinator
             {
                 return true;
             }
+            std::int64_t certificatePreparationWork() const override;
             RelativeStockDualTightening
             tightenOurUpperWithVerifiedDual(
                 const RelativeStockQuote & quote,
                 std::int64_t maximumWork) override;
             bool replayOurWitness(const RelativeStockQuote & quote) override;
             bool replayEnemyWitness(const RelativeStockQuote & quote) override;
+            std::shared_ptr<const RelativeStockProofSnapshot> captureProof(const RelativeStockQuote & quote) override;
+            bool replayLowerProof(const RelativeStockProofSnapshot & proof) const override;
             std::int64_t remainingWork() const override;
             std::int64_t ourRerunWork() const override;
             std::int64_t enemyRerunWork(const std::vector<std::int32_t> & capturedColumns) const override;
@@ -204,7 +217,7 @@ namespace Coordinator
         std::int64_t enemyRerunTariff(
             const std::vector<std::int32_t> & capturedColumns) const;
         std::int32_t liveDemandCapacity() const;
-        bool buildCheapModel(std::span<const PlanRowAction> actions);
+        bool buildCheapModel(std::span<const PlanRowAction> actions, bool retainSequentialRows = false);
         CheapRowTerms cheapRowTerms(
             const SequentialInstance & instance,
             const SequentialRow & row,
@@ -299,6 +312,8 @@ namespace Coordinator
         std::unique_ptr<PropertyStockField> m_pricingField;
         std::optional<RelativeSession> m_relativeSession;
         CheapPricingModel m_cheapModel;
+        std::shared_ptr<const MasterFutureCatalog> m_masterFutureCatalog;
+        std::int64_t m_masterOurSearchStates{0};
         mutable CheapUpperState m_cheapState;
         ContinuationPricingState m_pricingState{
             ContinuationPricingState::Unprepared

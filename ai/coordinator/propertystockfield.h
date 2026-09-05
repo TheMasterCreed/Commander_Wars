@@ -83,6 +83,7 @@ namespace Coordinator
                                                           std::span<const PropertyFacts> properties,
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);
         friend class JointPlanStockValuer;
+        friend class MasterAssignmentStockContext;
 
     private:
         struct JointActionFacts
