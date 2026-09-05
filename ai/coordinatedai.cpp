@@ -518,7 +518,7 @@ void CoordinatedAi::buildTurnPlan()
     const auto masterShadowNanos = Coordinator::observeMasterAssignment(
         masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-    ArenaMasterAssignmentProbe::record(input, m_assignment, traceIdentity);
+    ArenaMasterAssignmentProbe::record(input, m_assignment, m_propertyStock, traceIdentity);
 #endif
     recordCaptureDecisions(input);
     recordProductionBlocks(input);

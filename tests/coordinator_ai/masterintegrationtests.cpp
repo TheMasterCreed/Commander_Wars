@@ -190,6 +190,20 @@ namespace
             }
         }
         exportSearchCase(QStringLiteral("master-native-stock-search"), problem, reference, exact, searches);
+        for (const std::uint64_t burst : {1, 24})
+        {
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "challenger refinement burst ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            const auto result = searchMasterAssignment(problem, evaluator, ledger,
+                {.schedule = {.challengerRefinementBurst = burst}, .retainDiagnostics = true});
+            expect(result.globalOptimal && result.lower == exact.exactOptimum &&
+                   result.stats.proofFailures == 0 && result.stats.work.spent() <= 1000000,
+                   "bounded challenger bursts preserve the independently exact objective and single budget");
+            exportSearchCase(QStringLiteral("master-challenger-burst-%1").arg(burst), problem, reference, exact,
+                             {searchRecord(result)});
+        }
         {
             RefinementLedger ledger;
             require(ledger.open(1000000), "certificate integration ledger");
@@ -201,6 +215,8 @@ namespace
                    session.maximumCertificateAllowance > 1 &&
                    result.stats.work.grantedByWork[static_cast<std::size_t>(RefinementWork::PackingDualCertificate)] > 0,
                    "growing certificate slices reach a verified full catalog after the initial slice is too small");
+            expect(result.stats.cancelledEnemyRefinements > 0,
+                   "a shared enemy term is deferred while a complete challenger comparison is in focus");
             expect(result.lower && *result.lower <= *exact.exactOptimum &&
                    result.upper && *result.upper >= *exact.exactOptimum,
                    "native future-certificate search remains inside oracle bounds");
@@ -226,6 +242,26 @@ namespace
         }
         {
             RefinementLedger ledger;
+            require(ledger.open(1000000), "completed certificate scheduling ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger,
+                                       QuoteFault::None, true, true);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            auto evaluated = evaluator.evaluate({problem.identity(),
+                std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end())});
+            require(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 4096) ==
+                    MasterRefinementStatus::Updated && evaluated.quote()->ourUpperCertificateId != 0,
+                    "open friendly interval obtains a registered upper certificate");
+            const auto certificateCalls = session.certificateCalls;
+            const auto before = ledger.stats().spent();
+            const auto proof = evaluated.proof;
+            expect(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual,
+                                   std::numeric_limits<std::int64_t>::max()) == MasterRefinementStatus::Unavailable &&
+                   session.certificateCalls == certificateCalls && ledger.stats().spent() == before &&
+                   evaluated.proof == proof,
+                   "already certified upper neither reserves an oversized slice nor repeats certificate work");
+        }
+        {
+            RefinementLedger ledger;
             require(ledger.open(100000), "owned witness ledger");
             NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
             MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
@@ -240,9 +276,15 @@ namespace
                    evaluated.proof == recorded && session.proofCaptures == captures &&
                    ledger.stats().grantedByWork[static_cast<std::size_t>(RefinementWork::MasterWitness)] == witnessWork,
                    "an unchanged authenticated quote reuses its owned replayed proof without another witness charge");
-            require(evaluator.refine(evaluated, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated &&
-                    evaluator.refine(evaluated, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
-                    "mutable session replaces continuation witnesses");
+            require(evaluator.refine(evaluated, MasterRefinementTerm::Friendly, 4096) == MasterRefinementStatus::Updated,
+                    "mutable session replaces friendly continuation witness");
+            const auto beforeOpenEnemy = ledger.stats().spent();
+            expect(evaluated.quote()->ours.exact() && !evaluated.quote()->enemy.exact() &&
+                   evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 1000000) ==
+                       MasterRefinementStatus::Unavailable && ledger.stats().spent() == beforeOpenEnemy,
+                   "open enemy interval does not justify certifying an already exact friendly interval");
+            require(evaluator.refine(evaluated, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
+                    "mutable session replaces enemy continuation witness");
             expect(!sameRelativeStockQuote(recorded->quote, *evaluated.quote()) &&
                    evaluated.proof != recorded && session.proofCaptures > captures &&
                    session.replayLowerProof(*recorded), "changed quote replaces proof while the prior witness remains replayable");
@@ -250,11 +292,12 @@ namespace
             expect(evaluated.exact &&
                    evaluator.refine(evaluated, MasterRefinementTerm::Friendly, 1000000) == MasterRefinementStatus::Unavailable &&
                    evaluator.refine(evaluated, MasterRefinementTerm::Enemy, 1000000) == MasterRefinementStatus::Unavailable &&
+                   evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 1000000) == MasterRefinementStatus::Unavailable &&
                    ledger.stats().spent() == beforeExact,
                    "exact continuation terms need no larger rerun or budget reservation");
             const auto beforeCertificate = evaluated.proof;
-            require(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 4096) == MasterRefinementStatus::Updated,
-                    "fresh registered certificate refreshes an evaluated proof");
+            require(session.tightenOurUpperWithVerifiedDual(*evaluated.quote(), 4096).certificateValid &&
+                    evaluator.refresh(evaluated), "an externally changed certificate refreshes an evaluated proof");
             expect(evaluated.proof != beforeCertificate && evaluated.quote()->ourUpperCertificateId != 0,
                    "a changed certificate identity cannot reuse the old authenticated proof");
             auto corrupted = *recorded;
@@ -449,6 +492,8 @@ namespace
         expect(result.lower && *result.lower <= *exact.exactOptimum &&
                result.upper && *result.upper >= *exact.exactOptimum,
                "different enemy signatures preserve absolute search bounds");
+        expect(result.stats.cancelledEnemyRefinements == 0,
+               "different capture signatures cannot defer their enemy terms through common-enemy cancellation");
         auto left = evaluator.evaluate({problem.identity(), {0}});
         auto right = evaluator.evaluate({problem.identity(), {1}});
         for (auto* value : {&left, &right})
@@ -505,8 +550,8 @@ namespace
             require(evaluator.refine(incumbent, MasterRefinementTerm::Enemy, 4096) == MasterRefinementStatus::Updated,
                     "incoming enemy interval completes");
         }
-        require(evaluator.refine(incumbent, MasterRefinementTerm::FutureDual, 4096) == MasterRefinementStatus::Updated,
-                "incoming stock witness and registered certificate");
+        require(session.tightenOurUpperWithVerifiedDual(*incumbent.quote(), 4096).certificateValid &&
+                evaluator.refresh(incumbent), "incoming stock witness and externally registered certificate");
         const auto certificate = incumbent.quote()->ourUpperCertificateId;
         auto challenger = evaluator.evaluate({problem.identity(), {1}});
         require(challenger.lowerReplayed && challenger.upperVerified && challenger.quote() != nullptr,

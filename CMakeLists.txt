@@ -1922,6 +1922,9 @@ if (BUILD_TESTING)
         tests/arena/masterassignmentprobe.cpp
         tests/arena/masterassignmentoracleprobe.cpp
         tests/arena/masterassignmentoracleprobe.h
+        tests/arena/mastercomparisonprobe.cpp
+        tests/arena/mastercomparisonprobe.h
+        tests/arena/masterstockadmissionprobe.cpp
         ${MASTER_ASSIGNMENT_ORACLE_SRCS}
         tests/arena/relativestockprobe.h
         tests/arena/relativestockreceipts.h
@@ -2288,6 +2291,8 @@ if (BUILD_TESTING)
         ArenaPropertyEconomics tests/arena/fixtures/property_init.js 120)
     cow_add_arena_probe_test(
         ArenaFocusFireExposure tests/arena/fixtures/focus_fire_init.js 300)
+    cow_add_arena_probe_test(
+        ArenaMasterStockAdmission tests/arena/fixtures/master_stock_admission_init.js 300)
     cow_add_arena_probe_test(
         ArenaCoordinatedActionConstruction tests/arena/fixtures/action_construction_init.js 120)
     cow_add_arena_probe_test(

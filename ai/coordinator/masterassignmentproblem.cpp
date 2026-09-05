@@ -767,12 +767,8 @@ namespace Coordinator
             std::sort(actor.canonicalCandidates.begin(), actor.canonicalCandidates.end(),
                 [&](std::int32_t left, std::int32_t right)
                 {
-                    const auto generation = [&](std::int32_t slot)
-                    {
-                        const auto index = actor.candidates[static_cast<std::size_t>(slot)].identity.generationIndex;
-                        return index < 0 ? slot : index;
-                    };
-                    return std::pair{generation(left), left} < std::pair{generation(right), right};
+                    return actor.candidates[static_cast<std::size_t>(left)].identity.canonicalOrderKey() <
+                        actor.candidates[static_cast<std::size_t>(right)].identity.canonicalOrderKey();
                 });
             if (actor.incumbentCandidateIndex != NO_CANDIDATE)
             {

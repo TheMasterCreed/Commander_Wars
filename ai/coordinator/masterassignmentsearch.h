@@ -22,6 +22,19 @@ namespace Coordinator
         std::uint64_t incumbentRefinementStride{2};
         MasterFutureBoundScope futureBounds{MasterFutureBoundScope::RootOnly};
         bool incumbentCompletions{true};
+        std::uint64_t challengerRefinementBurst{24};
+    };
+
+    class MasterAssignmentSearchObserver
+    {
+    public:
+        virtual ~MasterAssignmentSearchObserver() = default;
+        virtual void evaluated(const MasterAssignmentEvaluation & evaluation, std::int64_t work) = 0;
+        virtual void refined(const MasterAssignmentEvaluation & evaluation, MasterRefinementTerm term,
+                             std::int64_t allowance, MasterRefinementStatus status,
+                             std::int64_t workBefore, std::int64_t workAfter) = 0;
+        virtual void compared(const MasterAssignmentEvaluation & challenger,
+                              const RelativeStockComparison & comparison, std::int64_t work) = 0;
     };
 
     struct MasterAssignmentSearchOptions
@@ -29,6 +42,7 @@ namespace Coordinator
         MasterAssignmentSchedule schedule;
         bool retainDiagnostics{false};
         MasterAssignmentProfile* profile{nullptr};
+        MasterAssignmentSearchObserver* observer{nullptr};
     };
 
     struct MasterPruneReceipt
@@ -65,6 +79,7 @@ namespace Coordinator
         std::uint64_t proofFailures{0};
         std::uint64_t refinements{0};
         std::uint64_t incumbentRefinements{0};
+        std::uint64_t cancelledEnemyRefinements{0};
         std::uint64_t incumbentCompletions{0};
         std::uint64_t evaluationCacheHits{0};
         std::uint64_t peakFrontier{0};

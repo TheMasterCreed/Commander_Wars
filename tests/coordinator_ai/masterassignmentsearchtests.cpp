@@ -12,14 +12,46 @@ namespace
     using namespace MasterAssignmentTest;
 
     MasterAssignmentSearchResult solve(const MasterAssignmentProblem & problem, std::int64_t work,
-                                      std::int32_t dualRounds = 4)
+                                      std::int32_t dualRounds = 4, MasterAssignmentSearchObserver* observer = nullptr)
     {
         RefinementLedger ledger;
         require(ledger.open(work), "search ledger");
         MasterAssignmentEvaluator evaluator(problem, ledger);
         return searchMasterAssignment(problem, evaluator, ledger,
-            {.schedule = {.currentDualRounds = dualRounds}, .retainDiagnostics = true});
+            {.schedule = {.currentDualRounds = dualRounds}, .retainDiagnostics = true, .observer = observer});
     }
+
+    class SearchObserver final : public MasterAssignmentSearchObserver
+    {
+    public:
+        void evaluated(const MasterAssignmentEvaluation & evaluation, std::int64_t work) override
+        {
+            ++evaluations;
+            choices.push_back(evaluation.state.choices);
+            expect(evaluation.state.complete() && work >= lastWork, "observer sees a complete evaluated tuple");
+            lastWork = work;
+        }
+
+        void refined(const MasterAssignmentEvaluation &, MasterRefinementTerm,
+                     std::int64_t, MasterRefinementStatus, std::int64_t, std::int64_t) override
+        {
+            expect(false, "immediate-only search has no continuation refinement event");
+        }
+
+        void compared(const MasterAssignmentEvaluation & challenger,
+                      const RelativeStockComparison & comparison, std::int64_t work) override
+        {
+            ++comparisons;
+            expect(challenger.lowerReplayed && comparison.valid() && work >= lastWork,
+                   "observer sees authenticated complete comparisons in work order");
+            lastWork = work;
+        }
+
+        std::uint64_t evaluations{0};
+        std::uint64_t comparisons{0};
+        std::int64_t lastWork{0};
+        std::vector<std::vector<std::int32_t>> choices;
+    };
 
     bool contains(const MasterAssignmentState & state, std::span<const std::int32_t> tuple)
     {
@@ -382,6 +414,53 @@ namespace
         expect(result.globalOptimal && result.lower == 16 && result.stats.evaluationCacheHits > 0,
                "an earlier completion witness is reused when best-upper traversal reaches that exact tuple");
     }
+
+    void observerIsolation()
+    {
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 7, 1));
+        fixture.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 9, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        const auto original = solve(problem, 1000000);
+        SearchObserver observer;
+        const auto observed = solve(problem, 1000000, 4, &observer);
+        expect(observer.evaluations == observed.stats.evaluated && observer.comparisons > 0,
+               "diagnostic observer receives every fresh evaluation and comparison");
+        expect(searchRecord(original) == searchRecord(observed),
+               "observation changes no selection, proof, bound, residual, or work receipt");
+    }
+
+    void missingGenerationOrdering()
+    {
+        Fixture fixture(3);
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            for (std::int32_t choice = 1; choice <= 3; ++choice)
+            {
+                fixture.input.actors[actor].candidates.push_back(
+                    moveCandidate(actor, {actor, 0}, {actor, choice}, 5, choice));
+            }
+        }
+        fixture.seat();
+        const auto indexed = fixture.extract();
+        for (auto & actor : fixture.input.actors)
+        {
+            for (auto & candidate : actor.candidates)
+            {
+                candidate.generationIndex = -1;
+            }
+        }
+        const auto unindexed = fixture.extract();
+        SearchObserver indexedObserver;
+        SearchObserver unindexedObserver;
+        const auto first = solve(indexed, 1000000, 4, &indexedObserver);
+        const auto second = solve(unindexed, 1000000, 4, &unindexedObserver);
+        expect(indexedObserver.choices == unindexedObserver.choices,
+               "missing generation ordinals preserve canonical original-index discovery order");
+        expect(searchRecord(first) == searchRecord(second),
+               "equivalent canonical candidate orders preserve search proof and work");
+    }
 }
 
 int main(int argc, char** argv)
@@ -396,6 +475,8 @@ int main(int argc, char** argv)
     scopedIdentitiesAndLargeResources();
     improvementBeforeGlobalProof();
     completionWitnessMemo();
+    observerIsolation();
+    missingGenerationOrdering();
     std::printf("Master assignment search: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;
 }

@@ -223,7 +223,9 @@ namespace Coordinator
             return MasterRefinementStatus::Unavailable;
         }
         if ((term == MasterRefinementTerm::Friendly && quote->ours.exact()) ||
-            (term == MasterRefinementTerm::Enemy && quote->enemy.exact()))
+            (term == MasterRefinementTerm::Enemy && quote->enemy.exact()) ||
+            (term == MasterRefinementTerm::FutureDual &&
+             (quote->ours.exact() || quote->ourUpperCertificateId != 0)))
         {
             return MasterRefinementStatus::Unavailable;
         }

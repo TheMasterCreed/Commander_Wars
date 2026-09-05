@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "ai/coordinator/candidatebundle.h"
@@ -60,6 +61,11 @@ namespace Coordinator
         std::int32_t engineUnitId{NO_UNIT};
         std::int32_t originalCandidateIndex{-1};
         std::int32_t generationIndex{-1};
+
+        std::pair<std::int32_t, std::int32_t> canonicalOrderKey() const
+        {
+            return {generationIndex < 0 ? originalCandidateIndex : generationIndex, originalCandidateIndex};
+        }
 
         friend bool operator==(const MasterCandidateIdentity &,
                                const MasterCandidateIdentity &) = default;
