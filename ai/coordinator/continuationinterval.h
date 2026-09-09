@@ -205,6 +205,11 @@ namespace Coordinator
     class ContinuationStore
     {
     public:
+        std::size_t entryCount() const
+        {
+            return m_entries.size();
+        }
+
         ContinuationEntry* find(const ContinuationKey & key)
         {
             const auto found = m_entries.find(key);

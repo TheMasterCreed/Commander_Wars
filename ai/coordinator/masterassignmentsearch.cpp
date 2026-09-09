@@ -9,6 +9,7 @@
 namespace
 {
     using namespace Coordinator;
+    constexpr std::int64_t REFINEMENT_ACCOUNTING_WORK = 4;
 
     enum class NodeStatus : std::int8_t
     {
@@ -58,9 +59,24 @@ namespace
         std::shared_ptr<MasterAssignmentEvaluation> evaluation;
         std::optional<MilliFunds> upper;
         MasterRefinementTerm next{MasterRefinementTerm::Friendly};
-        std::int64_t slice{0};
+        std::int64_t friendlySlice{0};
+        std::int64_t enemySlice{0};
         std::int64_t dualSlice{0};
         bool schedulable{true};
+        std::int64_t refinementWork{0};
+
+        std::int64_t & allowance()
+        {
+            if (next == MasterRefinementTerm::Friendly)
+            {
+                return friendlySlice;
+            }
+            if (next == MasterRefinementTerm::Enemy)
+            {
+                return enemySlice;
+            }
+            return dualSlice;
+        }
     };
 
     std::optional<MilliFunds> minimum(
@@ -143,6 +159,7 @@ namespace
         bool initialize(const CheapPricingModel* stock)
         {
             if (m_options.schedule.currentDualRounds < 0 || m_options.schedule.continuationSlice <= 0 ||
+                m_options.schedule.refinementGrowthFactor < 2 ||
                 m_options.schedule.futureDualAllowance <= 0 || m_options.schedule.nodesPerRefinement == 0 ||
                 m_options.schedule.incumbentRefinementStride == 0 ||
                 m_options.schedule.challengerRefinementBurst == 0 ||
@@ -623,6 +640,10 @@ namespace
                 if (!m_result.stats.firstImprovementWork)
                 {
                     m_result.stats.firstImprovementWork = m_ledger.stats().spent();
+                    if (m_options.profile != nullptr)
+                    {
+                        m_options.profile->recordFirstImprovement();
+                    }
                 }
             }
             if (m_ledger.stats().refusals != 0)
@@ -697,7 +718,8 @@ namespace
                 }
             }
             DeferredLeaf leaf{evaluation, upper, MasterRefinementTerm::Friendly,
-                              m_options.schedule.continuationSlice, m_options.schedule.futureDualAllowance};
+                              m_options.schedule.continuationSlice, m_options.schedule.continuationSlice,
+                              m_options.schedule.futureDualAllowance};
             leaf.schedulable = evaluation->status == MasterEvaluationStatus::Feasible &&
                                evaluation->quote() != nullptr && !evaluation->exact;
             m_leaves.push_back(std::move(leaf));
@@ -751,6 +773,12 @@ namespace
             if (incumbent != nullptr &&
                 m_result.stats.refinements % m_options.schedule.incumbentRefinementStride == 0)
             {
+                if (focused != nullptr && m_focusRemaining > 0 &&
+                    incumbent->refinementWork > focused->refinementWork)
+                {
+                    ++m_result.stats.workBalancedSelections;
+                    return focused;
+                }
                 return incumbent;
             }
             if (focused != nullptr && m_focusRemaining > 0)
@@ -765,23 +793,17 @@ namespace
             return selected;
         }
 
-        bool enemyCancelsInFocus() const
+        bool enemyCancelsInFocus()
         {
-            if (!m_incumbent || !m_refinementFocus ||
-                !m_incumbent->quote() || !m_refinementFocus->quote())
-            {
-                return false;
-            }
-            const auto & incumbent = *m_incumbent->quote();
-            const auto & challenger = *m_refinementFocus->quote();
-            return incumbent.identity.sameLiveModel(challenger.identity) &&
-                incumbent.capturedColumns == challenger.capturedColumns;
+            return m_incumbent && m_refinementFocus &&
+                m_evaluator.unresolvedCommonEnemy(*m_incumbent, *m_refinementFocus);
         }
 
         bool refineLeaf()
         {
             if (!chargeMasterWork(m_ledger, m_leaves.size() + 1, m_problem.actors().size() + 1,
-                                  RefinementWork::MasterExpansion))
+                                  RefinementWork::MasterExpansion) ||
+                !m_ledger.consume(REFINEMENT_ACCOUNTING_WORK, RefinementWork::MasterExpansion))
             {
                 m_result.budgetExhausted = true;
                 return false;
@@ -791,7 +813,15 @@ namespace
             {
                 return true;
             }
-            auto & leaf = *selected;
+            const auto workBefore = m_ledger.stats().spent();
+            const bool completed = refineSelectedLeaf(*selected);
+            // Each disjoint ledger delta includes refresh, eligibility and comparison work.
+            selected->refinementWork += m_ledger.stats().spent() - workBefore;
+            return completed;
+        }
+
+        bool refineSelectedLeaf(DeferredLeaf & leaf)
+        {
             if (!m_evaluator.refresh(*leaf.evaluation))
             {
                 if (m_ledger.stats().refusals != 0)
@@ -803,10 +833,16 @@ namespace
                 recordEvaluation(*leaf.evaluation);
                 return true;
             }
-            const auto allowance = leaf.next == MasterRefinementTerm::FutureDual ? leaf.dualSlice : leaf.slice;
+            auto & allowance = leaf.allowance();
+            const bool cancelEnemy = leaf.next == MasterRefinementTerm::Enemy && enemyCancelsInFocus();
+            if (m_ledger.stats().refusals != 0)
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
             const auto workBefore = m_ledger.stats().spent();
             auto status = MasterRefinementStatus::Unavailable;
-            if (leaf.next == MasterRefinementTerm::Enemy && enemyCancelsInFocus())
+            if (cancelEnemy)
             {
                 ++m_result.stats.cancelledEnemyRefinements;
             }
@@ -821,6 +857,7 @@ namespace
             }
             if (status == MasterRefinementStatus::BudgetExhausted)
             {
+                m_result.refinementRefusal = m_evaluator.refinementRefusal();
                 m_result.budgetExhausted = true;
                 return false;
             }
@@ -838,6 +875,18 @@ namespace
                 ++m_result.stats.proofFailures;
                 leaf.schedulable = false;
             }
+            if (status == MasterRefinementStatus::Updated)
+            {
+                const auto growth = m_options.schedule.refinementGrowthFactor;
+                if (allowance <= std::numeric_limits<std::int64_t>::max() / growth)
+                {
+                    allowance *= growth;
+                }
+                else
+                {
+                    leaf.schedulable = false;
+                }
+            }
             if (leaf.next == MasterRefinementTerm::Friendly)
             {
                 leaf.next = MasterRefinementTerm::Enemy;
@@ -846,16 +895,9 @@ namespace
             {
                 leaf.next = MasterRefinementTerm::FutureDual;
             }
-            else if (leaf.slice <= std::numeric_limits<std::int64_t>::max() / 2 &&
-                     leaf.dualSlice <= std::numeric_limits<std::int64_t>::max() / 2)
-            {
-                leaf.next = MasterRefinementTerm::Friendly;
-                leaf.slice *= 2;
-                leaf.dualSlice *= 2;
-            }
             else
             {
-                leaf.schedulable = false;
+                leaf.next = MasterRefinementTerm::Friendly;
             }
             if (leaf.evaluation->objective && leaf.evaluation->upperVerified)
             {

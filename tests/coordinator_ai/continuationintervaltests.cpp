@@ -749,6 +749,55 @@ namespace
         expect(!ledger.consume(1, RefinementWork::MasterBoundScan), "direct cumulative overflow fails closed");
         expectConserved(ledger, "maximum direct consumption remains conserved");
     }
+
+    void testReservationFailureReceipt()
+    {
+        using Coordinator::RefinementRefusalReason;
+        RefinementLedger ledger;
+        expect(ledger.open(10) && !ledger.lastRefusal(), "fresh ledger has no refusal receipt");
+        const auto grant = ledger.draw(7, RefinementWork::SearchSlice);
+        const auto before = coreOf(ledger);
+        expect(grant != NO_GRANT && ledger.draw(4, RefinementWork::SearchSlice) == NO_GRANT,
+               "refundable reservation can fail without consuming its available balance");
+        const auto first = ledger.lastRefusal();
+        expect(first && first->work == RefinementWork::SearchSlice &&
+                   first->reason == RefinementRefusalReason::Balance &&
+                   first->requested == 4 && first->balance == 3 && first->refundable,
+               "refusal records the exact request and balance at the failed operation");
+        expect(coreOf(ledger) == before && ledger.stats().refusals == 1,
+               "refusal metadata changes no existing accounting");
+        expect(!ledger.open(-1) && ledger.draw(-1, RefinementWork::SearchSlice) == NO_GRANT &&
+                   !ledger.consume(1, RefinementWork::Count) && !ledger.refund(NO_GRANT, 1) &&
+                   ledger.lastRefusal() == first,
+               "invalid inputs and refund errors do not replace a reservation failure");
+        expect(ledger.refund(grant, 7) && ledger.consume(2, RefinementWork::MasterExpansion) &&
+                   ledger.lastRefusal() == first && ledger.balance() == 8,
+               "later successful work preserves the historical failure's original balance");
+        const auto directBefore = coreOf(ledger);
+        expect(!ledger.consume(9, RefinementWork::MasterWitness), "direct reservation can be refused");
+        const auto direct = ledger.lastRefusal();
+        expect(direct && direct->work == RefinementWork::MasterWitness &&
+                   direct->reason == RefinementRefusalReason::Balance &&
+                   direct->requested == 9 && direct->balance == 8 && !direct->refundable &&
+                   coreOf(ledger) == directBefore && ledger.stats().refusals == 2,
+               "a later direct refusal replaces only the previous failure receipt");
+        expect(ledger.open(0) && !ledger.lastRefusal() && !ledger.consume(1, RefinementWork::MasterReplay) &&
+                   ledger.lastRefusal() && ledger.lastRefusal()->balance == 0,
+               "reopening resets refusal state before an exact-exhaustion receipt");
+        constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+        expect(ledger.open(maximum) && !ledger.lastRefusal(), "maximum reopening clears refusal state");
+        const auto maximumGrant = ledger.draw(maximum, RefinementWork::SearchSlice);
+        expect(maximumGrant != NO_GRANT && ledger.refund(maximumGrant, maximum),
+               "overflow receipt fixture restores its full balance");
+        const auto overflowBefore = coreOf(ledger);
+        expect(!ledger.consume(1, RefinementWork::MasterBoundScan), "cumulative accounting overflow is refused");
+        const auto overflow = ledger.lastRefusal();
+        expect(overflow && overflow->reason == RefinementRefusalReason::AccountingOverflow &&
+                   overflow->requested == 1 && overflow->balance == maximum && !overflow->refundable &&
+                   coreOf(ledger) == overflowBefore,
+               "overflow is distinguishable from an insufficient remaining allowance");
+        expectConserved(ledger, "refusal receipt lifecycle preserves ledger conservation");
+    }
 }
 
 int main()
@@ -766,6 +815,7 @@ int main()
     testRefinementLedgerRejectsAtomically();
     testRefinementLedgerExhaustionAndOverflow();
     testNonRefundableConsumption();
+    testReservationFailureReceipt();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

@@ -373,6 +373,20 @@ namespace MasterAssignmentTest
             return true;
         }
 
+        RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote) override
+        {
+            ++readinessCalls;
+            if (!owns(quote) || preparation.readinessWork < 0)
+            {
+                return {};
+            }
+            if (!m_ledger.consume(preparation.readinessWork, RefinementWork::MasterValuation))
+            {
+                return {.status = RelativeStockPreparationStatus::BudgetExhausted};
+            }
+            return preparation;
+        }
+
         RelativeStockDualTightening tightenOurUpperWithVerifiedDual(
             const RelativeStockQuote & quote, std::int64_t maximumWork) override
         {
@@ -489,6 +503,8 @@ namespace MasterAssignmentTest
         }
 
         std::uint64_t certificateCalls{0};
+        std::uint64_t readinessCalls{0};
+        RelativeStockCertificatePreparation preparation{.status = RelativeStockPreparationStatus::Ready};
         std::int64_t maximumCertificateAllowance{0};
         std::uint64_t proofCaptures{0};
         std::uint64_t verifiedCertificates{0};

@@ -123,6 +123,7 @@ bool resolveBehavior(const QString & name, GameEnums::AiBehavior & behavior)
 }
 
 const QString ArenaMatchConfig::FILE_NAME = QStringLiteral("arena_match.json");
+const QString ArenaMatchConfig::TIER_AUDIT_KEY = QStringLiteral("coordinatedTierAudit");
 
 bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config, QString & error)
 {
@@ -234,6 +235,15 @@ bool ArenaMatchConfig::load(const QString & path, ArenaMatchConfig & config,
     }
     config.resultFileName = resultValue.toString();
 
+    if (root.contains(TIER_AUDIT_KEY))
+    {
+        const auto value = root.value(TIER_AUDIT_KEY);
+        if (!value.isBool())
+        {
+            return reject(error, TIER_AUDIT_KEY + QStringLiteral(" must be a boolean"));
+        }
+        config.coordinatedTierAudit = value.toBool();
+    }
     if (root.contains("coordinatedRefinementWorkLimit"))
     {
         if (!readInteger(root, "coordinatedRefinementWorkLimit", 0,

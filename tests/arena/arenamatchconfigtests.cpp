@@ -89,7 +89,29 @@ bool refinementControls(const QString & path)
 {
     ArenaMatchConfig config;
     if (failed(!load(path, validConfig(), config) || config.coordinatedRefinementWorkLimit != -1 ||
-        !config.coordinatedRefinementReceiptFile.isEmpty()))
+        !config.coordinatedRefinementReceiptFile.isEmpty() || !config.coordinatedTierAudit))
+    {
+        return false;
+    }
+    for (const bool enabled : {false, true})
+    {
+        auto root = validConfig();
+        root[ArenaMatchConfig::TIER_AUDIT_KEY] = enabled;
+        if (failed(!load(path, root, config) || config.coordinatedTierAudit != enabled))
+        {
+            return false;
+        }
+    }
+    for (const QJsonValue & invalid : {QJsonValue{0}, QJsonValue{"false"}, QJsonValue{QJsonValue::Null}})
+    {
+        auto root = validConfig();
+        root[ArenaMatchConfig::TIER_AUDIT_KEY] = invalid;
+        if (failed(load(path, root, config)))
+        {
+            return false;
+        }
+    }
+    if (failed(!load(path, validConfig(), config) || !config.coordinatedTierAudit))
     {
         return false;
     }

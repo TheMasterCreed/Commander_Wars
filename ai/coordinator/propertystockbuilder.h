@@ -67,6 +67,22 @@ namespace Coordinator
     };
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct DiagnosticWarmStart
+    {
+        std::size_t witnesses{0};
+        std::size_t keyWidth{0};
+        std::size_t rows{0};
+        std::size_t columns{0};
+        std::optional<MilliFunds> seedValue;
+        MilliFunds floor{0};
+        MilliFunds repair{0};
+        MilliFunds booked{0};
+        std::int64_t states{0};
+        bool accepted{false};
+        bool selected{false};
+        bool witnessReplays{false};
+    };
+
     struct DiagnosticSequentialThresholdProof
     {
         SequentialThresholdResult proof;
@@ -81,7 +97,8 @@ namespace Coordinator
     class JointPlanStockValuer final : public PlanStockValuer
     {
     public:
-        JointPlanStockValuer(PropertyStockField & field, std::span<const KnownUnitLink> unitLinks);
+        JointPlanStockValuer(PropertyStockField & field, std::span<const KnownUnitLink> unitLinks,
+                            SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full);
         MilliFunds planStock(const TurnPlan & plan) override;
         MilliFunds originStock() const override;
         MilliFunds stockCeiling() const override;
@@ -107,9 +124,18 @@ namespace Coordinator
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         bool prepareDiagnosticContinuationPricing(
             ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit);
-        const SequentialTierResult & diagnosticLastOurRefinement() const
+        const SequentialTierResult* diagnosticLastOurRefinement() const
         {
-            return m_diagnosticLastOurRefinement;
+            return m_diagnosticLastOurRefinement ? &*m_diagnosticLastOurRefinement : nullptr;
+        }
+        const DiagnosticWarmStart* diagnosticLastWarmStart() const
+        {
+            return m_diagnosticLastWarmStart ? &*m_diagnosticLastWarmStart : nullptr;
+        }
+        static std::int64_t diagnosticWarmStartTariff(std::size_t witnesses, std::size_t keyWidth,
+                                                    std::size_t rows, std::size_t columns)
+        {
+            return warmStartTariff(witnesses, keyWidth, rows, columns);
         }
         DiagnosticSequentialThresholdProof
         diagnosticProveOurBelow(
@@ -153,7 +179,7 @@ namespace Coordinator
             {
                 return true;
             }
-            std::int64_t certificatePreparationWork() const override;
+            RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote) override;
             RelativeStockDualTightening
             tightenOurUpperWithVerifiedDual(
                 const RelativeStockQuote & quote,
@@ -218,6 +244,8 @@ namespace Coordinator
         std::int64_t ourRerunTariff() const;
         std::int64_t enemyRerunTariff(
             const std::vector<std::int32_t> & capturedColumns) const;
+        static std::int64_t warmStartTariff(std::size_t witnesses, std::size_t keyWidth,
+                                           std::size_t rows, std::size_t columns);
         std::int32_t liveDemandCapacity() const;
         bool buildCheapModel(std::span<const PlanRowAction> actions, bool retainSequentialRows = false);
         CheapRowTerms cheapRowTerms(
@@ -250,9 +278,17 @@ namespace Coordinator
             std::span<const PlanRowAction> actions,
             std::int64_t stateCap,
             bool captureWitness,
-            const RefinedWitness* pReplay = nullptr) const;
+            const RefinedWitness* pReplay = nullptr,
+            const SequentialWarmStart* pWarmStart = nullptr) const;
         OurSequentialProblem buildOurSequentialProblem(
             std::span<const PlanRowAction> actions) const;
+        static const PropertyStockActor* sequentialMover(
+            const PropertyStockField::JointActionFacts & facts, std::int32_t row);
+        static std::vector<std::int64_t> sequentialRowKey(
+            std::int32_t row, const PropertyStockActor* mover, std::span<const std::int32_t> capturedColumns);
+        ContinuationEntry* certificateEntry(const RelativeStockQuote & quote) const;
+        std::int64_t certificateReadinessTariff(const RelativeStockQuote & quote) const;
+        RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote);
         const PackingDualFieldIdentity &
         packingDualFieldIdentity() const;
         PackingDualProblemIdentity packingDualProblemIdentity(
@@ -288,9 +324,11 @@ namespace Coordinator
             const std::vector<std::int32_t> & capturedColumns,
             std::int64_t stateCap,
             bool captureWitness,
-            const RefinedWitness* pReplay = nullptr) const;
+            const RefinedWitness* pReplay = nullptr,
+            const SequentialWarmStart* pWarmStart = nullptr) const;
 
         PropertyStockField & m_field;
+        const SequentialTierAuditMode m_tierAuditMode;
         std::map<std::int32_t, std::int32_t> m_knowledgeOf;
         mutable bool m_ourStateBuilt{false};
         mutable std::vector<std::int32_t> m_ourNodeSlots;
@@ -307,15 +345,18 @@ namespace Coordinator
                          SequentialDetail::CachedRowEnumeration>
             m_rowOptionCache;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+        void recordWarmStart(std::size_t witnesses, std::size_t keyWidth, std::size_t rows, std::size_t columns,
+                             const std::optional<SequentialWarmStart> & seed,
+                             const SequentialTierResult & tier, bool witnessReplays);
+        std::optional<DiagnosticWarmStart> m_diagnosticLastWarmStart;
         mutable std::set<std::vector<std::int64_t>>
             m_rowOptionPaidKeys;
-        SequentialTierResult m_diagnosticLastOurRefinement;
+        std::optional<SequentialTierResult> m_diagnosticLastOurRefinement;
 #endif
         std::unique_ptr<PropertyStockField> m_pricingField;
         std::optional<RelativeSession> m_relativeSession;
         CheapPricingModel m_cheapModel;
         std::shared_ptr<const MasterFutureCatalog> m_masterFutureCatalog;
-        std::int64_t m_masterOurSearchStates{0};
         MasterAssignmentProfile* m_masterProfile{nullptr};
         mutable CheapUpperState m_cheapState;
         ContinuationPricingState m_pricingState{

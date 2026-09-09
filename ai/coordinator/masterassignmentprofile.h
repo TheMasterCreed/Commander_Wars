@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 
 namespace Coordinator
 {
@@ -22,6 +23,21 @@ namespace Coordinator
         LowerWitness,
         ContinuationRefinement,
         LeafReplay,
+        FriendlySetup,
+        FriendlySearch,
+        EnemySetup,
+        EnemySearch,
+        SequentialReplay,
+        ProofCapture,
+        ProofCopy,
+        ProofReplay,
+        TierArchiveCopy,
+        NativeCertificateSetup,
+        NativeCertificateIdentity,
+        NativeCertificateReadiness,
+        NativeCertificateCatalog,
+        NativeCertificateOptimization,
+        NativeCertificateVerification,
         Count,
     };
 
@@ -29,6 +45,10 @@ namespace Coordinator
         "shadow", "extraction", "catalog", "search", "initialIncumbent", "boundPreparation",
         "expansion", "boundScan", "dualOptimization", "certificateVerification", "quote",
         "lowerWitness", "continuationRefinement", "leafReplay",
+        "friendlySetup", "friendlySearch", "enemySetup", "enemySearch",
+        "sequentialReplay", "proofCapture", "proofCopy", "proofReplay", "tierArchiveCopy",
+        "nativeCertificateSetup", "nativeCertificateIdentity", "nativeCertificateReadiness",
+        "nativeCertificateCatalog", "nativeCertificateOptimization", "nativeCertificateVerification",
     };
 
     struct MasterPhaseSample
@@ -39,6 +59,7 @@ namespace Coordinator
     };
 
     class MasterProfileScope;
+    struct SequentialCostAudit;
 
     class MasterAssignmentProfile final
     {
@@ -46,7 +67,11 @@ namespace Coordinator
         MasterAssignmentProfile() = default;
         MasterAssignmentProfile(const MasterAssignmentProfile &) = delete;
         MasterAssignmentProfile & operator=(const MasterAssignmentProfile &) = delete;
+        void recordFirstImprovement();
         std::array<MasterPhaseSample, MASTER_PHASE_NAMES.size()> samples{};
+        std::optional<std::int64_t> firstImprovementNanos;
+        SequentialCostAudit* friendlySequentialCost{nullptr};
+        SequentialCostAudit* enemySequentialCost{nullptr};
 
     private:
         friend class MasterProfileScope;
@@ -70,6 +95,11 @@ namespace Coordinator
 
         ~MasterProfileScope()
         {
+            finish();
+        }
+
+        void finish()
+        {
             if (m_profile != nullptr)
             {
                 const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - m_start).count();
@@ -82,6 +112,7 @@ namespace Coordinator
                     m_parent->m_nestedNanos += elapsed;
                 }
                 m_profile->m_active = m_parent;
+                m_profile = nullptr;
             }
         }
 
@@ -89,6 +120,7 @@ namespace Coordinator
         MasterProfileScope & operator=(const MasterProfileScope &) = delete;
 
     private:
+        friend class MasterAssignmentProfile;
         using Clock = std::chrono::steady_clock;
         MasterAssignmentProfile* m_profile;
         MasterPhase m_phase;
@@ -96,4 +128,19 @@ namespace Coordinator
         Clock::time_point m_start;
         std::int64_t m_nestedNanos{0};
     };
+
+    inline void MasterAssignmentProfile::recordFirstImprovement()
+    {
+        if (firstImprovementNanos || m_active == nullptr)
+        {
+            return;
+        }
+        const auto* root = m_active;
+        while (root->m_parent != nullptr)
+        {
+            root = root->m_parent;
+        }
+        firstImprovementNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            MasterProfileScope::Clock::now() - root->m_start).count();
+    }
 }

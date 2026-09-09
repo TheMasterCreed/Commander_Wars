@@ -1,7 +1,25 @@
 #include "ai/coordinator/masterassignmenttrace.h"
+#include "ai/coordinator/masterassignmentshadow.h"
 
 namespace
 {
+    bool liveEvaluation(const Coordinator::MasterShadowObservation & observation,
+                        const Coordinator::MasterAssignmentEvaluation & evaluation)
+    {
+        if (observation.capture == nullptr || !observation.capture->extraction.valid() ||
+            !Coordinator::validMasterState(*observation.capture->extraction.problem, evaluation.state))
+        {
+            return false;
+        }
+        if (!evaluation.lowerReplayed)
+        {
+            return true;
+        }
+        return observation.session != nullptr && evaluation.proof &&
+            observation.session->owns(evaluation.proof->quote) &&
+            observation.session->replayLowerProof(*evaluation.proof);
+    }
+
     QJsonArray tile(Coordinator::TilePoint point)
     {
         return {point.x, point.y};
@@ -35,6 +53,49 @@ namespace
 
 namespace Coordinator
 {
+    bool masterShadowProofsMatch(const MasterShadowObservation & observation)
+    {
+        if (observation.search == nullptr)
+        {
+            return true;
+        }
+        const auto & result = *observation.search;
+        if ((result.incumbent && !liveEvaluation(observation, *result.incumbent)) ||
+            (result.best && !liveEvaluation(observation, *result.best)))
+        {
+            return false;
+        }
+        if (!result.improvement)
+        {
+            return true;
+        }
+        const auto & proof = *result.improvement;
+        if (!proof.incumbent.lowerReplayed || !proof.incumbent.upperVerified ||
+            !proof.challenger.lowerReplayed || !proof.challenger.upperVerified ||
+            !proof.incumbent.replay || !proof.challenger.replay ||
+            !proof.incumbent.proof || !proof.challenger.proof ||
+            !liveEvaluation(observation, proof.incumbent) || !liveEvaluation(observation, proof.challenger))
+        {
+            return false;
+        }
+        auto incumbent = *proof.incumbent.quote();
+        auto challenger = *proof.challenger.quote();
+        if (incumbent.economic != 0 || challenger.economic != 0)
+        {
+            return false;
+        }
+        // Historical stock snapshots use the shared comparator with their recorded seated economics.
+        incumbent.economic = proof.incumbent.replay->seatedEconomicTotal;
+        challenger.economic = proof.challenger.replay->seatedEconomicTotal;
+        const auto comparison = compareRelativeStock(incumbent, challenger);
+        return comparison.improves() && comparison.deltaLower == proof.comparison.deltaLower &&
+            comparison.deltaUpper == proof.comparison.deltaUpper &&
+            comparison.economicDelta == proof.comparison.economicDelta &&
+            comparison.ownedDelta == proof.comparison.ownedDelta &&
+            comparison.commonEnemyCancelled == proof.comparison.commonEnemyCancelled &&
+            comparison.reason == proof.comparison.reason;
+    }
+
     QJsonArray masterChoicesRecord(std::span<const std::int32_t> choices)
     {
         QJsonArray result;
@@ -75,6 +136,40 @@ namespace Coordinator
             {"refundClamps", QString::number(work.refundClamps)}};
     }
 
+    QJsonObject masterRefusalRecord(const std::optional<RefinementRefusal> & refusal)
+    {
+        if (!refusal)
+        {
+            return {};
+        }
+        return {{"work", static_cast<int>(refusal->work)}, {"reason", static_cast<int>(refusal->reason)},
+            {"requested", QString::number(refusal->requested)}, {"balance", QString::number(refusal->balance)},
+            {"refundable", refusal->refundable}};
+    }
+
+    QJsonObject masterRefinementRefusalRecord(const std::optional<MasterRefinementRefusal> & refusal)
+    {
+        if (!refusal)
+        {
+            return {};
+        }
+        return {{"term", static_cast<int>(refusal->term)}, {"requested", QString::number(refusal->requested)},
+            {"balance", QString::number(refusal->balance)}, {"allowance", QString::number(refusal->allowance)},
+            {"preparation", QString::number(refusal->preparation)}};
+    }
+
+    QJsonObject masterCertificatePreparationRecord(
+        const std::optional<RelativeStockCertificatePreparation> & preparation)
+    {
+        if (!preparation)
+        {
+            return {};
+        }
+        return {{"status", static_cast<int>(preparation->status)},
+            {"readinessWork", QString::number(preparation->readinessWork)},
+            {"scanWork", QString::number(preparation->scanWork)}};
+    }
+
     QJsonObject masterSearchRecord(const MasterAssignmentSearchResult & result)
     {
         QJsonArray residual;
@@ -102,6 +197,7 @@ namespace Coordinator
         QJsonObject record{
             {"schedule", QJsonObject{{"currentDualRounds", result.schedule.currentDualRounds},
                 {"continuationSlice", QString::number(result.schedule.continuationSlice)},
+                {"refinementGrowthFactor", QString::number(result.schedule.refinementGrowthFactor)},
                 {"futureDualAllowance", QString::number(result.schedule.futureDualAllowance)},
                 {"futureBounds", static_cast<int>(result.schedule.futureBounds)},
                 {"incumbentCompletions", result.schedule.incumbentCompletions},
@@ -123,6 +219,7 @@ namespace Coordinator
             {"incumbentCompletions", QString::number(result.stats.incumbentCompletions)},
             {"incumbentRefinements", QString::number(result.stats.incumbentRefinements)},
             {"cancelledEnemyRefinements", QString::number(result.stats.cancelledEnemyRefinements)},
+            {"workBalancedSelections", QString::number(result.stats.workBalancedSelections)},
             {"evaluationCacheHits", QString::number(result.stats.evaluationCacheHits)},
             {"infeasible", QString::number(result.stats.infeasible)}, {"pruned", QString::number(result.stats.pruned)},
             {"unsupported", QString::number(result.stats.unsupported)},

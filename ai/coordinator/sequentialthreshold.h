@@ -204,12 +204,7 @@ namespace Coordinator
             return true;
         }
 
-        struct ThresholdPackedRow
-        {
-            std::int32_t row{NO_STOCK_ROW};
-            std::span<const SequentialDetail::RowOption> options;
-            MilliFunds bestValue{0};
-        };
+        using ThresholdPackedRow = SequentialDetail::PackedRow;
 
         struct ThresholdNode
         {
@@ -246,27 +241,13 @@ namespace Coordinator
             MilliFunds globalUpper,
             MilliFunds & upper)
         {
-            upper = value;
-            for (std::size_t row = depth;
-                 row < rows.size();
-                 ++row)
+            const auto compatibleUpper = SequentialDetail::compatibleRowUpper(
+                rows, depth, value, used, [] { return true; });
+            if (!compatibleUpper)
             {
-                MilliFunds best = 0;
-                for (const SequentialDetail::RowOption & option :
-                     rows[row].options)
-                {
-                    if (compatible(option.nodes, used))
-                    {
-                        best = option.value;
-                        break;
-                    }
-                }
-                if (!checkedAdd(upper, best, upper))
-                {
-                    return false;
-                }
+                return false;
             }
-            upper = std::min(upper, globalUpper);
+            upper = std::min(*compatibleUpper, globalUpper);
             return true;
         }
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace Coordinator
@@ -33,6 +34,24 @@ namespace Coordinator
     using GrantId = std::int32_t;
     constexpr GrantId NO_GRANT = -1;
 
+    enum class RefinementRefusalReason : std::int8_t
+    {
+        Balance,
+        AccountingOverflow,
+        GrantCapacity,
+    };
+
+    struct RefinementRefusal
+    {
+        RefinementWork work;
+        RefinementRefusalReason reason;
+        std::int64_t requested;
+        std::int64_t balance;
+        bool refundable;
+
+        bool operator==(const RefinementRefusal &) const = default;
+    };
+
     struct RefinementLedgerStats
     {
         std::int64_t total{0};
@@ -44,6 +63,8 @@ namespace Coordinator
         std::array<std::int64_t, REFINEMENT_WORK_CLASSES> grantedByWork{};
         std::array<std::int64_t, REFINEMENT_WORK_CLASSES> refundedByWork{};
         std::array<std::int64_t, REFINEMENT_WORK_CLASSES> refusalsByWork{};
+
+        bool operator==(const RefinementLedgerStats &) const = default;
 
         std::int64_t spent() const
         {
@@ -64,6 +85,7 @@ namespace Coordinator
             m_stats.total = total;
             m_balance = total;
             m_grants.clear();
+            m_lastRefusal.reset();
             assertConservation();
             return true;
         }
@@ -142,6 +164,11 @@ namespace Coordinator
             return m_stats;
         }
 
+        const std::optional<RefinementRefusal> & lastRefusal() const
+        {
+            return m_lastRefusal;
+        }
+
         std::size_t retainedGrantCount() const
         {
             return m_grants.size();
@@ -165,7 +192,7 @@ namespace Coordinator
                 states > std::numeric_limits<std::int64_t>::max() - m_stats.granted ||
                 (needsRecord && m_grants.size() > static_cast<std::size_t>(std::numeric_limits<GrantId>::max())))
             {
-                recordRefusal(static_cast<std::size_t>(workValue));
+                recordRefusal(states, work, needsRecord);
                 assertConservation();
                 return false;
             }
@@ -179,8 +206,19 @@ namespace Coordinator
             m_stats.grantedByWork[static_cast<std::size_t>(work)] += states;
         }
 
-        void recordRefusal(std::size_t slot)
+        void recordRefusal(std::int64_t states, RefinementWork work, bool refundable)
         {
+            auto reason = RefinementRefusalReason::GrantCapacity;
+            if (states > m_balance)
+            {
+                reason = RefinementRefusalReason::Balance;
+            }
+            else if (states > std::numeric_limits<std::int64_t>::max() - m_stats.granted)
+            {
+                reason = RefinementRefusalReason::AccountingOverflow;
+            }
+            m_lastRefusal = RefinementRefusal{work, reason, states, m_balance, refundable};
+            const auto slot = static_cast<std::size_t>(work);
             if (m_stats.refusals < std::numeric_limits<std::int64_t>::max())
             {
                 ++m_stats.refusals;
@@ -220,5 +258,6 @@ namespace Coordinator
         std::int64_t m_balance{0};
         std::vector<GrantRecord> m_grants;
         RefinementLedgerStats m_stats;
+        std::optional<RefinementRefusal> m_lastRefusal;
     };
 }

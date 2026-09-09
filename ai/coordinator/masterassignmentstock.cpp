@@ -99,7 +99,7 @@ namespace Coordinator
 
     MasterStockSetupStatus MasterAssignmentStockContext::prepare(
         const PropertyStockField & source, const AssignmentInput & input, RefinementLedger & ledger,
-        MasterAssignmentProfile* profile)
+        MasterAssignmentProfile* profile, SequentialTierAuditMode auditMode)
     {
         MasterProfileScope timing(profile, MasterPhase::Catalog);
         if (m_status != MasterStockSetupStatus::Unprepared)
@@ -150,7 +150,7 @@ namespace Coordinator
             m_status = MasterStockSetupStatus::BudgetExhausted;
             return m_status;
         }
-        m_valuer = std::make_unique<JointPlanStockValuer>(m_field, input.unitLinks);
+        m_valuer = std::make_unique<JointPlanStockValuer>(m_field, input.unitLinks, auditMode);
         auto catalog = m_valuer->continuationPricingCatalog(input);
         if (!catalog.valid)
         {

@@ -48,6 +48,17 @@ namespace Coordinator
                m_problemIdentity.sameLiveProblem(problem.identity()) && &m_ledger == &ledger;
     }
 
+    const std::optional<MasterRefinementRefusal> & MasterAssignmentEvaluator::refinementRefusal() const
+    {
+        return m_refinementRefusal;
+    }
+
+    const std::optional<RelativeStockCertificatePreparation> &
+    MasterAssignmentEvaluator::certificatePreparation() const
+    {
+        return m_certificatePreparation;
+    }
+
     std::optional<std::int64_t> MasterAssignmentEvaluator::replayTariff(
         const MasterAssignmentState & state)
     {
@@ -212,10 +223,68 @@ namespace Coordinator
         return evaluation.status == MasterEvaluationStatus::Feasible && price(evaluation);
     }
 
+    MasterRefinementStatus MasterAssignmentEvaluator::refineCertificate(
+        MasterAssignmentEvaluation & evaluation, std::int64_t allowance)
+    {
+        if (!m_session->supportsVerifiedDual())
+        {
+            return MasterRefinementStatus::Unavailable;
+        }
+        const auto balanceBefore = m_ledger.balance();
+        m_certificatePreparation = m_session->prepareOurCertificate(*evaluation.quote());
+        const auto & preparation = *m_certificatePreparation;
+        if (m_session->remainingWork() != m_ledger.balance() || preparation.readinessWork < 0 ||
+            preparation.readinessWork != balanceBefore - m_ledger.balance() || preparation.scanWork < 0)
+        {
+            return MasterRefinementStatus::Invalid;
+        }
+        if (preparation.status == RelativeStockPreparationStatus::BudgetExhausted)
+        {
+            return MasterRefinementStatus::BudgetExhausted;
+        }
+        if (preparation.status == RelativeStockPreparationStatus::MissingRows)
+        {
+            return MasterRefinementStatus::Unavailable;
+        }
+        if (preparation.status != RelativeStockPreparationStatus::Ready)
+        {
+            return MasterRefinementStatus::Invalid;
+        }
+        auto preflight = preparation.scanWork;
+        auto total = allowance;
+        if (m_tariffs.certificateIdentity < 0 ||
+            !RelativeStockDetail::checkedAdd(preflight, m_tariffs.certificateIdentity) ||
+            !RelativeStockDetail::checkedAdd(preflight, m_tariffs.witness) ||
+            !RelativeStockDetail::checkedAdd(total, m_tariffs.quote) ||
+            !RelativeStockDetail::checkedAdd(total, m_tariffs.witness) ||
+            !RelativeStockDetail::checkedAdd(total, preflight))
+        {
+            return MasterRefinementStatus::Invalid;
+        }
+        if (m_ledger.balance() < total)
+        {
+            m_refinementRefusal = MasterRefinementRefusal{
+                MasterRefinementTerm::FutureDual, total, m_ledger.balance(), allowance, preparation.scanWork};
+            return MasterRefinementStatus::BudgetExhausted;
+        }
+        if (!m_ledger.consume(preflight, RefinementWork::MasterValuation))
+        {
+            return MasterRefinementStatus::BudgetExhausted;
+        }
+        const auto tightened = m_session->tightenOurUpperWithVerifiedDual(*evaluation.quote(), allowance);
+        if (tightened.globalFailure)
+        {
+            return MasterRefinementStatus::Invalid;
+        }
+        return refresh(evaluation) ? MasterRefinementStatus::Updated : MasterRefinementStatus::Invalid;
+    }
+
     MasterRefinementStatus MasterAssignmentEvaluator::refine(
         MasterAssignmentEvaluation & evaluation, MasterRefinementTerm term, std::int64_t allowance)
     {
         MasterProfileScope timing(m_profile, MasterPhase::ContinuationRefinement);
+        m_refinementRefusal.reset();
+        m_certificatePreparation.reset();
         const auto* quote = evaluation.quote();
         if (m_session == nullptr || quote == nullptr || allowance <= 0 ||
             m_ledger.balance() != m_session->remainingWork())
@@ -237,34 +306,7 @@ namespace Coordinator
         }
         if (term == MasterRefinementTerm::FutureDual)
         {
-            if (!m_session->supportsVerifiedDual())
-            {
-                return MasterRefinementStatus::Unavailable;
-            }
-            auto total = allowance;
-            auto preflight = m_session->certificatePreparationWork();
-            if (preflight < 0 || m_tariffs.certificateIdentity < 0 ||
-                !RelativeStockDetail::checkedAdd(preflight, m_tariffs.certificateIdentity) ||
-                !RelativeStockDetail::checkedAdd(preflight, m_tariffs.witness) ||
-                !RelativeStockDetail::checkedAdd(total, overhead) ||
-                !RelativeStockDetail::checkedAdd(total, preflight))
-            {
-                return MasterRefinementStatus::Invalid;
-            }
-            if (m_ledger.balance() < total)
-            {
-                return MasterRefinementStatus::BudgetExhausted;
-            }
-            if (m_ledger.draw(preflight, RefinementWork::MasterValuation) == NO_GRANT)
-            {
-                return MasterRefinementStatus::BudgetExhausted;
-            }
-            const auto tightened = m_session->tightenOurUpperWithVerifiedDual(*quote, allowance);
-            if (tightened.globalFailure)
-            {
-                return MasterRefinementStatus::Invalid;
-            }
-            return refresh(evaluation) ? MasterRefinementStatus::Updated : MasterRefinementStatus::Invalid;
+            return refineCertificate(evaluation, allowance);
         }
         const auto tariff = term == MasterRefinementTerm::Friendly ? m_session->ourRerunWork()
             : m_session->enemyRerunWork(quote->capturedColumns);
@@ -277,6 +319,8 @@ namespace Coordinator
         }
         if (m_ledger.balance() < total)
         {
+            m_refinementRefusal = MasterRefinementRefusal{
+                term, total, m_ledger.balance(), allowance, tariff};
             return MasterRefinementStatus::BudgetExhausted;
         }
         if (m_ledger.draw(m_tariffs.quote, RefinementWork::MasterValuation) == NO_GRANT)
@@ -307,8 +351,15 @@ namespace Coordinator
                 return result;
             }
         }
-        result.economicDelta = challenger.replay->seatedEconomicTotal;
-        if (!RelativeStockDetail::checkedSubtract(result.economicDelta, incumbent.replay->seatedEconomicTotal) ||
+        return includeSeatedEconomics(result, incumbent.replay->seatedEconomicTotal,
+                                     challenger.replay->seatedEconomicTotal);
+    }
+
+    RelativeStockComparison MasterAssignmentEvaluator::includeSeatedEconomics(
+        RelativeStockComparison result, MilliFunds incumbent, MilliFunds challenger)
+    {
+        result.economicDelta = challenger;
+        if (!RelativeStockDetail::checkedSubtract(result.economicDelta, incumbent) ||
             !RelativeStockDetail::checkedAdd(result.deltaLower, result.economicDelta) ||
             !RelativeStockDetail::checkedAdd(result.deltaUpper, result.economicDelta))
         {
@@ -318,5 +369,44 @@ namespace Coordinator
         result.reason = result.deltaLower > 0 ? RelativeStockReason::CertifiedPositive
             : result.deltaUpper <= 0 ? RelativeStockReason::CertifiedNonImprovement : RelativeStockReason::Overlap;
         return result;
+    }
+
+    bool MasterAssignmentEvaluator::unresolvedCommonEnemy(
+        const MasterAssignmentEvaluation & incumbent, const MasterAssignmentEvaluation & challenger)
+    {
+        if (m_session == nullptr || incumbent.status != MasterEvaluationStatus::Feasible ||
+            challenger.status != MasterEvaluationStatus::Feasible ||
+            incumbent.objectiveStatus != MasterObjectiveStatus::Verified ||
+            challenger.objectiveStatus != MasterObjectiveStatus::Verified ||
+            !incumbent.replay || !challenger.replay || !incumbent.proof || !challenger.proof ||
+            !incumbent.lowerReplayed || !challenger.lowerReplayed ||
+            !incumbent.upperVerified || !challenger.upperVerified ||
+            !m_problemIdentity.sameLiveProblem(incumbent.state.identity) ||
+            !m_problemIdentity.sameLiveProblem(challenger.state.identity))
+        {
+            return false;
+        }
+        const auto & left = incumbent.proof->quote;
+        const auto & right = challenger.proof->quote;
+        constexpr std::int64_t scalarWork = 32;
+        constexpr std::size_t canonicalPasses = 4;
+        const auto entries = left.key.size() + right.key.size() +
+                             left.capturedColumns.size() + right.capturedColumns.size();
+        const auto scans = masterWorkProduct(entries, canonicalPasses);
+        auto work = scalarWork;
+        if (!scans || !RelativeStockDetail::checkedAdd(work, *scans) ||
+            !m_ledger.consume(work, RefinementWork::MasterValuation) ||
+            !m_session->owns(left) || !m_session->owns(right))
+        {
+            return false;
+        }
+        const auto relative = compareRelativeStock(left, right);
+        if (!relative.valid())
+        {
+            return false;
+        }
+        const auto full = includeSeatedEconomics(relative, incumbent.replay->seatedEconomicTotal,
+                                               challenger.replay->seatedEconomicTotal);
+        return full.valid() && full.commonEnemyCancelled && full.unresolved();
     }
 }

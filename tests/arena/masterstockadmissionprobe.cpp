@@ -1,10 +1,16 @@
 #include <algorithm>
+#include <array>
 #include <limits>
+
+#include <QFile>
+#include <QJsonDocument>
+#include <QTemporaryDir>
 
 #include "ai/coreai.h"
 #include "ai/coordinator/battlefieldknowledge.h"
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/masterassignmentstock.h"
+#include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
@@ -13,6 +19,7 @@
 #include "game/gamerules.h"
 #include "game/player.h"
 #include "tests/arena/arenatestsupport.h"
+#include "tests/arena/masterassignmentprobe.h"
 
 namespace
 {
@@ -26,6 +33,106 @@ namespace
     constexpr bool SAVEGAME_LOAD = false;
     constexpr std::int64_t FIXTURE_ALLOWANCE = 1000000;
     constexpr std::int64_t AFFORDABLE_REFINEMENT = 4096;
+
+    class MemoryShadowInspection final : public MasterShadowInspection
+    {
+    public:
+        void completed(const MasterShadowObservation & observation) override
+        {
+            ++calls;
+            record = ArenaMasterAssignmentProbe::inspectShadow(observation);
+        }
+
+        std::int32_t calls{0};
+        QJsonObject record;
+    };
+
+    QVariantMap checkShadowExports(const PropertyStockField & field)
+    {
+        QTemporaryDir outputDirectory;
+        if (!outputDirectory.isValid())
+        {
+            return {{"ok", false}, {"error", QStringLiteral("could not isolate shadow-export fixture")}};
+        }
+        bool valid = true;
+        std::int32_t observations = 0;
+        for (const auto audit : {QByteArray("full"), QByteArray("counters")})
+        {
+            for (const auto allowance : std::array<std::int64_t, 4>{0, 1, 2, FIXTURE_ALLOWANCE})
+            {
+                std::optional<QJsonObject> expected;
+                for (const auto exportMode : {QByteArray("full"), QByteArray("off")})
+                {
+                    const auto path = outputDirectory.path() + QStringLiteral("/observation-%1.jsonl").arg(observations);
+                    const auto config = parseMasterShadowConfig("shadow", QByteArray::number(allowance), path, audit, exportMode);
+                    AssignmentInput input;
+                    RefinementLedger ledger;
+                    RefinementLedger legacy;
+                    valid = legacy.open(0) && config.enabled() && valid;
+                    prepareMasterShadow(config, input, ledger);
+                    const auto incumbent = MaximumValueAssignment::assign(input);
+                    MemoryShadowInspection inspection;
+                    const auto measured = observeMasterAssignment(config, input, incumbent, field, legacy, ledger,
+                        {.day = 1, .playerId = OBSERVER_PLAYER, .planSequence = 1,
+                         .horizonTurns = DEFAULT_ECONOMIC_RELEVANCE_HORIZON}, &inspection);
+                    auto record = inspection.record.value("record").toObject();
+                    record.remove("profile");
+                    valid = valid && inspection.calls == 1 &&
+                        inspection.record.value("ownedSnapshotsVerified").toBool() &&
+                        inspection.record.value("workUnchanged").toBool() &&
+                        measured.legacyPlanUnchanged && measured.legacyLedgerUnchanged;
+                    if (expected)
+                    {
+                        valid = valid && *expected == record;
+                    }
+                    else
+                    {
+                        expected = record;
+                    }
+                    if (exportMode == "off")
+                    {
+                        valid = valid && measured.exportRecords == 0 && measured.exportBytes == 0 &&
+                            measured.recordNanos == 0 && measured.encodingNanos == 0 &&
+                            measured.outputNanos == 0 && !QFile::exists(path);
+                        AssignmentInput quietInput;
+                        RefinementLedger quietLedger;
+                        prepareMasterShadow(config, quietInput, quietLedger);
+                        const auto quietIncumbent = MaximumValueAssignment::assign(quietInput);
+                        const auto quiet = observeMasterAssignment(config, quietInput, quietIncumbent, field,
+                            legacy, quietLedger, {.day = 1, .playerId = OBSERVER_PLAYER, .planSequence = 1,
+                                                  .horizonTurns = DEFAULT_ECONOMIC_RELEVANCE_HORIZON});
+                        valid = valid && quietLedger.stats() == ledger.stats() && quiet.outcome == measured.outcome &&
+                            quiet.firstImprovementWork == measured.firstImprovementWork &&
+                            quiet.improvementLower == measured.improvementLower && quiet.gap == measured.gap &&
+                            quiet.inspectionNanos == 0 && quiet.exportRecords == 0 && quiet.exportBytes == 0 &&
+                            quiet.recordNanos == 0 && quiet.encodingNanos == 0 &&
+                            quiet.outputNanos == 0 && !QFile::exists(path);
+                    }
+                    else
+                    {
+                        QFile file(path);
+                        valid = valid && measured.exportRecords == 1 && measured.exportBytes > 0 &&
+                            measured.exportSucceeded && file.open(QIODevice::ReadOnly);
+                        auto exported = QJsonDocument::fromJson(file.readAll()).object();
+                        exported.remove("profile");
+                        exported.remove("observeNanosBeforeWrite");
+                        valid = valid && exported == record;
+                    }
+                    ++observations;
+                }
+            }
+        }
+        AssignmentInput input;
+        AssignmentResult incumbent;
+        RefinementLedger legacy;
+        RefinementLedger ledger;
+        const auto before = ledger.stats();
+        MemoryShadowInspection disabledInspection;
+        const auto disabled = observeMasterAssignment({}, input, incumbent, field, legacy, ledger, {}, &disabledInspection);
+        valid = valid && disabled.totalNanos == 0 && disabled.exportRecords == 0 &&
+            disabledInspection.calls == 0 && ledger.stats() == before;
+        return {{"ok", valid}, {"observations", observations}, {"disabledNeutral", disabledInspection.calls == 0}};
+    }
 
     std::optional<PropertyStockField> buildField(GameMap & map, QString & error)
     {
@@ -116,7 +223,9 @@ namespace
             directCallFailsClosed = fresh.valid && fresh.ours.exact() && !fresh.enemy.exact() &&
                 direct.globalFailure && !direct.certificateValid;
         }
-        return {{"ok", unchanged && healthy && enemyHealthy && directCallFailsClosed},
+        const auto exports = checkShadowExports(field);
+        return {{"ok", unchanged && healthy && enemyHealthy && directCallFailsClosed && exports.value("ok").toBool()},
+            {"shadowExports", exports},
             {"initial", initial.toVariantMap()}, {"final", masterEvaluationRecord(evaluation).toVariantMap()},
             {"affordableStatus", static_cast<int>(affordable)}, {"oversizedStatus", static_cast<int>(oversized)},
             {"proofAndWorkUnchanged", unchanged}, {"sessionHealthy", healthy}, {"enemyRefinementHealthy", enemyHealthy},

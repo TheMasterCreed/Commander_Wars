@@ -1,4 +1,5 @@
 #include <array>
+#include <map>
 
 #include <QCoreApplication>
 #include <QDir>
@@ -12,6 +13,86 @@ namespace
 {
     using namespace Coordinator;
     using namespace MasterAssignmentTest;
+
+    class RefinementAllowanceObserver final : public MasterAssignmentSearchObserver
+    {
+    public:
+        explicit RefinementAllowanceObserver(const MasterAssignmentSchedule & schedule)
+            : m_schedule(schedule)
+        {
+        }
+
+        void evaluated(const MasterAssignmentEvaluation &, std::int64_t) override
+        {
+        }
+
+        void compared(const MasterAssignmentEvaluation &, const RelativeStockComparison &,
+                      std::int64_t) override
+        {
+        }
+
+        void refined(const MasterAssignmentEvaluation & evaluation, MasterRefinementTerm term,
+                     std::int64_t allowance, MasterRefinementStatus status,
+                     std::int64_t workBefore, std::int64_t workAfter) override
+        {
+            if (!firstRefinementWorkBefore)
+            {
+                firstRefinementWorkBefore = workBefore;
+            }
+            if (!firstCancelledWork && term == MasterRefinementTerm::Enemy &&
+                status == MasterRefinementStatus::Unavailable && evaluation.quote() &&
+                !evaluation.quote()->enemy.exact())
+            {
+                firstCancelledWork = workBefore;
+                firstCancelledEvent = refinementEvents;
+            }
+            ++refinementEvents;
+            const auto initial = term == MasterRefinementTerm::FutureDual
+                ? m_schedule.futureDualAllowance : m_schedule.continuationSlice;
+            auto [entry, inserted] = m_allowances.try_emplace(
+                std::pair{evaluation.state.choices, term}, Allowance{initial});
+            auto & expected = entry->second;
+            expect(!expected.exhausted, "overflowed continuation growth cannot schedule another attempt");
+            expect(allowance == expected.next, "skipped refinement cannot inflate its next native allowance");
+            if (status == MasterRefinementStatus::Updated)
+            {
+                resumedEnemy += expected.skipped && term == MasterRefinementTerm::Enemy;
+                expected.skipped = false;
+                const auto growth = m_schedule.refinementGrowthFactor;
+                expected.exhausted = allowance > std::numeric_limits<std::int64_t>::max() / growth;
+                overflowedGrowth += expected.exhausted;
+                if (!expected.exhausted)
+                {
+                    expected.next = allowance * growth;
+                }
+            }
+            else if (status == MasterRefinementStatus::Unavailable)
+            {
+                expect(workBefore == workAfter, "unavailable refinement does not consume a native slice");
+                expected.skipped = true;
+                ++skipped;
+            }
+        }
+
+        std::uint64_t skipped{0};
+        std::uint64_t resumedEnemy{0};
+        std::optional<std::int64_t> firstCancelledWork;
+        std::uint64_t firstCancelledEvent{0};
+        std::uint64_t refinementEvents{0};
+        std::uint64_t overflowedGrowth{0};
+        std::optional<std::int64_t> firstRefinementWorkBefore;
+
+    private:
+        struct Allowance
+        {
+            std::int64_t next;
+            bool skipped{false};
+            bool exhausted{false};
+        };
+
+        MasterAssignmentSchedule m_schedule;
+        std::map<std::pair<std::vector<std::int32_t>, MasterRefinementTerm>, Allowance> m_allowances;
+    };
 
     void partialStockBounds(const MasterAssignmentProblem & problem,
                             const MasterAssignmentOracle::Request & reference,
@@ -190,7 +271,7 @@ namespace
             }
         }
         exportSearchCase(QStringLiteral("master-native-stock-search"), problem, reference, exact, searches);
-        for (const std::uint64_t burst : {1, 24})
+        for (const std::uint64_t burst : {1, 2, 24})
         {
             RefinementLedger ledger;
             require(ledger.open(1000000), "challenger refinement burst ledger");
@@ -204,13 +285,149 @@ namespace
             exportSearchCase(QStringLiteral("master-challenger-burst-%1").arg(burst), problem, reference, exact,
                              {searchRecord(result)});
         }
+        std::uint64_t resumedEnemy = 0;
+        std::uint64_t balancedSelections = 0;
+        for (const bool deferFriendly : {false, true})
+        {
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "per-term refinement allowance ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger,
+                                       QuoteFault::None, true, deferFriendly);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            const MasterAssignmentSchedule schedule{
+                .continuationSlice = 1, .refinementGrowthFactor = 2,
+                .futureDualAllowance = 1, .nodesPerRefinement = 1};
+            RefinementAllowanceObserver observer(schedule);
+            const auto result = searchMasterAssignment(problem, evaluator, ledger,
+                {.schedule = schedule, .retainDiagnostics = true, .observer = &observer});
+            expect(observer.skipped > 0, "per-term allowance fixtures exercise unavailable refinement");
+            balancedSelections += result.stats.workBalancedSelections;
+            resumedEnemy += observer.resumedEnemy;
+            expect(result.lower && *result.lower <= *exact.exactOptimum &&
+                       result.upper && *result.upper >= *exact.exactOptimum &&
+                       result.stats.proofFailures == 0 && result.stats.work.spent() <= 1000000,
+                   "independent term allowances preserve oracle bounds, proofs and one ledger");
+            if (!deferFriendly)
+            {
+                expect(result.globalOptimal && result.lower == exact.exactOptimum,
+                       "resolved relative focus must release enemy refinement to close the small native domain");
+                require(observer.firstRefinementWorkBefore.has_value(), "first native refinement was observed");
+                constexpr std::int64_t refreshQuoteWork = 32;
+                constexpr std::int64_t accountingWork = 4;
+                const auto accountingPrefix = *observer.firstRefinementWorkBefore -
+                                              refreshQuoteWork - accountingWork;
+                for (const auto remainder : {std::int64_t{0}, accountingWork - 1, accountingWork})
+                {
+                    RefinementLedger prefixLedger;
+                    require(prefixLedger.open(accountingPrefix + remainder), "accounting-prefix ledger");
+                    NativeStockSession prefixSession(field, enemy, reference.continuation.cases, prefixLedger);
+                    MasterAssignmentEvaluator prefixEvaluator(
+                        problem, prefixLedger, prefixSession, {.quote = 32, .witness = 32});
+                    RefinementAllowanceObserver prefixObserver(schedule);
+                    const auto prefix = searchMasterAssignment(problem, prefixEvaluator, prefixLedger,
+                        {.schedule = schedule, .retainDiagnostics = true, .observer = &prefixObserver});
+                    require(prefixLedger.lastRefusal().has_value(), "accounting prefix reaches a refusal");
+                    const bool accountingPaid = remainder == accountingWork;
+                    expect(prefix.budgetExhausted && !prefix.refinementRefusal &&
+                               prefixObserver.refinementEvents == 0 && prefix.stats.refinements == 0 &&
+                               prefixLedger.lastRefusal()->requested ==
+                                   (accountingPaid ? refreshQuoteWork : accountingWork) &&
+                               prefixLedger.lastRefusal()->work ==
+                                   (accountingPaid ? RefinementWork::MasterValuation : RefinementWork::MasterExpansion) &&
+                               prefixLedger.balance() == (accountingPaid ? 0 : remainder),
+                           "accounting is prepaid exactly before selection and native refresh");
+                    expect(!prefix.globalOptimal && prefix.incumbent && prefix.incumbent->proof &&
+                               prefixSession.replayLowerProof(*prefix.incumbent->proof) &&
+                               prefix.upper && *prefix.upper >= *exact.exactOptimum,
+                           "accounting-prefix refusal retains the owned incumbent and oracle upper");
+                }
+                require(observer.firstCancelledWork.has_value(), "native fixture reaches accounted enemy cancellation");
+                constexpr std::int64_t eligibilityWork = 32 + 4 * 6;
+                for (const auto remaining : {std::int64_t{0}, eligibilityWork - 1})
+                {
+                    const auto limit = *observer.firstCancelledWork - eligibilityWork + remaining;
+                    RefinementLedger interruptedLedger;
+                    require(interruptedLedger.open(limit), "cancellation eligibility prefix ledger");
+                    NativeStockSession interruptedSession(field, enemy, reference.continuation.cases,
+                                                           interruptedLedger);
+                    MasterAssignmentEvaluator interruptedEvaluator(
+                        problem, interruptedLedger, interruptedSession, {.quote = 32, .witness = 32});
+                    RefinementAllowanceObserver interruptedObserver(schedule);
+                    const auto interrupted = searchMasterAssignment(
+                        problem, interruptedEvaluator, interruptedLedger,
+                        {.schedule = schedule, .retainDiagnostics = true, .observer = &interruptedObserver});
+                    expect(interrupted.budgetExhausted && interruptedLedger.lastRefusal() &&
+                               interruptedLedger.lastRefusal()->work == RefinementWork::MasterValuation &&
+                               interruptedLedger.lastRefusal()->requested == eligibilityWork &&
+                               interruptedLedger.balance() == remaining && !interrupted.refinementRefusal &&
+                               interruptedObserver.refinementEvents == observer.firstCancelledEvent,
+                           "unpaid cancellation eligibility stops before any native refinement event");
+                    for (const auto & tuple : exact.tuples)
+                    {
+                        if (interrupted.lower && tuple.objective.total <= *interrupted.lower)
+                        {
+                            continue;
+                        }
+                        const auto covered = std::any_of(interrupted.residual.begin(), interrupted.residual.end(),
+                            [&](const auto & region)
+                            {
+                                return region.state.choices.size() == tuple.choices.size() &&
+                                    std::equal(region.state.choices.begin(), region.state.choices.end(),
+                                               tuple.choices.begin(), [](auto selected, auto choice)
+                                               {
+                                                   return selected == MASTER_UNASSIGNED || selected == choice;
+                                               }) &&
+                                    (!region.upper || *region.upper >= tuple.objective.total);
+                            });
+                        expect(covered, "unpaid cancellation leaves every better oracle tuple covered");
+                    }
+                }
+            }
+            auto record = searchRecord(result);
+            record.insert("unavailableRefinements", QString::number(observer.skipped));
+            record.insert("resumedEnemyRefinements", QString::number(observer.resumedEnemy));
+            exportSearchCase(QStringLiteral("master-term-allowance-%1").arg(deferFriendly),
+                             problem, reference, exact, {record});
+        }
+        expect(resumedEnemy > 0, "native enemy refinement resumes after skipped terms on the same complete plan");
+        expect(balancedSelections > 0, "native search exercises charged-work balancing");
+        for (const auto growth : {std::int64_t{2}, std::int64_t{4},
+                                  std::numeric_limits<std::int64_t>::max()})
+        {
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "native growth boundary ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            const MasterAssignmentSchedule schedule{
+                .continuationSlice = 2, .refinementGrowthFactor = growth, .nodesPerRefinement = 1};
+            RefinementAllowanceObserver observer(schedule);
+            const auto result = searchMasterAssignment(problem, evaluator, ledger,
+                {.schedule = schedule, .retainDiagnostics = true, .observer = &observer});
+            expect(result.lower && *result.lower <= *exact.exactOptimum &&
+                       result.upper && *result.upper >= *exact.exactOptimum &&
+                       result.stats.proofFailures == 0 && result.stats.work.spent() <= 1000000,
+                   "continuation growth and overflow preserve certified bounds and one work allowance");
+            if (result.best)
+            {
+                expect(result.best->proof && session.replayLowerProof(*result.best->proof),
+                       "growth boundary retains an independently replayable lower witness");
+            }
+            if (growth == std::numeric_limits<std::int64_t>::max())
+            {
+                expect(observer.overflowedGrowth > 0,
+                       "the extreme growth case reaches the guarded multiplication");
+            }
+            exportSearchCase(QStringLiteral("master-native-growth-%1").arg(growth),
+                             problem, reference, exact, {searchRecord(result)});
+        }
         {
             RefinementLedger ledger;
             require(ledger.open(1000000), "certificate integration ledger");
             NativeStockSession session(field, enemy, reference.continuation.cases, ledger, QuoteFault::None, true, true);
             MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
             const auto result = searchMasterAssignment(problem, evaluator, ledger,
-                {.schedule = {.futureDualAllowance = 1}, .retainDiagnostics = true});
+                {.schedule = {.refinementGrowthFactor = 2, .futureDualAllowance = 1},
+                 .retainDiagnostics = true});
             expect(session.certificateCalls > 0 && session.verifiedCertificates > 0 &&
                    session.maximumCertificateAllowance > 1 &&
                    result.stats.work.grantedByWork[static_cast<std::size_t>(RefinementWork::PackingDualCertificate)] > 0,
@@ -392,6 +609,91 @@ namespace
                "incomplete class topology is rejected before transition traversal");
     }
 
+    void warmStartOracleBoundaries()
+    {
+        const auto source = continuationCase({
+            CanonicalPlanActionKey::fromAction(0, 0, 0, false),
+            CanonicalPlanActionKey::fromAction(1, 1, 0, false),
+            CanonicalPlanActionKey::fromAction(2, 2, 0, false)}).friendly;
+        for (std::int32_t variant = 0; variant < 8; ++variant)
+        {
+            auto input = source;
+            if ((variant & 1) != 0)
+            {
+                input.rows[0].ownedTurn[0] = 1;
+                input.rows[0].weight[0] = columnStreamValue(input.columns[0], 1, input.horizon);
+            }
+            if ((variant & 2) != 0)
+            {
+                input.rows[1].ownedTurn[1] = NO_CAPTURE_TURNS;
+                input.rows[1].weight[1] = 17;
+            }
+            if ((variant & 4) != 0)
+            {
+                input.capturedNodes[2] = true;
+                for (auto & row : input.rows)
+                {
+                    row.ownedTurn[2] = NO_CAPTURE_TURNS;
+                    row.weight[2] = 0;
+                }
+            }
+            std::vector<MilliFunds> weights;
+            for (const auto & row : input.rows)
+            {
+                weights.insert(weights.end(), row.weight.begin(), row.weight.end());
+            }
+            AssignmentSolver assignment;
+            assignment.solve(static_cast<std::int32_t>(input.rows.size()),
+                             static_cast<std::int32_t>(input.columns.size()), weights);
+            const auto floor = assignment.optimum();
+            const auto oracle = MasterAssignmentOracle::exhaustSequential(input, 1000000);
+            require(oracle.status == MasterAssignmentOracle::ObjectiveStatus::Exact,
+                    "warm-start reference uses the independent complete itinerary oracle");
+            NativeSequentialModel native(input);
+            const auto instance = native.instance();
+            const auto complete = solveSequentialPacking(instance, floor, 100000, nullptr, true,
+                SequentialWitnessPolicy::BookedValue, SequentialTierAuditMode::CountersOnly);
+            require((complete.certificate || complete.searchCompleted) && complete.bookedValue == oracle.value &&
+                        replaySequentialWitness(instance, complete.witness, complete.bookedValue),
+                    "native warm seed matches the independent optimum and replays");
+            const auto compatible = solveSequentialPacking(instance, floor, 100000, nullptr, true,
+                SequentialWitnessPolicy::BookedValue, SequentialTierAuditMode::CountersOnly, nullptr, nullptr,
+                SequentialPackingPolicy::CompatibleRows);
+            require((compatible.certificate || compatible.searchCompleted) && compatible.bookedValue == oracle.value &&
+                        replaySequentialWitness(instance, compatible.witness, compatible.bookedValue),
+                    "compatible-row pruning matches the independent complete itinerary oracle");
+            const SequentialWarmStart seed{complete.witness, complete.bookedValue};
+            for (std::int64_t cap = 0; cap <= compatible.searchStates + 1; ++cap)
+            {
+                for (const auto* warm : {static_cast<const SequentialWarmStart*>(nullptr), &seed})
+                {
+                    const auto result = solveSequentialPacking(instance, floor, cap, nullptr, true,
+                        SequentialWitnessPolicy::BookedValue, SequentialTierAuditMode::CountersOnly, warm, nullptr,
+                        SequentialPackingPolicy::CompatibleRows);
+                    expect(result.searchStates <= cap && result.bookedValue <= oracle.value &&
+                               result.relaxedValue >= oracle.value &&
+                               (!result.searchCompleted || result.bookedValue == oracle.value),
+                           "every charged compatible-bound interruption brackets the independent optimum");
+                    expect((result.witness.empty() && !result.searchCompleted && !warm) ||
+                               replaySequentialWitness(instance, result.witness, result.bookedValue),
+                           "compatible pruning preserves owned cold and warm witness replay");
+                }
+            }
+            for (std::int64_t cap = 0; cap <= complete.searchStates + 1; ++cap)
+            {
+                const auto result = solveSequentialPacking(instance, floor, cap, nullptr, true,
+                    SequentialWitnessPolicy::BookedValue, SequentialTierAuditMode::CountersOnly, &seed);
+                expect(result.warmStartAccepted && result.searchStates <= cap &&
+                           result.floorValue == floor && result.bookedValue == oracle.value &&
+                           result.relaxedValue == complete.relaxedValue && result.relaxedValue >= oracle.value &&
+                           replaySequentialWitness(instance, result.witness, result.bookedValue),
+                       "warm pruning and every interruption remain sound against the independent oracle");
+                expect(!result.certificate || result.bookedValue == result.relaxedValue,
+                       "a retained feasible seed is not an independent upper certificate");
+            }
+        }
+    }
+
     void signedAndWideFutureDomains()
     {
         SequentialInput input;
@@ -496,6 +798,8 @@ namespace
                "different capture signatures cannot defer their enemy terms through common-enemy cancellation");
         auto left = evaluator.evaluate({problem.identity(), {0}});
         auto right = evaluator.evaluate({problem.identity(), {1}});
+        expect(!evaluator.unresolvedCommonEnemy(left, right),
+               "owned quotes with distinct capture signatures cannot defer enemy refinement");
         for (auto* value : {&left, &right})
         {
             if (!value->quote()->ours.exact())
@@ -574,6 +878,32 @@ namespace
                "the complete search retains all same-continuation action alternatives");
         exportSearchCase(QStringLiteral("master-shared-stock-different-economics"), problem, input, exact,
                          {searchRecord(result)});
+        require(result.improvement.has_value(), "same-continuation search retains its strict economic proof");
+        MasterCaptureResult capture;
+        capture.extraction.problem = problem;
+        capture.extraction.error = MasterAssignmentProblemError::None;
+        MasterAssignmentProfile profile;
+        MasterShadowConfig config;
+        DecisionTraceIdentity identity;
+        const auto before = ledger.stats();
+        MasterShadowObservation observation{config, identity, profile, before, ledger.stats(), ledger};
+        observation.capture = &capture;
+        observation.search = &result;
+        observation.session = &session;
+        expect(masterShadowProofsMatch(observation) && ledger.stats() == before,
+               "observation inspection includes the strict proof's seated economic difference without extra work");
+        const auto & retained = *result.improvement;
+        require(session.tightenOurUpperWithVerifiedDual(*retained.incumbent.quote(), 4096).certificateValid,
+                "a later verified certificate supersedes the retained proof's live registry entry");
+        const auto afterRefresh = ledger.stats();
+        expect(!session.compare(*retained.incumbent.quote(), *retained.challenger.quote()).valid() &&
+               masterShadowProofsMatch(observation) && ledger.stats() == afterRefresh,
+               "the actual observation predicate accepts owned snapshots after fresh authorization becomes stale");
+        auto corrupted = result;
+        ++corrupted.improvement->comparison.deltaLower;
+        observation.search = &corrupted;
+        expect(!masterShadowProofsMatch(observation),
+               "historical inspection rejects an altered retained improvement margin");
     }
 
     void tenStockActors()
@@ -613,7 +943,7 @@ namespace
     void shadowControlsAndCapture()
     {
         const auto output = QDir::tempPath() + QStringLiteral("/master-shadow-test.jsonl");
-        const auto disabled = parseMasterShadowConfig({}, "invalid", {});
+        const auto disabled = parseMasterShadowConfig({}, "invalid", {}, "invalid", "invalid");
         expect(!disabled.enabled() && disabled.error == MasterShadowConfigError::None,
                "default disabled mode ignores inactive diagnostic settings");
         expect(parseMasterShadowConfig("stockControl", "160000", output).error ==
@@ -625,8 +955,33 @@ namespace
         expect(parseMasterShadowConfig("shadow", {}, "relative.jsonl").error ==
                MasterShadowConfigError::MissingAbsoluteOutput, "diagnostics require an explicit absolute destination");
         const auto enabled = parseMasterShadowConfig("shadow", {}, output);
-        expect(enabled.enabled() && enabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE,
-               "explicit shadow starts at the configurable initial allowance");
+        expect(enabled.enabled() && enabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE &&
+                   enabled.tierAuditMode == SequentialTierAuditMode::Full &&
+                   enabled.exportMode == MasterShadowExportMode::Full,
+               "explicit shadow starts at the initial allowance with full diagnostic retention");
+        const auto counters = parseMasterShadowConfig("shadow", {}, output, "counters");
+        expect(counters.enabled() && counters.tierAuditMode == SequentialTierAuditMode::CountersOnly,
+               "optional tier copies can be disabled independently of witness capture");
+        const auto full = parseMasterShadowConfig("shadow", {}, output, "full");
+        expect(full.enabled() && full.tierAuditMode == SequentialTierAuditMode::Full,
+               "full diagnostic retention remains explicitly selectable");
+        const auto invalidAudit = parseMasterShadowConfig("shadow", {}, output, "invalid");
+        expect(!invalidAudit.enabled() && invalidAudit.error == MasterShadowConfigError::InvalidTierAudit,
+               "an unknown audit retention mode fails closed");
+        for (const auto tier : {QByteArray("full"), QByteArray("counters")})
+        {
+            const auto off = parseMasterShadowConfig("shadow", {}, {}, tier, "off");
+            expect(off.enabled() && off.exportMode == MasterShadowExportMode::Off && off.outputPath.isEmpty(),
+                   "export-off needs no output path and is independent of tier retention");
+            const auto fullExport = parseMasterShadowConfig("shadow", {}, output, tier, "full");
+            expect(fullExport.enabled() && fullExport.exportMode == MasterShadowExportMode::Full,
+                   "full export remains explicitly selectable for either tier mode");
+        }
+        expect(parseMasterShadowConfig("shadow", {}, {}, {}, "full").error ==
+                   MasterShadowConfigError::MissingAbsoluteOutput &&
+                   parseMasterShadowConfig("shadow", {}, output, {}, "invalid").error ==
+                       MasterShadowConfigError::InvalidExport,
+               "full export requires a path and unknown export controls fail closed");
 
         Fixture fixture(2);
         fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 10, 1));
@@ -707,6 +1062,394 @@ namespace
         const auto & total = profile.samples[static_cast<std::size_t>(MasterPhase::Search)];
         expect(total.calls == 1 && exclusive == total.inclusiveNanos,
                "exclusive phase times account for the complete measured search");
+
+        MasterAssignmentProfile ended;
+        {
+            MasterProfileScope outer(&ended, MasterPhase::Shadow);
+            MasterProfileScope setup(&ended, MasterPhase::FriendlySetup);
+            {
+                MasterProfileScope nested(&ended, MasterPhase::Quote);
+            }
+            setup.finish();
+            setup.finish();
+            MasterProfileScope search(&ended, MasterPhase::FriendlySearch);
+        }
+        exclusive = 0;
+        for (const auto & sample : ended.samples)
+        {
+            expect(sample.exclusiveNanos >= 0 && sample.inclusiveNanos >= sample.exclusiveNanos,
+                   "explicitly ending setup preserves nonnegative nested measurements");
+            exclusive += sample.exclusiveNanos;
+        }
+        expect(ended.samples[static_cast<std::size_t>(MasterPhase::FriendlySetup)].calls == 1 &&
+                   ended.samples[static_cast<std::size_t>(MasterPhase::FriendlySearch)].calls == 1 &&
+                   ended.samples[static_cast<std::size_t>(MasterPhase::Quote)].calls == 1 &&
+                   exclusive == ended.samples[static_cast<std::size_t>(MasterPhase::Shadow)].inclusiveNanos,
+               "ending setup once restores the parent scope while prepared objects remain alive");
+    }
+
+    void reservationFailureExport()
+    {
+        RefinementLedger ledger;
+        require(ledger.open(5), "refusal export ledger");
+        expect(masterRefusalRecord(ledger.lastRefusal()).isEmpty(), "no invented failure in an unused ledger");
+        require(!ledger.consume(6, RefinementWork::MasterWitness), "export fixture refuses its indivisible witness");
+        const auto stats = ledger.stats();
+        const auto receipt = ledger.lastRefusal();
+        const auto record = masterRefusalRecord(receipt);
+        expect(record.size() == 5 && record.value("work").toInt() == static_cast<int>(RefinementWork::MasterWitness) &&
+                   record.value("reason").toInt() == static_cast<int>(RefinementRefusalReason::Balance) &&
+                   record.value("requested").toString() == QStringLiteral("6") &&
+                   record.value("balance").toString() == QStringLiteral("5") &&
+                   record.value("refundable").isBool() && !record.value("refundable").toBool(),
+               "failure serialization preserves exact request, reason, category and reservation kind");
+        expect(ledger.stats() == stats && ledger.lastRefusal() == receipt,
+               "serializing failure metadata changes neither ledger work nor failure state");
+    }
+
+    void refinementPreflightReceipts()
+    {
+        Fixture fixture(3);
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.input.actors[actor].candidates.push_back(moveCandidate(actor, {actor, 0}, {actor, 1}, -3, 1));
+        }
+        fixture.seat();
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.selections[actor].stockRow = actor;
+        }
+        const auto problem = fixture.extract();
+        std::vector<MasterAssignmentOracle::ContinuationCase> cases;
+        for (const auto & tuple : MasterAssignmentOracle::enumerate(problem, request()).tuples)
+        {
+            cases.push_back(continuationCase(tuple.reference.key));
+        }
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        constexpr MasterValuationTariffs tariffs{11, 17, 23};
+        constexpr std::int64_t nativeAllowance = 4096;
+        for (const auto term : {MasterRefinementTerm::Friendly, MasterRefinementTerm::Enemy,
+                                MasterRefinementTerm::FutureDual})
+        {
+            for (const auto shortfall : {0, 1})
+            {
+                RefinementLedger ledger;
+                require(ledger.open(1000000), "preflight receipt ledger");
+                NativeStockSession session(field, enemy, cases, ledger);
+                MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+                auto evaluated = evaluator.evaluate({problem.identity(),
+                    std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end())});
+                require(evaluated.lowerReplayed && evaluated.quote() && !evaluated.quote()->ours.exact() &&
+                            !evaluated.quote()->enemy.exact(), "preflight fixture has unresolved native terms");
+                auto preparation = session.ourRerunWork();
+                auto overhead = tariffs.quote * 2 + tariffs.witness;
+                if (term == MasterRefinementTerm::Enemy)
+                {
+                    preparation = session.enemyRerunWork(evaluated.quote()->capturedColumns);
+                }
+                else if (term == MasterRefinementTerm::FutureDual)
+                {
+                    preparation = session.preparation.scanWork;
+                    overhead = tariffs.quote + tariffs.witness * 2 + tariffs.certificateIdentity;
+                }
+                const auto required = nativeAllowance + preparation + overhead;
+                require(ledger.consume(ledger.balance() - required + shortfall, RefinementWork::MasterPreparation),
+                        "fixture leaves the exact requested preflight boundary");
+                const auto before = ledger.stats();
+                const auto proof = evaluated.proof;
+                const auto status = evaluator.refine(evaluated, term, nativeAllowance);
+                if (shortfall == 0)
+                {
+                    expect(status == MasterRefinementStatus::Updated && !evaluator.refinementRefusal() &&
+                               !ledger.lastRefusal(), "exact preflight balance admits native refinement");
+                }
+                else
+                {
+                    const auto refused = evaluator.refinementRefusal();
+                    expect(status == MasterRefinementStatus::BudgetExhausted && refused &&
+                               refused->term == term && refused->requested == required &&
+                               refused->balance == required - 1 && refused->allowance == nativeAllowance &&
+                               refused->preparation == preparation,
+                           "preflight receipt identifies the exact composite native request");
+                    expect(ledger.stats() == before && !ledger.lastRefusal() && evaluated.proof == proof,
+                           "preflight evidence adds no ledger charge, refusal count, or witness change");
+                    const auto record = masterRefinementRefusalRecord(refused);
+                    expect(record.size() == 5 && record.value("term").toInt() == static_cast<int>(term) &&
+                               record.value("requested").toString() == QString::number(required) &&
+                               record.value("balance").toString() == QString::number(required - 1) &&
+                               record.value("allowance").toString() == QString::number(nativeAllowance) &&
+                               record.value("preparation").toString() == QString::number(preparation),
+                           "preflight export preserves all native request components");
+                    expect(evaluator.refine(evaluated, term, 0) == MasterRefinementStatus::Unavailable &&
+                               !evaluator.refinementRefusal() && ledger.stats() == before,
+                           "the next refinement call clears stale preflight metadata without spending work");
+                }
+            }
+        }
+        RefinementLedger searchLedger;
+        require(searchLedger.open(50000), "search preflight receipt ledger");
+        NativeStockSession searchSession(field, enemy, cases, searchLedger);
+        MasterAssignmentEvaluator searchEvaluator(problem, searchLedger, searchSession, tariffs);
+        const auto result = searchMasterAssignment(problem, searchEvaluator, searchLedger,
+            {.schedule = {.continuationSlice = 1000000, .nodesPerRefinement = 1}});
+        expect(result.budgetExhausted && result.refinementRefusal &&
+                   result.refinementRefusal == searchEvaluator.refinementRefusal() && !searchLedger.lastRefusal() &&
+                   result.refinementRefusal->term == MasterRefinementTerm::Friendly &&
+                   result.refinementRefusal->allowance == 1000000 &&
+                   result.refinementRefusal->balance == searchLedger.balance(),
+               "bounded search retains the actual stopping preflight without inventing a ledger refusal");
+    }
+
+    void checkCertificateReadinessCutoff(
+        const MasterAssignmentProblem & problem, const std::vector<MasterAssignmentOracle::ContinuationCase> & cases,
+        std::int64_t remaining)
+    {
+        constexpr std::int64_t readinessFee = 37;
+        constexpr MasterValuationTariffs tariffs{11, 17, 23};
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "paid readiness ledger");
+        NativeStockSession session(field, enemy, cases, ledger);
+        MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+        auto evaluated = evaluator.evaluate({problem.identity(),
+            std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end())});
+        require(evaluated.quote() && !evaluated.quote()->ours.exact(), "paid readiness has an open friendly term");
+        session.preparation = {.status = RelativeStockPreparationStatus::MissingRows, .readinessWork = readinessFee};
+        require(ledger.consume(ledger.balance() - remaining, RefinementWork::MasterPreparation),
+                "leave exact readiness boundary");
+        const auto before = ledger.stats();
+        const auto proof = evaluated.proof;
+        const auto grants = ledger.retainedGrantCount();
+        const auto status = evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 4096);
+        const auto receipt = evaluator.certificatePreparation();
+        require(receipt.has_value(), "paid readiness retains its receipt");
+        const auto paid = remaining < readinessFee ? 0 : readinessFee;
+        expect(status == (remaining < readinessFee ? MasterRefinementStatus::BudgetExhausted
+                                                  : MasterRefinementStatus::Unavailable) &&
+                   ledger.stats().spent() - before.spent() == paid &&
+                   ledger.stats().consumed - before.consumed == paid &&
+                   ledger.retainedGrantCount() == grants && session.certificateCalls == 0 && evaluated.proof == proof,
+               "missing or unaffordable rows never start native certificate work or replace a proof");
+        expect(receipt->readinessWork == paid && receipt->scanWork == 0 && session.readinessCalls == 1,
+               "readiness receipts report only paid work and do not invent an option scan");
+        if (remaining < readinessFee)
+        {
+            expect(receipt->status == RelativeStockPreparationStatus::BudgetExhausted && ledger.lastRefusal() &&
+                       ledger.lastRefusal()->requested == readinessFee &&
+                       ledger.lastRefusal()->balance == remaining && !ledger.lastRefusal()->refundable,
+                   "readiness refusal identifies the non-refundable fee before key inspection");
+        }
+        else
+        {
+            expect(receipt->status == RelativeStockPreparationStatus::MissingRows && !ledger.lastRefusal(),
+                   "an exactly funded missing-row check remains distinct from budget exhaustion");
+        }
+        const auto after = ledger.stats();
+        const auto record = masterCertificatePreparationRecord(receipt);
+        expect(record.size() == 3 && record.value("readinessWork").toString() == QString::number(paid) &&
+                   record.value("scanWork").toString() == QStringLiteral("0") &&
+                   record.value("status").toInt() == static_cast<int>(receipt->status) &&
+                   ledger.stats() == after && session.readinessCalls == 1,
+               "serializing readiness does not execute the paid operation again");
+        if (remaining == 100000)
+        {
+            session.preparation = {.status = RelativeStockPreparationStatus::Ready,
+                                   .readinessWork = readinessFee, .scanWork = 42};
+            expect(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 1) == MasterRefinementStatus::Updated &&
+                       session.certificateCalls == 1 && session.verifiedCertificates == 0 && evaluated.proof == proof,
+                   "a newly ready catalog with an undersized native slice remains eligible for allowance growth");
+            expect(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 4096) == MasterRefinementStatus::Updated &&
+                       session.certificateCalls == 2 && session.verifiedCertificates == 1 &&
+                       session.replayLowerProof(*proof),
+                   "a later funded attempt verifies a certificate while the earlier owned lower proof survives");
+        }
+        const auto finalWork = ledger.stats();
+        expect(evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, 0) == MasterRefinementStatus::Unavailable &&
+                   !evaluator.certificatePreparation() && !evaluator.refinementRefusal() && ledger.stats() == finalWork,
+               "a new non-attempt clears old preparation receipts without charging another fee");
+    }
+
+    void checkCertificatePreparationReservation(
+        const MasterAssignmentProblem & problem, const std::vector<MasterAssignmentOracle::ContinuationCase> & cases,
+        std::int64_t scanWork, std::int64_t shortfall)
+    {
+        constexpr std::int64_t readinessFee = 37;
+        constexpr std::int64_t nativeAllowance = 4096;
+        constexpr MasterValuationTariffs tariffs{11, 17, 23};
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "per-key preparation ledger");
+        NativeStockSession session(field, enemy, cases, ledger);
+        MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+        auto evaluated = evaluator.evaluate({problem.identity(),
+            std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end())});
+        session.preparation = {.status = RelativeStockPreparationStatus::Ready,
+                               .readinessWork = readinessFee, .scanWork = scanWork};
+        const auto proof = evaluated.proof;
+        constexpr std::int64_t ordinaryScanWork = 42;
+        const auto required = nativeAllowance + ordinaryScanWork + tariffs.quote + 2 * tariffs.witness +
+            tariffs.certificateIdentity;
+        require(ledger.consume(ledger.balance() - required - readinessFee + shortfall, RefinementWork::MasterPreparation),
+                "leave readiness plus native composite boundary");
+        const auto before = ledger.stats().spent();
+        const auto status = evaluator.refine(evaluated, MasterRefinementTerm::FutureDual, nativeAllowance);
+        if (scanWork != ordinaryScanWork)
+        {
+            expect(status == MasterRefinementStatus::Invalid && session.certificateCalls == 0 &&
+                       evaluated.proof == proof && ledger.stats().spent() - before == readinessFee,
+                   "negative or overflowing scan reservations fail closed after only the real readiness fee");
+        }
+        else if (shortfall == 1)
+        {
+            const auto refused = evaluator.refinementRefusal();
+            expect(status == MasterRefinementStatus::BudgetExhausted && refused &&
+                       refused->requested == required && refused->balance == required - 1 &&
+                       refused->preparation == scanWork && session.certificateCalls == 0 &&
+                       !ledger.lastRefusal() && evaluated.proof == proof &&
+                       ledger.stats().spent() - before == readinessFee,
+                   "composite preflight retains refresh funding and distinguishes earlier paid readiness");
+        }
+        else
+        {
+            expect(status == MasterRefinementStatus::Updated && session.verifiedCertificates == 1 &&
+                       !evaluator.refinementRefusal() && !ledger.lastRefusal() && ledger.balance() >= 0,
+                   "exact readiness-plus-native funding admits independently verified tightening");
+        }
+    }
+
+    void certificateReadinessAccounting()
+    {
+        Fixture fixture(3);
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.input.actors[actor].candidates.push_back(moveCandidate(actor, {actor, 0}, {actor, 1}, -3, 1));
+        }
+        fixture.seat();
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.selections[actor].stockRow = actor;
+        }
+        const auto problem = fixture.extract();
+        std::vector<MasterAssignmentOracle::ContinuationCase> cases;
+        for (const auto & tuple : MasterAssignmentOracle::enumerate(problem, request()).tuples)
+        {
+            cases.push_back(continuationCase(tuple.reference.key));
+        }
+        for (const auto remaining : {0, 36, 37, 100000})
+        {
+            checkCertificateReadinessCutoff(problem, cases, remaining);
+        }
+        checkCertificatePreparationReservation(problem, cases, 42, 0);
+        checkCertificatePreparationReservation(problem, cases, 42, 1);
+        checkCertificatePreparationReservation(problem, cases, -1, 0);
+        checkCertificatePreparationReservation(problem, cases, std::numeric_limits<std::int64_t>::max(), 0);
+    }
+
+    void ownedCancellationEligibility()
+    {
+        struct ComparisonCase
+        {
+            MilliFunds incumbent;
+            MilliFunds challenger;
+            bool valid;
+            bool unresolved;
+        };
+        constexpr auto extreme = std::numeric_limits<MilliFunds>::max() / 2 + 10000;
+        const std::array<ComparisonCase, 4> comparisons{{
+            {0, 0, true, true}, {0, 10000, true, false},
+            {0, -10000, true, false}, {-extreme, extreme, false, false}}};
+        for (const auto & comparison : comparisons)
+        {
+            Fixture fixture(3);
+            fixture.input.actors[0].candidates[0] =
+                moveCandidate(0, {0, 0}, {0, 0}, comparison.incumbent, 0);
+            for (std::int32_t actor = 0; actor < 3; ++actor)
+            {
+                fixture.input.actors[actor].candidates.push_back(
+                    moveCandidate(actor, {actor, 0}, {actor, 1}, actor == 0 ? comparison.challenger : 0, 1));
+            }
+            fixture.seat();
+            for (std::int32_t actor = 0; actor < 3; ++actor)
+            {
+                fixture.selections[actor].stockRow = actor;
+            }
+            const auto problem = fixture.extract();
+            std::vector<MasterAssignmentOracle::ContinuationCase> cases;
+            for (const auto & tuple : MasterAssignmentOracle::enumerate(problem, request()).tuples)
+            {
+                cases.push_back(continuationCase(tuple.reference.key));
+            }
+            PropertyStockField field;
+            PropertyStockInstance enemy;
+            RefinementLedger ledger;
+            require(ledger.open(1000000), "owned cancellation ledger");
+            NativeStockSession session(field, enemy, cases, ledger);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, {.quote = 32, .witness = 32});
+            auto incumbent = evaluator.evaluate({problem.identity(), {0, 0, 0}});
+            auto challenger = evaluator.evaluate({problem.identity(), {1, 1, 1}});
+            const auto priced = evaluator.compare(incumbent, challenger);
+            require(incumbent.lowerReplayed && challenger.lowerReplayed && priced.commonEnemyCancelled,
+                    "same-enemy owned comparison fixture");
+            expect(priced.valid() == comparison.valid && priced.unresolved() == comparison.unresolved,
+                   "seated economics distinguish overlap, resolved comparisons and overflow");
+            const auto before = ledger.stats();
+            const auto grants = ledger.retainedGrantCount();
+            const auto captures = session.proofCaptures;
+            const auto incumbentProof = incumbent.proof;
+            const auto challengerProof = challenger.proof;
+            expect(evaluator.unresolvedCommonEnemy(incumbent, challenger) == priced.unresolved(),
+                   "cancellation eligibility agrees with the full economic comparison");
+            const auto cost = ledger.stats().spent() - before.spent();
+            const auto expectedCost = 32 + 4 * (incumbent.proof->quote.key.size() +
+                challenger.proof->quote.key.size() + incumbent.proof->quote.capturedColumns.size() +
+                challenger.proof->quote.capturedColumns.size());
+            expect(cost == static_cast<std::int64_t>(expectedCost) &&
+                       ledger.stats().consumed - before.consumed == cost &&
+                       ledger.retainedGrantCount() == grants && session.proofCaptures == captures &&
+                       incumbent.proof == incumbentProof && challenger.proof == challengerProof,
+                   "owned eligibility is charged without native repricing, grant retention or witness replacement");
+            auto missing = challenger;
+            missing.upperVerified = false;
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, missing),
+                   "unverified upper cannot justify scheduling cancellation");
+            missing = challenger;
+            missing.proof.reset();
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, missing),
+                   "missing owned proof cannot justify scheduling cancellation");
+            missing = challenger;
+            missing.lowerReplayed = false;
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, missing),
+                   "unreplayed lower cannot justify scheduling cancellation");
+            missing = challenger;
+            missing.replay.reset();
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, missing),
+                   "missing seated economics cannot justify scheduling cancellation");
+            auto foreign = challenger;
+            auto foreignProof = std::make_shared<RelativeStockProofSnapshot>(*challenger.proof);
+            foreignProof->quote.identity = {};
+            foreign.proof = std::move(foreignProof);
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, foreign),
+                   "foreign stock identity cannot justify scheduling cancellation");
+            require(ledger.consume(ledger.balance() - cost, RefinementWork::MasterPreparation),
+                    "owned eligibility exact allowance boundary");
+            expect(evaluator.unresolvedCommonEnemy(incumbent, challenger) == priced.unresolved() &&
+                       ledger.balance() == 0 && !ledger.lastRefusal(),
+                   "exact eligibility allowance pays the whole comparison");
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, challenger) && ledger.lastRefusal() &&
+                       ledger.lastRefusal()->work == RefinementWork::MasterValuation &&
+                       ledger.lastRefusal()->requested == cost,
+                   "unaffordable eligibility fails closed with its real ledger refusal");
+            auto failed = challenger;
+            require(!evaluator.refresh(failed) && failed.proof == challengerProof,
+                    "failed fresh pricing can retain an older owned snapshot");
+            const auto refusalCount = ledger.stats().refusals;
+            expect(!evaluator.unresolvedCommonEnemy(incumbent, failed) &&
+                       ledger.stats().refusals == refusalCount,
+                   "a failed objective status cannot reuse stale success flags for scheduling");
+        }
     }
 }
 
@@ -716,11 +1459,16 @@ int main(int argc, char** argv)
     sharedStockCertificateWithDifferentEconomics();
     nativeStockSearch();
     futurePricingBoundaries();
+    warmStartOracleBoundaries();
     signedAndWideFutureDomains();
     differentEnemySignatures();
     tenStockActors();
     shadowControlsAndCapture();
     observationalProfile();
+    reservationFailureExport();
+    refinementPreflightReceipts();
+    certificateReadinessAccounting();
+    ownedCancellationEligibility();
     std::printf("Master assignment integration: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;
 }

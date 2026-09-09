@@ -28,14 +28,26 @@ public:
     ~CoordinatedAi() override = default;
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+    std::uint64_t testPlanSequence() const
+    {
+        return m_planSequence;
+    }
+
+    bool testTierAuditEnabled() const
+    {
+        return m_testTierAuditMode == Coordinator::SequentialTierAuditMode::Full;
+    }
+
     void setRefinementTestControls(std::int64_t workLimit, std::shared_ptr<Coordinator::RelativeStockObserver> observer,
                                   Coordinator::RelativeStockSchedule schedule = Coordinator::RelativeStockSchedule::Current,
-                                  qint32 scheduleDay = -1)
+                                  qint32 scheduleDay = -1,
+                                  Coordinator::SequentialTierAuditMode tierAudit = Coordinator::SequentialTierAuditMode::Full)
     {
         m_testRefinementWorkLimit = workLimit < 0 ? Coordinator::DEFAULT_RELATIVE_STOCK_WORK_LIMIT : workLimit;
         m_testRefinementObserver = std::move(observer);
         m_testRefinementSchedule = schedule;
         m_testRefinementScheduleDay = scheduleDay;
+        m_testTierAuditMode = tierAudit;
     }
 #endif
 
@@ -91,6 +103,7 @@ private:
     std::shared_ptr<Coordinator::RelativeStockObserver> m_testRefinementObserver;
     Coordinator::RelativeStockSchedule m_testRefinementSchedule{Coordinator::RelativeStockSchedule::Current};
     qint32 m_testRefinementScheduleDay{-1};
+    Coordinator::SequentialTierAuditMode m_testTierAuditMode{Coordinator::SequentialTierAuditMode::Full};
 #endif
 };
 

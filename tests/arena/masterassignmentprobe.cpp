@@ -9,13 +9,40 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDebug>
+#include <QDir>
 
 #include "ai/coordinator/masterassignmentproblem.h"
+#include "ai/coordinator/masterassignmentshadow.h"
+#include "ai/coordinator/masterassignmenttrace.h"
 #include "ai/coordinator/bundleassignment.h"
 
 namespace
 {
     constexpr auto OUTPUT_VARIABLE = "COW_MASTER_ASSIGNMENT_AUDIT";
+    constexpr auto INSPECTION_VARIABLE = "COW_MASTER_ASSIGNMENT_INSPECTION";
+
+    class FileShadowInspection final : public Coordinator::MasterShadowInspection
+    {
+    public:
+        explicit FileShadowInspection(QString path) : m_path(std::move(path))
+        {
+        }
+
+        void completed(const Coordinator::MasterShadowObservation & observation) override
+        {
+            const auto record = ArenaMasterAssignmentProbe::inspectShadow(observation);
+            const auto line = QJsonDocument(record).toJson(QJsonDocument::Compact) + '\n';
+            QFile output(m_path);
+            if (!output.open(QIODevice::WriteOnly | QIODevice::Append) ||
+                output.write(line) != line.size() || !output.flush())
+            {
+                qWarning() << "Master shadow inspection write failed:" << m_path << output.errorString();
+            }
+        }
+
+    private:
+        const QString m_path;
+    };
 
     QJsonArray tile(Coordinator::TilePoint point)
     {
@@ -109,6 +136,36 @@ namespace
 
 namespace ArenaMasterAssignmentProbe
 {
+    std::unique_ptr<Coordinator::MasterShadowInspection> openShadowInspection()
+    {
+        if (qgetenv("COW_AI_ARENA_TEST") != "1")
+        {
+            return {};
+        }
+        const auto path = QString::fromLocal8Bit(qgetenv(INSPECTION_VARIABLE));
+        if (path.isEmpty())
+        {
+            return {};
+        }
+        if (!QDir::isAbsolutePath(path))
+        {
+            qWarning() << "Master shadow inspection requires an absolute path:" << path;
+            return {};
+        }
+        return std::make_unique<FileShadowInspection>(path);
+    }
+
+    QJsonObject inspectShadow(const Coordinator::MasterShadowObservation & observation)
+    {
+        const auto before = observation.masterLedger.stats();
+        const auto refusalBefore = observation.masterLedger.lastRefusal();
+        auto record = Coordinator::masterShadowRecord(observation);
+        return {{"performanceSample", false}, {"ownedSnapshotsVerified", Coordinator::masterShadowProofsMatch(observation)},
+            {"workUnchanged", before == observation.masterLedger.stats() &&
+                refusalBefore == observation.masterLedger.lastRefusal()},
+            {"exportMode", static_cast<int>(observation.config.exportMode)}, {"record", record}};
+    }
+
     bool enabled()
     {
         return qgetenv("COW_AI_ARENA_TEST") == "1" && !qgetenv(OUTPUT_VARIABLE).isEmpty();

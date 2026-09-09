@@ -194,8 +194,13 @@ bool ArenaMatchRunner::applyPlayerSetup()
         }
         if (auto* pCoordinated = dynamic_cast<CoordinatedAi*>(pInput))
         {
+            auto tierAudit = Coordinator::SequentialTierAuditMode::Full;
+            if (!m_config.coordinatedTierAudit)
+            {
+                tierAudit = Coordinator::SequentialTierAuditMode::CountersOnly;
+            }
             pCoordinated->setRefinementTestControls(m_config.coordinatedRefinementWorkLimit, m_relativeStockProbe,
-                m_config.coordinatedRefinementSchedule, m_config.coordinatedScheduleDay);
+                m_config.coordinatedRefinementSchedule, m_config.coordinatedScheduleDay, tierAudit);
         }
         pPlayer->setCO(playerConfig.coId, PRIMARY_CO);
         pPlayer->setCO({}, SECONDARY_CO);
@@ -469,7 +474,7 @@ QVariantMap ArenaMatchRunner::buildPlayerResult(qint32 playerId) const
 {
     Player* pPlayer = m_pMap->getPlayer(playerId);
     const ArenaMatchPlayerConfig & config = m_config.players.at(playerId);
-    return {
+    QVariantMap result{
         {"playerId", playerId},
         {"team", pPlayer->getTeam()},
         {"aiType", config.aiTypeName},
@@ -481,6 +486,12 @@ QVariantMap ArenaMatchRunner::buildPlayerResult(qint32 playerId) const
         {"buildingCount", pPlayer->getBuildingCount()},
         {"armyValue", pPlayer->calcArmyValue()},
     };
+    if (const auto* coordinated = dynamic_cast<const CoordinatedAi*>(pPlayer->getBaseGameInput()))
+    {
+        result.insert("coordinatedPlanCount", QString::number(coordinated->testPlanSequence()));
+        result.insert(ArenaMatchConfig::TIER_AUDIT_KEY, coordinated->testTierAuditEnabled());
+    }
+    return result;
 }
 
 AiArenaTestSupport* ArenaMatchRunner::support() const

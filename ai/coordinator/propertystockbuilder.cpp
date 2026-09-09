@@ -1,6 +1,7 @@
 #include "ai/coordinator/propertystockbuilder.h"
 
 #include <algorithm>
+#include <bit>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -26,6 +27,7 @@
 namespace
 {
     constexpr std::size_t ROW_ENUM_KEY_PREFIX = 5;
+    constexpr std::int64_t CERTIFICATE_OPTION_SCAN_WORK = 3;
 
     bool addWork(std::int64_t & total, std::int64_t amount)
     {
@@ -499,8 +501,10 @@ namespace Coordinator
     }
 
     JointPlanStockValuer::JointPlanStockValuer(PropertyStockField & field,
-                                               std::span<const KnownUnitLink> unitLinks)
-        : m_field(field)
+                                               std::span<const KnownUnitLink> unitLinks,
+                                               SequentialTierAuditMode auditMode)
+        : m_field(field),
+          m_tierAuditMode(auditMode)
     {
         for (std::size_t index = 0; index < unitLinks.size(); ++index)
         {
@@ -922,6 +926,27 @@ namespace Coordinator
                 {rows,
                  std::max<std::int64_t>(columns, 1),
                  2}))
+        {
+            return -1;
+        }
+        return tariff;
+    }
+
+    std::int64_t JointPlanStockValuer::warmStartTariff(
+        std::size_t witnesses, std::size_t keyWidth, std::size_t rows, std::size_t columns)
+    {
+        if (witnesses == 0)
+        {
+            return 0;
+        }
+        constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+        if (keyWidth >= maximum || rows > maximum || columns > maximum)
+        {
+            return -1;
+        }
+        auto tariff = sequentialWarmStartWork(static_cast<std::int64_t>(rows), static_cast<std::int64_t>(columns));
+        const std::int64_t lookupDepth = 2 * std::bit_width(witnesses) + 1;
+        if (tariff < 0 || !addProduct(tariff, {static_cast<std::int64_t>(keyWidth) + 1, lookupDepth}))
         {
             return -1;
         }
@@ -1927,8 +1952,10 @@ namespace Coordinator
         const std::vector<std::int32_t> & capturedColumns,
         std::int64_t stateCap,
         bool captureWitness,
-        const RefinedWitness* pReplay) const
+        const RefinedWitness* pReplay,
+        const SequentialWarmStart* pWarmStart) const
     {
+        MasterProfileScope setupTiming(m_masterProfile, MasterPhase::EnemySetup);
         PropertyStockField & field = continuationField();
         EnemySequentialSolve solved;
         const MilliFunds enemyFloor =
@@ -2019,20 +2046,30 @@ namespace Coordinator
                 nodeSlots,
                 classIndices[rowIndex]));
         }
+        setupTiming.finish();
         if (pReplay != nullptr)
         {
+            MasterProfileScope replayTiming(m_masterProfile, MasterPhase::SequentialReplay);
             solved.witnessReplays = replaySequentialWitness(instance, pReplay->rows, pReplay->value);
             return solved;
         }
-        solved.tier = solveSequentialPacking(
-            instance,
-            enemyFloor,
-            stateCap,
-            nullptr,
-            captureWitness,
-            m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly);
+        {
+            MasterProfileScope searchTiming(m_masterProfile, MasterPhase::EnemySearch);
+            solved.tier = solveSequentialPacking(
+                instance,
+                enemyFloor,
+                stateCap,
+                nullptr,
+                captureWitness,
+                m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly,
+                m_tierAuditMode,
+                pWarmStart,
+                m_masterProfile != nullptr ? m_masterProfile->enemySequentialCost : nullptr,
+                m_masterFutureCatalog ? SequentialPackingPolicy::CompatibleRows : SequentialPackingPolicy::LegacySuffix);
+        }
         if (captureWitness)
         {
+            MasterProfileScope replayTiming(m_masterProfile, MasterPhase::SequentialReplay);
             solved.witnessReplays = replaySequentialWitness(
                 instance,
                 solved.tier.witness,
@@ -2058,6 +2095,137 @@ namespace Coordinator
             capturedColumns,
             solved.tier.bookedValue);
         return solved.tier.bookedValue;
+    }
+
+    const PropertyStockActor* JointPlanStockValuer::sequentialMover(
+        const PropertyStockField::JointActionFacts & facts, std::int32_t row)
+    {
+        for (std::size_t mover = 0; mover < facts.moverRows.size(); ++mover)
+        {
+            if (facts.moverRows[mover] == row)
+            {
+                return &facts.movers[mover];
+            }
+        }
+        return nullptr;
+    }
+
+    std::vector<std::int64_t> JointPlanStockValuer::sequentialRowKey(
+        std::int32_t row, const PropertyStockActor* mover, std::span<const std::int32_t> capturedColumns)
+    {
+        std::vector<std::int64_t> key;
+        key.reserve(ROW_ENUM_KEY_PREFIX + capturedColumns.size());
+        key.push_back(row);
+        key.push_back(mover != nullptr ? mover->tile.x : NO_STOCK_COLUMN);
+        key.push_back(mover != nullptr ? mover->tile.y : NO_STOCK_COLUMN);
+        key.push_back(mover != nullptr ? mover->carriedCapturePoints : 0);
+        key.push_back(mover != nullptr ? static_cast<std::int64_t>(mover->survival) : 0);
+        key.insert(key.end(), capturedColumns.begin(), capturedColumns.end());
+        return key;
+    }
+
+    ContinuationEntry* JointPlanStockValuer::certificateEntry(const RelativeStockQuote & quote) const
+    {
+        auto* entry = m_continuationStore.find(quote.key);
+        if (entry == nullptr || !quote.valid || entry->capturedColumns != quote.capturedColumns ||
+            entry->ours.lower != quote.ours.lower || entry->ours.upper != quote.ours.upper ||
+            entry->searchCompleted != quote.ourSearchCompleted)
+        {
+            return nullptr;
+        }
+        return entry;
+    }
+
+    std::int64_t JointPlanStockValuer::certificateReadinessTariff(const RelativeStockQuote & quote) const
+    {
+        const auto & field = continuationField();
+        if (!std::in_range<std::int32_t>(field.m_ours.rows.size()) ||
+            !std::in_range<std::int32_t>(field.m_ours.columns.size()) ||
+            quote.key.size() > field.m_ours.rows.size() ||
+            quote.capturedColumns.size() > field.m_ours.columns.size())
+        {
+            return -1;
+        }
+        const auto rows = static_cast<std::int64_t>(field.m_ours.rows.size());
+        const auto columns = static_cast<std::int64_t>(field.m_ours.columns.size());
+        const auto actions = static_cast<std::int64_t>(quote.key.size());
+        const auto keyWidth = static_cast<std::int64_t>(ROW_ENUM_KEY_PREFIX) + columns;
+        const auto lookupDepth = 2 * static_cast<std::int64_t>(std::bit_width(m_rowOptionCache.size())) + 1;
+        const auto entryDepth = 2 * static_cast<std::int64_t>(std::bit_width(m_continuationStore.entryCount())) + 1;
+        std::int64_t work = 1;
+        // Both readiness and native setup look up the same immutable row domains.
+        if (!addProduct(work, {actions + 1, actions + 1}) ||
+            !addProduct(work, {rows, actions + 1}) ||
+            !addProduct(work, {rows, keyWidth, 2 * lookupDepth + 2}) ||
+            !addProduct(work, {actions + 1, 2 * entryDepth}) ||
+            !addProduct(work, {actions + columns + 1, 2}))
+        {
+            return -1;
+        }
+        return work;
+    }
+
+    RelativeStockCertificatePreparation JointPlanStockValuer::prepareOurCertificate(
+        const RelativeStockQuote & quote)
+    {
+        MasterProfileScope timing(m_masterProfile, MasterPhase::NativeCertificateReadiness);
+        RelativeStockCertificatePreparation result;
+        const auto tariff = certificateReadinessTariff(quote);
+        if (!livePairSwapIntervals() || m_pRefinementLedger == nullptr || tariff < 0)
+        {
+            m_pricingFailure = true;
+            return result;
+        }
+        if (!m_pRefinementLedger->consume(tariff, RefinementWork::MasterValuation))
+        {
+            result.status = RelativeStockPreparationStatus::BudgetExhausted;
+            return result;
+        }
+        result.readinessWork = tariff;
+        if (certificateEntry(quote) == nullptr)
+        {
+            m_pricingFailure = true;
+            return result;
+        }
+        const auto & field = continuationField();
+        const auto facts = field.jointActionFacts(planActions(quote.key));
+        auto owned = field.m_ownedBaseline;
+        for (const auto column : facts.capturedColumns)
+        {
+            if (!RelativeStockDetail::checkedAdd(owned, ownershipFlipSwing(
+                    field.m_ours.columns[static_cast<std::size_t>(column)], field.m_horizonTurns)))
+            {
+                m_pricingFailure = true;
+                return result;
+            }
+        }
+        if (facts.capturedColumns != quote.capturedColumns || owned != quote.owned)
+        {
+            m_pricingFailure = true;
+            return result;
+        }
+        std::int64_t scanWork = 0;
+        for (std::size_t row = 0; row < field.m_ours.rows.size(); ++row)
+        {
+            const auto rowIndex = static_cast<std::int32_t>(row);
+            const auto key = sequentialRowKey(rowIndex, sequentialMover(facts, rowIndex), facts.capturedColumns);
+            const auto cached = m_rowOptionCache.find(key);
+            if (cached == m_rowOptionCache.end())
+            {
+                result.status = RelativeStockPreparationStatus::MissingRows;
+                return result;
+            }
+            if (!std::in_range<std::int64_t>(cached->second.options.size()) ||
+                !addProduct(scanWork, {static_cast<std::int64_t>(cached->second.options.size()),
+                                      CERTIFICATE_OPTION_SCAN_WORK}))
+            {
+                m_pricingFailure = true;
+                return result;
+            }
+        }
+        result.scanWork = scanWork;
+        result.status = RelativeStockPreparationStatus::Ready;
+        return result;
     }
 
     JointPlanStockValuer::OurSequentialProblem
@@ -2108,45 +2276,15 @@ namespace Coordinator
             }
         }
 
-        std::vector<std::int64_t> sortedCaptured(
-            facts.capturedColumns.begin(),
-            facts.capturedColumns.end());
-        std::sort(sortedCaptured.begin(), sortedCaptured.end());
         problem.rowKeys.reserve(field.m_ours.rows.size());
         problem.instance.rows.reserve(field.m_ours.rows.size());
         for (std::size_t rowIndex = 0;
              rowIndex < field.m_ours.rows.size();
              ++rowIndex)
         {
-            const PropertyStockActor* pMover = nullptr;
-            for (std::size_t moverSlot = 0;
-                 moverSlot < facts.moverRows.size();
-                 ++moverSlot)
-            {
-                if (facts.moverRows[moverSlot] ==
-                    static_cast<std::int32_t>(rowIndex))
-                {
-                    pMover = &facts.movers[moverSlot];
-                    break;
-                }
-            }
-            std::vector<std::int64_t> rowKey;
-            rowKey.reserve(ROW_ENUM_KEY_PREFIX + sortedCaptured.size());
-            rowKey.push_back(static_cast<std::int64_t>(rowIndex));
-            rowKey.push_back(
-                pMover != nullptr ? pMover->tile.x : NO_STOCK_COLUMN);
-            rowKey.push_back(
-                pMover != nullptr ? pMover->tile.y : NO_STOCK_COLUMN);
-            rowKey.push_back(
-                pMover != nullptr ? pMover->carriedCapturePoints : 0);
-            rowKey.push_back(
-                pMover != nullptr
-                    ? static_cast<std::int64_t>(pMover->survival)
-                    : 0);
-            rowKey.insert(rowKey.end(),
-                          sortedCaptured.begin(),
-                          sortedCaptured.end());
-            problem.rowKeys.push_back(std::move(rowKey));
+            const auto* pMover = sequentialMover(facts, static_cast<std::int32_t>(rowIndex));
+            problem.rowKeys.push_back(sequentialRowKey(
+                static_cast<std::int32_t>(rowIndex), pMover, facts.capturedColumns));
             problem.instance.rows.push_back(sequentialRowFor(
                 field,
                 field.m_ours,
@@ -2234,6 +2372,7 @@ namespace Coordinator
             std::uint64_t sessionIdentity,
             std::int64_t maximumWork)
     {
+        MasterProfileScope setupTiming(m_masterProfile, MasterPhase::NativeCertificateSetup);
         RelativeStockDualTightening result;
         result.intervalBefore = quote.ours;
         result.intervalAfter = quote.ours;
@@ -2250,15 +2389,8 @@ namespace Coordinator
             failGlobal();
             return result;
         }
-        ContinuationEntry* pEntry =
-            m_continuationStore.find(quote.key);
-        if (pEntry == nullptr ||
-            pEntry->capturedColumns !=
-                quote.capturedColumns ||
-            pEntry->ours.lower != quote.ours.lower ||
-            pEntry->ours.upper != quote.ours.upper ||
-            pEntry->searchCompleted !=
-                quote.ourSearchCompleted)
+        ContinuationEntry* pEntry = certificateEntry(quote);
+        if (pEntry == nullptr)
         {
             failGlobal();
             return result;
@@ -2267,10 +2399,11 @@ namespace Coordinator
         OurSequentialProblem problem =
             buildOurSequentialProblem(
                 planActions(quote.key));
-        PackingDualProblemIdentity identity =
-            packingDualProblemIdentity(
-                quote,
-                problem);
+        PackingDualProblemIdentity identity;
+        {
+            MasterProfileScope identityTiming(m_masterProfile, MasterPhase::NativeCertificateIdentity);
+            identity = packingDualProblemIdentity(quote, problem);
+        }
         identity.session = sessionIdentity;
         if (problem.capturedColumns !=
                 quote.capturedColumns ||
@@ -2323,6 +2456,7 @@ namespace Coordinator
         std::int64_t expectedCatalogWork = 0;
         std::int64_t expectedOptionRecords = 0;
         std::int64_t expectedIncidences = 0;
+        MasterProfileScope readinessTiming(m_masterProfile, MasterPhase::NativeCertificateReadiness);
         for (std::size_t row = 0;
              row < problem.rowKeys.size();
              ++row)
@@ -2388,6 +2522,8 @@ namespace Coordinator
             result.locallyBudgetExhausted = true;
             return result;
         }
+        readinessTiming.finish();
+        setupTiming.finish();
         const std::int64_t balanceBefore =
             m_pRefinementLedger->balance();
         const GrantId grant =
@@ -2433,7 +2569,7 @@ namespace Coordinator
 
         PackingDualCatalog catalog;
         {
-            MasterProfileScope timing(m_masterProfile, MasterPhase::Catalog);
+            MasterProfileScope timing(m_masterProfile, MasterPhase::NativeCertificateCatalog);
             catalog = buildPackingDualCatalog(sources, identity, expectedCatalogWork);
         }
         result.catalogWork =
@@ -2465,7 +2601,7 @@ namespace Coordinator
             verifierWork;
         PackingDualOptimizerResult optimizer;
         {
-            MasterProfileScope timing(m_masterProfile, MasterPhase::DualOptimization);
+            MasterProfileScope timing(m_masterProfile, MasterPhase::NativeCertificateOptimization);
             optimizer = optimizePackingDualPrices(catalog, identity, optimizerLimit);
         }
         result.optimizerWork = optimizer.workUsed;
@@ -2488,7 +2624,7 @@ namespace Coordinator
 
         PackingDualVerification verified;
         {
-            MasterProfileScope timing(m_masterProfile, MasterPhase::CertificateVerification);
+            MasterProfileScope timing(m_masterProfile, MasterPhase::NativeCertificateVerification);
             verified = verifyPackingDualCertificate(catalog, sources, identity, optimizer.nodePrices, verifierWork);
         }
         result.verifierWork = verified.workUsed;
@@ -2614,16 +2750,20 @@ namespace Coordinator
         std::span<const PlanRowAction> actions,
         std::int64_t stateCap,
         bool captureWitness,
-        const RefinedWitness* pReplay) const
+        const RefinedWitness* pReplay,
+        const SequentialWarmStart* pWarmStart) const
     {
+        MasterProfileScope setupTiming(m_masterProfile, MasterPhase::FriendlySetup);
         OurSequentialProblem problem =
             buildOurSequentialProblem(actions);
         OurSequentialSolve solved;
         solved.capturedColumns = problem.capturedColumns;
         solved.owned = problem.owned;
+        setupTiming.finish();
 
         if (pReplay != nullptr)
         {
+            MasterProfileScope replayTiming(m_masterProfile, MasterPhase::SequentialReplay);
             solved.witnessReplays = replaySequentialWitness(
                 problem.instance,
                 pReplay->rows,
@@ -2639,15 +2779,23 @@ namespace Coordinator
                 ? &m_rowOptionPaidKeys
                 : nullptr;
 #endif
-        solved.tier = solveSequentialPacking(
-            problem.instance,
-            problem.floorValue,
-            stateCap,
-            &rowSource,
-            captureWitness,
-            m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly);
+        {
+            MasterProfileScope searchTiming(m_masterProfile, MasterPhase::FriendlySearch);
+            solved.tier = solveSequentialPacking(
+                problem.instance,
+                problem.floorValue,
+                stateCap,
+                &rowSource,
+                captureWitness,
+                m_masterFutureCatalog ? SequentialWitnessPolicy::BookedValue : SequentialWitnessPolicy::ImprovementOnly,
+                m_tierAuditMode,
+                pWarmStart,
+                m_masterProfile != nullptr ? m_masterProfile->friendlySequentialCost : nullptr,
+                m_masterFutureCatalog ? SequentialPackingPolicy::CompatibleRows : SequentialPackingPolicy::LegacySuffix);
+        }
         if (captureWitness)
         {
+            MasterProfileScope replayTiming(m_masterProfile, MasterPhase::SequentialReplay);
             solved.witnessReplays = replaySequentialWitness(
                 problem.instance,
                 solved.tier.witness,
@@ -2744,6 +2892,31 @@ namespace Coordinator
         return ours.owned + ours.tier.bookedValue - enemyBooked;
     }
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    void JointPlanStockValuer::recordWarmStart(
+        std::size_t witnesses, std::size_t keyWidth, std::size_t rows, std::size_t columns,
+        const std::optional<SequentialWarmStart> & seed, const SequentialTierResult & tier, bool witnessReplays)
+    {
+        m_diagnosticLastWarmStart = DiagnosticWarmStart{
+            .witnesses = witnesses,
+            .keyWidth = keyWidth,
+            .rows = rows,
+            .columns = columns,
+            .floor = tier.floorValue,
+            .repair = tier.repairValue,
+            .booked = tier.bookedValue,
+            .states = tier.searchStates,
+            .accepted = tier.warmStartAccepted,
+            .selected = tier.warmStartSelected,
+            .witnessReplays = witnessReplays,
+        };
+        if (seed)
+        {
+            m_diagnosticLastWarmStart->seedValue = seed->value;
+        }
+    }
+#endif
+
     bool JointPlanStockValuer::refineOur(
         ContinuationEntry & entry,
         GrantId grant,
@@ -2760,15 +2933,35 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
+        std::optional<SequentialWarmStart> seed;
+        if (m_masterFutureCatalog && schedule == RefinementSchedule::Relative && !m_refinedOurWitnesses.empty())
+        {
+            const auto known = m_refinedOurWitnesses.find(entry.key);
+            if (known != m_refinedOurWitnesses.end() && known->second.replays &&
+                known->second.value == entry.ours.lower)
+            {
+                seed = SequentialWarmStart{known->second.rows, known->second.value};
+            }
+        }
         OurSequentialSolve solved =
             solveOurSequential(
                 planActions(entry.key),
                 stateCap,
-                true);
+                true,
+                nullptr,
+                seed ? &*seed : nullptr);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-        m_diagnosticLastOurRefinement = solved.tier;
+        recordWarmStart(m_refinedOurWitnesses.size(), m_field.m_ours.rows.size(),
+                        m_field.m_ours.rows.size(), m_field.m_ours.columns.size(),
+                        seed, solved.tier, solved.witnessReplays);
+        if (m_tierAuditMode == SequentialTierAuditMode::Full)
+        {
+            MasterProfileScope archiveTiming(m_masterProfile, MasterPhase::TierArchiveCopy);
+            m_diagnosticLastOurRefinement = solved.tier;
+        }
 #endif
-        if (solved.capturedColumns != entry.capturedColumns ||
+        if ((seed && !solved.tier.warmStartAccepted) ||
+            solved.capturedColumns != entry.capturedColumns ||
             solved.tier.searchStates < 0 ||
             solved.tier.searchStates > stateCap ||
             solved.tier.bookedValue >
@@ -2844,12 +3037,30 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
+        std::optional<SequentialWarmStart> seed;
+        if (m_masterFutureCatalog && schedule == RefinementSchedule::Relative && !m_refinedEnemyWitnesses.empty())
+        {
+            const auto known = m_refinedEnemyWitnesses.find(capturedColumns);
+            if (known != m_refinedEnemyWitnesses.end() && known->second.replays &&
+                known->second.value == enemy.bounds.lower)
+            {
+                seed = SequentialWarmStart{known->second.rows, known->second.value};
+            }
+        }
         EnemySequentialSolve solved =
             solveEnemySequential(
                 capturedColumns,
                 stateCap,
-                true);
-        if (solved.tier.searchStates < 0 ||
+                true,
+                nullptr,
+                seed ? &*seed : nullptr);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        recordWarmStart(m_refinedEnemyWitnesses.size(), capturedColumns.size(),
+                        m_field.m_theirs.rows.size(), m_field.m_theirs.columns.size(),
+                        seed, solved.tier, solved.witnessReplays);
+#endif
+        if ((seed && !solved.tier.warmStartAccepted) ||
+            solved.tier.searchStates < 0 ||
             solved.tier.searchStates > stateCap ||
             solved.tier.bookedValue >
                 solved.tier.relaxedValue ||

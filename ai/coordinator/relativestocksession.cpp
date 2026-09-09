@@ -1,5 +1,7 @@
 #include "ai/coordinator/propertystockbuilder.h"
 
+#include "ai/coordinator/masterassignmentprofile.h"
+
 namespace Coordinator
 {
     JointPlanStockValuer::RelativeSession::RelativeSession(
@@ -121,13 +123,34 @@ namespace Coordinator
 
     std::int64_t JointPlanStockValuer::RelativeSession::ourRerunWork() const
     {
-        return m_owner.ourRerunTariff();
+        auto tariff = m_owner.ourRerunTariff();
+        if (m_owner.m_masterFutureCatalog)
+        {
+            const auto rows = m_owner.m_field.m_ours.rows.size();
+            const auto extra = warmStartTariff(m_owner.m_refinedOurWitnesses.size(), rows, rows,
+                                              m_owner.m_field.m_ours.columns.size());
+            if (tariff < 0 || extra < 0 || !RelativeStockDetail::checkedAdd(tariff, extra))
+            {
+                return -1;
+            }
+        }
+        return tariff;
     }
 
     std::int64_t JointPlanStockValuer::RelativeSession::enemyRerunWork(
         const std::vector<std::int32_t> & capturedColumns) const
     {
-        return m_owner.enemyRerunTariff(capturedColumns);
+        auto tariff = m_owner.enemyRerunTariff(capturedColumns);
+        if (m_owner.m_masterFutureCatalog)
+        {
+            const auto extra = warmStartTariff(m_owner.m_refinedEnemyWitnesses.size(), capturedColumns.size(),
+                m_owner.m_field.m_theirs.rows.size(), m_owner.m_field.m_theirs.columns.size());
+            if (tariff < 0 || extra < 0 || !RelativeStockDetail::checkedAdd(tariff, extra))
+            {
+                return -1;
+            }
+        }
+        return tariff;
     }
 
     GrantId JointPlanStockValuer::RelativeSession::grant(
@@ -145,6 +168,9 @@ namespace Coordinator
     RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::refineOur(
         const ContinuationKey & key, std::int64_t stateCap)
     {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        m_owner.m_diagnosticLastWarmStart.reset();
+#endif
         RelativeStockRefinedTerm result;
         CheapInitialPrice initial;
         if (!m_owner.livePairSwapIntervals() || !m_owner.priceCheap(key, initial))
@@ -165,8 +191,7 @@ namespace Coordinator
         result.valid = m_owner.refineOur(*entry, granted, stateCap, RefinementSchedule::Relative);
         result.workUsed = before - m_owner.m_pRefinementLedger->balance();
         result.statesUsed = result.workUsed - tariff;
-        if (m_owner.m_masterFutureCatalog && (result.statesUsed < 0 ||
-            !RelativeStockDetail::checkedAdd(m_owner.m_masterOurSearchStates, result.statesUsed)))
+        if (m_owner.m_masterFutureCatalog && result.statesUsed < 0)
         {
             result.valid = false;
             return result;
@@ -182,6 +207,9 @@ namespace Coordinator
     RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::refineEnemy(
         const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap)
     {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        m_owner.m_diagnosticLastWarmStart.reset();
+#endif
         RelativeStockRefinedTerm result;
         auto* enemy = m_owner.m_continuationStore.enemyFor(capturedColumns);
         if (!m_owner.livePairSwapIntervals() || enemy == nullptr)
@@ -231,14 +259,14 @@ namespace Coordinator
             maximumWork);
     }
 
-    std::int64_t JointPlanStockValuer::RelativeSession::certificatePreparationWork() const
+    RelativeStockCertificatePreparation JointPlanStockValuer::RelativeSession::prepareOurCertificate(
+        const RelativeStockQuote & quote)
     {
-        const auto length = std::max<std::int64_t>(m_owner.m_field.horizonTurns(), 1);
-        if (m_owner.m_masterOurSearchStates > std::numeric_limits<std::int64_t>::max() / length)
+        if (!owns(quote))
         {
-            return -1;
+            return {};
         }
-        return m_owner.m_masterOurSearchStates * length;
+        return m_owner.prepareOurCertificate(quote);
     }
 
     bool JointPlanStockValuer::RelativeSession::
@@ -289,6 +317,7 @@ namespace Coordinator
     std::shared_ptr<const RelativeStockProofSnapshot> JointPlanStockValuer::RelativeSession::captureProof(
         const RelativeStockQuote & expected)
     {
+        MasterProfileScope timing(m_owner.m_masterProfile, MasterPhase::ProofCapture);
         if (!owns(expected) || !expected.ourLowerWitnessReplays || !expected.enemyLowerWitnessReplays ||
             !sameRelativeStockQuote(expected, quote(expected.key, expected.economic)))
         {
@@ -314,6 +343,7 @@ namespace Coordinator
                 return {};
             }
             proof->ourKind = RelativeStockWitnessKind::Sequential;
+            MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
             proof->ourWitness = witness->second.rows;
         }
         if (expected.enemy.lower != 0)
@@ -323,6 +353,7 @@ namespace Coordinator
             {
                 return {};
             }
+            MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
             proof->enemyWitness = witness->second.rows;
         }
         if (expected.ourUpperCertificateId != 0)
@@ -339,6 +370,7 @@ namespace Coordinator
 
     bool JointPlanStockValuer::RelativeSession::replayLowerProof(const RelativeStockProofSnapshot & proof) const
     {
+        MasterProfileScope timing(m_owner.m_masterProfile, MasterPhase::ProofReplay);
         const auto & expected = proof.quote;
         if (!owns(expected) || !expected.valid || !RelativeStockDetail::canonical(expected) ||
             !RelativeStockDetail::coherent(expected))
@@ -362,7 +394,9 @@ namespace Coordinator
         }
         else if (proof.ourKind == RelativeStockWitnessKind::Sequential)
         {
+            MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
             const RefinedWitness witness{proof.ourWitness, expected.ours.lower, true};
+            copyTiming.finish();
             if (!proof.cheapOurWitness.empty() ||
                 !m_owner.solveOurSequential(planActions(expected.key), 0, false, &witness).witnessReplays)
             {
@@ -377,7 +411,9 @@ namespace Coordinator
         {
             return true;
         }
+        MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
         const RefinedWitness enemy{proof.enemyWitness, expected.enemy.lower, true};
+        copyTiming.finish();
         return m_owner.solveEnemySequential(expected.capturedColumns, 0, false, &enemy).witnessReplays;
     }
 }

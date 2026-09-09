@@ -351,9 +351,15 @@ QVariantList residualNodeReceipts(
 }
 
 QVariantMap sequentialPhaseReceipt(
-    const Coordinator::SequentialTierResult & tier)
+    const Coordinator::SequentialTierResult* recorded)
 {
+    if (recorded == nullptr)
+    {
+        return {{"available", false}};
+    }
+    const auto & tier = *recorded;
     return {
+        {"available", true},
         {"relaxedBoundConstructionStates", 0},
         {"rowCacheLookups", static_cast<qint64>(tier.rowCacheLookups)},
         {"rowCacheQuotedStates", static_cast<qint64>(tier.rowCacheQuotedStates)},

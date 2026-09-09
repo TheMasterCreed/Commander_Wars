@@ -17,6 +17,7 @@ namespace Coordinator
     {
         std::int32_t currentDualRounds{4};
         std::int64_t continuationSlice{128};
+        std::int64_t refinementGrowthFactor{4};
         std::int64_t futureDualAllowance{4096};
         std::uint64_t nodesPerRefinement{8};
         std::uint64_t incumbentRefinementStride{2};
@@ -80,6 +81,7 @@ namespace Coordinator
         std::uint64_t refinements{0};
         std::uint64_t incumbentRefinements{0};
         std::uint64_t cancelledEnemyRefinements{0};
+        std::uint64_t workBalancedSelections{0};
         std::uint64_t incumbentCompletions{0};
         std::uint64_t evaluationCacheHits{0};
         std::uint64_t peakFrontier{0};
@@ -98,6 +100,7 @@ namespace Coordinator
         std::shared_ptr<const MasterAssignmentEvaluation> incumbent;
         std::shared_ptr<const MasterAssignmentEvaluation> best;
         std::optional<MasterImprovementProof> improvement;
+        std::optional<MasterRefinementRefusal> refinementRefusal;
         std::optional<MilliFunds> lower;
         std::optional<MilliFunds> residualUpper;
         std::optional<MilliFunds> upper;

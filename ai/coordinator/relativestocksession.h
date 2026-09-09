@@ -50,6 +50,21 @@ namespace Coordinator
         }
     };
 
+    enum class RelativeStockPreparationStatus : std::int8_t
+    {
+        Invalid,
+        Ready,
+        MissingRows,
+        BudgetExhausted,
+    };
+
+    struct RelativeStockCertificatePreparation
+    {
+        RelativeStockPreparationStatus status{RelativeStockPreparationStatus::Invalid};
+        std::int64_t readinessWork{0};
+        std::int64_t scanWork{0};
+    };
+
     enum class RelativeStockWitnessKind : std::int8_t
     {
         Cheap,
@@ -92,9 +107,9 @@ namespace Coordinator
         {
             return false;
         }
-        virtual std::int64_t certificatePreparationWork() const
+        virtual RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote &)
         {
-            return 0;
+            return {.status = RelativeStockPreparationStatus::Ready};
         }
         virtual RelativeStockDualTightening
         tightenOurUpperWithVerifiedDual(

@@ -17,6 +17,7 @@ struct ArenaMatchPlayerConfig
 struct ArenaMatchConfig
 {
     static const QString FILE_NAME;
+    static const QString TIER_AUDIT_KEY;
 
     static bool load(const QString & path, ArenaMatchConfig & config, QString & error);
     static bool load(const QString & path, ArenaMatchConfig & config, QString & error,
@@ -36,6 +37,7 @@ struct ArenaMatchConfig
     qint32 stopAfterPlayer{-1};
     bool deterministicCounterpointSeed{false};
     qint64 coordinatedRefinementWorkLimit{-1};
+    bool coordinatedTierAudit{true};
     Coordinator::RelativeStockSchedule coordinatedRefinementSchedule{Coordinator::RelativeStockSchedule::Current};
     qint32 coordinatedScheduleDay{-1};
     QString coordinatedRefinementReceiptFile;

@@ -145,7 +145,7 @@ bool Coordinator::decisionTraceEnabled()
 
 bool Coordinator::planningTimingAuditEnabled()
 {
-#ifdef GAMEDEBUG
+#if defined(GAMEDEBUG) || defined(COW_COORDINATED_REFINEMENT_TESTING)
     return qgetenv("COW_COORDINATED_TIMING_AUDIT") ==
            QByteArray("1");
 #else
@@ -184,7 +184,7 @@ void Coordinator::writePlanningTimingAudit(
     const DecisionTraceIdentity & identity,
     const QString & fields)
 {
-#ifdef GAMEDEBUG
+#if defined(GAMEDEBUG) || defined(COW_COORDINATED_REFINEMENT_TESTING)
     Settings* pSettings = Settings::getInstance();
     if (!planningTimingAuditEnabled() ||
         pSettings == nullptr)

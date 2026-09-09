@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -21,6 +23,18 @@ namespace Coordinator
     {
         ImprovementOnly,
         BookedValue,
+    };
+
+    enum class SequentialTierAuditMode : std::int8_t
+    {
+        Full,
+        CountersOnly,
+    };
+
+    enum class SequentialPackingPolicy : std::int8_t
+    {
+        LegacySuffix,
+        CompatibleRows,
     };
 
     struct SequentialClassKey
@@ -480,6 +494,24 @@ namespace Coordinator
                                const SequentialRowWitness &) = default;
     };
 
+    struct SequentialWarmStart
+    {
+        std::span<const SequentialRowWitness> witness;
+        MilliFunds value{0};
+    };
+
+    constexpr std::int64_t sequentialWarmStartWork(std::int64_t rows, std::int64_t nodes)
+    {
+        // Flag initialization, replay visits and the owned result copy.
+        constexpr std::int64_t WITNESS_PASSES = 3;
+        constexpr auto maximumRecords = std::numeric_limits<std::int64_t>::max() / WITNESS_PASSES - 1;
+        if (rows < 0 || nodes < 0 || rows > maximumRecords || nodes > maximumRecords - rows)
+        {
+            return -1;
+        }
+        return WITNESS_PASSES * (rows + nodes + 1);
+    }
+
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     struct SequentialRowPhaseAudit
     {
@@ -529,7 +561,9 @@ namespace Coordinator
         bool continuationSeen{false};
         bool certificate{false};
         bool searchCompleted{false};
+        bool warmStartAccepted{false};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+        bool warmStartSelected{false};
         bool rowOptionDomainsComplete{false};
         bool packingAttempted{false};
         bool packingResidualUpperValid{false};
@@ -540,8 +574,89 @@ namespace Coordinator
         std::vector<SequentialRowWitness> witness;
     };
 
+    struct SequentialCostAudit
+    {
+        bool countOperations{false};
+        bool overflow{false};
+        std::uint64_t solves{0};
+        std::uint64_t packingCalls{0};
+        std::uint64_t optionsVisited{0};
+        std::uint64_t boundRejectedOptions{0};
+        std::uint64_t occupancyProbes{0};
+        std::uint64_t conflictingOptions{0};
+        std::uint64_t admittedOptions{0};
+        std::uint64_t refusedOptions{0};
+        std::uint64_t optionsAfterTruncation{0};
+        std::uint64_t compatibleBoundCalls{0};
+        std::uint64_t compatibleBoundWork{0};
+        std::uint64_t compatibleBoundPrunes{0};
+        std::uint64_t compatibleBoundIncomplete{0};
+        std::int64_t relaxationRepairNanos{0};
+        std::int64_t rowOptionsNanos{0};
+        std::int64_t packingNanos{0};
+        std::int64_t finalWitnessNanos{0};
+
+        void count(std::uint64_t & value)
+        {
+            if (value == std::numeric_limits<std::uint64_t>::max())
+            {
+                overflow = true;
+            }
+            else
+            {
+                ++value;
+            }
+        }
+    };
+
     namespace SequentialDetail
     {
+        class CostAuditScope final
+        {
+        public:
+            CostAuditScope(SequentialCostAudit* audit, std::int64_t SequentialCostAudit::* field)
+                : m_audit(audit), m_field(field)
+            {
+                if (m_audit != nullptr)
+                {
+                    m_start = Clock::now();
+                }
+            }
+
+            ~CostAuditScope()
+            {
+                finish();
+            }
+
+            void finish()
+            {
+                if (m_audit != nullptr)
+                {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - m_start).count();
+                    auto & total = m_audit->*m_field;
+                    if (elapsed < 0 || total > std::numeric_limits<std::int64_t>::max() - elapsed)
+                    {
+                        m_audit->overflow = true;
+                    }
+                    else
+                    {
+                        total += elapsed;
+                    }
+                    m_audit = nullptr;
+                }
+            }
+
+            CostAuditScope(const CostAuditScope &) = delete;
+            CostAuditScope & operator=(const CostAuditScope &) = delete;
+
+        private:
+            using Clock = std::chrono::steady_clock;
+            SequentialCostAudit* m_audit;
+            std::int64_t SequentialCostAudit::* m_field;
+            Clock::time_point m_start;
+        };
+
         inline MilliFunds continuationGain(const SequentialInstance & instance,
                                            const SequentialRow & row,
                                            std::int32_t node)
@@ -645,19 +760,73 @@ namespace Coordinator
             MilliFunds bestValue{0};
         };
 
+        template<typename Spend>
+        inline std::optional<MilliFunds> compatibleRowUpper(
+            std::span<const PackedRow> rows, std::size_t depth, MilliFunds value,
+            std::span<const std::uint8_t> used, Spend && spend)
+        {
+            if (depth > rows.size() || value < 0)
+            {
+                return std::nullopt;
+            }
+            auto upper = value;
+            for (std::size_t row = depth; row < rows.size(); ++row)
+            {
+                if (!spend())
+                {
+                    return std::nullopt;
+                }
+                MilliFunds best = 0;
+                for (const auto & option : rows[row].options)
+                {
+                    if (!spend())
+                    {
+                        return std::nullopt;
+                    }
+                    bool free = true;
+                    for (const auto node : option.nodes)
+                    {
+                        if (!spend() || node < 0 || static_cast<std::size_t>(node) >= used.size())
+                        {
+                            return std::nullopt;
+                        }
+                        if (used[static_cast<std::size_t>(node)])
+                        {
+                            free = false;
+                            break;
+                        }
+                    }
+                    if (free)
+                    {
+                        // Row options are ordered by descending value.
+                        best = std::max<MilliFunds>(option.value, 0);
+                        break;
+                    }
+                }
+                if (upper > std::numeric_limits<MilliFunds>::max() - best)
+                {
+                    return std::nullopt;
+                }
+                upper += best;
+            }
+            return upper;
+        }
+
         enum class IncumbentWitnessSource : std::int8_t
         {
             Untracked,
             Missing,
             Repair,
             Packing,
+            WarmStart,
         };
 
         struct PackSearch
         {
             std::span<const PackedRow> rows;
             std::vector<MilliFunds> suffixBound;
-            std::vector<bool> used;
+            // Byte flags avoid proxies in hot conflict checks.
+            std::vector<std::uint8_t> used;
             EnumerationBudget* pBudget{nullptr};
             MilliFunds incumbent{0};
             MilliFunds relaxedValue{0};
@@ -680,10 +849,16 @@ namespace Coordinator
                 (upper == pack.incumbent && pack.witnessSource == IncumbentWitnessSource::Missing);
         }
 
+        template<bool CountOperations = false, bool CompatibleRows = false>
         inline void packOptionRows(PackSearch & pack,
                                    std::size_t depth,
-                                   MilliFunds value)
+                                   MilliFunds value,
+                                   [[maybe_unused]] SequentialCostAudit* audit = nullptr)
         {
+            if constexpr (CountOperations)
+            {
+                audit->count(audit->packingCalls);
+            }
             if (pack.exact)
             {
                 return;
@@ -731,10 +906,63 @@ namespace Coordinator
 #endif
                 return;
             }
+            if constexpr (CompatibleRows)
+            {
+                if constexpr (CountOperations)
+                {
+                    audit->count(audit->compatibleBoundCalls);
+                }
+                const auto upper = compatibleRowUpper(pack.rows, depth, value, pack.used, [&] {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->compatibleBoundWork);
+                    }
+                    return pack.pBudget->spend();
+                });
+                if (!upper)
+                {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->compatibleBoundIncomplete);
+                    }
+                    if (pack.pBudget->truncated)
+                    {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                        ++pack.unexploredBranches;
+                        pack.maximumUnexploredBound = std::max(
+                            pack.maximumUnexploredBound, value + pack.suffixBound[depth]);
+#endif
+                        return;
+                    }
+                }
+                else if (!canImproveOrWitness(pack, *upper))
+                {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->compatibleBoundPrunes);
+                    }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                    ++pack.prunes;
+#endif
+                    return;
+                }
+            }
             for (const RowOption & option : pack.rows[depth].options)
             {
+                if constexpr (CountOperations)
+                {
+                    audit->count(audit->optionsVisited);
+                    if (pack.pBudget->truncated)
+                    {
+                        audit->count(audit->optionsAfterTruncation);
+                    }
+                }
                 if (!canImproveOrWitness(pack, value + option.value + pack.suffixBound[depth + 1]))
                 {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->boundRejectedOptions);
+                    }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
                     ++pack.prunes;
 #endif
@@ -743,6 +971,10 @@ namespace Coordinator
                 bool free = true;
                 for (const std::int32_t node : option.nodes)
                 {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->occupancyProbes);
+                    }
                     if (pack.used[static_cast<std::size_t>(node)])
                     {
                         free = false;
@@ -751,10 +983,18 @@ namespace Coordinator
                 }
                 if (!free)
                 {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->conflictingOptions);
+                    }
                     continue;
                 }
                 if (!pack.pBudget->spend())
                 {
+                    if constexpr (CountOperations)
+                    {
+                        audit->count(audit->refusedOptions);
+                    }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
                     ++pack.unexploredBranches;
                     pack.maximumUnexploredBound =
@@ -765,6 +1005,10 @@ namespace Coordinator
 #endif
                     return;
                 }
+                if constexpr (CountOperations)
+                {
+                    audit->count(audit->admittedOptions);
+                }
                 for (const std::int32_t node : option.nodes)
                 {
                     pack.used[static_cast<std::size_t>(node)] = true;
@@ -773,7 +1017,7 @@ namespace Coordinator
                 {
                     (*pack.pCurrentChoices)[depth] = &option;
                 }
-                packOptionRows(pack, depth + 1, value + option.value);
+                packOptionRows<CountOperations, CompatibleRows>(pack, depth + 1, value + option.value, audit);
                 for (const std::int32_t node : option.nodes)
                 {
                     pack.used[static_cast<std::size_t>(node)] = false;
@@ -787,7 +1031,7 @@ namespace Coordinator
             {
                 (*pack.pCurrentChoices)[depth] = nullptr;
             }
-            packOptionRows(pack, depth + 1, value);
+            packOptionRows<CountOperations, CompatibleRows>(pack, depth + 1, value, audit);
         }
     }
 
@@ -891,9 +1135,18 @@ namespace Coordinator
         std::int64_t stateCap,
         SequentialDetail::SequentialRowOptionSource* pRowSource = nullptr,
         bool captureWitness = false,
-        SequentialWitnessPolicy witnessPolicy = SequentialWitnessPolicy::ImprovementOnly)
+        SequentialWitnessPolicy witnessPolicy = SequentialWitnessPolicy::ImprovementOnly,
+        [[maybe_unused]] SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full,
+        const SequentialWarmStart* pWarmStart = nullptr,
+        SequentialCostAudit* pCostAudit = nullptr,
+        SequentialPackingPolicy packingPolicy = SequentialPackingPolicy::LegacySuffix)
     {
         using namespace SequentialDetail;
+        CostAuditScope relaxationTiming(pCostAudit, &SequentialCostAudit::relaxationRepairNanos);
+        if (pCostAudit != nullptr)
+        {
+            pCostAudit->count(pCostAudit->solves);
+        }
         const bool retainBookedWitness = captureWitness && witnessPolicy == SequentialWitnessPolicy::BookedValue;
 
         SequentialTierResult result;
@@ -901,7 +1154,7 @@ namespace Coordinator
         result.relaxedValue = floorValue;
         result.bookedValue = floorValue;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-        if (captureWitness)
+        if (captureWitness && auditMode == SequentialTierAuditMode::Full)
         {
             result.nodeColumns.assign(instance.nodeColumns.begin(),
                                       instance.nodeColumns.end());
@@ -969,6 +1222,22 @@ namespace Coordinator
                 std::max(result.relaxedValue, floorValue);
             if (!retainBookedWitness)
             {
+                return result;
+            }
+        }
+        if (pWarmStart != nullptr && retainBookedWitness &&
+            pWarmStart->value >= floorValue && pWarmStart->value <= result.relaxedValue)
+        {
+            result.warmStartAccepted = replaySequentialWitness(
+                instance, pWarmStart->witness, pWarmStart->value);
+            if (result.warmStartAccepted && (pWarmStart->value == result.relaxedValue || stateCap <= 0))
+            {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                result.warmStartSelected = true;
+#endif
+                result.certificate = pWarmStart->value == result.relaxedValue;
+                result.bookedValue = pWarmStart->value;
+                result.witness.assign(pWarmStart->witness.begin(), pWarmStart->witness.end());
                 return result;
             }
         }
@@ -1173,14 +1442,20 @@ namespace Coordinator
             return result;
         }
 
+        relaxationTiming.finish();
+        CostAuditScope rowTiming(pCostAudit, &SequentialCostAudit::rowOptionsNanos);
         EnumerationBudget budget{
             .stateCap = stateCap,
+            .truncated = packingPolicy == SequentialPackingPolicy::CompatibleRows && stateCap <= 0,
         };
         std::vector<std::vector<RowOption>> ownedOptions;
         ownedOptions.reserve(static_cast<std::size_t>(rowCount));
         std::vector<PackedRow> packedRows;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-        result.rowPhases.reserve(static_cast<std::size_t>(rowCount));
+        if (auditMode == SequentialTierAuditMode::Full)
+        {
+            result.rowPhases.reserve(static_cast<std::size_t>(rowCount));
+        }
         result.rowOptionDomainsComplete = true;
 #endif
         for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
@@ -1263,8 +1538,11 @@ namespace Coordinator
             result.totalUniqueRowOptions += phase.uniqueOptions;
             result.rowOptionDomainsComplete =
                 result.rowOptionDomainsComplete && phase.complete;
-            result.rowPhases.push_back(phase);
-            if (captureWitness)
+            if (auditMode == SequentialTierAuditMode::Full)
+            {
+                result.rowPhases.push_back(phase);
+            }
+            if (captureWitness && auditMode == SequentialTierAuditMode::Full)
             {
                 result.rowCatalogs.push_back(
                     SequentialRowCatalogAudit{
@@ -1288,6 +1566,8 @@ namespace Coordinator
         }
         result.rowsSearched =
             static_cast<std::int64_t>(packedRows.size());
+        rowTiming.finish();
+        CostAuditScope packingTiming(pCostAudit, &SequentialCostAudit::packingNanos);
         std::stable_sort(packedRows.begin(),
                          packedRows.end(),
                          [](const PackedRow & lhs, const PackedRow & rhs)
@@ -1316,6 +1596,14 @@ namespace Coordinator
             pack.witnessSource = repairTotal >= floorValue
                 ? IncumbentWitnessSource::Repair : IncumbentWitnessSource::Missing;
         }
+        if (result.warmStartAccepted && canImproveOrWitness(pack, pWarmStart->value))
+        {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            result.warmStartSelected = true;
+#endif
+            pack.incumbent = pWarmStart->value;
+            pack.witnessSource = IncumbentWitnessSource::WarmStart;
+        }
         std::optional<std::vector<const RowOption*>> currentChoices;
         std::optional<std::vector<const RowOption*>> bestChoices;
         if (captureWitness)
@@ -1329,7 +1617,27 @@ namespace Coordinator
         const std::int64_t statesBeforePacking = budget.states;
         result.packingAttempted = true;
 #endif
-        packOptionRows(pack, 0, 0);
+        if (packingPolicy == SequentialPackingPolicy::CompatibleRows)
+        {
+            if (pCostAudit != nullptr && pCostAudit->countOperations)
+            {
+                packOptionRows<true, true>(pack, 0, 0, pCostAudit);
+            }
+            else
+            {
+                packOptionRows<false, true>(pack, 0, 0);
+            }
+        }
+        else if (pCostAudit != nullptr && pCostAudit->countOperations)
+        {
+            packOptionRows<true>(pack, 0, 0, pCostAudit);
+        }
+        else
+        {
+            packOptionRows(pack, 0, 0);
+        }
+        packingTiming.finish();
+        CostAuditScope witnessTiming(pCostAudit, &SequentialCostAudit::finalWitnessNanos);
         result.searchStates = budget.states;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         result.packingStates =
@@ -1350,7 +1658,11 @@ namespace Coordinator
         result.certificate = pack.exact;
         result.bookedValue =
             std::max({floorValue, repairTotal, pack.incumbent});
-        if (captureWitness &&
+        if (pack.witnessSource == IncumbentWitnessSource::WarmStart)
+        {
+            result.witness.assign(pWarmStart->witness.begin(), pWarmStart->witness.end());
+        }
+        else if (captureWitness &&
             (pack.incumbent > std::max(floorValue, repairTotal) ||
              (retainBookedWitness && pack.witnessSource == IncumbentWitnessSource::Packing)))
         {

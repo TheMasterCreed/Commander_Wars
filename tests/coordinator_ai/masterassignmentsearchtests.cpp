@@ -369,6 +369,15 @@ namespace
         const auto unrelated = fixture.extract();
         expect(searchMasterAssignment(unrelated, evaluator, first).invalidInput,
                "equal-content independent problem cannot reuse a bound identity");
+        for (const std::int64_t growth : {-1, 0, 1})
+        {
+            const auto before = first.stats();
+            const auto invalid = searchMasterAssignment(problem, evaluator, first,
+                {.schedule = {.refinementGrowthFactor = growth}, .retainDiagnostics = true});
+            expect(invalid.invalidInput && invalid.implicitRoot && !invalid.globalOptimal &&
+                       first.stats() == before,
+                   "non-growing continuation policies fail before work while retaining the full domain");
+        }
     }
 
     void improvementBeforeGlobalProof()
@@ -431,6 +440,74 @@ namespace
                "observation changes no selection, proof, bound, residual, or work receipt");
     }
 
+    void firstOwnedProofTiming()
+    {
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 7, 1));
+        fixture.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 9, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        const auto complete = solve(problem, 1000000);
+        require(complete.globalOptimal && complete.stats.firstImprovementWork &&
+                    *complete.stats.firstImprovementWork > 0, "timing fixture retains a strict proof");
+        const auto firstWork = *complete.stats.firstImprovementWork;
+        for (const auto allowance : {std::int64_t{0}, firstWork - 1, firstWork,
+                                     complete.stats.work.spent(), std::int64_t{1000000}})
+        {
+            MasterAssignmentProfile profile;
+            profile.recordFirstImprovement();
+            expect(!profile.firstImprovementNanos, "inactive profiling cannot invent a proof time");
+            RefinementLedger ledger;
+            require(ledger.open(allowance), "proof timing ledger");
+            MasterAssignmentEvaluator evaluator(problem, ledger, &profile);
+            MasterAssignmentSearchResult result;
+            {
+                MasterProfileScope outer(&profile, MasterPhase::Shadow);
+                {
+                    MasterProfileScope setup(&profile, MasterPhase::Catalog);
+                }
+                result = searchMasterAssignment(problem, evaluator, ledger,
+                    {.retainDiagnostics = true, .profile = &profile});
+                if (result.improvement)
+                {
+                    const auto retained = profile.firstImprovementNanos;
+                    profile.recordFirstImprovement();
+                    expect(retained == profile.firstImprovementNanos,
+                           "later observations cannot reset the first retained proof time");
+                }
+            }
+            expect(searchRecord(result) == searchRecord(solve(problem, allowance)),
+                   "proof timestamps preserve all deterministic search results and work");
+            expect(profile.firstImprovementNanos.has_value() == result.improvement.has_value() &&
+                       profile.firstImprovementNanos.has_value() == result.stats.firstImprovementWork.has_value(),
+                   "a timestamp exists exactly when a complete strict proof was retained");
+            if (profile.firstImprovementNanos)
+            {
+                const auto elapsed = profile.samples[static_cast<std::size_t>(MasterPhase::Shadow)].inclusiveNanos;
+                const auto setup = profile.samples[static_cast<std::size_t>(MasterPhase::Catalog)].inclusiveNanos;
+                expect(*profile.firstImprovementNanos >= setup && *profile.firstImprovementNanos <= elapsed,
+                       "first proof uses the enclosing computation origin, including setup");
+            }
+            if (allowance == firstWork - 1)
+            {
+                expect(!result.improvement && !profile.firstImprovementNanos && ledger.lastRefusal() &&
+                           ledger.lastRefusal()->work == RefinementWork::MasterWitness,
+                       "an unpaid improvement witness does not receive a retained-proof timestamp");
+            }
+        }
+        Fixture equal(2);
+        equal.seat();
+        const auto equalProblem = equal.extract();
+        RefinementLedger equalLedger;
+        require(equalLedger.open(100000), "equality timing ledger");
+        MasterAssignmentProfile equalProfile;
+        MasterAssignmentEvaluator equalEvaluator(equalProblem, equalLedger, &equalProfile);
+        const auto unchanged = searchMasterAssignment(equalProblem, equalEvaluator, equalLedger,
+            {.profile = &equalProfile});
+        expect(unchanged.globalOptimal && !unchanged.improvement && !equalProfile.firstImprovementNanos,
+               "exact equality is not timed as a useful strict improvement");
+    }
+
     void missingGenerationOrdering()
     {
         Fixture fixture(3);
@@ -476,6 +553,7 @@ int main(int argc, char** argv)
     improvementBeforeGlobalProof();
     completionWitnessMemo();
     observerIsolation();
+    firstOwnedProofTiming();
     missingGenerationOrdering();
     std::printf("Master assignment search: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;

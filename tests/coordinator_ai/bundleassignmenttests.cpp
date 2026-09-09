@@ -3043,6 +3043,36 @@ void testStockDecompositionIsDeferredAndNeutral()
            "origin mismatch receipts expose both origin values");
 }
 
+void testPlanningTimingsAreNeutral()
+{
+    for (const auto failure : {IntervalFailure::None, IntervalFailure::IncumbentWitness,
+                              IntervalFailure::LeafQuote, IntervalFailure::ReplayQuote,
+                              IntervalFailure::ReplayUpper})
+    {
+        PairIntervalValuer baselineValuer(failure, ATTACKER_UNIT);
+        auto baselineInput = fullPlanDestinationSwapInput();
+        baselineInput.pStockValuer = &baselineValuer;
+        const auto baseline = MaximumValueAssignment::assign(baselineInput);
+
+        PairIntervalValuer timedValuer(failure, ATTACKER_UNIT);
+        auto timedInput = fullPlanDestinationSwapInput();
+        timedInput.pStockValuer = &timedValuer;
+        timedInput.measureTimings = true;
+        const auto timed = MaximumValueAssignment::assign(timedInput);
+
+        expect(samePlan(baseline, timed) && statsSnapshot(baseline.stats) == statsSnapshot(timed.stats),
+               "timing without decision tracing preserves actions, ordering and work through pair failures");
+        expect(baselineValuer.liveLeaves == timedValuer.liveLeaves &&
+                   baselineValuer.nonLeafQuotes == timedValuer.nonLeafQuotes &&
+                   baselineValuer.scalarCalls == timedValuer.scalarCalls &&
+                   baselineValuer.scalarCallsAfterLiveQuote == timedValuer.scalarCallsAfterLiveQuote &&
+                   timedValuer.auditCalls == 0 && timed.selections.empty(),
+               "timing alone does not enable diagnostic pricing or selection copies");
+        expect(timed.phaseTiming.prepareNanos > 0 && timed.phaseTiming.greedyNanos > 0,
+               "timing-only fixture exercises the measured assignment path");
+    }
+}
+
 void testDecisionTraceIsNeutralAndDeterministic()
 {
     PairIntervalValuer baselineValuer(
@@ -3145,6 +3175,7 @@ void testDecisionTraceIsNeutralAndDeterministic()
 
 int main()
 {
+    testPlanningTimingsAreNeutral();
     testConversionMapsEngineActionsAndTargets();
     testDestinationConflictRollsBackTheRefusedAction();
     testAttackAndCaptureClaimsRejectOverbooking();

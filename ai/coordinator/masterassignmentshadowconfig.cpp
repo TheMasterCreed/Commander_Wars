@@ -10,12 +10,15 @@ namespace
     constexpr auto MODE_VARIABLE = "COW_MASTER_ASSIGNMENT_MODE";
     constexpr auto WORK_VARIABLE = "COW_MASTER_ASSIGNMENT_WORK";
     constexpr auto OUTPUT_VARIABLE = "COW_MASTER_ASSIGNMENT_OUTPUT";
+    constexpr auto TIER_AUDIT_VARIABLE = "COW_MASTER_ASSIGNMENT_TIER_AUDIT";
+    constexpr auto EXPORT_VARIABLE = "COW_MASTER_ASSIGNMENT_EXPORT";
 }
 
 namespace Coordinator
 {
     MasterShadowConfig parseMasterShadowConfig(
-        const QByteArray & mode, const QByteArray & work, const QString & output)
+        const QByteArray & mode, const QByteArray & work, const QString & output, const QByteArray & tierAudit,
+        const QByteArray & exportMode)
     {
         MasterShadowConfig result;
         if (mode.isEmpty() || mode == "disabled")
@@ -38,7 +41,26 @@ namespace Coordinator
                 return result;
             }
         }
-        if (output.isEmpty() || !QDir::isAbsolutePath(output))
+        if (tierAudit == "counters")
+        {
+            result.tierAuditMode = SequentialTierAuditMode::CountersOnly;
+        }
+        else if (!tierAudit.isEmpty() && tierAudit != "full")
+        {
+            result.error = MasterShadowConfigError::InvalidTierAudit;
+            return result;
+        }
+        if (exportMode == "off")
+        {
+            result.exportMode = MasterShadowExportMode::Off;
+        }
+        else if (!exportMode.isEmpty() && exportMode != "full")
+        {
+            result.error = MasterShadowConfigError::InvalidExport;
+            return result;
+        }
+        if (result.exportMode == MasterShadowExportMode::Full &&
+            (output.isEmpty() || !QDir::isAbsolutePath(output)))
         {
             result.error = MasterShadowConfigError::MissingAbsoluteOutput;
             return result;
@@ -50,7 +72,7 @@ namespace Coordinator
     MasterShadowConfig readMasterShadowConfig()
     {
         const auto result = parseMasterShadowConfig(qgetenv(MODE_VARIABLE), qgetenv(WORK_VARIABLE),
-            QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)));
+            QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)), qgetenv(TIER_AUDIT_VARIABLE), qgetenv(EXPORT_VARIABLE));
         if (result.error != MasterShadowConfigError::None)
         {
             qWarning() << "Master assignment shadow configuration rejected:" << static_cast<int>(result.error);

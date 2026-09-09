@@ -22,10 +22,17 @@ namespace Coordinator
         MasterAssignmentStockContext & operator=(const MasterAssignmentStockContext &) = delete;
 
         MasterStockSetupStatus prepare(const PropertyStockField & source, const AssignmentInput & input,
-                                       RefinementLedger & ledger, MasterAssignmentProfile* profile = nullptr);
+                                       RefinementLedger & ledger, MasterAssignmentProfile* profile = nullptr,
+                                       SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full);
         RelativeStockSession* session();
         MasterValuationTariffs tariffs() const;
         MasterStockSetupStatus status() const;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        const DiagnosticWarmStart* diagnosticLastWarmStart() const
+        {
+            return m_valuer ? m_valuer->diagnosticLastWarmStart() : nullptr;
+        }
+#endif
 
     private:
         bool copyColdField(const PropertyStockField & source, RefinementLedger & ledger);

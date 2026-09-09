@@ -4,6 +4,8 @@
 #include <chrono>
 #include <utility>
 
+#include <QJsonDocument>
+
 #include "ai/coordinator/attackopportunitybuilder.h"
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/decisiontrace.h"
@@ -11,6 +13,7 @@
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
 #include "ai/coordinator/masterassignmentshadow.h"
+#include "ai/coordinator/masterassignmenttrace.h"
 
 #include "coreengine/qmlvector.h"
 
@@ -24,6 +27,25 @@
 
 namespace
 {
+std::int64_t planningNanosSince(std::chrono::steady_clock::time_point start, bool timed)
+{
+    if (!timed)
+    {
+        return 0;
+    }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+QString optionalPlanningValue(std::optional<std::int64_t> value)
+{
+    if (!value)
+    {
+        return QStringLiteral("unavailable");
+    }
+    return QString::number(*value);
+}
+
 bool sameExecutionIntent(
     const Coordinator::PlannedAction & left,
     const Coordinator::PlannedAction & right)
@@ -169,7 +191,7 @@ void CoordinatedAi::process()
             const bool usedCoPower = useStartOfDayCoPower();
             if (timed)
             {
-                m_coPowerCheckNanos =
+                m_coPowerCheckNanos +=
                     std::chrono::duration_cast<
                         std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() -
@@ -242,11 +264,11 @@ void CoordinatedAi::buildFactLayers()
     if (timed)
     {
         const Clock::time_point factEnd = Clock::now();
-        m_propertyStockBuildNanos =
+        m_propertyStockBuildNanos +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 factEnd - propertyStockStart)
                 .count();
-        m_factLayersNanos =
+        m_factLayersNanos +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 factEnd - factStart)
                 .count();
@@ -312,6 +334,9 @@ void CoordinatedAi::buildTurnPlan()
     {
         planningStart = Clock::now();
     }
+    const auto factLayersNanos = std::exchange(m_factLayersNanos, 0);
+    const auto propertyStockBuildNanos = std::exchange(m_propertyStockBuildNanos, 0);
+    const auto coPowerCheckNanos = std::exchange(m_coPowerCheckNanos, 0);
     if (m_decisionTrace != nullptr)
     {
         for (std::size_t propertyIndex = 0;
@@ -345,8 +370,12 @@ void CoordinatedAi::buildTurnPlan()
     Coordinator::AssignmentInput input;
     input.actionIds = Coordinator::engineActionIds();
     input.unitLinks = linkKnownUnits(m_dayStartKnowledge);
+    auto tierAudit = Coordinator::SequentialTierAuditMode::Full;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    tierAudit = m_testTierAuditMode;
+#endif
     Coordinator::JointPlanStockValuer stockValuer(
-        m_propertyStock, input.unitLinks);
+        m_propertyStock, input.unitLinks, tierAudit);
     input.pStockValuer = &stockValuer;
     input.pTrace = m_decisionTrace.get();
     input.measureTimings = timed;
@@ -511,17 +540,46 @@ void CoordinatedAi::buildTurnPlan()
                   std::chrono::nanoseconds>(
                   Clock::now() - continuationStart)
                   .count();
+    const auto legacyPreparationNanos = planningNanosSince(planningStart, timed);
+    Clock::time_point phaseStart;
+    if (timed)
+    {
+        phaseStart = Clock::now();
+    }
     const auto masterShadow = Coordinator::readMasterShadowConfig();
     Coordinator::RefinementLedger masterLedger;
+    std::unique_ptr<Coordinator::MasterShadowInspection> shadowInspection;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (masterShadow.enabled())
+    {
+        shadowInspection = ArenaMasterAssignmentProbe::openShadowInspection();
+    }
+#endif
     Coordinator::prepareMasterShadow(masterShadow, input, masterLedger);
+    const auto masterPreparationNanos = planningNanosSince(phaseStart, timed);
+    if (timed)
+    {
+        phaseStart = Clock::now();
+    }
     m_assignment = Coordinator::MaximumValueAssignment::assign(input);
-    const auto masterShadowNanos = Coordinator::observeMasterAssignment(
-        masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity);
+    const auto legacyAssignmentNanos = planningNanosSince(phaseStart, timed);
+    const auto masterTiming = Coordinator::observeMasterAssignment(
+        masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity, shadowInspection.get());
+    if (timed)
+    {
+        phaseStart = Clock::now();
+    }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     ArenaMasterAssignmentProbe::record(input, m_assignment, m_propertyStock, traceIdentity);
 #endif
+    const auto arenaProbeNanos = planningNanosSince(phaseStart, timed);
+    if (timed)
+    {
+        phaseStart = Clock::now();
+    }
     recordCaptureDecisions(input);
     recordProductionBlocks(input);
+    const auto decisionRecordingNanos = planningNanosSince(phaseStart, timed);
     const std::int64_t turnPlanNanos =
         !timed
             ? 0
@@ -540,9 +598,9 @@ void CoordinatedAi::buildTurnPlan()
             QStringLiteral(
                 "actorCount=%1 factLayersNanos=%2 propertyStockBuildNanos=%3 coPowerCheckNanos=%4 candidateBuildNanos=%5 continuationPricingPrepareNanos=%6 assignmentPrepareNanos=%7 greedyNanos=%8 settlingNanos=%9 pairRefinementNanos=%10 clusterNanos=%11 finishPlanNanos=%12 totalPlanningNanos=%13 totalCandidates=%14 maxCandidatesPerActor=%15 damageOracleCalls=%16 damageOracleHits=%17 stockCoupledActors=%18 settlingSweeps=%19 settlingMoves=%20 swapStates=%21 swapImprovements=%22 clustersTotal=%23 clustersEnumerated=%24 clustersCapped=%25 clustersSkippedStockBudget=%26 enumerationStates=%27 planSequence=%28")
                 .arg(input.actors.size())
-                .arg(m_factLayersNanos)
-                .arg(m_propertyStockBuildNanos)
-                .arg(m_coPowerCheckNanos)
+                .arg(factLayersNanos)
+                .arg(propertyStockBuildNanos)
+                .arg(coPowerCheckNanos)
                 .arg(candidateBuildNanos)
                 .arg(continuationPricingPrepareNanos)
                 .arg(assignmentTiming.prepareNanos)
@@ -551,8 +609,8 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(assignmentTiming.pairRefinementNanos)
                 .arg(assignmentTiming.clusterNanos)
                 .arg(assignmentTiming.finishPlanNanos)
-                .arg(m_factLayersNanos +
-                     m_coPowerCheckNanos +
+                .arg(factLayersNanos +
+                     coPowerCheckNanos +
                      turnPlanNanos)
                 .arg(buildStats.candidateCount)
                 .arg(maxCandidatesPerActor)
@@ -569,6 +627,11 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(stats.clustersSkippedStockBudget)
                 .arg(stats.enumerationStates)
                 .arg(m_planSequence);
+        phaseTimingFields += QStringLiteral(
+            " legacyPlanningNanos=%1 legacyPreparationNanos=%2 legacyAssignmentNanos=%3 masterPreparationNanos=%4 arenaProbeNanos=%5 decisionRecordingNanos=%6 turnPlanNanos=%7")
+            .arg(factLayersNanos + coPowerCheckNanos + legacyPreparationNanos + legacyAssignmentNanos)
+            .arg(legacyPreparationNanos).arg(legacyAssignmentNanos).arg(masterPreparationNanos)
+            .arg(arenaProbeNanos).arg(decisionRecordingNanos).arg(turnPlanNanos);
         phaseTimingFields += QStringLiteral(
             " stockPairEnumerationNanos=%1 stockPairRelativeNanos=%2 stockPairReplayNanos=%3 stockJointEnumerationNanos=%4 stockJointRelativeNanos=%5 stockJointReplayNanos=%6 stockPairStates=%7 stockPairEnemyStates=%8 stockPairWork=%9 stockPairImprovements=%10 stockPairUnresolved=%11 stockPairBudgetExhaustions=%12 stockJointStates=%13 stockJointEnemyStates=%14 stockJointWork=%15 stockJointImprovements=%16 stockJointUnresolved=%17 stockJointBudgetExhaustions=%18 stockJointSkipped=%19 ledgerTotal=%20 ledgerSpent=%21 ledgerRemaining=%22")
             .arg(assignmentTiming.stockPairs.enumerationNanos).arg(assignmentTiming.stockPairs.refinementNanos)
@@ -588,7 +651,39 @@ void CoordinatedAi::buildTurnPlan()
         if (masterShadow.enabled())
         {
             phaseTimingFields += QStringLiteral(" masterShadowNanos=%1 masterShadowWork=%2 masterShadowAllowance=%3")
-                .arg(masterShadowNanos).arg(masterLedger.stats().spent()).arg(masterShadow.allowance);
+                .arg(masterTiming.totalNanos).arg(masterLedger.stats().spent()).arg(masterShadow.allowance);
+            phaseTimingFields += QStringLiteral(
+                " masterComputationNanos=%1 masterRecordNanos=%2 masterEncodingNanos=%3 masterOutputNanos=%4 masterInspectionNanos=%5 masterExportMode=%6 masterExportRecords=%7 masterExportBytes=%8 masterExportSucceeded=%9 masterOutcome=%10 masterFirstImprovementWork=%11 masterImprovementLower=%12 masterGap=%13 masterLegacyPlanUnchanged=%14 masterLegacyLedgerUnchanged=%15")
+                .arg(masterTiming.computationNanos).arg(masterTiming.recordNanos).arg(masterTiming.encodingNanos)
+                .arg(masterTiming.outputNanos).arg(masterTiming.inspectionNanos)
+                .arg(static_cast<int>(masterShadow.exportMode)).arg(masterTiming.exportRecords)
+                .arg(masterTiming.exportBytes).arg(masterTiming.exportSucceeded)
+                .arg(Coordinator::masterShadowOutcomeName(masterTiming.outcome))
+                .arg(optionalPlanningValue(masterTiming.firstImprovementWork))
+                .arg(optionalPlanningValue(masterTiming.improvementLower)).arg(optionalPlanningValue(masterTiming.gap))
+                .arg(masterTiming.legacyPlanUnchanged).arg(masterTiming.legacyLedgerUnchanged);
+            std::optional<std::int64_t> afterFirstImprovement;
+            if (masterTiming.firstImprovementNanos)
+            {
+                afterFirstImprovement =
+                    masterTiming.phases[static_cast<std::size_t>(Coordinator::MasterPhase::Shadow)].inclusiveNanos -
+                    *masterTiming.firstImprovementNanos;
+            }
+            phaseTimingFields += QStringLiteral(
+                " masterFirstImprovementNanos=%1 masterAfterFirstImprovementNanos=%2 masterRefusal=%3 masterRefinementRefusal=%4")
+                .arg(optionalPlanningValue(masterTiming.firstImprovementNanos))
+                .arg(optionalPlanningValue(afterFirstImprovement))
+                .arg(QString::fromUtf8(QJsonDocument(Coordinator::masterRefusalRecord(
+                    masterLedger.lastRefusal())).toJson(QJsonDocument::Compact)))
+                .arg(QString::fromUtf8(QJsonDocument(Coordinator::masterRefinementRefusalRecord(
+                    masterTiming.refinementRefusal)).toJson(QJsonDocument::Compact)));
+            for (std::size_t phase = 0; phase < masterTiming.phases.size(); ++phase)
+            {
+                const auto & sample = masterTiming.phases[phase];
+                phaseTimingFields += QStringLiteral(" master_%1_calls=%2 master_%1_inclusiveNanos=%3 master_%1_exclusiveNanos=%4")
+                    .arg(QLatin1String(Coordinator::MASTER_PHASE_NAMES[phase])).arg(sample.calls)
+                    .arg(sample.inclusiveNanos).arg(sample.exclusiveNanos);
+            }
         }
     }
     if (m_decisionTrace != nullptr)
