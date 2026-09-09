@@ -41,6 +41,7 @@ private:
     bool loadConfig();
     bool loadMap();
     bool applyPlayerSetup();
+    void setStockControlPrefixHold(bool held);
     bool applyGameRules();
     void addDefaultVictoryRules(GameRules* pRules);
     void startMenue();
@@ -67,6 +68,7 @@ private:
     QStringList m_actionPayloadBase64;
     QVariantList m_seedTrace;
     QVariantList m_actionTargets;
+    QVariantList m_actionPlanningContexts;
     std::shared_ptr<ArenaRelativeStockProbe> m_relativeStockProbe;
     std::unique_ptr<ArenaActionPrefix> m_actionPrefix;
     bool m_finished{false};

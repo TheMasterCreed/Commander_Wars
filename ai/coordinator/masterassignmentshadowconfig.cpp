@@ -12,25 +12,36 @@ namespace
     constexpr auto OUTPUT_VARIABLE = "COW_MASTER_ASSIGNMENT_OUTPUT";
     constexpr auto TIER_AUDIT_VARIABLE = "COW_MASTER_ASSIGNMENT_TIER_AUDIT";
     constexpr auto EXPORT_VARIABLE = "COW_MASTER_ASSIGNMENT_EXPORT";
+    constexpr auto STOCK_CONTROL_MODE = "stockControl";
 }
 
 namespace Coordinator
 {
     MasterShadowConfig parseMasterShadowConfig(
         const QByteArray & mode, const QByteArray & work, const QString & output, const QByteArray & tierAudit,
-        const QByteArray & exportMode)
+        const QByteArray & exportMode, bool isolatedArena)
     {
         MasterShadowConfig result;
         if (mode.isEmpty() || mode == "disabled")
         {
             return result;
         }
-        if (mode != "shadow")
+        if (mode != "shadow" && mode != STOCK_CONTROL_MODE)
         {
             result.error = MasterShadowConfigError::UnknownMode;
             return result;
         }
-        result.mode = MasterAssignmentMode::Shadow;
+        result.mode = mode == STOCK_CONTROL_MODE ? MasterAssignmentMode::StockControl : MasterAssignmentMode::Shadow;
+        if (result.controlsStock() && !isolatedArena)
+        {
+            result.error = MasterShadowConfigError::StockControlOutsideArena;
+            return result;
+        }
+        if (result.controlsStock() && work.isEmpty())
+        {
+            result.error = MasterShadowConfigError::MissingExplicitAllowance;
+            return result;
+        }
         if (!work.isEmpty())
         {
             bool valid = false;
@@ -71,11 +82,16 @@ namespace Coordinator
 
     MasterShadowConfig readMasterShadowConfig()
     {
+        bool isolatedArena = false;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        isolatedArena = qgetenv("COW_AI_ARENA_TEST") == "1";
+#endif
         const auto result = parseMasterShadowConfig(qgetenv(MODE_VARIABLE), qgetenv(WORK_VARIABLE),
-            QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)), qgetenv(TIER_AUDIT_VARIABLE), qgetenv(EXPORT_VARIABLE));
+            QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)), qgetenv(TIER_AUDIT_VARIABLE),
+            qgetenv(EXPORT_VARIABLE), isolatedArena);
         if (result.error != MasterShadowConfigError::None)
         {
-            qWarning() << "Master assignment shadow configuration rejected:" << static_cast<int>(result.error);
+            qWarning() << "Master assignment configuration rejected:" << static_cast<int>(result.error);
         }
         return result;
     }

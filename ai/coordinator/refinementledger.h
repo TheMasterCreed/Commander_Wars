@@ -25,6 +25,7 @@ namespace Coordinator
         MasterValuation,
         MasterWitness,
         MasterReplay,
+        MasterInstallation,
         Count,
     };
 

@@ -98,6 +98,7 @@ void ArenaMatchRunner::run()
     {
         return;
     }
+    setStockControlPrefixHold(m_actionPrefix && !m_actionPrefix->complete());
     Settings::getInstance()->setAutoSavingCycle(0);
     Settings::getInstance()->setRecord(false);
     m_stopBoundary.configure(m_config);
@@ -206,6 +207,18 @@ bool ArenaMatchRunner::applyPlayerSetup()
         pPlayer->setCO({}, SECONDARY_CO);
     }
     return true;
+}
+
+void ArenaMatchRunner::setStockControlPrefixHold(bool held)
+{
+    for (qint32 player = 0; player < m_pMap->getPlayerCount(); ++player)
+    {
+        auto* coordinated = dynamic_cast<CoordinatedAi*>(m_pMap->getPlayer(player)->getBaseGameInput());
+        if (coordinated != nullptr)
+        {
+            coordinated->setStockControlTestHold(held);
+        }
+    }
 }
 
 bool ArenaMatchRunner::applyGameRules()
@@ -371,6 +384,15 @@ void ArenaMatchRunner::onAiAction(spGameAction pAction)
     m_actionPayloadBase64.append(QString::fromLatin1(payload.toBase64()));
     m_seedTrace.append(QVariant::fromValue<qulonglong>(pAction->getSeed()));
     m_actionTargets.append(QVariantMap{{"x", target.x()}, {"y", target.y()}});
+    auto* player = m_pMap->getCurrentPlayer();
+    QVariant planSequence;
+    if (const auto* coordinated = dynamic_cast<const CoordinatedAi*>(player->getBaseGameInput()))
+    {
+        planSequence = QString::number(coordinated->testPlanSequence());
+    }
+    m_actionPlanningContexts.append(QVariantMap{
+        {"day", m_pMap->getCurrentDay()}, {"player", player->getPlayerID()}, {"planSequence", planSequence},
+    });
     if (m_actionPrefix)
     {
         m_pMenue->getActionPerformer()->performAction(pAction);
@@ -380,9 +402,9 @@ void ArenaMatchRunner::onAiAction(spGameAction pAction)
 void ArenaMatchRunner::onActionPerformed()
 {
     Player* pCurrent = m_pMap->getCurrentPlayer();
-    if (m_actionPrefix && !m_finished)
+    if (m_actionPrefix && !m_finished && m_actionPrefix->observeBoundary(*m_pMap))
     {
-        m_actionPrefix->observeBoundary(*m_pMap);
+        setStockControlPrefixHold(false);
     }
     if (!m_finished && pCurrent != nullptr &&
         m_stopBoundary.shouldStop(m_pMap->getCurrentDay(), pCurrent->getPlayerID()))
@@ -441,6 +463,7 @@ void ArenaMatchRunner::finishMatch(Outcome outcome)
         {"seedTrace", m_seedTrace},
         {"actionIds", m_actionIds},
         {"actionTargets", m_actionTargets},
+        {"actionPlanningContexts", m_actionPlanningContexts},
         {"preActionStateHashes", m_preActionStateHashes},
         {"actionPayloadSha256", m_actionPayloadSha256},
         {"actionPayloadBase64", m_actionPayloadBase64},

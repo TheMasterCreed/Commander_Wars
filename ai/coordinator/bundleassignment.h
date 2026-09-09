@@ -1,9 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -18,6 +20,7 @@
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/planstockvaluer.h"
 #include "ai/coordinator/planidentity.h"
+#include "ai/coordinator/refinementledger.h"
 #include "ai/coordinator/relativestockaudit.h"
 #include "ai/coordinator/turnplan.h"
 
@@ -113,6 +116,16 @@ namespace Coordinator
         friend bool operator==(const AssignmentStats &, const AssignmentStats &) = default;
     };
 
+    enum class StockConstructionStatus : std::int8_t
+    {
+        NotRequested,
+        Complete,
+        Incomplete,
+        InvalidInput,
+        ArithmeticFailure,
+        BudgetExhausted,
+    };
+
     struct AssignmentResult
     {
         enum class SelectionPhase : std::int8_t
@@ -122,6 +135,7 @@ namespace Coordinator
             Settling,
             PairRefinement,
             Cluster,
+            Master,
         };
 
         struct CandidateCompleteValue
@@ -160,6 +174,9 @@ namespace Coordinator
         AssignmentStats stats;
         std::vector<Selection> selections;
         PhaseTiming phaseTiming;
+        StockConstructionStatus stockConstructionStatus{StockConstructionStatus::NotRequested};
+        std::int64_t stockConstructionWork{0};
+        bool nonStockRefinementRolledBack{false};
     };
 
     inline QString traceSelectionPhase(AssignmentResult::SelectionPhase phase)
@@ -176,6 +193,8 @@ namespace Coordinator
                 return QStringLiteral("PAIR_REFINEMENT");
             case AssignmentResult::SelectionPhase::Cluster:
                 return QStringLiteral("CLUSTER");
+            case AssignmentResult::SelectionPhase::Master:
+                return QStringLiteral("MASTER");
         }
         return QStringLiteral("UNKNOWN");
     }
@@ -871,6 +890,30 @@ namespace Coordinator
 
         static AssignmentResult assign(const AssignmentInput & input)
         {
+            return assign(input, AssignmentPolicy::Legacy);
+        }
+
+        static AssignmentResult constructStockIncumbent(const AssignmentInput & input, RefinementLedger & ledger)
+        {
+            AssignmentResult result;
+            const auto before = ledger.stats().spent();
+            if (prepayStockConstruction(input, ledger, result.stockConstructionStatus))
+            {
+                result = assign(input, AssignmentPolicy::StockIncumbent);
+            }
+            result.stockConstructionWork = ledger.stats().spent() - before;
+            return result;
+        }
+
+    private:
+        enum class AssignmentPolicy : std::int8_t
+        {
+            Legacy,
+            StockIncumbent,
+        };
+
+        static AssignmentResult assign(const AssignmentInput & input, AssignmentPolicy policy)
+        {
             using Clock = std::chrono::steady_clock;
             AssignmentResult result;
             DeferredAudits audits;
@@ -900,7 +943,23 @@ namespace Coordinator
                         .count();
                 phaseStart = Clock::now();
             }
-            const std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
+            std::optional<TurnPlan> greedyPlan;
+            std::vector<ActorProgress> greedyActors;
+            bool greedyComplete = false;
+            std::vector<std::int32_t> sweepOrder = actorSweepOrder(actors);
+            if (policy == AssignmentPolicy::StockIncumbent)
+            {
+                greedyPlan = result.plan;
+                greedyComplete = completeStockConstruction(*greedyPlan, actors, input);
+                if (greedyComplete)
+                {
+                    greedyActors = actors;
+                }
+                std::erase_if(sweepOrder, [&](std::int32_t slot)
+                {
+                    return stockCoupled(input, actors[static_cast<std::size_t>(slot)].pActor->engineUnitId);
+                });
+            }
             settle(
                 result.plan,
                 input,
@@ -917,7 +976,8 @@ namespace Coordinator
                 phaseStart = Clock::now();
             }
             const std::vector<ConflictEdge> edges = conflictEdges(input, actors, sweepOrder);
-            const RelativeAssignmentBudget relativeBudget = relativeAssignmentBudget(result.plan, input, actors, edges);
+            const RelativeAssignmentBudget relativeBudget = policy == AssignmentPolicy::Legacy
+                ? relativeAssignmentBudget(result.plan, input, actors, edges) : RelativeAssignmentBudget{};
             improveBySwaps(
                 result.plan,
                 input,
@@ -945,9 +1005,33 @@ namespace Coordinator
                         .count();
                 phaseStart = Clock::now();
             }
-            finishPlan(result);
+            if (policy == AssignmentPolicy::Legacy)
+            {
+                finishPlan(result);
+            }
+            else
+            {
+                bool complete = completeStockConstruction(result.plan, actors, input);
+                if (complete && greedyPlan)
+                {
+                    complete = fixedStockActionsMatch(*greedyPlan, result.plan, actors, input);
+                }
+                if (!complete && greedyComplete)
+                {
+                    result.plan = std::move(*greedyPlan);
+                    actors = std::move(greedyActors);
+                    result.nonStockRefinementRolledBack = true;
+                    complete = true;
+                }
+                result.stockConstructionStatus = complete
+                    ? StockConstructionStatus::Complete : StockConstructionStatus::Incomplete;
+                const auto ordering = result.plan.executionOrder();
+                result.executionOrder = ordering.order;
+                result.stats.unorderedActions =
+                    static_cast<std::int32_t>(ordering.cycleMembers.size() + ordering.blockedByCycle.size());
+            }
             countAssignments(result.plan, actors, result.stats);
-            recordFinalAssignment(result, actors, input);
+            recordFinalAssignment(result, actors, input, policy == AssignmentPolicy::StockIncumbent);
             if (timed)
             {
                 result.phaseTiming.finishPlanNanos =
@@ -955,8 +1039,11 @@ namespace Coordinator
                         Clock::now() - phaseStart)
                         .count();
             }
-            recordDeferredAudits(input, audits);
-            if (input.pRelativeStockObserver != nullptr)
+            if (policy == AssignmentPolicy::Legacy)
+            {
+                recordDeferredAudits(input, audits);
+            }
+            if (policy == AssignmentPolicy::Legacy && input.pRelativeStockObserver != nullptr)
             {
                 const auto remaining = relativeBudget.session == nullptr ? 0 : relativeBudget.session->remainingWork();
                 input.pRelativeStockObserver->finishPlan(result, {
@@ -967,7 +1054,144 @@ namespace Coordinator
             return result;
         }
 
-    private:
+        static bool prepayStockConstruction(const AssignmentInput & input, RefinementLedger & ledger,
+                                            StockConstructionStatus & status)
+        {
+            if (input.pStockValuer == nullptr)
+            {
+                status = StockConstructionStatus::InvalidInput;
+                return false;
+            }
+            constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+            const auto charge = [&](std::size_t count)
+            {
+                if (count >= static_cast<std::uint64_t>(maximum))
+                {
+                    status = StockConstructionStatus::ArithmeticFailure;
+                    return false;
+                }
+                if (!ledger.consume(static_cast<std::int64_t>(count) + 1, RefinementWork::MasterPreparation))
+                {
+                    status = StockConstructionStatus::BudgetExhausted;
+                    return false;
+                }
+                return true;
+            };
+            if (!charge(input.actors.size()))
+            {
+                return false;
+            }
+            std::int64_t candidates = 0;
+            std::int64_t payload = 0;
+            for (const auto & actor : input.actors)
+            {
+                if (!charge(actor.candidates.size()))
+                {
+                    return false;
+                }
+                for (const auto & candidate : actor.candidates)
+                {
+                    if (candidate.bundle.path.size() >= static_cast<std::uint64_t>(maximum) ||
+                        candidate.bundle.components.size() >= static_cast<std::uint64_t>(maximum) ||
+                        !RelativeStockDetail::checkedAdd(candidates, 1) ||
+                        !RelativeStockDetail::checkedAdd(payload, 1) ||
+                        !RelativeStockDetail::checkedAdd(payload, static_cast<std::int64_t>(candidate.bundle.path.size())) ||
+                        !RelativeStockDetail::checkedAdd(payload, static_cast<std::int64_t>(candidate.bundle.components.size())))
+                    {
+                        status = StockConstructionStatus::ArithmeticFailure;
+                        return false;
+                    }
+                }
+            }
+            auto structure = static_cast<std::int64_t>(input.actors.size()) + 1;
+            if (input.unitLinks.size() >= static_cast<std::uint64_t>(maximum) ||
+                !RelativeStockDetail::checkedAdd(structure, static_cast<std::int64_t>(input.unitLinks.size())))
+            {
+                status = StockConstructionStatus::ArithmeticFailure;
+                return false;
+            }
+            // Structural passes cover claims, snapshots, fixed shares, occupancy and both complete-order checks.
+            constexpr std::int64_t STRUCTURAL_PASSES = 6;
+            auto scan = structure;
+            auto records = candidates;
+            if (!RelativeStockDetail::checkedAdd(scan, std::bit_width(static_cast<std::uint64_t>(candidates)) + 1) ||
+                !RelativeStockDetail::checkedAdd(records, payload) ||
+                !RelativeStockDetail::checkedAdd(records, 1) ||
+                scan > maximum / records || structure > maximum / structure ||
+                structure * structure > maximum / STRUCTURAL_PASSES)
+            {
+                status = StockConstructionStatus::ArithmeticFailure;
+                return false;
+            }
+            auto tariff = scan * records;
+            if (!RelativeStockDetail::checkedAdd(tariff, STRUCTURAL_PASSES * structure * structure))
+            {
+                status = StockConstructionStatus::ArithmeticFailure;
+                return false;
+            }
+            if (!ledger.consume(tariff, RefinementWork::MasterPreparation))
+            {
+                status = StockConstructionStatus::BudgetExhausted;
+                return false;
+            }
+            return true;
+        }
+
+        static bool completeStockConstruction(TurnPlan & plan, const std::vector<ActorProgress> & actors,
+                                              const AssignmentInput & input)
+        {
+            for (const auto & actor : actors)
+            {
+                if (actor.chosen == NO_CANDIDATE || !plan.hasAction(actor.actionIndex) ||
+                    !isLiveState(plan.action(actor.actionIndex).state) ||
+                    plan.action(actor.actionIndex).unitId != actor.pActor->engineUnitId)
+                {
+                    return false;
+                }
+                const auto link = linkOf(input.unitLinks, actor.pActor->knowledgeUnitIndex);
+                const auto & candidate = actor.pActor->candidates[static_cast<std::size_t>(actor.chosen)];
+                if (link.engineUnitId != actor.pActor->engineUnitId ||
+                    candidate.bundle.unitId != actor.pActor->knowledgeUnitIndex ||
+                    candidate.bundle.origin != link.tile || candidate.bundle.path.empty() ||
+                    candidate.bundle.path.front() != link.tile || !candidate.valuation.valid)
+                {
+                    return false;
+                }
+            }
+            std::vector<OccupancyEntry> occupancy;
+            occupancy.reserve(input.unitLinks.size());
+            for (const auto & link : input.unitLinks)
+            {
+                if (link.engineUnitId != NO_UNIT && link.tile != INVALID_TILE)
+                {
+                    occupancy.push_back({link.engineUnitId, link.tile});
+                }
+            }
+            if (!plan.rebuildVacateEdges(occupancy).empty())
+            {
+                return false;
+            }
+            const auto ordering = plan.executionOrder();
+            return ordering.cycleMembers.empty() && ordering.blockedByCycle.empty() &&
+                ordering.order.size() == actors.size();
+        }
+
+        static bool fixedStockActionsMatch(const TurnPlan & incoming, const TurnPlan & refined,
+                                           const std::vector<ActorProgress> & actors, const AssignmentInput & input)
+        {
+            for (const auto & actor : actors)
+            {
+                if (stockCoupled(input, actor.pActor->engineUnitId) &&
+                    (!incoming.hasAction(actor.actionIndex) || !refined.hasAction(actor.actionIndex) ||
+                     incoming.action(actor.actionIndex) != refined.action(actor.actionIndex) ||
+                     incoming.actionReservations(actor.actionIndex) != refined.actionReservations(actor.actionIndex)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         enum class SearchPricingMode : std::int8_t
         {
             LegacyScalar,
@@ -4706,9 +4930,10 @@ namespace Coordinator
         static void recordFinalAssignment(
             AssignmentResult & result,
             const std::vector<ActorProgress> & actors,
-            const AssignmentInput & input)
+            const AssignmentInput & input,
+            bool retainSelections = false)
         {
-            if (input.pTrace == nullptr && !input.retainSelections)
+            if (input.pTrace == nullptr && !input.retainSelections && !retainSelections)
             {
                 return;
             }

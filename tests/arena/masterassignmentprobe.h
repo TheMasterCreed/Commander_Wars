@@ -3,6 +3,7 @@
 #include <memory>
 
 class QJsonObject;
+class QString;
 
 namespace Coordinator
 {
@@ -17,6 +18,7 @@ namespace Coordinator
 namespace ArenaMasterAssignmentProbe
 {
     bool enabled();
+    void failStockControlSetup(const QString & reason);
     std::unique_ptr<Coordinator::MasterShadowInspection> openShadowInspection();
     QJsonObject inspectShadow(const Coordinator::MasterShadowObservation & observation);
     void record(const Coordinator::AssignmentInput & input,

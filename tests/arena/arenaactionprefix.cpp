@@ -216,11 +216,11 @@ bool ArenaActionPrefix::apply(spGameAction & action, GameMap & map, QString & er
     return true;
 }
 
-void ArenaActionPrefix::observeBoundary(GameMap & map)
+bool ArenaActionPrefix::observeBoundary(GameMap & map)
 {
     if (!complete() || !m_boundary.isEmpty())
     {
-        return;
+        return false;
     }
     QVariantList units;
     for (qint32 y = 0; y < map.getMapHeight(); ++y)
@@ -254,6 +254,7 @@ void ArenaActionPrefix::observeBoundary(GameMap & map)
         {"fog", static_cast<int>(map.getGameRules()->getFogMode())},
         {"aiBehavior", static_cast<int>(map.getGameRules()->getAiBehaviorMode())},
     };
+    return true;
 }
 
 quint32 ArenaActionPrefix::initialSeed() const

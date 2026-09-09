@@ -3,8 +3,10 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QJsonDocument>
 
 #include "ai/coordinator/masterassignmentcapture.h"
+#include "ai/coordinator/masterassignmentinstallation.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "tests/coordinator_ai/masterassignmentstockfixture.h"
 #include "tests/coordinator_ai/masterassignmenttestexport.h"
@@ -946,8 +948,19 @@ namespace
         const auto disabled = parseMasterShadowConfig({}, "invalid", {}, "invalid", "invalid");
         expect(!disabled.enabled() && disabled.error == MasterShadowConfigError::None,
                "default disabled mode ignores inactive diagnostic settings");
-        expect(parseMasterShadowConfig("stockControl", "160000", output).error ==
-               MasterShadowConfigError::UnknownMode, "Phase 3 cannot activate gameplay control");
+        const auto control = parseMasterShadowConfig("stockControl", "60000000", output, {}, {}, true);
+        expect(control.controlsStock() && !control.enabled() && control.allowance == 60000000,
+               "StockControl requires an explicit mode and allowance without enabling Shadow");
+        expect(parseMasterShadowConfig("stockControl", {}, output, {}, {}, true).error ==
+               MasterShadowConfigError::MissingExplicitAllowance,
+               "StockControl cannot inherit the global initial allowance implicitly");
+        expect(parseMasterShadowConfig("stockControl", "60000000", output).error ==
+               MasterShadowConfigError::StockControlOutsideArena,
+               "StockControl cannot activate outside the explicit isolated arena");
+        expect(!disabled.controlsStock() && disabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE,
+               "ordinary gameplay remains disabled with the unchanged initial allowance");
+        expect(parseMasterShadowConfig("unknown", "60000000", output).error ==
+               MasterShadowConfigError::UnknownMode, "unknown modes fail closed");
         expect(parseMasterShadowConfig("shadow", "-1", output).error ==
                MasterShadowConfigError::InvalidAllowance, "negative work fails closed");
         expect(parseMasterShadowConfig("shadow", "9223372036854775808", output).error ==
@@ -1033,6 +1046,644 @@ namespace
         expect(incumbent.plan.equivalentState(fixture.plan) &&
                incumbent.executionOrder == fixture.plan.executionOrder().order,
                "every extraction interruption leaves the original plan untouched");
+    }
+
+    AssignmentResult installationIncoming(const Fixture & fixture, const MasterAssignmentProblem & problem)
+    {
+        AssignmentResult incoming;
+        incoming.plan = fixture.plan;
+        incoming.executionOrder = fixture.plan.executionOrder().order;
+        for (const auto & actor : problem.actors())
+        {
+            incoming.selections.push_back({
+                .knowledgeUnitIndex = actor.knowledgeUnitIndex,
+                .engineUnitId = actor.engineUnitId,
+                .actionIndex = actor.actionIndex,
+                .candidateIndex = actor.incumbentCandidateIndex,
+                .greedyCandidateIndex = actor.incumbentCandidateIndex,
+                .seatedValue = actor.incumbentSeatedValue,
+                .stockCoupled = actor.role == MasterActorRole::Mutable,
+                .phase = AssignmentResult::SelectionPhase::Greedy});
+        }
+        return incoming;
+    }
+
+    bool sameInstalledPlan(const AssignmentResult & left, const AssignmentResult & right)
+    {
+        if (!left.plan.equivalentState(right.plan) || left.executionOrder != right.executionOrder ||
+            left.stats != right.stats || left.stockConstructionStatus != right.stockConstructionStatus ||
+            left.stockConstructionWork != right.stockConstructionWork ||
+            left.selections.size() != right.selections.size())
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < left.selections.size(); ++index)
+        {
+            const auto & a = left.selections[index];
+            const auto & b = right.selections[index];
+            if (a.knowledgeUnitIndex != b.knowledgeUnitIndex || a.engineUnitId != b.engineUnitId ||
+                a.actionIndex != b.actionIndex || a.candidateIndex != b.candidateIndex ||
+                a.greedyCandidateIndex != b.greedyCandidateIndex || a.seatedValue != b.seatedValue ||
+                a.stockCoupled != b.stockCoupled || a.phase != b.phase ||
+                !std::equal(a.completeValues.begin(), a.completeValues.end(),
+                    b.completeValues.begin(), b.completeValues.end(), [](const auto & x, const auto & y)
+                    {
+                        return x.value == y.value && x.known == y.known;
+                    }))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void transactionalInstallation()
+    {
+        Fixture fixture(3);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 20, 1));
+        fixture.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 30, 1));
+        fixture.input.actors[2].candidates.push_back(moveCandidate(2, {2, 0}, {2, 1}, 40, 1));
+        fixture.seat();
+        fixture.selections[1].role = MasterActorRole::Fixed;
+        require(fixture.plan.commit(2), "committed stock action is fixed before installation preparation");
+        const auto problem = fixture.extract();
+        auto original = installationIncoming(fixture, problem);
+        original.selections[2].completeValues.push_back({40, true});
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "transaction ledger opens once");
+        MasterAssignmentEvaluator evaluator(problem, ledger);
+        MasterAssignmentInstallation installation(problem, evaluator, ledger);
+        auto incoming = original;
+        require(installation.prepare(incoming) == MasterInstallationStatus::Reserved,
+                "finalization is reserved before normal search begins");
+        const auto result = searchMasterAssignment(problem, evaluator, ledger);
+        require(result.improvement.has_value(), "normal search supplies the retained strict challenger");
+        require(ledger.consume(ledger.balance(), RefinementWork::MasterExpansion),
+                "search can exhaust all unreserved balance");
+        const auto installed = installation.finish(result.improvement, incoming);
+        expect(installed.status == MasterInstallationStatus::Installed && installed.proof &&
+               installed.proof->comparison.deltaLower == 19,
+               "terminal reservation funds fresh strict proof and atomic installation");
+        expect(incoming.plan.action(0).destination == TilePoint{0, 1} &&
+               incoming.plan.action(1) == original.plan.action(1) &&
+               incoming.plan.actionReservations(1) == original.plan.actionReservations(1) &&
+               incoming.selections[1].phase == original.selections[1].phase,
+               "the certified mutable action changes while the fixed action and claims remain exact");
+        expect(incoming.plan.action(2) == original.plan.action(2) &&
+               incoming.plan.actionReservations(2) == original.plan.actionReservations(2) &&
+               incoming.selections[2].phase == original.selections[2].phase &&
+               incoming.selections[2].completeValues.size() == 1 &&
+               incoming.selections[2].completeValues[0].value == 40 &&
+               incoming.selections[2].completeValues[0].known,
+               "committed stock actors retain their action, claims, provenance and diagnostics");
+        expect(incoming.selections[0].phase == AssignmentResult::SelectionPhase::Master &&
+               incoming.executionOrder == installed.proof->challenger.replay->ordering.order &&
+               installed.finalizationWork <= installed.reservedWork && ledger.stats().total == 1000000,
+               "installed provenance, full execution order and one-ledger finalization are explicit");
+        const auto after = ledger.stats();
+        expect(installation.finish(result.improvement, incoming).status == MasterInstallationStatus::InvalidContext &&
+               ledger.stats() == after, "a terminal reservation cannot be released or published twice");
+
+        enum class Mutation
+        {
+            None,
+            ForeignContext,
+            DifferentIncoming,
+            MissingClaim,
+            ChangedOrder,
+            FixedChoice,
+            InvalidChoice,
+            EqualChoice,
+            DiagnosticGrowth,
+        };
+        for (const auto mutation : {Mutation::None, Mutation::ForeignContext, Mutation::DifferentIncoming,
+             Mutation::MissingClaim, Mutation::ChangedOrder, Mutation::FixedChoice, Mutation::InvalidChoice,
+             Mutation::EqualChoice, Mutation::DiagnosticGrowth})
+        {
+            RefinementLedger retryLedger;
+            require(retryLedger.open(1000000), "failure transaction ledger");
+            MasterAssignmentEvaluator retryEvaluator(problem, retryLedger);
+            MasterAssignmentInstallation retry(problem, retryEvaluator, retryLedger);
+            auto unchanged = original;
+            require(retry.prepare(unchanged) == MasterInstallationStatus::Reserved,
+                    "failure injection occurs after paid preparation");
+            auto retained = result.improvement;
+            switch (mutation)
+            {
+                case Mutation::None:
+                    retained.reset();
+                    break;
+                case Mutation::ForeignContext:
+                    retained->challenger.state.identity = fixture.extract().identity();
+                    break;
+                case Mutation::DifferentIncoming:
+                    ++unchanged.selections[0].seatedValue;
+                    break;
+                case Mutation::MissingClaim:
+                    require(unchanged.plan.replan(0, unchanged.plan.action(0)).accepted,
+                            "remove an incoming claim after preparation");
+                    break;
+                case Mutation::ChangedOrder:
+                    std::reverse(unchanged.executionOrder.begin(), unchanged.executionOrder.end());
+                    break;
+                case Mutation::FixedChoice:
+                    retained->challenger.state.choices[1] = 1;
+                    break;
+                case Mutation::InvalidChoice:
+                    retained->challenger.state.choices[0] = 99;
+                    break;
+                case Mutation::EqualChoice:
+                    retained->challenger = retained->incumbent;
+                    break;
+                case Mutation::DiagnosticGrowth:
+                    unchanged.selections[1].completeValues.push_back({0, true});
+                    break;
+            }
+            const auto before = unchanged;
+            const auto spent = retryLedger.stats().spent();
+            const auto refused = retry.finish(retained, unchanged);
+            expect(refused.status != MasterInstallationStatus::Installed && sameInstalledPlan(unchanged, before),
+                   "every post-preparation failure leaves plan, claims, order and selections unchanged");
+            expect(retryLedger.stats().total == 1000000 &&
+                   retryLedger.stats().spent() == spent - refused.reservedWork + refused.finalizationWork &&
+                   refused.finalizationWork <= refused.reservedWork,
+                   "rollback keeps charged work and only returns the held finalization reservation");
+        }
+    }
+
+    enum class StockInstallationFault
+    {
+        None,
+        FriendlyWitness,
+        EnemyWitness,
+        OversizedWitness,
+        ForeignWitness,
+        SupersededCertificate,
+        CurrentForeignQuote,
+        CurrentMissingWitness,
+        CurrentMissingEnemyWitness,
+        CurrentUnregisteredCertificate,
+        AccountingOverflow,
+    };
+
+    void corruptInstallationWitness(MasterImprovementProof & retained, StockInstallationFault fault,
+                                    std::int64_t witnessTariff)
+    {
+        auto proof = std::make_shared<RelativeStockProofSnapshot>(*retained.challenger.proof);
+        if (fault == StockInstallationFault::OversizedWitness)
+        {
+            proof->ourWitness.resize(static_cast<std::size_t>(witnessTariff) + 1);
+        }
+        else if (fault == StockInstallationFault::EnemyWitness)
+        {
+            if (proof->enemyWitness.empty())
+            {
+                proof->enemyWitness.push_back({NO_STOCK_ROW, {}, 0});
+            }
+            else
+            {
+                require(!proof->enemyWitness.front().steps.empty(), "retained enemy row has an owned step");
+                ++proof->enemyWitness.front().steps.front().gain;
+            }
+        }
+        else if (proof->ourKind == RelativeStockWitnessKind::Sequential)
+        {
+            require(!proof->ourWitness.empty() && !proof->ourWitness.front().steps.empty(),
+                    "retained friendly sequential row has an owned step");
+            ++proof->ourWitness.front().steps.front().gain;
+        }
+        else
+        {
+            require(!proof->cheapOurWitness.empty() && !proof->cheapOurWitness.front().nodes.empty(),
+                    "retained friendly cheap row has an owned node");
+            proof->cheapOurWitness.front().nodes.front() = std::numeric_limits<std::int32_t>::max();
+        }
+        retained.challenger.proof = std::move(proof);
+    }
+
+    Fixture stockInstallationFixture()
+    {
+        Fixture fixture(3);
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.input.actors[actor].candidates.push_back(
+                moveCandidate(actor, {actor, 0}, {actor, 1}, -3 - actor, 1));
+        }
+        fixture.seat();
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            fixture.selections[actor].stockRow = actor;
+        }
+        return fixture;
+    }
+
+    MasterAssignmentOracle::Request stockInstallationReference(const MasterAssignmentProblem & problem)
+    {
+        auto reference = request();
+        reference.continuation.mode = MasterAssignmentOracle::ContinuationMode::Sequential;
+        for (const auto & tuple : MasterAssignmentOracle::enumerate(problem, request()).tuples)
+        {
+            reference.continuation.cases.push_back(continuationCase(tuple.reference.key));
+        }
+        return reference;
+    }
+
+    void stockInstallationAuthentication()
+    {
+        const auto fixture = stockInstallationFixture();
+        const auto problem = fixture.extract();
+        const auto original = installationIncoming(fixture, problem);
+        const auto reference = stockInstallationReference(problem);
+        const auto exact = MasterAssignmentOracle::enumerate(problem, reference);
+        require(exact.exactOptimum.has_value(), "stock installation has an independent complete oracle");
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        constexpr MasterValuationTariffs tariffs{.quote = 32, .witness = 32};
+        struct Case
+        {
+            StockInstallationFault fault;
+            MasterInstallationStatus expected;
+        };
+        for (const auto & test : {
+            Case{StockInstallationFault::None, MasterInstallationStatus::Installed},
+            Case{StockInstallationFault::FriendlyWitness, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::EnemyWitness, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::OversizedWitness, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::ForeignWitness, MasterInstallationStatus::InvalidContext},
+            Case{StockInstallationFault::SupersededCertificate, MasterInstallationStatus::Installed},
+            Case{StockInstallationFault::CurrentForeignQuote, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::CurrentMissingWitness, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::CurrentMissingEnemyWitness, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::CurrentUnregisteredCertificate, MasterInstallationStatus::ProofFailure},
+            Case{StockInstallationFault::AccountingOverflow, MasterInstallationStatus::BudgetExhausted}})
+        {
+            RefinementLedger ledger;
+            const auto allowance = test.fault == StockInstallationFault::AccountingOverflow
+                ? std::numeric_limits<std::int64_t>::max() : 1000000;
+            require(ledger.open(allowance), "native stock installation ledger");
+            NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+            MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+            MasterAssignmentInstallation installation(problem, evaluator, ledger);
+            auto incoming = original;
+            require(installation.prepare(incoming) == MasterInstallationStatus::Reserved,
+                    "native stock finalization is paid before discovery");
+            if (test.fault == StockInstallationFault::SupersededCertificate)
+            {
+                const auto quote = session.quote(problem.incumbentContinuationKey(), 0);
+                require(session.tightenOurUpperWithVerifiedDual(quote, 4096).certificateValid,
+                        "incoming native certificate exists before the retained search proof");
+            }
+            const auto searched = searchMasterAssignment(problem, evaluator, ledger);
+            require(searched.improvement && searched.improvement->incumbent.proof &&
+                    searched.improvement->challenger.proof && searched.stats.proofFailures == 0,
+                    "normal native search supplies genuine owned stock proofs");
+            expect(searched.stats.firstImprovementWork && searched.stats.firstImprovementLower &&
+                   *searched.stats.firstImprovementLower > 0 &&
+                   *searched.stats.firstImprovementLower <= searched.improvement->comparison.deltaLower,
+                   "first retained margin is positive and distinct from later proof metadata");
+            auto retained = searched.improvement;
+            std::unique_ptr<NativeStockSession> foreign;
+            switch (test.fault)
+            {
+                case StockInstallationFault::FriendlyWitness:
+                case StockInstallationFault::EnemyWitness:
+                case StockInstallationFault::OversizedWitness:
+                    corruptInstallationWitness(*retained, test.fault, tariffs.witness);
+                    require(evaluator.ownsRetainedEvaluation(retained->challenger),
+                            "witness-byte faults preserve the cheap retained association");
+                    break;
+                case StockInstallationFault::ForeignWitness:
+                {
+                    foreign = std::make_unique<NativeStockSession>(
+                        field, enemy, reference.continuation.cases, ledger);
+                    MasterAssignmentEvaluator foreignEvaluator(problem, ledger, *foreign, tariffs);
+                    const auto evaluated = foreignEvaluator.evaluate(retained->challenger.state);
+                    require(evaluated.proof != nullptr, "foreign equal-content session owns its own witness");
+                    retained->challenger.proof = evaluated.proof;
+                    break;
+                }
+                case StockInstallationFault::SupersededCertificate:
+                {
+                    const auto & previous = retained->incumbent.proof;
+                    require(previous->ourUpperCertificate != nullptr, "retained proof owns its prior certificate");
+                    const auto historical = masterEvaluationRecord(retained->incumbent);
+                    const auto replacement = session.tightenOurUpperWithVerifiedDual(previous->quote, 4096);
+                    require(replacement.certificateValid &&
+                            replacement.certificateId != previous->quote.ourUpperCertificateId &&
+                            session.replayLowerProof(*previous) &&
+                            !session.compare(previous->quote, previous->quote).valid(),
+                            "superseded certificate loses live authority without losing its owned lower witness");
+                    const auto beforeExport = ledger.stats();
+                    const auto captures = session.proofCaptures;
+                    const auto certificates = session.certificateCalls;
+                    const auto exported = masterEvaluationRecord(retained->incumbent);
+                    expect(exported == historical && beforeExport == ledger.stats() &&
+                           captures == session.proofCaptures && certificates == session.certificateCalls &&
+                           exported["quote"].toObject()["ownedUpperCertificatePayload"].toObject()["dualObjective"].toString() ==
+                               QString::number(previous->ourUpperCertificate->dualObjective),
+                           "historical certificate export preserves owned bytes without registry replay or work");
+                    break;
+                }
+                case StockInstallationFault::CurrentForeignQuote:
+                    session.setQuoteFault(QuoteFault::ForeignIdentity);
+                    break;
+                case StockInstallationFault::CurrentMissingWitness:
+                    session.setQuoteFault(QuoteFault::MissingWitness);
+                    break;
+                case StockInstallationFault::CurrentMissingEnemyWitness:
+                    session.setQuoteFault(QuoteFault::MissingEnemyWitness);
+                    break;
+                case StockInstallationFault::CurrentUnregisteredCertificate:
+                    session.setQuoteFault(QuoteFault::UnregisteredCertificate);
+                    break;
+                case StockInstallationFault::AccountingOverflow:
+                    require(ledger.consume(std::numeric_limits<std::int64_t>::max() - ledger.stats().granted,
+                                           RefinementWork::MasterExpansion),
+                            "gross accounting reaches its limit after preparation and discovery");
+                    break;
+                case StockInstallationFault::None:
+                    require(ledger.consume(ledger.balance(), RefinementWork::MasterExpansion),
+                            "native search may consume every unreserved unit");
+                    break;
+            }
+            const auto before = ledger.stats();
+            const auto finalized = installation.finish(retained, incoming);
+            expect(finalized.status == test.expected, "native installation reports the injected boundary");
+            expect(finalized.finalizationWork <= finalized.reservedWork && ledger.stats().total == allowance &&
+                   ledger.stats().spent() == before.spent() - finalized.reservedWork + finalized.finalizationWork,
+                   "native finalization uses only its original reservation and preserves performed work");
+            if (test.expected == MasterInstallationStatus::Installed)
+            {
+                require(finalized.proof && finalized.proof->comparison.improves(),
+                        "installation publishes only a freshly authenticated strict proof");
+                const auto & proof = *finalized.proof;
+                const auto challenger = MasterAssignmentOracle::evaluateObjective(
+                    MasterAssignmentOracle::constructReference(problem, proof.challenger.state.choices),
+                    reference.continuation, 1000000);
+                const auto incumbent = MasterAssignmentOracle::evaluateObjective(
+                    MasterAssignmentOracle::constructReference(problem, proof.incumbent.state.choices),
+                    reference.continuation, 1000000);
+                expect(proof.comparison.deltaLower > 0 &&
+                       proof.comparison.deltaLower <= challenger.total - incumbent.total &&
+                       incoming.plan.equivalentState(proof.challenger.replay->plan) &&
+                       incoming.executionOrder == proof.challenger.replay->ordering.order,
+                       "installed stock margin and complete plan agree with the independent oracle");
+                if (test.fault == StockInstallationFault::SupersededCertificate)
+                {
+                    expect(proof.incumbent.quote()->ourUpperCertificateId !=
+                               retained->incumbent.quote()->ourUpperCertificateId &&
+                           session.compare(*proof.incumbent.quote(), *proof.challenger.quote()).valid(),
+                           "fresh certificate authentication replaces historical registry authority");
+                }
+            }
+            else
+            {
+                expect(!finalized.proof && sameInstalledPlan(incoming, original),
+                       "native authentication failure preserves all incoming selections, claims and order");
+            }
+            if (test.fault == StockInstallationFault::AccountingOverflow)
+            {
+                expect(ledger.lastRefusal() &&
+                       ledger.lastRefusal()->reason == RefinementRefusalReason::AccountingOverflow &&
+                       finalized.finalizationWork == 0,
+                       "refund does not hide gross accounting overflow or fabricate performed work");
+            }
+        }
+    }
+
+    void ownedCertificateSerialization()
+    {
+        constexpr std::int64_t beyondExactDouble = 9007199254740993LL;
+        const auto minimum = std::numeric_limits<std::int64_t>::min();
+        const auto maximum = std::numeric_limits<std::int64_t>::max();
+        PackingDualCertificate certificate;
+        auto & identity = certificate.identity;
+        auto & field = identity.immutableField;
+        field.horizonTurns = 10;
+        field.width = 2;
+        field.height = 1;
+        field.capturePointsToCapture = 20;
+        field.ownedBaseline = minimum;
+        field.ourRows = {{11, 0, 3, 7, 10, {1, 0}}};
+        field.enemyRows = {{12, 1, 2, 3, 5, {0, 1}}};
+        field.ourColumns = {{4, {1, 0}, {maximum, beyondExactDouble}, OwnerSign::Enemy, 19}};
+        field.enemyColumns = {{9, {0, 0}, {minimum, -beyondExactDouble}, OwnerSign::Ours, 23}};
+        field.ourWeights = {minimum, maximum, beyondExactDouble};
+        field.enemyWeights = {-beyondExactDouble, 0};
+        field.columnTiles = {{1, 0}, {0, 0}};
+        field.columnCapturers = {-1, 11};
+        field.columnCapturePoints = {0, 7};
+        field.enemyArrivals = {-1, 2};
+        MobilityCostGrid grid(2, 1);
+        grid.setCost(0, 0, EntryDirection::West, -1);
+        grid.setCost(0, 0, EntryDirection::East, 0);
+        grid.setCost(0, 0, EntryDirection::South, std::numeric_limits<std::int32_t>::max());
+        grid.setCost(0, 0, EntryDirection::North, 5);
+        for (const auto direction : ENTRY_DIRECTIONS)
+        {
+            grid.setCost(1, 0, direction, static_cast<std::int32_t>(direction) + 1);
+        }
+        field.mobilityGrids = {grid, MobilityCostGrid{}};
+        identity.session = std::numeric_limits<std::uint64_t>::max();
+        identity.key = {CanonicalPlanActionKey::fromAction(0, 1, 0, true),
+                        CanonicalPlanActionKey::fromAction(1, 0, 0, false)};
+        identity.capturedColumns = {0, 129};
+        identity.rowDomains = {{minimum, maximum}, {beyondExactDouble, -1}};
+        identity.nodeColumns = field.enemyColumns;
+        identity.usedNodes = PackingDualNodeMask(130);
+        require(identity.usedNodes.set(0) && identity.usedNodes.set(64) && identity.usedNodes.set(129),
+                "wide serialized node mask fixture");
+        identity.economic = -beyondExactDouble;
+        identity.owned = beyondExactDouble;
+        identity.incumbentFloor = 17;
+        identity.fixedValue = -3;
+        certificate.rows = {0, 7};
+        certificate.nodePrices = {beyondExactDouble, maximum, minimum};
+        certificate.rowReducedMaxima = {minimum + 1, maximum - 1};
+        certificate.dualObjective = maximum;
+        auto proof = std::make_shared<RelativeStockProofSnapshot>();
+        proof->ourUpperCertificate = std::make_shared<const PackingDualCertificate>(certificate);
+        MasterAssignmentEvaluation evaluation;
+        evaluation.proof = proof;
+        const auto recorded = masterEvaluationRecord(evaluation);
+        const auto encoded = QJsonDocument(recorded).toJson(QJsonDocument::Compact);
+        const auto parsed = QJsonDocument::fromJson(encoded).object();
+        const auto payload = parsed["quote"].toObject()["ownedUpperCertificatePayload"].toObject();
+        const auto recordedIdentity = payload["identity"].toObject();
+        const auto recordedField = recordedIdentity["immutableField"].toObject();
+        expect(parsed == recorded && payload.size() == 5 && recordedIdentity.size() == 11 &&
+               recordedField.size() == 16 && *proof->ourUpperCertificate == certificate &&
+               !recorded["upperVerified"].toBool(),
+               "owned certificate serialization is complete payload, not a new authentication claim");
+        expect(payload["rows"].toArray() == QJsonArray{0, 7} &&
+               payload["nodePrices"].toArray() ==
+                   QJsonArray{QString::number(beyondExactDouble), QString::number(maximum), QString::number(minimum)} &&
+               payload["rowReducedMaxima"].toArray() ==
+                   QJsonArray{QString::number(minimum + 1), QString::number(maximum - 1)} &&
+               payload["dualObjective"].isString() && payload["dualObjective"].toString() == QString::number(maximum),
+               "certificate prices, maxima and objective retain signed 64-bit values exactly");
+        expect(recordedIdentity["session"].toString() == QString::number(identity.session) &&
+               recordedIdentity["key"].toArray() == QJsonArray{QJsonArray{0, 1, 0, true}, QJsonArray{1, 0, 0, false}} &&
+               recordedIdentity["capturedColumns"].toArray() == QJsonArray{0, 129} &&
+               recordedIdentity["rowDomains"].toArray() == QJsonArray{
+                   QJsonArray{QString::number(minimum), QString::number(maximum)},
+                   QJsonArray{QString::number(beyondExactDouble), QStringLiteral("-1")}} &&
+               recordedIdentity["usedNodes"].toObject() ==
+                   QJsonObject{{"nodeCount", 130}, {"nodes", QJsonArray{0, 64, 129}}},
+               "certificate identity preserves full keys, domains and every wide-mask bit");
+        expect(recordedIdentity["economic"].toString() == QString::number(-beyondExactDouble) &&
+               recordedIdentity["owned"].toString() == QString::number(beyondExactDouble) &&
+               recordedIdentity["incumbentFloor"].toString() == QStringLiteral("17") &&
+               recordedIdentity["fixedValue"].toString() == QStringLiteral("-3"),
+               "certificate identity economics remain lossless and distinct");
+        expect(recordedField["horizonTurns"].toInt() == 10 && recordedField["width"].toInt() == 2 &&
+               recordedField["height"].toInt() == 1 && recordedField["capturePointsToCapture"].toInt() == 20 &&
+               recordedField["ownedBaseline"].toString() == QString::number(minimum) &&
+               recordedField["ourWeights"].toArray() ==
+                   QJsonArray{QString::number(minimum), QString::number(maximum), QString::number(beyondExactDouble)} &&
+               recordedField["enemyWeights"].toArray() == QJsonArray{QString::number(-beyondExactDouble), QStringLiteral("0")},
+               "immutable field dimensions, capture threshold and all weights are retained");
+        expect(recordedField["ourRows"].toArray() == QJsonArray{QJsonObject{{"knowledgeIndex", 11}, {"gridIdentity", 0},
+                   {"movementPoints", 3}, {"capturePoints", 7}, {"captureRate", 10}, {"tile", QJsonArray{1, 0}}}} &&
+               recordedField["enemyRows"].toArray() == QJsonArray{QJsonObject{{"knowledgeIndex", 12}, {"gridIdentity", 1},
+                   {"movementPoints", 2}, {"capturePoints", 3}, {"captureRate", 5}, {"tile", QJsonArray{0, 1}}}},
+               "both sides retain every public stock-row field");
+        const QJsonArray ourColumns{QJsonObject{{"slot", 4}, {"tile", QJsonArray{1, 0}},
+            {"income", QJsonObject{{"oursPerTurn", QString::number(maximum)},
+                {"enemyPerTurn", QString::number(beyondExactDouble)}}}, {"ownerBefore", -1}, {"buildingIndex", 19}}};
+        const QJsonArray enemyColumns{QJsonObject{{"slot", 9}, {"tile", QJsonArray{0, 0}},
+            {"income", QJsonObject{{"oursPerTurn", QString::number(minimum)},
+                {"enemyPerTurn", QString::number(-beyondExactDouble)}}}, {"ownerBefore", 1}, {"buildingIndex", 23}}};
+        expect(recordedField["ourColumns"].toArray() == ourColumns &&
+               recordedField["enemyColumns"].toArray() == enemyColumns &&
+               recordedIdentity["nodeColumns"].toArray() == enemyColumns,
+               "stock and native-node columns preserve identity, ownership and side-specific income");
+        expect(recordedField["columnTiles"].toArray() == QJsonArray{QJsonArray{1, 0}, QJsonArray{0, 0}} &&
+               recordedField["columnCapturers"].toArray() == QJsonArray{-1, 11} &&
+               recordedField["columnCapturePoints"].toArray() == QJsonArray{0, 7} &&
+               recordedField["enemyArrivals"].toArray() == QJsonArray{-1, 2},
+               "immutable capture and arrival metadata are not inferred from other fields");
+        const auto grids = recordedField["mobilityGrids"].toArray();
+        expect(grids.size() == 2 && grids[0].toObject() == QJsonObject{
+                   {"width", 2}, {"height", 1}, {"entryDirections", QJsonArray{0, 1, 2, 3}},
+                   {"costs", QJsonArray{QJsonArray{
+                       QJsonArray{-1, 0, std::numeric_limits<std::int32_t>::max(), 5}, QJsonArray{1, 2, 3, 4}}}}} &&
+               grids[1].toObject() == QJsonObject{{"width", 0}, {"height", 0},
+                   {"entryDirections", QJsonArray{0, 1, 2, 3}}, {"costs", QJsonArray{}}},
+               "mobility export preserves y/x/direction ordering, impassability and empty grids");
+        proof->ourUpperCertificate.reset();
+        expect(!masterEvaluationRecord(evaluation)["quote"].toObject().contains("ownedUpperCertificatePayload") &&
+               !masterEvaluationRecord(MasterAssignmentEvaluation{}).contains("quote"),
+               "missing owned certificate data is omitted rather than fabricated");
+    }
+
+    void stockFinalizationBudgets()
+    {
+        const auto fixture = stockInstallationFixture();
+        const auto problem = fixture.extract();
+        const auto original = installationIncoming(fixture, problem);
+        const auto reference = stockInstallationReference(problem);
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        constexpr MasterValuationTariffs tariffs{.quote = 32, .witness = 32};
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "finalization upper ledger");
+        NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+        MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+        const auto upper = evaluator.finalizationWork();
+        require(upper.has_value(), "checked finalization upper is available before terminal work");
+        const auto incomingState = MasterAssignmentState{
+            problem.identity(), std::vector<std::int32_t>(problem.incumbentChoices().begin(),
+                                                          problem.incumbentChoices().end())};
+        const auto challengerState = MasterAssignmentState{problem.identity(), {1, 1, 1}};
+        const auto retainedIncoming = evaluator.evaluate(incomingState);
+        const auto retainedChallenger = evaluator.evaluate(challengerState);
+        require(evaluator.ownsRetainedEvaluation(retainedIncoming) &&
+                evaluator.ownsRetainedEvaluation(retainedChallenger),
+                "terminal budget fixture owns both native lower snapshots");
+        const auto before = ledger.stats();
+        expect(evaluator.replayRetainedEvaluation(retainedIncoming) == MasterObjectiveStatus::Verified &&
+               evaluator.replayRetainedEvaluation(retainedChallenger) == MasterObjectiveStatus::Verified,
+               "generated native witness payloads fit their unchanged witness tariff");
+        expect(ledger.stats().spent() - before.spent() == 2 * tariffs.witness &&
+               ledger.stats().consumed - before.consumed == 2 * tariffs.witness,
+               "both retained lower replays are explicitly charged and nonrefundable");
+        auto freshIncoming = evaluator.evaluate(incomingState);
+        auto freshChallenger = evaluator.evaluate(challengerState);
+        expect(evaluator.compare(freshIncoming, freshChallenger).valid() &&
+               ledger.stats().spent() - before.spent() <= *upper,
+               "two owned replays, fresh full evaluations and current comparison fit the reserved upper");
+
+        for (const std::int64_t balance : {std::int64_t{0}, tariffs.witness - 1, tariffs.witness})
+        {
+            RefinementLedger prefixLedger;
+            require(prefixLedger.open(1000000), "owned replay prefix ledger");
+            NativeStockSession prefixSession(field, enemy, reference.continuation.cases, prefixLedger);
+            MasterAssignmentEvaluator prefixEvaluator(problem, prefixLedger, prefixSession, tariffs);
+            const auto retained = prefixEvaluator.evaluate(incomingState);
+            require(prefixEvaluator.ownsRetainedEvaluation(retained), "prefix failure starts with a native witness");
+            require(prefixLedger.consume(prefixLedger.balance() - balance, RefinementWork::MasterExpansion),
+                    "refinement consumes the available prefix before retained replay");
+            const auto prefixBefore = prefixLedger.stats();
+            const auto status = prefixEvaluator.replayRetainedEvaluation(retained);
+            expect(status == (balance < tariffs.witness ? MasterObjectiveStatus::BudgetExhausted
+                                                       : MasterObjectiveStatus::Verified) &&
+                   prefixLedger.stats().spent() - prefixBefore.spent() ==
+                       (balance < tariffs.witness ? 0 : tariffs.witness),
+                   "one-short retained replay refuses before native work and exact tariff succeeds");
+            if (balance < tariffs.witness)
+            {
+                expect(prefixLedger.lastRefusal() &&
+                       prefixLedger.lastRefusal()->work == RefinementWork::MasterWitness &&
+                       prefixLedger.lastRefusal()->requested == tariffs.witness &&
+                       prefixLedger.lastRefusal()->balance == balance,
+                       "retained replay budget failure records the exact shared-ledger boundary");
+            }
+        }
+        for (const auto invalid : {
+            MasterValuationTariffs{.quote = std::numeric_limits<std::int64_t>::max(), .witness = 32},
+            MasterValuationTariffs{.quote = 32, .witness = std::numeric_limits<std::int64_t>::max()},
+            MasterValuationTariffs{.quote = -1, .witness = 32},
+            MasterValuationTariffs{.quote = 32, .witness = -1}})
+        {
+            RefinementLedger invalidLedger;
+            require(invalidLedger.open(1000000), "invalid finalization tariff ledger");
+            NativeStockSession invalidSession(field, enemy, reference.continuation.cases, invalidLedger);
+            MasterAssignmentEvaluator invalidEvaluator(problem, invalidLedger, invalidSession, invalid);
+            MasterAssignmentInstallation installation(problem, invalidEvaluator, invalidLedger);
+            auto incoming = original;
+            expect(installation.prepare(incoming) == MasterInstallationStatus::ArithmeticFailure &&
+                   installation.finish(std::nullopt, incoming).status == MasterInstallationStatus::ArithmeticFailure &&
+                   sameInstalledPlan(incoming, original) &&
+                   invalidLedger.stats().grantedByWork[static_cast<std::size_t>(RefinementWork::MasterInstallation)] == 0,
+                   "negative or overflowing terminal tariffs cannot reserve or publish a plan");
+        }
+        MasterAssignmentInstallation installation(problem, evaluator, ledger);
+        const auto preparationBefore = ledger.stats().spent();
+        require(installation.prepare(original) == MasterInstallationStatus::Reserved,
+                "measure the complete successful preparation boundary");
+        const auto required = ledger.stats().spent() - preparationBefore;
+        const auto metadata = required - installation.reservedWork();
+        auto unchanged = original;
+        require(installation.finish(std::nullopt, unchanged).status == MasterInstallationStatus::NoImprovement &&
+                sameInstalledPlan(unchanged, original), "unused native reservation is returned exactly once");
+        for (const auto allowance : {std::int64_t{0}, metadata - 1, metadata, required - 1, required})
+        {
+            RefinementLedger prefixLedger;
+            require(prefixLedger.open(allowance), "installation preparation prefix ledger");
+            NativeStockSession prefixSession(field, enemy, reference.continuation.cases, prefixLedger);
+            MasterAssignmentEvaluator prefixEvaluator(problem, prefixLedger, prefixSession, tariffs);
+            MasterAssignmentInstallation prefix(problem, prefixEvaluator, prefixLedger);
+            auto incoming = original;
+            const auto status = prefix.prepare(incoming);
+            expect(status == (allowance < required ? MasterInstallationStatus::BudgetExhausted
+                                                  : MasterInstallationStatus::Reserved),
+                   "preparation retains the exact metadata and terminal-reservation cutoff");
+            const auto finalized = prefix.finish(std::nullopt, incoming);
+            expect(sameInstalledPlan(incoming, original) && prefixLedger.stats().spent() <= allowance &&
+                   finalized.finalizationWork == 0,
+                   "all preparation cutoffs preserve the original complete plan without a second allowance");
+        }
     }
 
     void observationalProfile()
@@ -1464,6 +2115,10 @@ int main(int argc, char** argv)
     differentEnemySignatures();
     tenStockActors();
     shadowControlsAndCapture();
+    transactionalInstallation();
+    stockInstallationAuthentication();
+    stockFinalizationBudgets();
+    ownedCertificateSerialization();
     observationalProfile();
     reservationFailureExport();
     refinementPreflightReceipts();

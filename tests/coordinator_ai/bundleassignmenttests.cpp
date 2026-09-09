@@ -3171,6 +3171,309 @@ void testDecisionTraceIsNeutralAndDeterministic()
                tracedInput.actors.size(),
            "decision tracing retains one final selection receipt per actor");
 }
+
+class ConstructionStockValuer final : public PlanStockValuer
+{
+public:
+    explicit ConstructionStockValuer(std::vector<std::int32_t> stockActors)
+        : m_stockActors(std::move(stockActors))
+    {
+    }
+
+    MilliFunds planStock(const TurnPlan &) override
+    {
+        ++pricingCalls;
+        return 0;
+    }
+
+    MilliFunds originStock() const override
+    {
+        ++pricingCalls;
+        return 0;
+    }
+
+    MilliFunds stockCeiling() const override
+    {
+        ++pricingCalls;
+        return 0;
+    }
+
+    bool affectsStock(std::int32_t unit) const override
+    {
+        return std::find(m_stockActors.begin(), m_stockActors.end(), unit) != m_stockActors.end();
+    }
+
+    bool livePairSwapIntervals() const override
+    {
+        return true;
+    }
+
+    bool liveSettlingIntervals() const override
+    {
+        return true;
+    }
+
+    Coordinator::LivePlanStockQuote livePlanStock(const TurnPlan &, MilliFunds, bool) override
+    {
+        ++pricingCalls;
+        return {};
+    }
+
+    Coordinator::LiveRefinementResult refineLiveAtBoundary(AssignPhase, std::int64_t) override
+    {
+        ++pricingCalls;
+        return {};
+    }
+
+    Coordinator::RelativeStockSession* relativeStockSession() override
+    {
+        ++pricingCalls;
+        return nullptr;
+    }
+
+    PlanStockAudit auditPlanStock(const TurnPlan &) override
+    {
+        ++pricingCalls;
+        return {};
+    }
+
+    mutable std::int32_t pricingCalls{0};
+
+private:
+    std::vector<std::int32_t> m_stockActors;
+};
+
+constexpr std::int64_t CONSTRUCTION_TEST_ALLOWANCE = 1000000;
+
+AssignmentResult constructStockPlan(AssignmentInput & input, ConstructionStockValuer & valuer)
+{
+    Coordinator::RefinementLedger ledger;
+    expect(ledger.open(CONSTRUCTION_TEST_ALLOWANCE), "construction opens its test caller ledger");
+    input.pStockValuer = &valuer;
+    return MaximumValueAssignment::constructStockIncumbent(input, ledger);
+}
+
+void testStockConstructionSkipsEveryStockOptimizer()
+{
+    ConstructionStockValuer valuer({ATTACKER_UNIT, SUPPORT_UNIT});
+    RecordingTrace trace;
+    auto input = destinationSwapInput();
+    input.pTrace = &trace;
+    const auto result = constructStockPlan(input, valuer);
+    expect(result.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               isIncumbentPair(result),
+           "stock construction keeps the complete greedy choices without stock refinement");
+    expect(result.stats.settlingMoves == 0 && result.stats.swapStates == 0 &&
+               result.stats.enumerationStates == 0 && result.stats.stockPairs.workUsed == 0 &&
+               result.stats.stockJoints.workUsed == 0 && result.stats.mixedPairs.workUsed == 0 &&
+               valuer.pricingCalls == 0,
+           "stock construction calls no scalar, live, relative, refinement or audit stock pricing");
+    expect(result.selections.size() == input.actors.size() &&
+               std::all_of(result.selections.begin(), result.selections.end(),
+                   [](const AssignmentResult::Selection & selection)
+                   {
+                       return selection.stockCoupled && selection.candidateIndex == selection.greedyCandidateIndex;
+                   }),
+           "stock metadata and complete incoming selections remain available");
+}
+
+void testStockConstructionPreservesNonStockRefinement()
+{
+    ConstructionStockValuer valuer({TARGET_UNIT});
+    auto pair = destinationSwapInput();
+    pair.actors.push_back(actorWith(TARGET_INDEX, TARGET_UNIT, {
+        valuedCandidate(TARGET_INDEX, TARGET_TILE, TARGET_TILE, POOR_VALUE),
+    }));
+    RecordingTrace trace;
+    pair.pTrace = &trace;
+    const auto swapped = constructStockPlan(pair, valuer);
+    const auto* fixed = actionOf(swapped, TARGET_UNIT);
+    expect(swapped.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               actionOf(swapped, ATTACKER_UNIT) != nullptr &&
+               actionOf(swapped, ATTACKER_UNIT)->destination == SPARE_TILE &&
+               actionOf(swapped, SUPPORT_UNIT) != nullptr &&
+               actionOf(swapped, SUPPORT_UNIT)->destination == CONTESTED_TILE &&
+               plannedTotal(swapped) == GOOD_VALUE + FAIR_VALUE + POOR_VALUE &&
+               swapped.stats.swapImprovements > 0 && fixed != nullptr &&
+               fixed->destination == TARGET_TILE && valuer.pricingCalls == 0,
+           "pure non-stock pair refinement improves around a seated stock constraint without stock auditing");
+
+    constexpr std::int32_t fixedUnit = 14;
+    constexpr std::int32_t fixedKnowledge = 3;
+    constexpr TilePoint fixedTile{8, 8};
+    ConstructionStockValuer clusterValuer({fixedUnit});
+    auto cluster = threeActorClusterInput();
+    cluster.unitLinks.push_back({fixedUnit, fixedTile});
+    cluster.actors.push_back(actorWith(fixedKnowledge, fixedUnit, {
+        valuedCandidate(fixedKnowledge, fixedTile, fixedTile, POOR_VALUE),
+    }));
+    const auto clustered = constructStockPlan(cluster, clusterValuer);
+    expect(clustered.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               plannedTotal(clustered) == CLUSTER_OPTIMUM + POOR_VALUE &&
+               clustered.stats.clustersEnumerated > 0 && clusterValuer.pricingCalls == 0,
+           "pure non-stock cluster refinement can complete a greedy partial assignment");
+    expect(clustered.selections.size() == cluster.actors.size() &&
+               clustered.selections.back().stockCoupled &&
+               clustered.selections.back().candidateIndex == clustered.selections.back().greedyCandidateIndex,
+           "retained selections preserve the fixed stock actor without decision logging");
+}
+
+void testStockConstructionRetainsCompleteNegativeFallback()
+{
+    ConstructionStockValuer valuer({ATTACKER_UNIT});
+    auto input = losingFallbackInput();
+    const auto result = constructStockPlan(input, valuer);
+    const auto* support = actionOf(result, SUPPORT_UNIT);
+    expect(result.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               result.nonStockRefinementRolledBack && support != nullptr &&
+               support->state == PlanActionState::Pending && support->destination == SUPPORT_TILE &&
+               result.executionOrder.size() == input.actors.size(),
+           "non-stock abandonment restores the complete legal greedy fallback");
+    expect(plannedTotal(result) == BEST_VALUE + LOSING_VALUE && result.selections.size() == 2 &&
+               result.selections[1].candidateIndex == 1 &&
+               result.selections[1].seatedValue == LOSING_VALUE &&
+               result.selections[1].phase == AssignmentResult::SelectionPhase::Greedy &&
+               valuer.pricingCalls == 0,
+           "completeness rollback restores incoming choices, value and provenance with no stock fallback");
+}
+
+void testStockConstructionRollsBackVacateCycle()
+{
+    constexpr TilePoint stockOrigin{0, 0};
+    constexpr TilePoint moverOrigin{1, 0};
+    constexpr TilePoint moverSpare{2, 0};
+    constexpr TilePoint peerOrigin{3, 0};
+    constexpr TilePoint peerSpare{4, 0};
+    constexpr MilliFunds stockValue = 95;
+    constexpr MilliFunds moverSwapValue = 90;
+    constexpr MilliFunds moverFallbackValue = 10;
+    constexpr MilliFunds peerGreedyValue = 100;
+    constexpr MilliFunds peerSwapValue = 99;
+    ConstructionStockValuer valuer({ATTACKER_UNIT});
+    auto input = inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, {
+            valuedCandidate(ATTACKER_INDEX, stockOrigin, moverOrigin, stockValue),
+        }),
+        actorWith(SUPPORT_INDEX, SUPPORT_UNIT, {
+            valuedCandidate(SUPPORT_INDEX, moverOrigin, stockOrigin, moverSwapValue),
+            valuedCandidate(SUPPORT_INDEX, moverOrigin, moverSpare, moverFallbackValue),
+        }),
+        actorWith(TARGET_INDEX, TARGET_UNIT, {
+            valuedCandidate(TARGET_INDEX, peerOrigin, stockOrigin, peerGreedyValue),
+            valuedCandidate(TARGET_INDEX, peerOrigin, peerSpare, peerSwapValue),
+        }),
+    });
+    input.unitLinks = {{ATTACKER_UNIT, stockOrigin}, {SUPPORT_UNIT, moverOrigin}, {TARGET_UNIT, peerOrigin}};
+    const auto result = constructStockPlan(input, valuer);
+    expect(result.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               result.nonStockRefinementRolledBack && result.stats.swapImprovements > 0,
+           "a non-stock pair's scalar improvement cannot install a stock-dependent vacate cycle");
+    const auto* stock = actionOf(result, ATTACKER_UNIT);
+    const auto* mover = actionOf(result, SUPPORT_UNIT);
+    const auto* peer = actionOf(result, TARGET_UNIT);
+    expect(stock != nullptr && mover != nullptr && peer != nullptr &&
+               stock->destination == moverOrigin && mover->destination == moverSpare &&
+               peer->destination == stockOrigin &&
+               result.executionOrder == std::vector<std::int32_t>{mover->actionIndex, stock->actionIndex, peer->actionIndex},
+           "cycle rollback preserves the complete incoming vacate chain and its execution order");
+    expect(stock != nullptr && mover != nullptr && result.selections.size() == 3 &&
+               result.selections[0].candidateIndex == 0 && result.selections[1].candidateIndex == 1 &&
+               result.selections[2].candidateIndex == 0 &&
+               result.plan.destinationClaimant(moverOrigin) == stock->actionIndex &&
+               result.plan.destinationClaimant(moverSpare) == mover->actionIndex && valuer.pricingCalls == 0,
+           "cycle rollback restores claims and candidate records after non-stock preparation began");
+}
+
+void testStockConstructionPreservesFixedDamage()
+{
+    constexpr MilliFunds targetReplacementCost = 3000;
+    auto stockShot = firingCandidate(ATTACKER_INDEX, ATTACKER_TILE, ATTACKER_TILE, 2, BEST_VALUE);
+    stockShot.bundle.components.front().fire.targetReplacementCost = targetReplacementCost;
+    auto nonStockShot = firingCandidate(SUPPORT_INDEX, SUPPORT_TILE, SUPPORT_TILE, 3, GOOD_VALUE);
+    nonStockShot.bundle.components.front().fire.targetReplacementCost = targetReplacementCost;
+    ConstructionStockValuer valuer({ATTACKER_UNIT});
+    auto input = inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, {
+            stockShot,
+        }),
+        actorWith(SUPPORT_INDEX, SUPPORT_UNIT, {
+            nonStockShot,
+            valuedCandidate(SUPPORT_INDEX, SUPPORT_TILE, SPARE_TILE, FAIR_VALUE),
+        }),
+    });
+    const auto result = constructStockPlan(input, valuer);
+    const auto* stock = actionOf(result, ATTACKER_UNIT);
+    const auto* support = actionOf(result, SUPPORT_UNIT);
+    expect(result.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               !result.nonStockRefinementRolledBack && result.stats.settlingMoves > 0 &&
+               stock != nullptr && stock->plannedDamageSteps == 2 && support != nullptr &&
+               support->destination == SPARE_TILE,
+           "non-stock settling improves a trimmed shot while preserving the stock actor's granted damage");
+    const auto reservations = stock == nullptr ? Coordinator::ActionReservations{}
+        : result.plan.actionReservations(stock->actionIndex);
+    expect(reservations.damage.size() == 1 && reservations.damage.front().damageSteps == 2 &&
+               valuer.pricingCalls == 0,
+           "releasing the non-stock shot leaves the fixed stock damage claim intact");
+}
+
+void testStockConstructionAccountingAndRefusal()
+{
+    ConstructionStockValuer valuer({ATTACKER_UNIT, SUPPORT_UNIT});
+    auto input = destinationSwapInput();
+    input.pStockValuer = &valuer;
+    Coordinator::RefinementLedger ledger;
+    expect(ledger.open(CONSTRUCTION_TEST_ALLOWANCE), "construction accounting opens the caller ledger");
+    const auto funded = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+    const auto work = funded.stockConstructionWork;
+    expect(work > 0 && work == ledger.stats().spent() && ledger.stats().total == CONSTRUCTION_TEST_ALLOWANCE &&
+               ledger.stats().grantedByWork[static_cast<std::size_t>(Coordinator::RefinementWork::MasterPreparation)] == work &&
+               ledger.retainedGrantCount() == 0,
+           "construction consumes prepaid work in the caller's one ledger without retaining refund records");
+    constexpr std::int64_t priorWork = 11;
+    expect(ledger.open(work + priorWork) &&
+               ledger.consume(priorWork, Coordinator::RefinementWork::MasterBoundScan),
+           "construction boundary retains earlier work in the shared ledger");
+    const auto exact = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+    expect(exact.stockConstructionStatus == Coordinator::StockConstructionStatus::Complete &&
+               exact.stockConstructionWork == work && ledger.balance() == 0 &&
+               ledger.stats().total == work + priorWork && samePlan(exact, funded),
+           "the exact prepaid boundary constructs deterministically without resetting the shared allowance");
+    expect(ledger.open(work - 1), "construction opens the one-unit-short control");
+    const auto refused = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+    expect(refused.stockConstructionStatus == Coordinator::StockConstructionStatus::BudgetExhausted &&
+               refused.plan.actionCount() == 0 && refused.stockConstructionWork > 0 &&
+               refused.stockConstructionWork == ledger.stats().spent() && ledger.stats().refusals == 1,
+           "a refusal after tariff preparation retains charged work and starts no unaccounted assignment");
+    expect(ledger.open(0), "construction opens the zero allowance control");
+    const auto zero = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+    expect(zero.stockConstructionStatus == Coordinator::StockConstructionStatus::BudgetExhausted &&
+               zero.plan.actionCount() == 0 && zero.stockConstructionWork == 0 && valuer.pricingCalls == 0,
+           "zero allowance cannot start greedy or a second stock budget");
+    input.pStockValuer = nullptr;
+    const auto invalid = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+    expect(invalid.stockConstructionStatus == Coordinator::StockConstructionStatus::InvalidInput &&
+               invalid.plan.actionCount() == 0,
+           "construction refuses missing stock metadata instead of declaring every actor non-stock");
+}
+
+void testStockConstructionReportsIncompleteOccupancy()
+{
+    ConstructionStockValuer valuer({ATTACKER_UNIT});
+    auto input = inputWith({
+        actorWith(ATTACKER_INDEX, ATTACKER_UNIT, {
+            valuedCandidate(ATTACKER_INDEX, ATTACKER_TILE, SUPPORT_TILE, BEST_VALUE),
+        }),
+    });
+    const auto blocked = constructStockPlan(input, valuer);
+    expect(blocked.stockConstructionStatus == Coordinator::StockConstructionStatus::Incomplete &&
+               !blocked.nonStockRefinementRolledBack && valuer.pricingCalls == 0,
+           "a non-planning known occupant blocks construction without launching a stock fallback");
+    input.actors.front().candidates.clear();
+    const auto unavailable = constructStockPlan(input, valuer);
+    expect(unavailable.stockConstructionStatus == Coordinator::StockConstructionStatus::Incomplete &&
+               unavailable.plan.actionCount() == 0 && unavailable.selections.size() == 1,
+           "an unsupported empty actor domain is explicitly incomplete");
+}
 }
 
 int main()
@@ -3227,6 +3530,13 @@ int main()
     testCapsAndSharedBudgetBoundTheSearch();
     testStockDecompositionIsDeferredAndNeutral();
     testDecisionTraceIsNeutralAndDeterministic();
+    testStockConstructionSkipsEveryStockOptimizer();
+    testStockConstructionPreservesNonStockRefinement();
+    testStockConstructionRetainsCompleteNegativeFallback();
+    testStockConstructionRollsBackVacateCycle();
+    testStockConstructionPreservesFixedDamage();
+    testStockConstructionAccountingAndRefusal();
+    testStockConstructionReportsIncompleteOccupancy();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

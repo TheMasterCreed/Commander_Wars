@@ -14,6 +14,12 @@
 
 namespace
 {
+const QString PLANNING_CONTEXTS_KEY = QStringLiteral("actionPlanningContexts");
+const QString CONTEXT_DAY_KEY = QStringLiteral("day");
+const QString CONTEXT_PLAYER_KEY = QStringLiteral("player");
+const QString CONTEXT_SEQUENCE_KEY = QStringLiteral("planSequence");
+const QString COORDINATED_AI_TYPE = QStringLiteral("Coordinated");
+
 const QSet<QString> REQUIRED_FIELDS = {
     QStringLiteral("version"),
     QStringLiteral("mapPath"),
@@ -71,7 +77,8 @@ bool fixedHex(const QJsonValue & value, qint32 length)
 
 bool hasRequiredFields(const QJsonObject & root)
 {
-    if (root.size() != REQUIRED_FIELDS.size())
+    const auto optionalFields = root.contains(PLANNING_CONTEXTS_KEY) ? 1 : 0;
+    if (root.size() != REQUIRED_FIELDS.size() + optionalFields)
     {
         return false;
     }
@@ -117,6 +124,60 @@ bool validTargets(const QJsonArray & targets)
                 target.value("y"),
                 std::numeric_limits<qint32>::min(),
                 std::numeric_limits<qint32>::max()))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validPlanningContexts(const QJsonObject & root, qint32 actionCount)
+{
+    if (!root.contains(PLANNING_CONTEXTS_KEY))
+    {
+        return true;
+    }
+    const auto value = root.value(PLANNING_CONTEXTS_KEY);
+    if (!value.isArray() || value.toArray().size() != actionCount)
+    {
+        return false;
+    }
+    for (const auto & entry : value.toArray())
+    {
+        const auto context = entry.toObject();
+        if (!entry.isObject() || context.size() != 3 ||
+            !integerInRange(context.value(CONTEXT_DAY_KEY), 0, std::numeric_limits<qint32>::max()) ||
+            !integerInRange(context.value(CONTEXT_PLAYER_KEY), 0, std::numeric_limits<qint32>::max()) ||
+            !context.contains(CONTEXT_SEQUENCE_KEY))
+        {
+            return false;
+        }
+        qint32 matches = 0;
+        bool coordinated = false;
+        for (const auto & record : root.value("players").toArray())
+        {
+            const auto player = record.toObject();
+            if (player.value("playerId") == context.value(CONTEXT_PLAYER_KEY))
+            {
+                ++matches;
+                coordinated = player.value("aiType").toString() == COORDINATED_AI_TYPE;
+            }
+        }
+        if (matches != 1)
+        {
+            return false;
+        }
+        const auto sequence = context.value(CONTEXT_SEQUENCE_KEY);
+        if (coordinated)
+        {
+            bool valid = false;
+            const auto parsed = sequence.toString().toULongLong(&valid);
+            if (!sequence.isString() || !valid || QString::number(parsed) != sequence.toString())
+            {
+                return false;
+            }
+        }
+        else if (!sequence.isNull())
         {
             return false;
         }
@@ -224,12 +285,83 @@ bool validResult(const QByteArray & data)
         (exitCode != 5 || watchdog) &&
         (exitCode == 0 || exitCode == 4 ||
          exitCode == 5 || exitCode == 6);
-    return outcomeValid && validActionArrays(root, count);
+    return outcomeValid && validActionArrays(root, count) && validPlanningContexts(root, count);
 }
 
 QByteArray encoded(const QJsonObject & root)
 {
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
+
+bool checkPlanningContexts(const QJsonObject & valid)
+{
+    const QJsonObject context{
+        {CONTEXT_DAY_KEY, 2}, {CONTEXT_PLAYER_KEY, 0}, {CONTEXT_SEQUENCE_KEY, QStringLiteral("1")},
+    };
+    auto candidate = valid;
+    for (const auto & sequence : {QStringLiteral("0"), QStringLiteral("1"), QStringLiteral("18446744073709551615")})
+    {
+        auto recorded = context;
+        recorded[CONTEXT_SEQUENCE_KEY] = sequence;
+        candidate[PLANNING_CONTEXTS_KEY] = QJsonArray{recorded};
+        if (!validResult(encoded(candidate)))
+        {
+            return false;
+        }
+    }
+    auto normal = context;
+    normal[CONTEXT_PLAYER_KEY] = 1;
+    normal[CONTEXT_SEQUENCE_KEY] = QJsonValue::Null;
+    candidate[PLANNING_CONTEXTS_KEY] = QJsonArray{normal};
+    if (!validResult(encoded(candidate)))
+    {
+        return false;
+    }
+    QList<QJsonValue> rejected{QJsonValue::Null, QJsonObject{}, QJsonArray{}, QJsonArray{context, context},
+        QJsonArray{QStringLiteral("invalid")}};
+    for (const auto & field : {CONTEXT_DAY_KEY, CONTEXT_PLAYER_KEY, CONTEXT_SEQUENCE_KEY})
+    {
+        auto missing = context;
+        missing.remove(field);
+        rejected.append(QJsonArray{missing});
+    }
+    for (const auto & day : {QJsonValue(-1), QJsonValue(1.5), QJsonValue(QStringLiteral("2"))})
+    {
+        auto invalid = context;
+        invalid[CONTEXT_DAY_KEY] = day;
+        rejected.append(QJsonArray{invalid});
+    }
+    for (const auto & player : {QJsonValue(-1), QJsonValue(2), QJsonValue(0.5), QJsonValue(QStringLiteral("0"))})
+    {
+        auto invalid = context;
+        invalid[CONTEXT_PLAYER_KEY] = player;
+        rejected.append(QJsonArray{invalid});
+    }
+    for (const auto & sequence : {QJsonValue(QJsonValue::Null), QJsonValue(1), QJsonValue(true),
+         QJsonValue(QStringLiteral("-1")), QJsonValue(QStringLiteral("+1")), QJsonValue(QStringLiteral("01")),
+         QJsonValue(QStringLiteral("18446744073709551616"))})
+    {
+        auto invalid = context;
+        invalid[CONTEXT_SEQUENCE_KEY] = sequence;
+        rejected.append(QJsonArray{invalid});
+    }
+    normal[CONTEXT_SEQUENCE_KEY] = QStringLiteral("1");
+    rejected.append(QJsonArray{normal});
+    auto unknown = context;
+    unknown.insert(QStringLiteral("unknown"), 0);
+    rejected.append(QJsonArray{unknown});
+    for (const auto & invalid : rejected)
+    {
+        candidate[PLANNING_CONTEXTS_KEY] = invalid;
+        if (validResult(encoded(candidate)))
+        {
+            return false;
+        }
+    }
+    candidate = valid;
+    candidate[PLANNING_CONTEXTS_KEY] = QJsonArray{context};
+    candidate.insert(QStringLiteral("unknown"), 0);
+    return !validResult(encoded(candidate));
 }
 }
 
@@ -252,6 +384,10 @@ int main(int argc, char** argv)
     }
     const QJsonObject valid =
         QJsonDocument::fromJson(validData).object();
+    if (!checkPlanningContexts(valid))
+    {
+        return 8;
+    }
     QJsonObject unlimited = valid;
     unlimited["turnLimit"] = 0;
     if (!validResult(encoded(unlimited)))

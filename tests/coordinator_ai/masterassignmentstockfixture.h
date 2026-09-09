@@ -168,6 +168,11 @@ namespace MasterAssignmentTest
             return &m_future;
         }
 
+        void setQuoteFault(QuoteFault fault)
+        {
+            m_fault = fault;
+        }
+
         RelativeStockQuote quote(const TurnPlan &, MilliFunds) override
         {
             return {};

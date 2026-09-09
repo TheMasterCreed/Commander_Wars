@@ -35,6 +35,120 @@ namespace
         return result;
     }
 
+    QJsonArray valuesRecord(std::span<const std::int64_t> values)
+    {
+        QJsonArray result;
+        for (const auto value : values)
+        {
+            result.append(QString::number(value));
+        }
+        return result;
+    }
+
+    QJsonArray stockRowsRecord(std::span<const Coordinator::PropertyStockRow> rows)
+    {
+        QJsonArray result;
+        for (const auto & row : rows)
+        {
+            result.append(QJsonObject{{"knowledgeIndex", row.knowledgeIndex}, {"gridIdentity", row.gridIdentity},
+                {"movementPoints", row.movementPoints}, {"capturePoints", row.capturePoints},
+                {"captureRate", row.captureRate}, {"tile", tile(row.tile)}});
+        }
+        return result;
+    }
+
+    QJsonArray stockColumnsRecord(std::span<const Coordinator::PropertyStockColumn> columns)
+    {
+        QJsonArray result;
+        for (const auto & column : columns)
+        {
+            result.append(QJsonObject{{"slot", column.slot}, {"tile", tile(column.tile)},
+                {"income", QJsonObject{{"oursPerTurn", QString::number(column.income.oursPerTurn)},
+                    {"enemyPerTurn", QString::number(column.income.enemyPerTurn)}}},
+                {"ownerBefore", static_cast<int>(column.ownerBefore)}, {"buildingIndex", column.buildingIndex}});
+        }
+        return result;
+    }
+
+    QJsonObject mobilityGridRecord(const Coordinator::MobilityCostGrid & grid)
+    {
+        QJsonArray directions;
+        for (const auto direction : Coordinator::ENTRY_DIRECTIONS)
+        {
+            directions.append(static_cast<int>(direction));
+        }
+        QJsonArray costs;
+        for (std::int32_t y = 0; y < grid.height(); ++y)
+        {
+            QJsonArray row;
+            for (std::int32_t x = 0; x < grid.width(); ++x)
+            {
+                QJsonArray cell;
+                for (const auto direction : Coordinator::ENTRY_DIRECTIONS)
+                {
+                    cell.append(grid.cost(x, y, direction));
+                }
+                row.append(cell);
+            }
+            costs.append(row);
+        }
+        return {{"width", grid.width()}, {"height", grid.height()}, {"entryDirections", directions}, {"costs", costs}};
+    }
+
+    QJsonObject packingFieldRecord(const Coordinator::PackingDualFieldIdentity & field)
+    {
+        QJsonArray columnTiles;
+        for (const auto point : field.columnTiles)
+        {
+            columnTiles.append(tile(point));
+        }
+        QJsonArray grids;
+        for (const auto & grid : field.mobilityGrids)
+        {
+            grids.append(mobilityGridRecord(grid));
+        }
+        return {{"horizonTurns", field.horizonTurns}, {"width", field.width}, {"height", field.height},
+            {"capturePointsToCapture", field.capturePointsToCapture},
+            {"ownedBaseline", QString::number(field.ownedBaseline)},
+            {"ourRows", stockRowsRecord(field.ourRows)}, {"ourColumns", stockColumnsRecord(field.ourColumns)},
+            {"ourWeights", valuesRecord(field.ourWeights)}, {"enemyRows", stockRowsRecord(field.enemyRows)},
+            {"enemyColumns", stockColumnsRecord(field.enemyColumns)}, {"enemyWeights", valuesRecord(field.enemyWeights)},
+            {"columnTiles", columnTiles}, {"columnCapturers", Coordinator::masterChoicesRecord(field.columnCapturers)},
+            {"columnCapturePoints", Coordinator::masterChoicesRecord(field.columnCapturePoints)},
+            {"enemyArrivals", Coordinator::masterChoicesRecord(field.enemyArrivals)}, {"mobilityGrids", grids}};
+    }
+
+    QJsonObject packingIdentityRecord(const Coordinator::PackingDualProblemIdentity & identity)
+    {
+        QJsonArray rowDomains;
+        for (const auto & domain : identity.rowDomains)
+        {
+            rowDomains.append(valuesRecord(domain));
+        }
+        QJsonArray usedNodes;
+        for (std::int32_t node = 0; node < identity.usedNodes.nodeCount(); ++node)
+        {
+            if (identity.usedNodes.contains(node))
+            {
+                usedNodes.append(node);
+            }
+        }
+        return {{"session", QString::number(identity.session)}, {"immutableField", packingFieldRecord(identity.immutableField)},
+            {"key", keyRecord(identity.key)}, {"capturedColumns", Coordinator::masterChoicesRecord(identity.capturedColumns)},
+            {"rowDomains", rowDomains}, {"nodeColumns", stockColumnsRecord(identity.nodeColumns)},
+            {"usedNodes", QJsonObject{{"nodeCount", identity.usedNodes.nodeCount()}, {"nodes", usedNodes}}},
+            {"economic", QString::number(identity.economic)}, {"owned", QString::number(identity.owned)},
+            {"incumbentFloor", QString::number(identity.incumbentFloor)}, {"fixedValue", QString::number(identity.fixedValue)}};
+    }
+
+    QJsonObject packingCertificateRecord(const Coordinator::PackingDualCertificate & certificate)
+    {
+        return {{"identity", packingIdentityRecord(certificate.identity)},
+            {"rows", Coordinator::masterChoicesRecord(certificate.rows)},
+            {"nodePrices", valuesRecord(certificate.nodePrices)}, {"rowReducedMaxima", valuesRecord(certificate.rowReducedMaxima)},
+            {"dualObjective", QString::number(certificate.dualObjective)}};
+    }
+
     QJsonArray sequentialWitnessRecord(std::span<const Coordinator::SequentialRowWitness> witness)
     {
         QJsonArray result;
@@ -116,7 +230,7 @@ namespace Coordinator
         constexpr std::array<const char*, REFINEMENT_WORK_CLASSES> names{
             "mandatoryPrecompute", "ourAdmission", "enemyEntry", "searchSlice", "packingDualCertificate",
             "masterPreparation", "masterExpansion", "masterBoundScan", "masterDualOptimization",
-            "masterDualVerification", "masterValuation", "masterWitness", "masterReplay",
+            "masterDualVerification", "masterValuation", "masterWitness", "masterReplay", "masterInstallation",
         };
         QJsonArray net;
         QJsonObject categories;
@@ -226,6 +340,7 @@ namespace Coordinator
             {"arithmeticFailures", QString::number(result.stats.arithmeticFailures)},
             {"proofFailures", QString::number(result.stats.proofFailures)},
             {"firstImprovementWork", masterValueRecord(result.stats.firstImprovementWork)},
+            {"firstImprovementLower", masterValueRecord(result.stats.firstImprovementLower)},
             {"futurePricingCache", QJsonObject{{"hits", QString::number(result.stats.futurePricingCache.hits)},
                 {"recomputations", QString::number(result.stats.futurePricingCache.recomputations)}}},
             {"retainedGrants", QString::number(result.stats.retainedGrants)},
@@ -295,10 +410,11 @@ namespace Coordinator
                     path.append(tile(point));
                 }
                 actions.append(QJsonObject{
-                    {"actor", action.unitId}, {"actionId", action.actionId}, {"kind", static_cast<int>(action.kind)},
+                    {"index", action.actionIndex}, {"actor", action.unitId},
+                    {"actionId", action.actionId}, {"kind", static_cast<int>(action.kind)},
                     {"destination", tile(action.destination)}, {"target", tile(action.target)},
                     {"targetUnit", action.targetUnitId}, {"path", path}, {"state", static_cast<int>(action.state)},
-                    {"damage", action.plannedDamageSteps}});
+                    {"damage", action.plannedDamageSteps}, {"claims", masterClaimsRecord(plan.actionReservations(index))}});
             }
         }
         QJsonObject record{
@@ -311,6 +427,18 @@ namespace Coordinator
                 ? std::optional<MilliFunds>{evaluation.objective->lower} : std::nullopt)},
             {"upper", masterValueRecord(evaluation.objective
                 ? std::optional<MilliFunds>{evaluation.objective->upper} : std::nullopt)}};
+        if (evaluation.replay)
+        {
+            QJsonArray edges;
+            for (std::int32_t index = 0; index < evaluation.replay->plan.edgeCount(); ++index)
+            {
+                const auto & edge = evaluation.replay->plan.edge(index);
+                edges.append(QJsonArray{edge.from, edge.to, static_cast<int>(edge.kind)});
+            }
+            record.insert("edges", edges);
+            record.insert("executionOrder", masterChoicesRecord(evaluation.replay->ordering.order));
+            record.insert("actionIndices", masterChoicesRecord(evaluation.replay->actionIndices));
+        }
         if (const auto* quote = evaluation.quote())
         {
             const auto & proof = *evaluation.proof;
@@ -320,7 +448,7 @@ namespace Coordinator
                 cheapWitness.append(QJsonObject{{"row", row.row}, {"nodes", masterChoicesRecord(row.nodes)},
                     {"value", QString::number(row.value)}});
             }
-            record.insert("quote", QJsonObject{
+            QJsonObject quoted{
                 {"key", keyRecord(quote->key)}, {"capturedColumns", masterChoicesRecord(quote->capturedColumns)},
                 {"economic", QString::number(quote->economic)}, {"owned", QString::number(quote->owned)},
                 {"ours", QJsonArray{QString::number(quote->ours.lower), QString::number(quote->ours.upper)}},
@@ -330,9 +458,35 @@ namespace Coordinator
                 {"ourWitnessKind", static_cast<int>(proof.ourKind)},
                 {"cheapOurWitness", cheapWitness},
                 {"ourWitness", sequentialWitnessRecord(proof.ourWitness)},
-                {"enemyWitness", sequentialWitnessRecord(proof.enemyWitness)}});
+                {"enemyWitness", sequentialWitnessRecord(proof.enemyWitness)}};
+            if (proof.ourUpperCertificate)
+            {
+                quoted.insert("ownedUpperCertificatePayload", packingCertificateRecord(*proof.ourUpperCertificate));
+            }
+            record.insert("quote", quoted);
         }
         return record;
+    }
+
+    QJsonObject masterClaimsRecord(const ActionReservations & claims)
+    {
+        QJsonArray destinations;
+        QJsonArray captures;
+        QJsonArray damage;
+        for (const auto point : claims.destinations)
+        {
+            destinations.append(tile(point));
+        }
+        for (const auto point : claims.captures)
+        {
+            captures.append(tile(point));
+        }
+        for (const auto & share : claims.damage)
+        {
+            damage.append(QJsonArray{share.targetUnitId, share.targetHpSteps, share.damageSteps});
+        }
+        return {{"destinations", destinations}, {"captures", captures},
+                {"services", masterChoicesRecord(claims.services)}, {"damage", damage}};
     }
 
     QJsonObject masterProfileRecord(const MasterAssignmentProfile & profile)

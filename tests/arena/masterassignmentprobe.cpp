@@ -15,6 +15,8 @@
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
 #include "ai/coordinator/bundleassignment.h"
+#include "coreengine/interpreter.h"
+#include "tests/arena/arenatestsupport.h"
 
 namespace
 {
@@ -69,27 +71,6 @@ namespace
         return result;
     }
 
-    QJsonObject claimRecord(const Coordinator::ActionReservations & claims)
-    {
-        QJsonArray destinations;
-        QJsonArray captures;
-        QJsonArray damage;
-        for (const auto point : claims.destinations)
-        {
-            destinations.append(tile(point));
-        }
-        for (const auto point : claims.captures)
-        {
-            captures.append(tile(point));
-        }
-        for (const auto & share : claims.damage)
-        {
-            damage.append(QJsonArray{share.targetUnitId, share.targetHpSteps, share.damageSteps});
-        }
-        return {{"destinations", destinations}, {"captures", captures},
-                {"services", indices(claims.services)}, {"damage", damage}};
-    }
-
     QJsonObject planRecord(const Coordinator::TurnPlan & plan)
     {
         QJsonArray actions;
@@ -113,7 +94,7 @@ namespace
                 {"captureClaimant", plan.captureClaimant(action.destination)},
                 {"plannedTargetDamage", plan.plannedDamageOn(action.targetUnitId)},
                 {"remainingTargetHp", plan.remainingHpStepsOn(action.targetUnitId)},
-                {"claims", claimRecord(plan.actionReservations(index))},
+                {"claims", Coordinator::masterClaimsRecord(plan.actionReservations(index))},
             });
         }
         QJsonArray edges;
@@ -136,6 +117,17 @@ namespace
 
 namespace ArenaMasterAssignmentProbe
 {
+    void failStockControlSetup(const QString & reason)
+    {
+        qWarning() << "StockControl planning setup failed:" << reason;
+        auto* interpreter = Interpreter::getInstance();
+        auto* support = interpreter == nullptr ? nullptr : interpreter->findChild<AiArenaTestSupport*>();
+        if (support != nullptr)
+        {
+            support->finish(ArenaExitCode::SetupError);
+        }
+    }
+
     std::unique_ptr<Coordinator::MasterShadowInspection> openShadowInspection()
     {
         if (qgetenv("COW_AI_ARENA_TEST") != "1")

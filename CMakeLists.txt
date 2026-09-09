@@ -856,6 +856,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/masterassignmenttrace.h ai/coordinator/masterassignmenttrace.cpp
     ai/coordinator/masterassignmentshadow.h ai/coordinator/masterassignmentshadow.cpp
     ai/coordinator/masterassignmentshadowconfig.cpp
+    ai/coordinator/masterassignmentinstallation.h ai/coordinator/masterassignmentinstallation.cpp
+    ai/coordinator/masterassignmentcontrol.h ai/coordinator/masterassignmentcontrol.cpp
     ai/coordinator/assignmentvaluation.h ai/coordinator/planidentity.h
     ai/coordinator/engineactionbuilder.h ai/coordinator/engineactionbuilder.cpp
     ai/transporterselector.h ai/transporterselector.cpp
@@ -1549,6 +1551,7 @@ if (BUILD_TESTING)
         tests/coordinator_ai/masterintegrationtests.cpp
         ai/coordinator/masterassignmentcapture.cpp
         ai/coordinator/masterassignmentshadowconfig.cpp
+        ai/coordinator/masterassignmentinstallation.cpp
         ${MASTER_ASSIGNMENT_SEARCH_SRCS}
         ${MASTER_ASSIGNMENT_ORACLE_SRCS}
     )

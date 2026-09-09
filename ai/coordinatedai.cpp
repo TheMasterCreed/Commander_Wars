@@ -12,6 +12,7 @@
 #include "ai/coordinator/engineactionbuilder.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/masterassignmentcontrol.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
 
@@ -131,6 +132,8 @@ QString selectionDecisionBasis(
             return QStringLiteral("PAIR_COMPARE_PLAN_BOUNDS");
         case Coordinator::AssignmentResult::SelectionPhase::Cluster:
             return QStringLiteral("CLUSTER_PLAN_COMPLETE_VALUE");
+        case Coordinator::AssignmentResult::SelectionPhase::Master:
+            return QStringLiteral("MASTER_CERTIFIED_PLAN_BOUNDS");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -151,6 +154,8 @@ QString selectionPhaseName(
             return QStringLiteral("PAIR_REFINEMENT");
         case Coordinator::AssignmentResult::SelectionPhase::Cluster:
             return QStringLiteral("CLUSTER");
+        case Coordinator::AssignmentResult::SelectionPhase::Master:
+            return QStringLiteral("MASTER");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -209,6 +214,11 @@ void CoordinatedAi::process()
             }
         }
         ensureTurnPlan();
+    }
+    if (m_assignment.stockConstructionStatus != Coordinator::StockConstructionStatus::NotRequested &&
+        m_assignment.stockConstructionStatus != Coordinator::StockConstructionStatus::Complete)
+    {
+        return;
     }
     if (executeNextPlannedAction())
     {
@@ -367,6 +377,13 @@ void CoordinatedAi::buildTurnPlan()
                     .arg(facts.captureTurnsRemaining));
         }
     }
+    auto masterShadow = Coordinator::readMasterShadowConfig();
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (m_testStockControlHeld && masterShadow.controlsStock())
+    {
+        masterShadow.mode = Coordinator::MasterAssignmentMode::Disabled;
+    }
+#endif
     Coordinator::AssignmentInput input;
     input.actionIds = Coordinator::engineActionIds();
     input.unitLinks = linkKnownUnits(m_dayStartKnowledge);
@@ -389,7 +406,7 @@ void CoordinatedAi::buildTurnPlan()
         input.relativeStockSchedule = m_testRefinementSchedule;
     }
     input.pRelativeStockObserver = m_testRefinementObserver.get();
-    if (m_testRefinementObserver)
+    if (m_testRefinementObserver && !masterShadow.controlsStock())
     {
         m_testRefinementObserver->beginPlan({
             traceIdentity.day, traceIdentity.playerId, traceIdentity.planSequence, traceIdentity.horizonTurns,
@@ -513,66 +530,87 @@ void CoordinatedAi::buildTurnPlan()
             }
         }
     }
-    Clock::time_point continuationStart;
-    if (timed)
-    {
-        continuationStart = Clock::now();
-    }
-#ifdef COW_COORDINATED_REFINEMENT_TESTING
-    if (m_testRefinementObserver && m_testRefinementObserver->frontierReceiptsEnabled())
-    {
-        m_testRefinementObserver->model(input, m_propertyStock);
-    }
-#endif
-    Coordinator::ContinuationPricingCatalog catalog =
-        stockValuer.continuationPricingCatalog(input);
     Coordinator::RefinementLedger ledger;
-    if (catalog.valid && ledger.open(catalog.ledgerTotal))
-    {
-        static_cast<void>(
-            stockValuer.prepareContinuationPricing(
-                std::move(catalog), ledger));
-    }
-    const std::int64_t continuationPricingPrepareNanos =
-        !timed
-            ? 0
-            : std::chrono::duration_cast<
-                  std::chrono::nanoseconds>(
-                  Clock::now() - continuationStart)
-                  .count();
-    const auto legacyPreparationNanos = planningNanosSince(planningStart, timed);
-    Clock::time_point phaseStart;
-    if (timed)
-    {
-        phaseStart = Clock::now();
-    }
-    const auto masterShadow = Coordinator::readMasterShadowConfig();
     Coordinator::RefinementLedger masterLedger;
-    std::unique_ptr<Coordinator::MasterShadowInspection> shadowInspection;
+    Coordinator::MasterShadowTiming masterTiming;
+    Coordinator::MasterStockControlTiming controlTiming;
+    std::int64_t stockControlCallNanos = 0;
+    std::int64_t continuationPricingPrepareNanos = 0;
+    std::int64_t legacyPreparationNanos = 0;
+    std::int64_t masterPreparationNanos = 0;
+    std::int64_t legacyAssignmentNanos = 0;
+    std::int64_t arenaProbeNanos = 0;
+    Clock::time_point phaseStart;
+    if (masterShadow.controlsStock())
+    {
+        if (timed)
+        {
+            phaseStart = Clock::now();
+        }
+        controlTiming = Coordinator::controlMasterAssignment(
+            masterShadow, input, m_assignment, m_propertyStock, traceIdentity);
+        stockControlCallNanos = planningNanosSince(phaseStart, timed);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-    if (masterShadow.enabled())
-    {
-        shadowInspection = ArenaMasterAssignmentProbe::openShadowInspection();
-    }
+        if (!controlTiming.constructorComplete)
+        {
+            ArenaMasterAssignmentProbe::failStockControlSetup(
+                Coordinator::masterStockControlStatusName(controlTiming.status));
+        }
 #endif
-    Coordinator::prepareMasterShadow(masterShadow, input, masterLedger);
-    const auto masterPreparationNanos = planningNanosSince(phaseStart, timed);
-    if (timed)
-    {
-        phaseStart = Clock::now();
     }
-    m_assignment = Coordinator::MaximumValueAssignment::assign(input);
-    const auto legacyAssignmentNanos = planningNanosSince(phaseStart, timed);
-    const auto masterTiming = Coordinator::observeMasterAssignment(
-        masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity, shadowInspection.get());
-    if (timed)
+    else
     {
-        phaseStart = Clock::now();
-    }
+        Clock::time_point continuationStart;
+        if (timed)
+        {
+            continuationStart = Clock::now();
+        }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
-    ArenaMasterAssignmentProbe::record(input, m_assignment, m_propertyStock, traceIdentity);
+        if (m_testRefinementObserver && m_testRefinementObserver->frontierReceiptsEnabled())
+        {
+            m_testRefinementObserver->model(input, m_propertyStock);
+        }
 #endif
-    const auto arenaProbeNanos = planningNanosSince(phaseStart, timed);
+        Coordinator::ContinuationPricingCatalog catalog =
+            stockValuer.continuationPricingCatalog(input);
+        if (catalog.valid && ledger.open(catalog.ledgerTotal))
+        {
+            static_cast<void>(
+                stockValuer.prepareContinuationPricing(
+                    std::move(catalog), ledger));
+        }
+        continuationPricingPrepareNanos = planningNanosSince(continuationStart, timed);
+        legacyPreparationNanos = planningNanosSince(planningStart, timed);
+        if (timed)
+        {
+            phaseStart = Clock::now();
+        }
+        std::unique_ptr<Coordinator::MasterShadowInspection> shadowInspection;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (masterShadow.enabled())
+        {
+            shadowInspection = ArenaMasterAssignmentProbe::openShadowInspection();
+        }
+#endif
+        Coordinator::prepareMasterShadow(masterShadow, input, masterLedger);
+        masterPreparationNanos = planningNanosSince(phaseStart, timed);
+        if (timed)
+        {
+            phaseStart = Clock::now();
+        }
+        m_assignment = Coordinator::MaximumValueAssignment::assign(input);
+        legacyAssignmentNanos = planningNanosSince(phaseStart, timed);
+        masterTiming = Coordinator::observeMasterAssignment(
+            masterShadow, input, m_assignment, m_propertyStock, ledger, masterLedger, traceIdentity, shadowInspection.get());
+        if (timed)
+        {
+            phaseStart = Clock::now();
+        }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        ArenaMasterAssignmentProbe::record(input, m_assignment, m_propertyStock, traceIdentity);
+#endif
+        arenaProbeNanos = planningNanosSince(phaseStart, timed);
+    }
     if (timed)
     {
         phaseStart = Clock::now();
@@ -684,6 +722,25 @@ void CoordinatedAi::buildTurnPlan()
                     .arg(QLatin1String(Coordinator::MASTER_PHASE_NAMES[phase])).arg(sample.calls)
                     .arg(sample.inclusiveNanos).arg(sample.exclusiveNanos);
             }
+        }
+        if (masterShadow.controlsStock())
+        {
+            phaseTimingFields += QStringLiteral(" stockControlCallNanos=%1").arg(stockControlCallNanos);
+            phaseTimingFields += QStringLiteral(
+                " stockControlNanos=%1 stockControlConstructorNanos=%2 stockControlSearchNanos=%3 stockControlFinalizationNanos=%4 stockControlExportNanos=%5 stockControlWork=%6 stockControlAllowance=%7 stockControlReservedWork=%8 stockControlFinalizationWork=%9 stockControlConstructorComplete=%10 stockControlStatus=%11 stockControlInstallationStatus=%12 stockControlExportSucceeded=%13")
+                .arg(controlTiming.totalNanos).arg(controlTiming.constructorNanos).arg(controlTiming.searchNanos)
+                .arg(controlTiming.finalizationNanos).arg(controlTiming.exportNanos).arg(controlTiming.work.spent())
+                .arg(controlTiming.work.total).arg(controlTiming.reservedWork).arg(controlTiming.finalizationWork)
+                .arg(controlTiming.constructorComplete).arg(Coordinator::masterStockControlStatusName(controlTiming.status))
+                .arg(static_cast<int>(controlTiming.installationStatus)).arg(controlTiming.exportSucceeded);
+            phaseTimingFields += QStringLiteral(
+                " stockControlFirstImprovementWork=%1 stockControlFirstImprovementNanos=%2 stockControlFirstImprovementLower=%3 stockControlImprovementLower=%4 stockControlGap=%5 stockControlWorkCategories=%6")
+                .arg(optionalPlanningValue(controlTiming.firstImprovementWork))
+                .arg(optionalPlanningValue(controlTiming.firstImprovementNanos))
+                .arg(optionalPlanningValue(controlTiming.firstImprovementLower))
+                .arg(optionalPlanningValue(controlTiming.improvementLower)).arg(optionalPlanningValue(controlTiming.gap))
+                .arg(QString::fromUtf8(QJsonDocument(
+                    Coordinator::masterWorkRecord(controlTiming.work)).toJson(QJsonDocument::Compact)));
         }
     }
     if (m_decisionTrace != nullptr)

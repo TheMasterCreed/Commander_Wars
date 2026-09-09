@@ -18,6 +18,7 @@ namespace Coordinator
     {
         Disabled,
         Shadow,
+        StockControl,
     };
 
     enum class MasterShadowConfigError : std::int8_t
@@ -28,6 +29,8 @@ namespace Coordinator
         MissingAbsoluteOutput,
         InvalidTierAudit,
         InvalidExport,
+        MissingExplicitAllowance,
+        StockControlOutsideArena,
     };
 
     enum class MasterShadowExportMode : std::int8_t
@@ -59,6 +62,11 @@ namespace Coordinator
         bool enabled() const
         {
             return error == MasterShadowConfigError::None && mode == MasterAssignmentMode::Shadow;
+        }
+
+        bool controlsStock() const
+        {
+            return error == MasterShadowConfigError::None && mode == MasterAssignmentMode::StockControl;
         }
     };
 
@@ -112,7 +120,8 @@ namespace Coordinator
     QString masterShadowOutcomeName(MasterShadowOutcome outcome);
     QJsonObject masterShadowRecord(const MasterShadowObservation & observation);
     MasterShadowConfig parseMasterShadowConfig(const QByteArray & mode, const QByteArray & work, const QString & output,
-                                               const QByteArray & tierAudit = {}, const QByteArray & exportMode = {});
+                                               const QByteArray & tierAudit = {}, const QByteArray & exportMode = {},
+                                               bool isolatedArena = false);
     MasterShadowConfig readMasterShadowConfig();
     void prepareMasterShadow(const MasterShadowConfig & config, AssignmentInput & input, RefinementLedger & ledger);
     MasterShadowTiming observeMasterAssignment(const MasterShadowConfig & config, const AssignmentInput & input,

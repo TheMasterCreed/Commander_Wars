@@ -86,6 +86,7 @@ namespace Coordinator
                                   RelativeStockSession & session, MasterValuationTariffs tariffs,
                                   MasterAssignmentProfile* profile = nullptr);
 
+        std::optional<std::int64_t> finalizationWork();
         MasterAssignmentEvaluation evaluate(const MasterAssignmentState & state);
         bool refresh(MasterAssignmentEvaluation & evaluation);
         MasterRefinementStatus refine(MasterAssignmentEvaluation & evaluation,
@@ -99,6 +100,8 @@ namespace Coordinator
         const CheapPricingModel* stockModel() const;
         const MasterFutureCatalog* futureCatalog() const;
         bool matches(const MasterAssignmentProblem & problem, const RefinementLedger & ledger) const;
+        bool ownsRetainedEvaluation(const MasterAssignmentEvaluation & evaluation) const;
+        MasterObjectiveStatus replayRetainedEvaluation(const MasterAssignmentEvaluation & evaluation);
         const std::optional<MasterRefinementRefusal> & refinementRefusal() const;
         const std::optional<RelativeStockCertificatePreparation> & certificatePreparation() const;
 
@@ -107,6 +110,9 @@ namespace Coordinator
             RelativeStockComparison comparison, MilliFunds incumbent, MilliFunds challenger);
         bool price(MasterAssignmentEvaluation & evaluation);
         MasterRefinementStatus refineCertificate(MasterAssignmentEvaluation & evaluation, std::int64_t allowance);
+        static bool retainedWitnessFits(const RelativeStockProofSnapshot & proof, std::int64_t work);
+        static std::optional<std::int64_t> candidateReplayWork(const MasterCandidate & candidate);
+        std::optional<std::int64_t> replayWork(std::int64_t payload) const;
         std::optional<std::int64_t> replayTariff(const MasterAssignmentState & state);
 
         const MasterAssignmentProblem & m_problem;

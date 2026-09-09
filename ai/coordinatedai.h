@@ -38,6 +38,11 @@ public:
         return m_testTierAuditMode == Coordinator::SequentialTierAuditMode::Full;
     }
 
+    void setStockControlTestHold(bool held)
+    {
+        m_testStockControlHeld = held;
+    }
+
     void setRefinementTestControls(std::int64_t workLimit, std::shared_ptr<Coordinator::RelativeStockObserver> observer,
                                   Coordinator::RelativeStockSchedule schedule = Coordinator::RelativeStockSchedule::Current,
                                   qint32 scheduleDay = -1,
@@ -104,6 +109,7 @@ private:
     Coordinator::RelativeStockSchedule m_testRefinementSchedule{Coordinator::RelativeStockSchedule::Current};
     qint32 m_testRefinementScheduleDay{-1};
     Coordinator::SequentialTierAuditMode m_testTierAuditMode{Coordinator::SequentialTierAuditMode::Full};
+    bool m_testStockControlHeld{false};
 #endif
 };
 

@@ -48,6 +48,99 @@ namespace Coordinator
                m_problemIdentity.sameLiveProblem(problem.identity()) && &m_ledger == &ledger;
     }
 
+    bool MasterAssignmentEvaluator::ownsRetainedEvaluation(
+        const MasterAssignmentEvaluation & evaluation) const
+    {
+        const auto actorCount = m_problem.actors().size();
+        if (!m_problemIdentity.sameLiveProblem(m_problem.identity()) ||
+            !m_problemIdentity.sameLiveProblem(evaluation.state.identity) ||
+            evaluation.status != MasterEvaluationStatus::Feasible ||
+            evaluation.objectiveStatus != MasterObjectiveStatus::Verified ||
+            !evaluation.replay || !evaluation.replay->complete() || !evaluation.objective ||
+            !evaluation.lowerReplayed || !evaluation.upperVerified ||
+            evaluation.objective->lower > evaluation.objective->upper ||
+            evaluation.state.choices.size() != actorCount ||
+            evaluation.replay->actionIndices.size() != actorCount ||
+            evaluation.replay->seatedValues.size() != actorCount ||
+            evaluation.replay->continuationKey.size() > actorCount || !evaluation.state.complete())
+        {
+            return false;
+        }
+        if (m_session == nullptr)
+        {
+            return !evaluation.proof && evaluation.exact &&
+                evaluation.objective->lower == evaluation.replay->seatedEconomicTotal &&
+                evaluation.objective->upper == evaluation.replay->seatedEconomicTotal;
+        }
+        const auto quote = evaluation.quote();
+        return quote != nullptr && quote->key.size() <= actorCount &&
+            quote->capturedColumns.size() <= actorCount && m_session->owns(*quote) &&
+            quote->valid && quote->economic == 0 &&
+            quote->ourLowerWitnessReplays && quote->enemyLowerWitnessReplays &&
+            RelativeStockDetail::coherent(*quote) && quote->key == evaluation.replay->continuationKey;
+    }
+
+    bool MasterAssignmentEvaluator::retainedWitnessFits(
+        const RelativeStockProofSnapshot & proof, std::int64_t work)
+    {
+        const auto subtract = [&](std::size_t count)
+        {
+            const auto units = masterWorkProduct(count, 1);
+            return units && RelativeStockDetail::checkedSubtract(work, *units) && work >= 0;
+        };
+        if (!subtract(proof.cheapOurWitness.size()) || !subtract(proof.ourWitness.size()) ||
+            !subtract(proof.enemyWitness.size()))
+        {
+            return false;
+        }
+        for (const auto & row : proof.cheapOurWitness)
+        {
+            if (!subtract(row.nodes.size()))
+            {
+                return false;
+            }
+        }
+        for (const auto* rows : {&proof.ourWitness, &proof.enemyWitness})
+        {
+            for (const auto & row : *rows)
+            {
+                if (!subtract(row.steps.size()))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    MasterObjectiveStatus MasterAssignmentEvaluator::replayRetainedEvaluation(
+        const MasterAssignmentEvaluation & evaluation)
+    {
+        if (!ownsRetainedEvaluation(evaluation))
+        {
+            return MasterObjectiveStatus::InvalidIdentity;
+        }
+        if (m_session == nullptr)
+        {
+            return MasterObjectiveStatus::Verified;
+        }
+        if (m_tariffs.witness < 0 || m_ledger.balance() != m_session->remainingWork())
+        {
+            return MasterObjectiveStatus::InvalidIdentity;
+        }
+        if (!m_ledger.consume(m_tariffs.witness, RefinementWork::MasterWitness))
+        {
+            return MasterObjectiveStatus::BudgetExhausted;
+        }
+        MasterProfileScope timing(m_profile, MasterPhase::LowerWitness);
+        if (!retainedWitnessFits(*evaluation.proof, m_tariffs.witness) ||
+            !m_session->replayLowerProof(*evaluation.proof))
+        {
+            return MasterObjectiveStatus::WitnessFailure;
+        }
+        return MasterObjectiveStatus::Verified;
+    }
+
     const std::optional<MasterRefinementRefusal> & MasterAssignmentEvaluator::refinementRefusal() const
     {
         return m_refinementRefusal;
@@ -57,6 +150,93 @@ namespace Coordinator
     MasterAssignmentEvaluator::certificatePreparation() const
     {
         return m_certificatePreparation;
+    }
+
+    std::optional<std::int64_t> MasterAssignmentEvaluator::candidateReplayWork(const MasterCandidate & candidate)
+    {
+        return masterWorkProduct(candidate.source.bundle.path.size() +
+            candidate.source.bundle.components.size() + candidate.resources.size() + 1, 1);
+    }
+
+    std::optional<std::int64_t> MasterAssignmentEvaluator::replayWork(std::int64_t payload) const
+    {
+        const auto actions = m_problem.actors().size() + m_problem.actionTemplates().size() +
+                             m_problem.incumbentEdges().size() + m_problem.unitLinks().size() + 1;
+        const auto structural = masterWorkProduct(actions, actions);
+        if (!structural || !RelativeStockDetail::checkedAdd(payload, *structural))
+        {
+            return std::nullopt;
+        }
+        return payload;
+    }
+
+    std::optional<std::int64_t> MasterAssignmentEvaluator::finalizationWork()
+    {
+        if (!m_problemIdentity.sameLiveProblem(m_problem.identity()) ||
+            (m_session != nullptr && (m_tariffs.quote < 0 || m_tariffs.witness < 0 ||
+                                     m_session->remainingWork() != m_ledger.balance())) ||
+            !chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 1, RefinementWork::MasterReplay))
+        {
+            return std::nullopt;
+        }
+        std::int64_t payload = 0;
+        for (const auto & actor : m_problem.actors())
+        {
+            if (!chargeMasterWork(m_ledger, actor.candidates.size() + 1, 1, RefinementWork::MasterReplay))
+            {
+                return std::nullopt;
+            }
+            std::int64_t largest = 0;
+            for (const auto & candidate : actor.candidates)
+            {
+                const auto work = candidateReplayWork(candidate);
+                if (!work)
+                {
+                    return std::nullopt;
+                }
+                largest = std::max(largest, *work);
+            }
+            if (!RelativeStockDetail::checkedAdd(payload, largest))
+            {
+                return std::nullopt;
+            }
+        }
+        constexpr std::size_t evaluationCalls = 2;
+        constexpr std::size_t scansPerEvaluation = 2;
+        constexpr std::size_t comparisonRefreshes = 2;
+        constexpr std::size_t retainedReplays = 2;
+        auto total = masterWorkProduct(m_problem.actors().size() + 1, evaluationCalls * scansPerEvaluation);
+        const auto replay = replayWork(payload);
+        if (!total || !replay)
+        {
+            return std::nullopt;
+        }
+        for (std::size_t call = 0; call < evaluationCalls; ++call)
+        {
+            if (!RelativeStockDetail::checkedAdd(*total, *replay))
+            {
+                return std::nullopt;
+            }
+        }
+        if (m_session != nullptr)
+        {
+            for (std::size_t call = 0; call < evaluationCalls + comparisonRefreshes; ++call)
+            {
+                if (!RelativeStockDetail::checkedAdd(*total, m_tariffs.quote) ||
+                    !RelativeStockDetail::checkedAdd(*total, m_tariffs.witness))
+                {
+                    return std::nullopt;
+                }
+            }
+            for (std::size_t call = 0; call < retainedReplays; ++call)
+            {
+                if (!RelativeStockDetail::checkedAdd(*total, m_tariffs.witness))
+                {
+                    return std::nullopt;
+                }
+            }
+        }
+        return total;
     }
 
     std::optional<std::int64_t> MasterAssignmentEvaluator::replayTariff(
@@ -76,22 +256,13 @@ namespace Coordinator
             }
             const auto & candidate = m_problem.actors()[actor].candidates[
                 static_cast<std::size_t>(state.choices[actor])];
-            const auto work = masterWorkProduct(candidate.source.bundle.path.size() +
-                candidate.source.bundle.components.size() +
-                candidate.resources.size() + 1, 1);
+            const auto work = candidateReplayWork(candidate);
             if (!work || !RelativeStockDetail::checkedAdd(payload, *work))
             {
                 return std::nullopt;
             }
         }
-        const auto actions = m_problem.actors().size() + m_problem.actionTemplates().size() +
-                             m_problem.incumbentEdges().size() + m_problem.unitLinks().size() + 1;
-        const auto structural = masterWorkProduct(actions, actions);
-        if (!structural || !RelativeStockDetail::checkedAdd(payload, *structural))
-        {
-            return std::nullopt;
-        }
-        return payload;
+        return replayWork(payload);
     }
 
     MasterAssignmentEvaluation MasterAssignmentEvaluator::evaluate(const MasterAssignmentState & state)

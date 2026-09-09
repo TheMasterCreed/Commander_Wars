@@ -88,6 +88,7 @@ namespace Coordinator
         std::uint64_t peakResidentRegions{0};
         std::uint64_t residualRegions{0};
         std::optional<std::int64_t> firstImprovementWork;
+        std::optional<MilliFunds> firstImprovementLower;
         MasterFutureCacheStats futurePricingCache;
         std::size_t retainedGrants{0};
         std::size_t refundableStorageBytes{0};

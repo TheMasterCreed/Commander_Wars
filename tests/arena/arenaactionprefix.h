@@ -13,7 +13,7 @@ class ArenaActionPrefix
 public:
     bool load(const QString & path, QString & error);
     bool apply(spGameAction & action, GameMap & map, QString & error);
-    void observeBoundary(GameMap & map);
+    bool observeBoundary(GameMap & map);
     quint32 initialSeed() const;
     bool complete() const;
     QVariantMap result() const;

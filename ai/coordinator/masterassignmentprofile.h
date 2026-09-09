@@ -38,6 +38,9 @@ namespace Coordinator
         NativeCertificateCatalog,
         NativeCertificateOptimization,
         NativeCertificateVerification,
+        StockControl,
+        IncomingConstruction,
+        Installation,
         Count,
     };
 
@@ -49,6 +52,7 @@ namespace Coordinator
         "sequentialReplay", "proofCapture", "proofCopy", "proofReplay", "tierArchiveCopy",
         "nativeCertificateSetup", "nativeCertificateIdentity", "nativeCertificateReadiness",
         "nativeCertificateCatalog", "nativeCertificateOptimization", "nativeCertificateVerification",
+        "stockControl", "incomingConstruction", "installation",
     };
 
     struct MasterPhaseSample

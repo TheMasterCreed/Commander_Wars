@@ -640,6 +640,7 @@ namespace
                 if (!m_result.stats.firstImprovementWork)
                 {
                     m_result.stats.firstImprovementWork = m_ledger.stats().spent();
+                    m_result.stats.firstImprovementLower = comparison.deltaLower;
                     if (m_options.profile != nullptr)
                     {
                         m_options.profile->recordFirstImprovement();
