@@ -79,6 +79,22 @@ namespace Coordinator
             return m_horizonTurns;
         }
 
+        std::int32_t capturePointsToCapture() const
+        {
+            return m_capturePointsToCapture;
+        }
+
+        // The enemy instance's mirrored column at a slot from columnSlotAt.
+        const PropertyStockColumn & enemyColumn(std::int32_t slot) const
+        {
+            return m_theirs.columns[static_cast<std::size_t>(slot)];
+        }
+
+        MilliFunds enemyWeight(std::int32_t row, std::int32_t slot) const
+        {
+            return m_theirs.weights[static_cast<std::size_t>(row) * m_theirs.columns.size() + static_cast<std::size_t>(slot)];
+        }
+
         friend PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,
                                                           std::span<const PropertyFacts> properties,
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);

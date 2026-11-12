@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <vector>
 
 #include "ai/coordinator/bundlebuilder.h"
+#include "ai/coordinator/bundlevaluation.h"
+#include "ai/coordinator/capturedanger.h"
 #include "ai/coordinator/coordinatorcommon.h"
 #include "ai/coordinator/mobilityfield.h"
 #include "ai/coordinator/ownershipschedule.h"
@@ -190,5 +193,124 @@ namespace Coordinator
     constexpr bool shooterCouldCaptureInPlace(bool canCapture, bool capturable, OwnerSign ownerFromOurSide)
     {
         return canCapture && capturable && ownerFromOurSide != OwnerSign::Enemy;
+    }
+
+    // Without its candidate only a kind that leaves the actor's hp alone has a known start for the reply.
+    constexpr bool replyStartKnown(bool candidateMatched, PlanBundleKind kind)
+    {
+        if (candidateMatched)
+        {
+            return true;
+        }
+        switch (kind)
+        {
+            case PlanBundleKind::Wait:
+            case PlanBundleKind::Move:
+            case PlanBundleKind::Capture:
+            case PlanBundleKind::MoveAndCapture:
+                return true;
+            case PlanBundleKind::Fire:
+            case PlanBundleKind::MoveAndFire:
+            case PlanBundleKind::Service:
+            case PlanBundleKind::MoveAndService:
+            case PlanBundleKind::Compound:
+                break;
+        }
+        return false;
+    }
+
+    // The engine counters only at melee range, so the firing tile, not the reach, decides.
+    constexpr bool drawsCounter(bool direct, const TilePoint & firingTile, const TilePoint & target)
+    {
+        return direct && firingTile != INVALID_TILE && manhattanDistance(firingTile, target) == 1;
+    }
+
+    struct PlanWideHp
+    {
+        std::int32_t before{0};
+        std::int32_t after{0};
+    };
+
+    // Keyed by target knowledge index; one chain per bundle is the isolated view, one per plan the plan view.
+    using TargetHpChain = std::map<std::int32_t, PlanWideHp>;
+
+    // A shooter the plan kills is out; one it only damages is repaired on its own building from the reduced hp.
+    constexpr std::int32_t oneActionShooterHpSteps(std::int32_t planHpSteps, bool onOwnBuilding)
+    {
+        return planHpSteps <= 0 ? 0 : pricedShooterHpSteps(planHpSteps, onOwnBuilding);
+    }
+
+    // victimIndex is the last fire target, NO_UNIT without one; its hp after our shots is what it replies with.
+    struct ActionHpOutcome
+    {
+        std::int32_t hpSteps{0};
+        bool counterApplied{false};
+        std::int32_t victimIndex{NO_UNIT};
+        std::int32_t victimHpSteps{0};
+        // A counter or a self service changed the hp in whole steps, so the real hp is known only as those steps.
+        bool realHpFromSteps{false};
+        // The target survives weaker than the candidate assumed, so the counter steps are the isolated overestimate.
+        bool counterFromIsolatedView{false};
+    };
+
+    // valueBundle's hp walk on a target chain the caller may share across bundles; booking stops at death.
+    inline ActionHpOutcome hpAfterActionOn(const ActionBundle & bundle, std::int32_t actorHpSteps, TargetHpChain & chain)
+    {
+        ActionHpOutcome outcome{.hpSteps = actorHpSteps};
+        for (const BundleComponent & component : bundle.components)
+        {
+            if (outcome.hpSteps <= 0)
+            {
+                break;
+            }
+            switch (component.kind)
+            {
+                case ComponentKind::Fire:
+                {
+                    const FireFacts & fire = component.fire;
+                    PlanWideHp & target =
+                        chain.emplace(fire.targetUnitId, PlanWideHp{fire.targetHpSteps, fire.targetHpSteps}).first->second;
+                    const std::int32_t dealt = std::min(fire.damageSteps, target.after);
+                    if (dealt < target.after)
+                    {
+                        const std::int32_t taken = std::min(fire.counterSteps, outcome.hpSteps);
+                        outcome.hpSteps -= taken;
+                        outcome.counterApplied = outcome.counterApplied || taken > 0;
+                        outcome.realHpFromSteps = outcome.realHpFromSteps || taken > 0;
+                        const std::int32_t isolatedAfter = fire.targetHpSteps - std::min(fire.damageSteps, fire.targetHpSteps);
+                        outcome.counterFromIsolatedView =
+                            outcome.counterFromIsolatedView || (taken > 0 && target.after - dealt < isolatedAfter);
+                    }
+                    target.after -= dealt;
+                    outcome.victimIndex = fire.targetUnitId;
+                    outcome.victimHpSteps = target.after;
+                    break;
+                }
+                case ComponentKind::Capture:
+                    break;
+                case ComponentKind::Service:
+                    if (component.service.partnerUnitId == bundle.unitId &&
+                        component.service.partnerHpStepsAfter != outcome.hpSteps)
+                    {
+                        outcome.hpSteps = component.service.partnerHpStepsAfter;
+                        outcome.realHpFromSteps = true;
+                    }
+                    break;
+            }
+        }
+        return outcome;
+    }
+
+    // The per-candidate view the planner prices: the bundle alone, from each target's start-of-day hp.
+    inline ActionHpOutcome hpAfterAction(const ActionBundle & bundle, std::int32_t actorHpSteps)
+    {
+        TargetHpChain chain;
+        return hpAfterActionOn(bundle, actorHpSteps, chain);
+    }
+
+    // The step value is the top of the real interval, so the record marks it approximate.
+    constexpr double realHpAfterAction(double realHpBefore, const ActionHpOutcome & outcome)
+    {
+        return outcome.realHpFromSteps ? static_cast<double>(outcome.hpSteps) : realHpBefore;
     }
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -33,6 +34,22 @@ namespace Coordinator::CaptureDangerRecord
     constexpr auto STATUS_AMMO_GATED = "AMMO_GATED";
     constexpr auto STATUS_REPAIR_PENDING = "REPAIR_PENDING";
     constexpr auto STATUS_NO_LIVE_SHOOTER = "NO_LIVE_SHOOTER";
+    constexpr auto STATUS_NOT_QUERIED = "NOT_QUERIED";
+    constexpr auto KEY_HP_AFTER_REPLY = "hpAfterReply";
+    constexpr auto KEY_HP_REAL_AFTER_REPLY = "hpRealAfterReply";
+    constexpr auto KEY_SHOTS_APPLIED = "shotsApplied";
+    constexpr auto KEY_FIRES = "fires";
+    constexpr auto KEY_WORTH = "worth";
+    constexpr auto KEY_COUNTER_COST = "counterCost";
+    constexpr auto KEY_CAPTURE_COST = "captureCost";
+    constexpr auto KEY_PRICED_SHOTS = "shots";
+    constexpr auto RESOLUTION_KNOWN = "KNOWN";
+    constexpr auto RESOLUTION_AMMO_RESUPPLIED = "AMMO_RESUPPLIED";
+    constexpr auto RESOLUTION_AMMO_AWAY = "AMMO_AWAY";
+    constexpr auto RESOLUTION_REPAIRED = "REPAIRED";
+    constexpr auto INTERRUPTION_NONE = "NONE";
+    constexpr auto INTERRUPTION_DELAYED = "DELAYED";
+    constexpr auto INTERRUPTION_RESTARTED = "RESTARTED";
 
     inline const char* statusName(ShotStatus status)
     {
@@ -52,6 +69,8 @@ namespace Coordinator::CaptureDangerRecord
                 return STATUS_NO_LIVE_SHOOTER;
             case ShotStatus::RepairPending:
                 return STATUS_REPAIR_PENDING;
+            case ShotStatus::NotQueried:
+                return STATUS_NOT_QUERIED;
             case ShotStatus::NotOnProperty:
                 break;
         }
@@ -78,10 +97,74 @@ namespace Coordinator::CaptureDangerRecord
                 return STATUS_NO_LIVE_SHOOTER;
             case ExactStatus::RepairPending:
                 return STATUS_REPAIR_PENDING;
+            case ExactStatus::NotQueried:
+                return STATUS_NOT_QUERIED;
             case ExactStatus::NotOnProperty:
                 break;
         }
         return STATUS_NOT_ON_PROPERTY;
+    }
+
+    inline const char* resolutionName(PricedResolution resolution)
+    {
+        switch (resolution)
+        {
+            case PricedResolution::Known:
+                return RESOLUTION_KNOWN;
+            case PricedResolution::AmmoResupplied:
+                return RESOLUTION_AMMO_RESUPPLIED;
+            case PricedResolution::AmmoAway:
+                return RESOLUTION_AMMO_AWAY;
+            case PricedResolution::Repaired:
+                return RESOLUTION_REPAIRED;
+            case PricedResolution::NoLiveShooter:
+                return STATUS_NO_LIVE_SHOOTER;
+            case PricedResolution::NoFiringTile:
+                break;
+        }
+        return STATUS_NO_FIRING_TILE;
+    }
+
+    inline const char* interruptionName(CaptureInterruption interruption)
+    {
+        switch (interruption)
+        {
+            case CaptureInterruption::None:
+                return INTERRUPTION_NONE;
+            case CaptureInterruption::Delayed:
+                return INTERRUPTION_DELAYED;
+            case CaptureInterruption::Restarted:
+                break;
+        }
+        return INTERRUPTION_RESTARTED;
+    }
+
+    inline QJsonObject outcomeRecord(const ReplyOutcome & outcome)
+    {
+        return QJsonObject{
+            {KEY_HP_AFTER_REPLY, outcome.hpSteps},
+            {KEY_HP_REAL_AFTER_REPLY, outcome.hp},
+            {KEY_DESTROYED, outcome.destroyed},
+            {KEY_SHOTS_APPLIED, static_cast<qint64>(std::count(outcome.fired.begin(), outcome.fired.end(), true))},
+            {KEY_DAMAGE, outcome.reply.damage},
+            {KEY_APPLIED, outcome.reply.applied},
+        };
+    }
+
+    // An unknown R1 or R2 reply is null; P always resolves.
+    inline QJsonValue outcomeRecord(const std::optional<ReplyOutcome> & outcome)
+    {
+        return outcome ? QJsonValue(outcomeRecord(*outcome)) : QJsonValue();
+    }
+
+    inline QJsonObject pricedShotRecord(const PricedShot & shot)
+    {
+        return QJsonObject{
+            {KEY_FIRES, shot.fires},
+            {KEY_WORTH, static_cast<qint64>(shot.worth)},
+            {KEY_COUNTER_COST, static_cast<qint64>(shot.counterCost)},
+            {KEY_CAPTURE_COST, static_cast<qint64>(shot.captureCost)},
+        };
     }
 
     inline QJsonValue shotEntry(const ShotReport & shot)
