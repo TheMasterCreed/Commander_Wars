@@ -1,6 +1,9 @@
 #include "ai/coordinator/masterassignmentsearch.h"
+#include "ai/coordinator/masteroperationservice.h"
+#include "ai/coordinator/masterplanpricingadapter.h"
 
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <queue>
@@ -10,6 +13,12 @@ namespace
 {
     using namespace Coordinator;
     constexpr std::int64_t REFINEMENT_ACCOUNTING_WORK = 4;
+    // Seeding one challenger costs at most the incumbent evaluation and root preparation already paid, twice over.
+    constexpr std::size_t PLAN_PRICING_RESERVE_FACTOR = 2;
+    // The incumbent tune takes at most half the balance left after the restriction; the rest funds the cap scan and the search.
+    constexpr std::int64_t PLAN_PRICING_INCUMBENT_SHARE = 2;
+    // The audit tune is bounded by the challenger tune's work limit, so it may draw on the whole scratch balance.
+    constexpr std::int64_t NEIGHBOR_AUDIT_TUNE_SHARE = 1;
 
     enum class NodeStatus : std::int8_t
     {
@@ -79,6 +88,20 @@ namespace
         }
     };
 
+    struct ProofCaps
+    {
+        std::optional<MilliFunds> incumbent;
+        std::optional<MilliFunds> challenger;
+        RelativeStockComparison uncapped;
+    };
+
+    struct FirstImprovement
+    {
+        std::optional<std::int64_t> work;
+        std::optional<MilliFunds> lower;
+        std::optional<std::int64_t> nanos;
+    };
+
     std::optional<MilliFunds> minimum(
         std::optional<MilliFunds> left, std::optional<MilliFunds> right)
     {
@@ -93,6 +116,8 @@ namespace
             : m_problem(problem),
               m_evaluator(evaluator),
               m_ledger(ledger),
+              m_refusalsBefore(ledger.stats().refusals),
+              m_workBefore(ledger.stats().spent()),
               m_options(options),
               m_bounds(problem, options.profile)
         {
@@ -106,8 +131,24 @@ namespace
             {
                 return finish();
             }
+            if (!seedFromPlanPricing())
+            {
+                return finish();
+            }
+            if (m_options.schedule.initialContributionCompletion && !completeInitialContributions())
+            {
+                return finish();
+            }
+            if (m_options.schedule.initialIncumbentAlternatives && !evaluateInitialAlternatives())
+            {
+                return finish();
+            }
             while (!m_frontier.empty() || hasRefinement())
             {
+                if (m_evaluator.hasGuardedStock() && m_result.improvement)
+                {
+                    break;
+                }
                 if (m_frontier.empty() || m_nodesSinceRefinement >= m_options.schedule.nodesPerRefinement)
                 {
                     if (!refineLeaf())
@@ -144,6 +185,10 @@ namespace
                     {
                         break;
                     }
+                    if (m_evaluator.hasGuardedStock() && m_result.improvement)
+                    {
+                        break;
+                    }
                     if (!prune(*m_active) && !expandActive())
                     {
                         break;
@@ -163,8 +208,14 @@ namespace
                 m_options.schedule.futureDualAllowance <= 0 || m_options.schedule.nodesPerRefinement == 0 ||
                 m_options.schedule.incumbentRefinementStride == 0 ||
                 m_options.schedule.challengerRefinementBurst == 0 ||
+                m_options.schedule.planPricingRounds < 0 || m_options.schedule.planPricingWork < 0 ||
+                m_options.schedule.planPricingWitnessWork < 0 ||
                 (m_options.schedule.futureBounds != MasterFutureBoundScope::RootOnly &&
                  m_options.schedule.futureBounds != MasterFutureBoundScope::EveryNode) ||
+                (m_options.schedule.allocation != MasterRefinementAllocation::Baseline &&
+                 m_options.schedule.allocation != MasterRefinementAllocation::OperationService) ||
+                (m_options.schedule.allocation == MasterRefinementAllocation::OperationService &&
+                 m_options.schedule.refinementGrowthFactor != MASTER_OPERATION_GROWTH_FACTOR) ||
                 m_evaluator.hasContinuation() != (stock != nullptr) || !m_evaluator.matches(m_problem, m_ledger))
             {
                 m_result.invalidInput = true;
@@ -195,8 +246,13 @@ namespace
             ++m_result.stats.evaluated;
             recordEvaluation(*m_incumbent);
             consider(m_incumbent);
+            if (m_evaluator.hasGuardedStock())
+            {
+                m_best = m_incumbent;
+                m_unknownResidual = true;
+            }
             if (m_incumbent->status == MasterEvaluationStatus::BudgetExhausted ||
-                m_ledger.stats().refusals != 0)
+                m_ledger.stats().refusals != m_refusalsBefore)
             {
                 m_result.budgetExhausted = true;
                 return false;
@@ -206,7 +262,8 @@ namespace
             {
                 return false;
             }
-            const auto prepared = m_bounds.prepare(stock, m_ledger, m_evaluator.futureCatalog());
+            const auto prepared = m_evaluator.hasGuardedStock() ? MasterBoundStatus::Unavailable :
+                m_bounds.prepare(stock, m_ledger, m_evaluator.futureCatalog());
             if (prepared == MasterBoundStatus::BudgetExhausted || !prepareConflicts())
             {
                 m_result.budgetExhausted = true;
@@ -231,6 +288,418 @@ namespace
             }
             m_active.reset();
             return true;
+        }
+
+        bool completeInitialContributions()
+        {
+            if (m_frontier.empty() || !m_bounds.ready())
+            {
+                return true;
+            }
+            if (!chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 2, RefinementWork::MasterReplay))
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            SearchNode completion;
+            completion.state = m_frontier.top()->state;
+            completion.upper = m_frontier.top()->upper;
+            while (!completion.state.complete())
+            {
+                const auto status = chooseBranch(completion);
+                if (status == NodeStatus::Interrupted)
+                {
+                    m_result.budgetExhausted = true;
+                    return false;
+                }
+                if (status != NodeStatus::Ready)
+                {
+                    return true;
+                }
+                if (!chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 2, RefinementWork::MasterReplay))
+                {
+                    m_result.budgetExhausted = true;
+                    return false;
+                }
+                SearchNode child;
+                child.state = completion.state;
+                child.upper = completion.upper;
+                child.state.choices[static_cast<std::size_t>(completion.branchActor)] = completion.branchChoices.front();
+                completion = std::move(child);
+            }
+            if (completion.state.choices == m_incumbent->state.choices)
+            {
+                return true;
+            }
+            ++m_result.stats.contributionCompletions;
+            ++m_nodesSinceRefinement;
+            return evaluateLeaf(completion);
+        }
+
+        bool evaluateInitialAlternatives()
+        {
+            if (m_frontier.empty() || m_incumbent->status != MasterEvaluationStatus::Feasible)
+            {
+                return true;
+            }
+            for (std::size_t actor = 0; actor < m_problem.actors().size(); ++actor)
+            {
+                if (!m_ledger.consume(1, RefinementWork::MasterExpansion))
+                {
+                    m_result.budgetExhausted = true;
+                    return false;
+                }
+                if (!m_problem.canChangeActor(static_cast<std::int32_t>(actor)))
+                {
+                    continue;
+                }
+                for (const auto choice : m_problem.actors()[actor].canonicalCandidates)
+                {
+                    if (!m_ledger.consume(1, RefinementWork::MasterExpansion))
+                    {
+                        m_result.budgetExhausted = true;
+                        return false;
+                    }
+                    if (choice == m_problem.incumbentChoices()[actor])
+                    {
+                        continue;
+                    }
+                    if (!chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 2,
+                                          RefinementWork::MasterReplay))
+                    {
+                        m_result.budgetExhausted = true;
+                        return false;
+                    }
+                    SearchNode completion;
+                    completion.state = m_incumbent->state;
+                    completion.state.choices[actor] = choice;
+                    completion.upper = m_rootUpper;
+                    if (!evaluateLeaf(completion))
+                    {
+                        return false;
+                    }
+                    ++m_result.stats.initialIncumbentAlternatives;
+                    ++m_nodesSinceRefinement;
+                    if (m_nodesSinceRefinement >= m_options.schedule.nodesPerRefinement)
+                    {
+                        if (!refineLeaf())
+                        {
+                            return false;
+                        }
+                        m_nodesSinceRefinement = 0;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool seedFromPlanPricing()
+        {
+            const auto & schedule = m_options.schedule;
+            auto & stats = m_result.stats.planPricing;
+            if (schedule.planPricingRounds == 0)
+            {
+                return true;
+            }
+            if (schedule.planBoundCap == MasterPlanBoundCap::Verified)
+            {
+                stats.boundCap.emplace();
+            }
+            stats.outcome = MasterPlanPricingOutcome::Unavailable;
+            const auto* stock = m_evaluator.stockModel();
+            const auto* catalog = m_evaluator.futureCatalog();
+            const auto challengerLimit = schedule.planPricingWork / MASTER_PLAN_PRICING_CHALLENGER_SHARE;
+            const auto preparationWork = m_ledger.stats().spent() - m_workBefore;
+            if (stock == nullptr || catalog == nullptr || m_evaluator.hasGuardedStock() || !m_bounds.ready() ||
+                m_incumbent->status != MasterEvaluationStatus::Feasible || m_incumbent->quote() == nullptr ||
+                challengerLimit <= 0)
+            {
+                return true;
+            }
+            const auto adapterStart = m_ledger.stats().spent();
+            const auto instance = buildMasterPlanPricingInstance(m_problem, *stock, *catalog, m_ledger, challengerLimit);
+            stats.adapterWork = m_ledger.stats().spent() - adapterStart;
+            if (!instance)
+            {
+                return true;
+            }
+            stats.outcome = MasterPlanPricingOutcome::NoChallenger;
+            const auto challengerStart = m_ledger.stats().spent();
+            const auto priced = tuneMasterPlanPrices(instance->model,
+                {.rounds = schedule.planPricingRounds, .maximumWork = challengerLimit,
+                 .witnessBuildWork = schedule.planPricingWitnessWork}, m_ledger);
+            stats.challengerRounds = priced.rounds;
+            stats.challengerWork = m_ledger.stats().spent() - challengerStart;
+            if (priced.witness.valid && !seedChallenger(*instance, priced.witness, preparationWork))
+            {
+                return false;
+            }
+            if (stats.outcome != MasterPlanPricingOutcome::ValuerFailure)
+            {
+                const auto prices = hintIncumbent(*instance, schedule.planPricingWork - stats.challengerWork);
+                return capIncumbentOurs(prices);
+            }
+            return true;
+        }
+
+        bool seedChallenger(const MasterPlanPricingInstance & instance, const MasterPlanWitness & witness,
+                            std::int64_t preparationWork)
+        {
+            auto & stats = m_result.stats.planPricing;
+            const auto state = masterPlanWitnessState(m_problem, instance, witness);
+            if (!state || state->choices == m_incumbent->state.choices)
+            {
+                return true;
+            }
+            const auto reserve = masterWorkProduct(static_cast<std::size_t>(preparationWork), PLAN_PRICING_RESERVE_FACTOR);
+            if (!reserve || m_ledger.balance() < *reserve)
+            {
+                stats.outcome = MasterPlanPricingOutcome::Unavailable;
+                return true;
+            }
+            const auto evaluation = evaluationFor(*state);
+            if (!evaluation || evaluation->status == MasterEvaluationStatus::BudgetExhausted)
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            if (evaluation->status != MasterEvaluationStatus::Feasible || evaluation->quote() == nullptr)
+            {
+                stats.outcome = MasterPlanPricingOutcome::ChallengerInfeasible;
+                return true;
+            }
+            if (stats.boundCap)
+            {
+                m_planChallenger = evaluation;
+            }
+            const auto friendly = masterPlanFriendlyWitness(witness);
+            const auto adopted = friendly
+                ? m_evaluator.adoptFriendlyWitness(*evaluation, friendly->rows, friendly->value)
+                : MasterRefinementStatus::Unavailable;
+            switch (adopted)
+            {
+                case MasterRefinementStatus::Updated:
+                    stats.outcome = MasterPlanPricingOutcome::Seeded;
+                    stats.adoptedValue = friendly->value;
+                    break;
+                case MasterRefinementStatus::Unavailable:
+                    stats.outcome = MasterPlanPricingOutcome::WitnessDeclined;
+                    break;
+                case MasterRefinementStatus::BudgetExhausted:
+                    stats.outcome = MasterPlanPricingOutcome::AdoptionBudgetExhausted;
+                    break;
+                case MasterRefinementStatus::Invalid:
+                    stats.outcome = MasterPlanPricingOutcome::ValuerFailure;
+                    return true;
+            }
+            consider(evaluation);
+            if (!defer(evaluation, m_rootUpper))
+            {
+                return false;
+            }
+            if (stats.outcome == MasterPlanPricingOutcome::Seeded)
+            {
+                m_refinementFocus = evaluation;
+                m_focusRemaining = m_options.schedule.challengerRefinementBurst;
+            }
+            RelativeStockComparison comparison;
+            if (!compare(evaluation, &comparison))
+            {
+                return false;
+            }
+            stats.firstComparisonImproved = comparison.improves();
+            return true;
+        }
+
+        enum class RestrictedTuneStatus : std::int8_t
+        {
+            Overflow,
+            Unaffordable,
+            RestrictionFailed,
+            Tuned,
+        };
+
+        struct RestrictedPricing
+        {
+            RestrictedTuneStatus status{RestrictedTuneStatus::Unaffordable};
+            std::int64_t restrictionWork{0};
+            MasterPlanPricingResult priced;
+            std::int64_t tuneWork{0};
+        };
+
+        RestrictedPricing tuneRestricted(const MasterPlanPricingInstance & instance,
+                                         const std::optional<std::vector<std::int32_t>> & forced,
+                                         std::int64_t work, std::int64_t balanceShare, RefinementLedger & ledger) const
+        {
+            RestrictedPricing result;
+            // Copying the model and rebuilding its actions for the restriction is paid separately.
+            const auto restrictionWork = masterPlanRestrictionWork(instance.model);
+            if (!restrictionWork)
+            {
+                result.status = RestrictedTuneStatus::Overflow;
+                return result;
+            }
+            if (work <= 0 || ledger.balance() <= *restrictionWork)
+            {
+                return result;
+            }
+            work = std::min(work, (ledger.balance() - *restrictionWork) / balanceShare);
+            if (work <= 0 || !ledger.consume(*restrictionWork, RefinementWork::MasterPreparation))
+            {
+                return result;
+            }
+            result.restrictionWork = *restrictionWork;
+            // A plan the model cannot represent fails here, after the charge, like any other failed restriction.
+            const auto restricted = forced ? restrictMasterPlanModel(instance.model, *forced) : std::nullopt;
+            if (!restricted)
+            {
+                result.status = RestrictedTuneStatus::RestrictionFailed;
+                return result;
+            }
+            const auto start = ledger.stats().spent();
+            result.priced = tuneMasterPlanPrices(*restricted,
+                {.rounds = m_options.schedule.planPricingRounds, .maximumWork = work,
+                 .witnessBuildWork = m_options.schedule.planPricingWitnessWork}, ledger);
+            result.tuneWork = ledger.stats().spent() - start;
+            result.status = RestrictedTuneStatus::Tuned;
+            return result;
+        }
+
+        std::vector<MilliFunds> hintIncumbent(const MasterPlanPricingInstance & instance, std::int64_t work)
+        {
+            auto & stats = m_result.stats.planPricing;
+            const auto tuned = tuneRestricted(instance, masterPlanStateChoices(m_problem, instance, m_incumbent->state),
+                                              work, PLAN_PRICING_INCUMBENT_SHARE, m_ledger);
+            if (tuned.status == RestrictedTuneStatus::RestrictionFailed || tuned.status == RestrictedTuneStatus::Tuned)
+            {
+                stats.restrictionWork = tuned.restrictionWork;
+            }
+            if (tuned.status != RestrictedTuneStatus::Tuned)
+            {
+                return {};
+            }
+            const auto & priced = tuned.priced;
+            stats.incumbentRounds = priced.rounds;
+            stats.incumbentWork = tuned.tuneWork;
+            stats.hintStored = !priced.prices.empty() && m_evaluator.hintFriendlyUpperPrices(*m_incumbent, priced.prices);
+            return priced.prices;
+        }
+
+        bool capIncumbentOurs(std::span<const MilliFunds> futurePrices)
+        {
+            auto & stats = m_result.stats.planPricing;
+            const auto* quote = m_incumbent->quote();
+            if (!stats.boundCap || futurePrices.empty() || quote == nullptr)
+            {
+                return true;
+            }
+            auto & cap = *stats.boundCap;
+            cap.incumbentOursUpperBefore = quote->ours.upper;
+            cap.futurePrices.assign(futurePrices.begin(), futurePrices.end());
+            std::vector<MilliFunds> prices(m_problem.resources().size(), 0);
+            prices.insert(prices.end(), futurePrices.begin(), futurePrices.end());
+            // The scan runs against a mirror of the balance so an unaffordable scan never records a refusal.
+            RefinementLedger mirror;
+            if (!mirror.open(m_ledger.balance()))
+            {
+                cap.status = MasterPlanBoundCapStatus::Unaffordable;
+                return true;
+            }
+            const auto spentBefore = m_ledger.stats().spent();
+            const auto bound = m_bounds.boundAt(m_incumbent->state, MasterBoundFamily::CombinedCurrentFuture,
+                                                std::move(prices), mirror);
+            const auto scanWork = mirror.stats().spent();
+            if (!m_ledger.consume(scanWork, RefinementWork::MasterBoundScan))
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            cap.work = scanWork;
+            if (bound.status == MasterBoundStatus::BudgetExhausted)
+            {
+                cap.status = MasterPlanBoundCapStatus::Unaffordable;
+                return true;
+            }
+            if (!bound.valid())
+            {
+                cap.status = MasterPlanBoundCapStatus::ScanInvalid;
+                return true;
+            }
+            cap.scanUpper = bound.certificate->upper;
+            // A verification never costs more than its scan.
+            auto registrationWork = scanWork;
+            if (!RelativeStockDetail::checkedAdd(registrationWork, m_evaluator.oursCapCheckWork()) ||
+                m_ledger.balance() < registrationWork)
+            {
+                cap.status = MasterPlanBoundCapStatus::Unaffordable;
+                return true;
+            }
+            const auto receipt = m_evaluator.capOursUpper(*m_incumbent, *bound.certificate, m_bounds);
+            cap.work = m_ledger.stats().spent() - spentBefore;
+            cap.oursCeiling = receipt.ceiling;
+            if (m_ledger.stats().refusals != m_refusalsBefore)
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            switch (receipt.status)
+            {
+                case MasterOursCapStatus::Registered:
+                    cap.status = MasterPlanBoundCapStatus::Registered;
+                    break;
+                case MasterOursCapStatus::Rejected:
+                    cap.status = MasterPlanBoundCapStatus::VerifyFailed;
+                    return true;
+                case MasterOursCapStatus::Contradiction:
+                    cap.status = MasterPlanBoundCapStatus::Contradiction;
+                    ++m_result.stats.proofFailures;
+                    dropCappedImprovement();
+                    return true;
+                case MasterOursCapStatus::OwnedMismatch:
+                    cap.status = MasterPlanBoundCapStatus::OwnedMismatch;
+                    ++m_result.stats.proofFailures;
+                    return true;
+                case MasterOursCapStatus::CatalogMismatch:
+                    cap.status = MasterPlanBoundCapStatus::CatalogMismatch;
+                    ++m_result.stats.proofFailures;
+                    return true;
+            }
+            if (!m_planChallenger)
+            {
+                return true;
+            }
+            RelativeStockComparison comparison;
+            if (!compare(m_planChallenger, &comparison))
+            {
+                return false;
+            }
+            cap.improvedAtCap = comparison.improves();
+            return true;
+        }
+
+        static bool capped(const MasterImprovementProof & proof)
+        {
+            return proof.incumbentOursCap || proof.challengerOursCap;
+        }
+
+        void dropCappedImprovement()
+        {
+            if (!m_result.improvement || !capped(*m_result.improvement))
+            {
+                return;
+            }
+            m_result.improvement = std::move(m_uncappedImprovement);
+            m_uncappedImprovement.reset();
+            if (m_result.stats.planPricing.boundCap)
+            {
+                m_result.stats.planPricing.boundCap->cappedProofDropped = true;
+            }
+            m_result.stats.firstImprovementWork = m_firstUncapped.work;
+            m_result.stats.firstImprovementLower = m_firstUncapped.lower;
+            if (m_options.profile != nullptr)
+            {
+                m_options.profile->firstImprovementNanos = m_firstUncapped.nanos;
+            }
         }
 
         bool expandActive()
@@ -339,13 +808,13 @@ namespace
             return true;
         }
 
-        std::optional<bool> compatible(const MasterAssignmentState & state,
-                                       std::size_t actor, std::int32_t choice)
+        std::optional<bool> compatible(const MasterAssignmentState & state, std::size_t actor,
+                                       std::int32_t choice, RefinementLedger & ledger) const
         {
             const auto & candidate = m_problem.actors()[actor].candidates[static_cast<std::size_t>(choice)];
             for (std::size_t other = 0; other < state.choices.size(); ++other)
             {
-                if (!chargeMasterWork(m_ledger, 1, 1, RefinementWork::MasterExpansion))
+                if (!chargeMasterWork(ledger, 1, 1, RefinementWork::MasterExpansion))
                 {
                     return std::nullopt;
                 }
@@ -360,7 +829,7 @@ namespace
                 {
                     continue;
                 }
-                if (!chargeMasterWork(m_ledger, candidate.resources.size() + 1,
+                if (!chargeMasterWork(ledger, candidate.resources.size() + 1,
                                       otherCandidate.resources.size() + 1, RefinementWork::MasterExpansion))
                 {
                     return std::nullopt;
@@ -390,7 +859,7 @@ namespace
                     m_problem.actors()[actor].candidates[static_cast<std::size_t>(selected)].identity.canonicalOrderKey());
                 if (selected >= 0)
                 {
-                    const auto legal = compatible(node.state, actor, selected);
+                    const auto legal = compatible(node.state, actor, selected, m_ledger);
                     if (!legal)
                     {
                         return NodeStatus::Interrupted;
@@ -407,12 +876,16 @@ namespace
                 std::vector<std::int32_t> domain;
                 for (const auto choice : m_problem.actors()[actor].canonicalCandidates)
                 {
-                    const auto legal = compatible(node.state, actor, choice);
+                    const auto legal = compatible(node.state, actor, choice, m_ledger);
                     if (!legal)
                     {
                         return NodeStatus::Interrupted;
                     }
-                    if (*legal)
+                    if (*legal && !m_evaluator.guardedAdmits(actor, choice))
+                    {
+                        ++m_result.stats.guardedExcluded;
+                    }
+                    else if (*legal)
                     {
                         domain.push_back(choice);
                     }
@@ -450,6 +923,10 @@ namespace
 
         bool prune(const SearchNode & node)
         {
+            if (m_evaluator.hasGuardedStock())
+            {
+                return false;
+            }
             if (!node.upper || !m_result.lower || *node.upper > *m_result.lower)
             {
                 return false;
@@ -491,7 +968,7 @@ namespace
                 }
                 return branch;
             }
-            if (m_bounds.ready() && !node.state.complete())
+            if (!m_evaluator.hasGuardedStock() && m_bounds.ready() && !node.state.complete())
             {
                 for (const auto family : {MasterBoundFamily::Immediate, MasterBoundFamily::EndpointCoupled,
                                           MasterBoundFamily::CombinedCurrentFuture})
@@ -566,6 +1043,10 @@ namespace
 
         void consider(const std::shared_ptr<MasterAssignmentEvaluation> & evaluation)
         {
+            if (m_evaluator.hasGuardedStock())
+            {
+                return;
+            }
             if (evaluation->status != MasterEvaluationStatus::Feasible ||
                 !evaluation->objective || !evaluation->lowerReplayed)
             {
@@ -606,7 +1087,8 @@ namespace
             }
         }
 
-        bool compare(std::shared_ptr<MasterAssignmentEvaluation> evaluation)
+        bool compare(std::shared_ptr<MasterAssignmentEvaluation> evaluation,
+                     RelativeStockComparison* observed = nullptr)
         {
             if (evaluation == m_incumbent || !m_incumbent ||
                 m_incumbent->status != MasterEvaluationStatus::Feasible ||
@@ -614,7 +1096,23 @@ namespace
             {
                 return true;
             }
+            if (m_evaluator.hasGuardedStock())
+            {
+                return compareGuarded(evaluation);
+            }
+            const auto contradictions = m_evaluator.oursCapContradictions();
             const auto comparison = m_evaluator.compare(*m_incumbent, *evaluation);
+            noteCapContradictions(contradictions);
+            // Read before any observer runs, so a proof records exactly the ceilings its comparison applied.
+            ProofCaps caps{m_evaluator.oursCap(*m_incumbent), m_evaluator.oursCap(*evaluation), comparison};
+            if (comparison.improves() && (caps.incumbent || caps.challenger))
+            {
+                caps.uncapped = m_evaluator.recordedComparison(*m_incumbent, *evaluation, std::nullopt, std::nullopt);
+            }
+            if (observed != nullptr)
+            {
+                *observed = comparison;
+            }
             if (m_refinementFocus == evaluation && comparison.valid() && !comparison.unresolved())
             {
                 m_refinementFocus.reset();
@@ -622,21 +1120,76 @@ namespace
             }
             if (m_options.observer != nullptr)
             {
+                m_options.observer->comparisonObserved(
+                    *m_incumbent, *evaluation, comparison, m_ledger.stats().spent());
                 m_options.observer->compared(*evaluation, comparison, m_ledger.stats().spent());
             }
             consider(m_incumbent);
             consider(evaluation);
-            if (comparison.improves() && (!m_result.improvement ||
-                comparison.deltaLower > m_result.improvement->comparison.deltaLower))
+            if (comparison.improves() && !recordImprovement(evaluation, comparison, caps))
             {
-                if (!chargeMasterWork(m_ledger, m_problem.actors().size() + 1,
-                                      m_problem.actors().size() + 1, RefinementWork::MasterWitness))
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            if (m_ledger.stats().refusals != m_refusalsBefore)
+            {
+                m_result.budgetExhausted = true;
+                return false;
+            }
+            return true;
+        }
+
+        void noteCapContradictions(std::uint64_t before)
+        {
+            if (m_evaluator.oursCapContradictions() == before)
+            {
+                return;
+            }
+            ++m_result.stats.proofFailures;
+            if (m_result.stats.planPricing.boundCap)
+            {
+                m_result.stats.planPricing.boundCap->status = MasterPlanBoundCapStatus::Contradiction;
+            }
+            dropCappedImprovement();
+        }
+
+        bool chargeProofCopy()
+        {
+            return chargeMasterWork(m_ledger, m_problem.actors().size() + 1,
+                                    m_problem.actors().size() + 1, RefinementWork::MasterWitness);
+        }
+
+        void noteFirstUncapped(MilliFunds lower)
+        {
+            if (m_firstUncapped.work)
+            {
+                return;
+            }
+            m_firstUncapped.work = m_ledger.stats().spent();
+            m_firstUncapped.lower = lower;
+            if (m_options.profile != nullptr)
+            {
+                m_firstUncapped.nanos = m_options.profile->elapsedNanos();
+            }
+        }
+
+        // Keeps the best proof and, while that one relies on a cap, the best proof that relies on none.
+        bool recordImprovement(const std::shared_ptr<MasterAssignmentEvaluation> & evaluation,
+                               const RelativeStockComparison & comparison, const ProofCaps & caps)
+        {
+            const bool relies = caps.incumbent || caps.challenger;
+            const auto & uncapped = caps.uncapped;
+            if (!m_result.improvement || comparison.deltaLower > m_result.improvement->comparison.deltaLower)
+            {
+                if (!chargeProofCopy())
                 {
-                    m_result.budgetExhausted = true;
                     return false;
                 }
+                auto previous = std::move(m_result.improvement);
                 m_result.improvement = MasterImprovementProof{
                     *m_incumbent, *evaluation, comparison, m_ledger.stats().spent()};
+                m_result.improvement->incumbentOursCap = caps.incumbent;
+                m_result.improvement->challengerOursCap = caps.challenger;
                 if (!m_result.stats.firstImprovementWork)
                 {
                     m_result.stats.firstImprovementWork = m_ledger.stats().spent();
@@ -646,8 +1199,65 @@ namespace
                         m_options.profile->recordFirstImprovement();
                     }
                 }
+                if (!relies)
+                {
+                    m_uncappedImprovement.reset();
+                    noteFirstUncapped(comparison.deltaLower);
+                    return true;
+                }
+                if (previous && !capped(*previous))
+                {
+                    m_uncappedImprovement = std::move(previous);
+                }
             }
-            if (m_ledger.stats().refusals != 0)
+            else if (!capped(*m_result.improvement))
+            {
+                return true;
+            }
+            if (!uncapped.improves() || (m_uncappedImprovement &&
+                uncapped.deltaLower <= m_uncappedImprovement->comparison.deltaLower))
+            {
+                return true;
+            }
+            if (!chargeProofCopy())
+            {
+                return false;
+            }
+            m_uncappedImprovement = MasterImprovementProof{
+                *m_incumbent, *evaluation, uncapped, m_ledger.stats().spent()};
+            noteFirstUncapped(uncapped.deltaLower);
+            return true;
+        }
+
+        bool compareGuarded(const std::shared_ptr<MasterAssignmentEvaluation> & evaluation)
+        {
+            const auto comparison = m_evaluator.compareGuarded(*m_incumbent, *evaluation);
+            if (m_options.observer != nullptr)
+            {
+                m_options.observer->guardedCompared(
+                    *m_incumbent, *evaluation, comparison, m_ledger.stats().spent());
+            }
+            if (comparison.improves())
+            {
+                auto copies = m_evaluator.retainedCopyWork(*m_incumbent);
+                const auto challengerCopy = m_evaluator.retainedCopyWork(*evaluation);
+                if (!copies || !challengerCopy ||
+                    !RelativeStockDetail::checkedAdd(*copies, *challengerCopy) ||
+                    !m_ledger.consume(*copies, RefinementWork::MasterWitness))
+                {
+                    m_result.budgetExhausted = true;
+                    return false;
+                }
+                m_result.improvement = MasterImprovementProof{
+                    *m_incumbent, *evaluation, {}, m_ledger.stats().spent(), comparison.proof};
+                m_best = evaluation;
+                m_result.stats.firstImprovementWork = m_ledger.stats().spent();
+                if (m_options.profile != nullptr)
+                {
+                    m_options.profile->recordFirstImprovement();
+                }
+            }
+            if (comparison.status == GuardedRelationStatus::BudgetExhausted || m_ledger.stats().refusals != m_refusalsBefore)
             {
                 m_result.budgetExhausted = true;
                 return false;
@@ -730,6 +1340,10 @@ namespace
 
         bool hasRefinement()
         {
+            if (m_evaluator.hasGuardedStock())
+            {
+                return false;
+            }
             if (!chargeMasterWork(m_ledger, m_leaves.size() + 1, 1, RefinementWork::MasterExpansion))
             {
                 m_result.budgetExhausted = true;
@@ -796,8 +1410,14 @@ namespace
 
         bool enemyCancelsInFocus()
         {
-            return m_incumbent && m_refinementFocus &&
-                m_evaluator.unresolvedCommonEnemy(*m_incumbent, *m_refinementFocus);
+            if (!m_incumbent || !m_refinementFocus)
+            {
+                return false;
+            }
+            const auto contradictions = m_evaluator.oursCapContradictions();
+            const bool cancels = m_evaluator.unresolvedCommonEnemy(*m_incumbent, *m_refinementFocus);
+            noteCapContradictions(contradictions);
+            return cancels;
         }
 
         bool refineLeaf()
@@ -809,23 +1429,429 @@ namespace
                 m_result.budgetExhausted = true;
                 return false;
             }
+            const auto balancedBefore = m_result.stats.workBalancedSelections;
             auto* selected = selectRefinement();
             if (selected == nullptr)
             {
                 return true;
             }
+            std::optional<MasterRefinementTicketReceipt> observation;
+            if (m_options.observer != nullptr &&
+                m_options.schedule.allocation == MasterRefinementAllocation::OperationService)
+            {
+                observation.emplace(MasterRefinementTicketReceipt{
+                    *selected->evaluation, selected->next, selected->next,
+                    selected->refinementWork, selected->refinementWork,
+                    m_result.stats.refinements, m_result.stats.refinements,
+                    m_focusRemaining, m_focusRemaining, selected->evaluation == m_refinementFocus,
+                    m_result.stats.workBalancedSelections != balancedBefore,
+                    m_result.improvement.has_value(), m_result.improvement.has_value(), false});
+            }
             const auto workBefore = m_ledger.stats().spent();
-            const bool completed = refineSelectedLeaf(*selected);
+            const auto serviceBefore = m_result.stats.operationPaidWork;
+            const auto parkedBefore = m_result.stats.fundingParkedTickets;
+            if (observation)
+            {
+                const auto challenger = selected->evaluation == m_incumbent
+                    ? m_refinementFocus : selected->evaluation;
+                m_options.observer->ticketStarted(
+                    *observation, *m_incumbent, challenger.get(), workBefore);
+            }
+            const bool completed = m_options.schedule.allocation == MasterRefinementAllocation::OperationService
+                ? refineOperationLeaf(*selected) : refineSelectedLeaf(*selected);
             // Each disjoint ledger delta includes refresh, eligibility and comparison work.
             selected->refinementWork += m_ledger.stats().spent() - workBefore;
+            if (m_options.schedule.allocation == MasterRefinementAllocation::OperationService)
+            {
+                m_result.stats.operationScreeningWork += m_ledger.stats().spent() - workBefore -
+                    (m_result.stats.operationPaidWork - serviceBefore);
+            }
+            if (observation)
+            {
+                observation->cursorAfter = selected->next;
+                observation->aggregateAfter = selected->refinementWork;
+                observation->refinementsAfter = m_result.stats.refinements;
+                observation->focusAfter = m_focusRemaining;
+                observation->proofAfter = m_result.improvement.has_value();
+                observation->completed = completed;
+                observation->fundingParked = m_result.stats.fundingParkedTickets != parkedBefore;
+                m_options.observer->ticketFinished(*observation);
+            }
             return completed;
+        }
+
+        static void rotate(DeferredLeaf & leaf)
+        {
+            if (leaf.next == MasterRefinementTerm::Friendly)
+            {
+                leaf.next = MasterRefinementTerm::Enemy;
+            }
+            else if (leaf.next == MasterRefinementTerm::Enemy)
+            {
+                leaf.next = MasterRefinementTerm::FutureDual;
+            }
+            else
+            {
+                leaf.next = MasterRefinementTerm::Friendly;
+            }
+        }
+
+        void completeTicket(DeferredLeaf & leaf)
+        {
+            ++m_result.stats.refinements;
+            if (leaf.evaluation == m_refinementFocus && m_focusRemaining > 0)
+            {
+                --m_focusRemaining;
+            }
+            if (leaf.evaluation == m_incumbent)
+            {
+                ++m_result.stats.incumbentRefinements;
+            }
+            rotate(leaf);
+        }
+
+        void refreshLeafBound(DeferredLeaf & leaf)
+        {
+            if (leaf.evaluation->objective && leaf.evaluation->upperVerified)
+            {
+                leaf.upper = minimum(leaf.upper, leaf.evaluation->objective->upper);
+            }
+            leaf.schedulable = leaf.schedulable && !leaf.evaluation->exact;
+            consider(leaf.evaluation);
+        }
+
+        bool stopOperation(MasterOperationStatus status)
+        {
+            m_result.operationStop = status;
+            if (status == MasterOperationStatus::FundingRefused)
+            {
+                m_result.refinementRefusal = m_evaluator.refinementRefusal();
+                m_result.budgetExhausted = true;
+            }
+            else if (status == MasterOperationStatus::Invalid)
+            {
+                ++m_result.stats.proofFailures;
+            }
+            return false;
+        }
+
+        bool creditOperation(MasterOperationService & operation, std::int64_t work)
+        {
+            if (!MasterOperationRegistry::credit(operation, work) ||
+                !RelativeStockDetail::checkedAdd(m_result.stats.operationPaidWork, work))
+            {
+                ++m_result.stats.arithmeticFailures;
+                return false;
+            }
+            return true;
+        }
+
+        bool inspectOperations(
+            std::span<MasterOperationDescriptor> roles, std::span<const std::size_t> indices,
+            std::array<std::optional<MasterOperationOffer>, MASTER_OPERATION_ROLE_LIMIT> & offers,
+            MasterOperationStatus & unavailable)
+        {
+            std::array<bool, MASTER_OPERATION_ROLE_LIMIT> inspected{};
+            for (std::size_t pass = 0; pass < roles.size(); ++pass)
+            {
+                std::optional<std::size_t> next;
+                std::optional<std::size_t> ready;
+                for (std::size_t role = 0; role < roles.size(); ++role)
+                {
+                    if (!inspected[role])
+                    {
+                        if (!next || MasterOperationRegistry::before(
+                                m_operations.at(indices[role]), m_operations.at(indices[*next])))
+                        {
+                            next = role;
+                        }
+                    }
+                    else if (offers[role] &&
+                             offers[role]->remainingRequiredWork <= m_ledger.balance() - MASTER_OPERATION_QUOTA_WORK &&
+                             (!ready || MasterOperationRegistry::before(
+                                 m_operations.at(indices[role]), m_operations.at(indices[*ready]))))
+                    {
+                        ready = role;
+                    }
+                }
+                if (!next || (ready && MasterOperationRegistry::before(
+                                  m_operations.at(indices[*ready]), m_operations.at(indices[*next]))))
+                {
+                    break;
+                }
+                auto & descriptor = roles[*next];
+                auto & operation = m_operations.at(indices[*next]);
+                for (std::size_t role = 0; role < roles.size(); ++role)
+                {
+                    if (indices[role] == indices[*next])
+                    {
+                        inspected[role] = true;
+                        if (role != *next)
+                        {
+                            descriptor.lowerRelevant = descriptor.lowerRelevant || roles[role].lowerRelevant;
+                            descriptor.upperRelevant = descriptor.upperRelevant || roles[role].upperRelevant;
+                        }
+                    }
+                }
+                if (operation.growthExhausted)
+                {
+                    unavailable = MasterOperationStatus::FundingRefused;
+                    continue;
+                }
+                const auto offerStart = m_options.observer != nullptr ? m_ledger.stats().spent() : 0;
+                auto offer = m_evaluator.operationOffer(
+                    *descriptor.evaluation, descriptor.term, operation.allowance, operation.readiness);
+                if (m_options.observer != nullptr)
+                {
+                    m_options.observer->operationOffered(
+                        *descriptor.evaluation, offer, descriptor.lowerRelevant, descriptor.upperRelevant,
+                        operation.paidWork, offerStart, m_ledger.stats().spent());
+                }
+                if (!creditOperation(operation, offer.preparationWork))
+                {
+                    return stopOperation(MasterOperationStatus::Invalid);
+                }
+                if (offer.preparation.status == RelativeStockPreparationStatus::Ready &&
+                    offer.allowance > operation.allowance)
+                {
+                    operation.allowance = offer.allowance;
+                }
+                if (offer.status == MasterOperationStatus::Invalid)
+                {
+                    return stopOperation(offer.status);
+                }
+                if (offer.status == MasterOperationStatus::Ready)
+                {
+                    offers[*next] = std::move(offer);
+                }
+                else if (offer.status == MasterOperationStatus::FundingRefused)
+                {
+                    unavailable = MasterOperationStatus::FundingRefused;
+                }
+                else if (offer.status == MasterOperationStatus::MissingPrerequisite &&
+                         unavailable != MasterOperationStatus::FundingRefused)
+                {
+                    unavailable = MasterOperationStatus::MissingPrerequisite;
+                }
+                if (m_ledger.stats().refusals != m_refusalsBefore)
+                {
+                    return stopOperation(MasterOperationStatus::FundingRefused);
+                }
+            }
+            return true;
+        }
+
+        std::optional<std::size_t> affordableOperation(
+            std::span<const std::optional<MasterOperationOffer>> offers, std::span<const std::size_t> indices,
+            MasterOperationStatus & unavailable) const
+        {
+            std::optional<std::size_t> selected;
+            for (std::size_t role = 0; role < offers.size(); ++role)
+            {
+                if (!offers[role])
+                {
+                    continue;
+                }
+                if (offers[role]->remainingRequiredWork > m_ledger.balance() - MASTER_OPERATION_QUOTA_WORK)
+                {
+                    unavailable = MasterOperationStatus::FundingRefused;
+                    continue;
+                }
+                if (!selected || MasterOperationRegistry::before(
+                        m_operations.at(indices[role]), m_operations.at(indices[*selected])))
+                {
+                    selected = role;
+                }
+            }
+            return selected;
+        }
+
+        bool parkUnfundableComparison(
+            DeferredLeaf & ticket, const std::shared_ptr<MasterAssignmentEvaluation> & challenger)
+        {
+            auto* blocked = &ticket;
+            if (challenger)
+            {
+                if (!chargeMasterWork(m_ledger, m_leaves.size() + 1, 1, RefinementWork::MasterExpansion))
+                {
+                    return stopOperation(MasterOperationStatus::FundingRefused);
+                }
+                const auto found = std::find_if(m_leaves.begin(), m_leaves.end(),
+                    [&](const DeferredLeaf & leaf) { return leaf.evaluation == challenger; });
+                if (found == m_leaves.end())
+                {
+                    return stopOperation(MasterOperationStatus::Invalid);
+                }
+                blocked = &*found;
+            }
+            blocked->schedulable = false;
+            ++m_result.stats.fundingParkedTickets;
+            completeTicket(ticket);
+            refreshLeafBound(ticket);
+            if (blocked->evaluation == m_refinementFocus)
+            {
+                m_refinementFocus.reset();
+                m_focusRemaining = 0;
+            }
+            return true;
+        }
+
+        bool refineOperationLeaf(DeferredLeaf & ticket)
+        {
+            const auto ticketStart = m_ledger.stats().spent();
+            const bool firstProofPhase = !m_result.improvement;
+            const auto challenger = ticket.evaluation == m_incumbent
+                ? m_refinementFocus : ticket.evaluation;
+            RelativeStockComparison comparison;
+            if (challenger)
+            {
+                if (!compare(challenger, &comparison))
+                {
+                    return stopOperation(MasterOperationStatus::FundingRefused);
+                }
+                if (!comparison.valid())
+                {
+                    return stopOperation(MasterOperationStatus::Invalid);
+                }
+                if (firstProofPhase && !comparison.unresolved())
+                {
+                    ++m_result.stats.resolvedOperationTickets;
+                    completeTicket(ticket);
+                    refreshLeafBound(ticket);
+                    return true;
+                }
+            }
+            const bool allocatePair = challenger && comparison.unresolved() && !m_result.improvement;
+            constexpr std::int64_t descriptorWork = 32;
+            if (!m_ledger.consume(descriptorWork, RefinementWork::MasterExpansion))
+            {
+                return stopOperation(MasterOperationStatus::FundingRefused);
+            }
+            std::array<MasterOperationDescriptor, MASTER_OPERATION_ROLE_LIMIT> roles{};
+            std::size_t count = 0;
+            if (allocatePair)
+            {
+                roles[count++] = {challenger, MasterRefinementTerm::Friendly, true, false};
+                roles[count++] = {m_incumbent, MasterRefinementTerm::Friendly, false, true};
+                if (!comparison.commonEnemyCancelled)
+                {
+                    roles[count++] = {m_incumbent, MasterRefinementTerm::Enemy, true, false};
+                    roles[count++] = {challenger, MasterRefinementTerm::Enemy, false, true};
+                }
+                roles[count++] = {m_incumbent, MasterRefinementTerm::FutureDual, false, true};
+            }
+            else
+            {
+                if (ticket.next == MasterRefinementTerm::Enemy && challenger &&
+                    comparison.unresolved() && comparison.commonEnemyCancelled)
+                {
+                    ++m_result.stats.cancelledEnemyRefinements;
+                    completeTicket(ticket);
+                    return true;
+                }
+                roles[count++] = {ticket.evaluation, ticket.next, true, true};
+            }
+            std::array<std::size_t, MASTER_OPERATION_ROLE_LIMIT> indices{};
+            if (!m_operations.prepare(m_problem.identity(), std::span(roles).first(count), m_ledger,
+                                      m_options.schedule.continuationSlice,
+                                      m_options.schedule.futureDualAllowance, indices))
+            {
+                return stopOperation(m_ledger.stats().refusals != m_refusalsBefore
+                    ? MasterOperationStatus::FundingRefused : MasterOperationStatus::Invalid);
+            }
+            m_result.stats.operationRecords = m_operations.size();
+            std::array<std::optional<MasterOperationOffer>, MASTER_OPERATION_ROLE_LIMIT> offers{};
+            MasterOperationStatus unavailable = MasterOperationStatus::Unavailable;
+            if (!inspectOperations(std::span(roles).first(count), std::span(indices).first(count), offers, unavailable))
+            {
+                return false;
+            }
+            const auto selected = affordableOperation(
+                std::span(offers).first(count), std::span(indices).first(count), unavailable);
+            if (!selected)
+            {
+                if (unavailable == MasterOperationStatus::FundingRefused)
+                {
+                    return parkUnfundableComparison(ticket, allocatePair ? challenger : nullptr);
+                }
+                completeTicket(ticket);
+                refreshLeafBound(ticket);
+                if (allocatePair && unavailable == MasterOperationStatus::MissingPrerequisite)
+                {
+                    return stopOperation(unavailable);
+                }
+                return true;
+            }
+            return performOperation(ticket, challenger, roles[*selected], m_operations.at(indices[*selected]),
+                                    *offers[*selected], ticketStart);
+        }
+
+        bool performOperation(DeferredLeaf & ticket, const std::shared_ptr<MasterAssignmentEvaluation> & challenger,
+                              const MasterOperationDescriptor & descriptor, MasterOperationService & operation,
+                              const MasterOperationOffer & selectedOffer, std::int64_t ticketStart)
+        {
+            operation.allowance = selectedOffer.allowance;
+            const auto operationStart = m_ledger.stats().spent();
+            if (m_options.observer != nullptr)
+            {
+                m_options.observer->operationStarted(
+                    *descriptor.evaluation, descriptor.term, operation.allowance, operationStart);
+            }
+            const auto outcome = m_evaluator.executeOperation(*descriptor.evaluation, selectedOffer);
+            if (m_options.observer != nullptr)
+            {
+                m_options.observer->operationExecuted(
+                    *descriptor.evaluation, descriptor.term, outcome, operationStart, m_ledger.stats().spent());
+                m_options.observer->refined(*descriptor.evaluation, descriptor.term, operation.allowance,
+                    outcome.status, operationStart, m_ledger.stats().spent());
+            }
+            if (outcome.status == MasterRefinementStatus::BudgetExhausted)
+            {
+                creditOperation(operation, outcome.admitted ? outcome.executionWork : 0);
+                return stopOperation(MasterOperationStatus::FundingRefused);
+            }
+            completeTicket(ticket);
+            if (outcome.status == MasterRefinementStatus::Invalid)
+            {
+                creditOperation(operation, outcome.admitted ? outcome.executionWork : 0);
+                return stopOperation(MasterOperationStatus::Invalid);
+            }
+            const auto beforeGrowth = m_ledger.stats().spent();
+            if (!MasterOperationRegistry::grow(operation, m_ledger, m_options.schedule.refinementGrowthFactor,
+                                                outcome.admitted, outcome.completed, true))
+            {
+                creditOperation(operation, outcome.admitted ? outcome.executionWork : 0);
+                return stopOperation(MasterOperationStatus::FundingRefused);
+            }
+            const auto growthWork = m_ledger.stats().spent() - beforeGrowth;
+            refreshLeafBound(ticket);
+            consider(descriptor.evaluation);
+            const bool compared = !challenger || compare(challenger);
+            const auto serviceWork = outcome.status == MasterRefinementStatus::Unavailable ? 0 :
+                m_ledger.stats().spent() - operationStart - growthWork;
+            if (!creditOperation(operation, serviceWork))
+            {
+                return stopOperation(MasterOperationStatus::Invalid);
+            }
+            if (m_options.observer != nullptr)
+            {
+                m_options.observer->operationServiced({
+                    *ticket.evaluation, challenger.get(), descriptor.evaluation.get(), descriptor.term,
+                    selectedOffer.allowance, m_ledger.stats().spent() - ticketStart, serviceWork,
+                    outcome.admitted, outcome.completed,
+                    (descriptor.lowerRelevant && outcome.lowerProgress) ||
+                        (descriptor.upperRelevant && outcome.upperProgress),
+                    (!descriptor.lowerRelevant && outcome.lowerProgress) ||
+                        (!descriptor.upperRelevant && outcome.upperProgress)});
+            }
+            return compared;
         }
 
         bool refineSelectedLeaf(DeferredLeaf & leaf)
         {
             if (!m_evaluator.refresh(*leaf.evaluation))
             {
-                if (m_ledger.stats().refusals != 0)
+                if (m_ledger.stats().refusals != m_refusalsBefore)
                 {
                     m_result.budgetExhausted = true;
                     return false;
@@ -836,7 +1862,7 @@ namespace
             }
             auto & allowance = leaf.allowance();
             const bool cancelEnemy = leaf.next == MasterRefinementTerm::Enemy && enemyCancelsInFocus();
-            if (m_ledger.stats().refusals != 0)
+            if (m_ledger.stats().refusals != m_refusalsBefore)
             {
                 m_result.budgetExhausted = true;
                 return false;
@@ -935,8 +1961,203 @@ namespace
             }
         }
 
+    public:
+        // Runs after the search has returned and only on its own ledger, so nothing it does can change the result.
+        void auditNeighbors(MasterAssignmentSearchResult & result) const
+        {
+            const auto & schedule = m_options.schedule;
+            if (schedule.planNeighborAudit != MasterPlanNeighborAudit::Recorded || schedule.planPricingRounds == 0)
+            {
+                return;
+            }
+            const auto started = std::chrono::steady_clock::now();
+            auto & audit = result.stats.planPricing.neighborAudit.emplace();
+            RefinementLedger scratch;
+            audit.status = measureNeighbors(result, audit, scratch);
+            if (audit.status != MasterPlanNeighborAuditStatus::Recorded)
+            {
+                audit.changes.clear();
+                audit.provenNotBetter = 0;
+                audit.open = 0;
+                audit.conflicting = 0;
+                audit.unavailable = 0;
+            }
+            audit.work = scratch.stats().spent();
+            audit.nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        }
+
+    private:
+        MasterPlanNeighborAuditStatus measureNeighbors(const MasterAssignmentSearchResult & result,
+                                                       MasterPlanNeighborAuditStats & audit,
+                                                       RefinementLedger & scratch) const
+        {
+            const auto & schedule = m_options.schedule;
+            const auto* stock = m_evaluator.stockModel();
+            const auto* catalog = m_evaluator.futureCatalog();
+            if (stock == nullptr || catalog == nullptr || m_evaluator.hasGuardedStock() ||
+                !m_bounds.covers(m_problem.identity(), stock, catalog) || !m_incumbent ||
+                m_incumbent->status != MasterEvaluationStatus::Feasible || m_incumbent->quote() == nullptr)
+            {
+                return MasterPlanNeighborAuditStatus::Unavailable;
+            }
+            audit.plan = result.improvement ? MasterNeighborAuditedPlan::Challenger : MasterNeighborAuditedPlan::Incumbent;
+            const auto & plan = result.improvement ? result.improvement->challenger : *m_incumbent;
+            if (!scratch.open(schedule.planNeighborAuditAllowance))
+            {
+                return MasterPlanNeighborAuditStatus::Unaffordable;
+            }
+            switch (m_evaluator.oursBasis(plan, scratch))
+            {
+                case MasterOursBasisStatus::Proven:
+                    break;
+                case MasterOursBasisStatus::Unproven:
+                    return MasterPlanNeighborAuditStatus::FloorUnproven;
+                case MasterOursBasisStatus::CatalogMismatch:
+                    return MasterPlanNeighborAuditStatus::CatalogMismatch;
+                case MasterOursBasisStatus::OwnedMismatch:
+                    return MasterPlanNeighborAuditStatus::OwnedMismatch;
+                case MasterOursBasisStatus::BudgetExhausted:
+                    return MasterPlanNeighborAuditStatus::Unaffordable;
+            }
+            const auto* quote = plan.quote();
+            auto floor = plan.replay->seatedEconomicTotal;
+            const auto adapterWork = masterPlanAdapterWork(m_problem, *catalog);
+            if (!RelativeStockDetail::checkedAdd(floor, quote->owned) ||
+                !RelativeStockDetail::checkedAdd(floor, quote->ours.lower) || !adapterWork)
+            {
+                return MasterPlanNeighborAuditStatus::ArithmeticFailure;
+            }
+            audit.trustedFloor = floor;
+            if (scratch.balance() < *adapterWork)
+            {
+                return MasterPlanNeighborAuditStatus::Unaffordable;
+            }
+            const auto instance = buildMasterPlanPricingInstance(m_problem, *stock, *catalog, scratch);
+            if (!instance)
+            {
+                return MasterPlanNeighborAuditStatus::Unavailable;
+            }
+            const auto forced = masterPlanStateChoices(m_problem, *instance, plan.state);
+            if (!forced)
+            {
+                return MasterPlanNeighborAuditStatus::Unrepresentable;
+            }
+            const auto tuned = tuneRestricted(*instance, forced,
+                                              schedule.planPricingWork / MASTER_PLAN_PRICING_CHALLENGER_SHARE,
+                                              NEIGHBOR_AUDIT_TUNE_SHARE, scratch);
+            switch (tuned.status)
+            {
+                case RestrictedTuneStatus::Overflow:
+                    return MasterPlanNeighborAuditStatus::ArithmeticFailure;
+                case RestrictedTuneStatus::Unaffordable:
+                    return MasterPlanNeighborAuditStatus::Unaffordable;
+                case RestrictedTuneStatus::RestrictionFailed:
+                    return MasterPlanNeighborAuditStatus::TuneFailed;
+                case RestrictedTuneStatus::Tuned:
+                    break;
+            }
+            const auto & priced = tuned.priced;
+            if (priced.prices.empty())
+            {
+                return MasterPlanNeighborAuditStatus::TuneFailed;
+            }
+            audit.rounds = priced.rounds;
+            std::vector<MilliFunds> prices(m_problem.resources().size(), 0);
+            prices.insert(prices.end(), priced.prices.begin(), priced.prices.end());
+            const auto table = m_bounds.termsAt(plan.state, std::move(prices), scratch);
+            if (table.status == MasterBoundStatus::BudgetExhausted)
+            {
+                return MasterPlanNeighborAuditStatus::Unaffordable;
+            }
+            if (table.status != MasterBoundStatus::Valid)
+            {
+                return MasterPlanNeighborAuditStatus::ScanInvalid;
+            }
+            audit.scanUpper = table.upper;
+            if (priced.witness.valid)
+            {
+                // The witness books economic values and capture swings without the owned baseline; the floor's terms replace them.
+                const auto friendly = masterPlanFriendlyWitness(priced.witness);
+                auto witness = plan.replay->seatedEconomicTotal;
+                if (!friendly || !RelativeStockDetail::checkedAdd(witness, quote->owned) ||
+                    !RelativeStockDetail::checkedAdd(witness, friendly->value))
+                {
+                    return MasterPlanNeighborAuditStatus::ArithmeticFailure;
+                }
+                audit.witnessValue = witness;
+                if (witness > table.upper)
+                {
+                    return MasterPlanNeighborAuditStatus::WitnessAboveCeiling;
+                }
+            }
+            for (std::size_t slot = 0; slot < table.actorTerms.size(); ++slot)
+            {
+                const auto selected = plan.state.choices[slot];
+                if (selected < 0 || !m_problem.canChangeActor(static_cast<std::int32_t>(slot)))
+                {
+                    continue;
+                }
+                const auto & terms = table.actorTerms[slot];
+                const auto base = std::find_if(terms.begin(), terms.end(),
+                    [&](const MasterCandidateTerm & entry) { return entry.candidate == selected; });
+                if (base == terms.end() || !base->term)
+                {
+                    return MasterPlanNeighborAuditStatus::ScanInvalid;
+                }
+                for (const auto & entry : terms)
+                {
+                    if (entry.candidate == selected)
+                    {
+                        continue;
+                    }
+                    MasterNeighborChange change{m_problem.actors()[slot].engineUnitId,
+                                                static_cast<std::int32_t>(slot), entry.candidate};
+                    const auto legal = compatible(plan.state, slot, entry.candidate, scratch);
+                    if (!legal)
+                    {
+                        return MasterPlanNeighborAuditStatus::Unaffordable;
+                    }
+                    change.conflictFree = *legal;
+                    auto gain = entry.term.value_or(0);
+                    auto ceiling = table.upper;
+                    const bool measured = entry.term && RelativeStockDetail::checkedSubtract(gain, *base->term) &&
+                                          RelativeStockDetail::checkedAdd(ceiling, gain);
+                    if (measured)
+                    {
+                        change.gain = gain;
+                    }
+                    // A conflicting state is no real plan, so its ceiling bounds nothing until paired with another move.
+                    change.verdict = !measured ? MasterNeighborVerdict::Unavailable
+                        : !change.conflictFree ? MasterNeighborVerdict::Conflicting
+                        : ceiling <= floor ? MasterNeighborVerdict::ProvenNotBetter : MasterNeighborVerdict::Open;
+                    switch (change.verdict)
+                    {
+                        case MasterNeighborVerdict::ProvenNotBetter:
+                            ++audit.provenNotBetter;
+                            break;
+                        case MasterNeighborVerdict::Open:
+                            ++audit.open;
+                            break;
+                        case MasterNeighborVerdict::Conflicting:
+                            ++audit.conflicting;
+                            break;
+                        case MasterNeighborVerdict::Unavailable:
+                            ++audit.unavailable;
+                            break;
+                    }
+                    audit.changes.push_back(change);
+                }
+            }
+            return MasterPlanNeighborAuditStatus::Recorded;
+        }
+
         MasterAssignmentSearchResult finish()
         {
+            if (m_evaluator.oursCapContradictions() != 0)
+            {
+                dropCappedImprovement();
+            }
             if (m_active)
             {
                 account(m_active->state, m_active->upper, false);
@@ -1011,12 +2232,18 @@ namespace
         const MasterAssignmentProblem & m_problem;
         MasterAssignmentEvaluator & m_evaluator;
         RefinementLedger & m_ledger;
+        const std::int64_t m_refusalsBefore;
+        const std::int64_t m_workBefore;
         const MasterAssignmentSearchOptions & m_options;
         MasterAssignmentBounds m_bounds;
+        MasterOperationRegistry m_operations;
         MasterAssignmentSearchResult m_result;
         std::shared_ptr<MasterAssignmentEvaluation> m_incumbent;
         std::shared_ptr<MasterAssignmentEvaluation> m_best;
         std::shared_ptr<MasterAssignmentEvaluation> m_refinementFocus;
+        std::shared_ptr<MasterAssignmentEvaluation> m_planChallenger;
+        std::optional<MasterImprovementProof> m_uncappedImprovement;
+        FirstImprovement m_firstUncapped;
         std::shared_ptr<SearchNode> m_active;
         std::priority_queue<std::shared_ptr<SearchNode>, std::vector<std::shared_ptr<SearchNode>>, NodeOrder> m_frontier;
         std::vector<DeferredLeaf> m_leaves;
@@ -1036,6 +2263,9 @@ namespace Coordinator
         const MasterAssignmentProblem & problem, MasterAssignmentEvaluator & evaluator,
         RefinementLedger & ledger, const MasterAssignmentSearchOptions & options)
     {
-        return Search(problem, evaluator, ledger, options).run(evaluator.stockModel());
+        Search search(problem, evaluator, ledger, options);
+        auto result = search.run(evaluator.stockModel());
+        search.auditNeighbors(result);
+        return result;
     }
 }

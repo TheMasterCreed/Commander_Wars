@@ -1,6 +1,9 @@
 #include <cstdio>
 
+#include <QCoreApplication>
+#include <QEvent>
 #include <QMetaObject>
+#include <QPointer>
 
 #include "tests/oxygine_lifetime/oxyginelifetimetests.h"
 #include "3rd_party/oxygine-framework/oxygine/actor/Actor.h"
@@ -9,6 +12,9 @@
 #include "3rd_party/oxygine-framework/oxygine/core/gamewindow.h"
 #include "3rd_party/oxygine-framework/oxygine/Event.h"
 #include "coreengine/memorymanagement.h"
+#include "menue/basegamemenu.h"
+#include "menue/gamemenue.h"
+#include "game/ui/ingameinfobar.h"
 
 namespace OxygineLifetimeTests
 {
@@ -247,6 +253,112 @@ namespace OxygineLifetimeTests
         drainOnMain();
     }
 
+    class RegistrationTestMenu final : public BaseGamemenu
+    {
+    public:
+        using BaseGamemenu::BaseGamemenu;
+    protected:
+        void onEnter() override {}
+    };
+
+    void testMenuRegistrationOwnership()
+    {
+        const QString name = "__menu_registration_lifetime_test";
+        auto* interpreter = Interpreter::getInstance();
+        auto retiredMap = MemoryManagement::create<GameMap>(1, 1, 1);
+        auto currentMap = MemoryManagement::create<GameMap>(1, 1, 1);
+        auto retired = MemoryManagement::create<RegistrationTestMenu>(retiredMap, false);
+        auto current = MemoryManagement::create<RegistrationTestMenu>(currentMap, false);
+        retired->registerAtInterpreter(name);
+        check(interpreter->getGlobal(name).toQObject() == retired.get(), "first menu owns its registration");
+        current->registerAtInterpreter(name);
+        QPointer<BaseGamemenu> retiredObject(retired.get());
+        retired.reset();
+        QCoreApplication::sendPostedEvents(retiredObject.data(), QEvent::DeferredDelete);
+        check(retiredObject.isNull(), "retired menu was destroyed");
+        check(interpreter->getGlobal(name).toQObject() == current.get(), "retired menu preserves replacement registration");
+        QPointer<BaseGamemenu> currentObject(current.get());
+        current.reset();
+        QCoreApplication::sendPostedEvents(currentObject.data(), QEvent::DeferredDelete);
+        check(currentObject.isNull(), "current menu was destroyed");
+        check(interpreter->getGlobal(name).isUndefined(), "current menu removes its own registration");
+    }
+
+
+    void testRetiredInfoBarOwners()
+    {
+        auto* interpreter = Interpreter::getInstance();
+        auto map = MemoryManagement::create<GameMap>(2, 2, 2);
+        auto menu = MemoryManagement::create<GameMenue>(map, false);
+        constexpr QSize VIEWPORT_SIZE{320, 240};
+        menu->initSlidingActor(0, 0, VIEWPORT_SIZE.width(), VIEWPORT_SIZE.height());
+        map->setMenu(menu.get());
+        auto bar = MemoryManagement::create<IngameInfoBar>(menu.get(), map.get());
+        check(bar->getGameMenu() == menu.get() && bar->getMap() == map.get() && map->getMenu() == menu.get(),
+              "info bar exposes its linked live owners");
+        auto* minimap = bar->getMinimap();
+        check(minimap != nullptr, "real info bar has its minimap");
+        if (minimap == nullptr)
+        {
+            return;
+        }
+        const QPoint retiredPosition{-1000, -1000};
+        minimap->setPosition(retiredPosition);
+        bar->syncMinimapPosition();
+        check(minimap->getPosition() != retiredPosition, "live minimap synchronization still updates position");
+        const auto connection = QObject::connect(map.get(), &GameMap::sigMovedMap,
+            bar.get(), &IngameInfoBar::syncMinimapPosition, Qt::QueuedConnection);
+        check(static_cast<bool>(connection), "map movement queues the real minimap synchronization slot");
+        map->moveMap(0, 0);
+        minimap->setPosition(retiredPosition);
+        bool syncSafe = false;
+        auto entries = interpreter->getRealmEntries();
+        check(QMetaObject::invokeMethod(bar.get(), "updateTerrainInfoInternal", Qt::DirectConnection) &&
+              interpreter->getRealmEntries() > entries, "live info bar updates still enter script");
+        bar->updateTerrainInfo(0, 0, true);
+        check(QMetaObject::invokeMethod(bar.get(), "updateTerrainInfoInternal", Qt::QueuedConnection),
+              "late info bar update is queued before owner disposal");
+        QPointer<GameMenue> menuWatch(menu.get());
+        menu.reset();
+        QCoreApplication::sendPostedEvents(menuWatch.data(), QEvent::DeferredDelete);
+        check(menuWatch.isNull(), "info bar does not retain its retired menu");
+        check(bar->getGameMenu() == nullptr, "info bar does not expose a deleted menu");
+        const bool menuSafe = menuWatch.isNull() && bar->getGameMenu() == nullptr;
+        if (menuSafe)
+        {
+            entries = interpreter->getRealmEntries();
+            QCoreApplication::sendPostedEvents(bar.get(), QEvent::MetaCall);
+            syncSafe = minimap->getPosition() == retiredPosition;
+            bar->syncMinimapPosition();
+            syncSafe = syncSafe && minimap->getPosition() == retiredPosition;
+            check(syncSafe, "queued and direct minimap synchronization stop after menu disposal");
+            bar->updateCursorInfo(0, 0);
+            bar->updateTerrainInfo(0, 0, true);
+            bar->updatePlayerInfo();
+            bar->updateMinimap();
+            check(interpreter->getRealmEntries() == entries, "retired menu blocks queued and public info bar updates");
+        }
+        QPointer<GameMap> mapWatch(map.get());
+        map.reset();
+        QCoreApplication::sendPostedEvents(mapWatch.data(), QEvent::DeferredDelete);
+        check(mapWatch.isNull(), "info bar does not retain its retired map");
+        check(bar->getMap() == nullptr, "info bar does not expose a deleted map");
+        bool lateSafe = false;
+        if (menuSafe && mapWatch.isNull() && bar->getMap() == nullptr)
+        {
+            entries = interpreter->getRealmEntries();
+            lateSafe = QMetaObject::invokeMethod(bar.get(), "updateTerrainInfoInternal", Qt::DirectConnection) &&
+                interpreter->getRealmEntries() == entries;
+            check(lateSafe, "late info bar update avoids script after both owners retire");
+        }
+        qCritical("[infobar-lifetime] menuSafe=%d mapSafe=%d lateSafe=%d syncSafe=%d failures=%d",
+            menuSafe, mapWatch.isNull() && bar->getMap() == nullptr, lateSafe, syncSafe, s_failures);
+        QPointer<IngameInfoBar> barWatch(bar.get());
+        bar.reset();
+        QCoreApplication::sendPostedEvents(barWatch.data(), QEvent::DeferredDelete);
+        check(barWatch.isNull(), "retired info bar disposes normally");
+    }
+
     void runTest(std::function<void()> func, std::string name)
     {
         s_failures = 0;
@@ -265,6 +377,7 @@ namespace OxygineLifetimeTests
     qint32 runAll()
     {
         s_totalTestsFailures = 0;
+        oxygine::EventDispatcher::setSyncEvents(false);
         runTest(test1, "test1");
         runTest(test2, "test2");
         runTest(test3, "test3");
@@ -276,6 +389,10 @@ namespace OxygineLifetimeTests
         runTest(test9, "test9");
         runTest(test10, "test10");
         runTest(test11, "test11");
+        drainOnMain();
+        oxygine::EventDispatcher::setSyncEvents(true);
+        runTest(testMenuRegistrationOwnership, "menu registration ownership");
+        runTest(testRetiredInfoBarOwners, "retired info bar owners");
 
         std::printf("[oxygine-selftest] finished with %d failure(s)\n", s_totalTestsFailures);
         std::fflush(stdout);

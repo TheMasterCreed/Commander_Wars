@@ -163,6 +163,7 @@ namespace
         const auto result = searchMasterAssignment(problem, evaluator, ledger, {.profile = &profile});
         observation.search = &result;
         observation.session = stock.session();
+        observation.evaluator = &evaluator;
         observation.future = evaluator.futureCatalog();
         observation.outcome = outcomeOf(result);
         observation.legacyPlanUnchanged =

@@ -558,13 +558,7 @@ namespace
         std::sort(result.capturedColumns.begin(), result.capturedColumns.end());
         for (const auto & column : result.friendly.columns)
         {
-            auto enemyColumn = mirroredColumn(column);
-            if (std::find(result.capturedColumns.begin(), result.capturedColumns.end(), column.slot) !=
-                result.capturedColumns.end())
-            {
-                enemyColumn.ownerBefore = OwnerSign::Enemy;
-            }
-            result.enemy.columns.push_back(enemyColumn);
+            result.enemy.columns.push_back(mirroredColumn(column));
         }
         result.enemy.capturedNodes.assign(3, false);
         result.enemy.classes.push_back(travelClass(result.enemy.columns, 2));
@@ -736,9 +730,9 @@ namespace
             PropertyStockInstance enemy;
             IdentityFixture identity(field, enemy);
             const auto comparison = identity.compare(identity.bind(left), identity.bind(right));
-            expect(comparison.exact() && comparison.commonEnemyCancelled == (carried == 0) &&
+            expect(comparison.exact() && comparison.commonEnemyCancelled &&
                    comparison.deltaLower == right.objective.total - left.objective.total,
-                   "only matching captured-column signatures permit common-enemy cancellation");
+                   "every captured-column signature shares the start-of-turn enemy value");
             if (carried == 0)
             {
                 expect(right.objective.owned == left.objective.owned &&
@@ -749,27 +743,29 @@ namespace
             {
                 expect(right.objective.capturedColumns == std::vector<std::int32_t>{0} &&
                        right.objective.owned - left.objective.owned == 1000 &&
-                       request.continuation.cases[0].enemy.rows[0].weight !=
+                       request.continuation.cases[0].enemy.rows[0].weight ==
                            request.continuation.cases[1].enemy.rows[0].weight,
-                       "completed capture changes ownership and enemy inputs even if its best route stays equal");
+                       "completed capture changes ownership and leaves enemy inputs at start-of-turn ownership");
                 auto missingWitness = identity.bind(right);
                 missingWitness.enemyLowerWitnessReplays = false;
-                expect(identity.compare(identity.bind(left), missingWitness).reason == RelativeStockReason::MissingEnemyWitness,
-                       "different enemy signature still requires its replayed witness");
+                expect(identity.compare(identity.bind(left), missingWitness).valid(),
+                       "cancelled enemy needs no replayed witness under any captured signature");
                 auto nearby = request;
-                nearby.fixture = QStringLiteral("capture-changes-enemy-optimum");
+                nearby.fixture = QStringLiteral("capture-keeps-enemy-optimum");
                 nearby.continuation.cases = {
                     smallStock(left.reference.key, carried, {-1, 0}),
                     smallStock(right.reference.key, carried, {-1, 0})};
                 const auto changedEnemy = run(fixture.extract(), nearby);
-                expect(changedEnemy.tuples[0].objective.enemy != changedEnemy.tuples[1].objective.enemy,
-                       "nearby enemy exact optimum changes after captured-column flip");
-                const auto distinct = identity.compare(identity.bind(changedEnemy.tuples[0]),
-                                                       identity.bind(changedEnemy.tuples[1]));
-                expect(distinct.exact() && !distinct.commonEnemyCancelled &&
-                       distinct.deltaLower == changedEnemy.tuples[1].objective.total -
-                                              changedEnemy.tuples[0].objective.total,
-                       "distinct enemy optima enter the exact relative difference without cancellation");
+                expect(changedEnemy.tuples[0].objective.enemy == changedEnemy.tuples[1].objective.enemy &&
+                       changedEnemy.tuples[0].objective.enemy > 0,
+                       "nearby enemy exact optimum is unchanged by our capture this turn");
+                const auto nearbyComparison = identity.compare(identity.bind(changedEnemy.tuples[0]),
+                                                               identity.bind(changedEnemy.tuples[1]));
+                expect(nearbyComparison.exact() && nearbyComparison.commonEnemyCancelled &&
+                       nearbyComparison.deltaLower == changedEnemy.tuples[1].objective.total -
+                                                      changedEnemy.tuples[0].objective.total &&
+                       nearbyComparison.deltaLower == comparison.deltaLower,
+                       "a reachable enemy cannot change what finishing the capture is worth");
             }
             fixture.input.actionIds.wait = QStringLiteral("LABEL_Z");
             fixture.input.actionIds.capture = QStringLiteral("LABEL_A");

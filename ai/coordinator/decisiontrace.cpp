@@ -182,7 +182,7 @@ Coordinator::openDecisionTrace(const DecisionTraceIdentity & identity)
 
 void Coordinator::writePlanningTimingAudit(
     const DecisionTraceIdentity & identity,
-    const QString & fields)
+    const QString & fields, PlanningTimingKind kind)
 {
 #if defined(GAMEDEBUG) || defined(COW_COORDINATED_REFINEMENT_TESTING)
     Settings* pSettings = Settings::getInstance();
@@ -191,8 +191,10 @@ void Coordinator::writePlanningTimingAudit(
     {
         return;
     }
+    const auto category = kind == PlanningTimingKind::Call ? QStringLiteral("PLANNING_CALL") : QStringLiteral("PHASE_TIMING");
     QString line =
-        QStringLiteral("[COORD][PHASE_TIMING] day=%1 player=%2 ai=COORDINATED rng=unused plan=%3 horizon=%4")
+        QStringLiteral("[COORD][%1] day=%2 player=%3 ai=COORDINATED rng=unused plan=%4 horizon=%5")
+            .arg(category)
             .arg(identity.day)
             .arg(identity.playerId)
             .arg(identity.planSequence)
@@ -210,5 +212,6 @@ void Coordinator::writePlanningTimingAudit(
 #else
     static_cast<void>(identity);
     static_cast<void>(fields);
+    static_cast<void>(kind);
 #endif
 }

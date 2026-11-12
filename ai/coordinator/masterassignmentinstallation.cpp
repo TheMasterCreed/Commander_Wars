@@ -18,6 +18,13 @@ namespace
 
     bool verified(const Coordinator::MasterAssignmentEvaluation & evaluation)
     {
+        if (evaluation.guardedRoot)
+        {
+            return evaluation.status == Coordinator::MasterEvaluationStatus::Feasible &&
+                evaluation.objectiveStatus == Coordinator::MasterObjectiveStatus::GuardedRootPrepared &&
+                evaluation.replay && evaluation.replay->complete() &&
+                !evaluation.objective && !evaluation.proof && !evaluation.exact;
+        }
         return evaluation.status == Coordinator::MasterEvaluationStatus::Feasible &&
             evaluation.objectiveStatus == Coordinator::MasterObjectiveStatus::Verified &&
             evaluation.replay && evaluation.replay->complete() && evaluation.objective &&
@@ -44,6 +51,15 @@ namespace
     bool sameNominee(const Coordinator::MasterAssignmentEvaluation & fresh,
                      const Coordinator::MasterAssignmentEvaluation & retained)
     {
+        if (fresh.guardedRoot || retained.guardedRoot)
+        {
+            if (!fresh.guardedRoot || !retained.guardedRoot ||
+                fresh.guardedRoot->authority() != retained.guardedRoot->authority() ||
+                fresh.guardedRoot->consequences() != retained.guardedRoot->consequences())
+            {
+                return false;
+            }
+        }
         return retained.replay && fresh.replay &&
             fresh.replay->continuationKey == retained.replay->continuationKey &&
             fresh.replay->seatedEconomicTotal == retained.replay->seatedEconomicTotal &&
@@ -51,17 +67,24 @@ namespace
             fresh.replay->ordering.order == retained.replay->ordering.order;
     }
 
-    bool recordedComparisonMatches(const Coordinator::MasterImprovementProof & proof)
+    bool recordedComparisonMatches(const Coordinator::MasterImprovementProof & proof,
+                                   const Coordinator::MasterAssignmentEvaluator & evaluator)
     {
         using namespace Coordinator;
+        if (proof.guardedProof)
+        {
+            return proof.incumbent.guardedRoot && proof.challenger.guardedRoot &&
+                proof.guardedProof->incoming().state().choices == proof.incumbent.state.choices &&
+                proof.guardedProof->challenger().state().choices == proof.challenger.state.choices &&
+                proof.guardedProof->incoming().consequences() == proof.incumbent.guardedRoot->consequences() &&
+                proof.guardedProof->challenger().consequences() == proof.challenger.guardedRoot->consequences() &&
+                proof.guardedProof->relation().minimumPaymentShift > 0 && !proof.comparison.valid();
+        }
         RelativeStockComparison comparison;
         if (proof.incumbent.quote() && proof.challenger.quote())
         {
-            auto incumbent = *proof.incumbent.quote();
-            auto challenger = *proof.challenger.quote();
-            incumbent.economic = proof.incumbent.replay->seatedEconomicTotal;
-            challenger.economic = proof.challenger.replay->seatedEconomicTotal;
-            comparison = compareRelativeStock(incumbent, challenger);
+            comparison = evaluator.recordedComparison(proof.incumbent, proof.challenger,
+                                                      proof.incumbentOursCap, proof.challengerOursCap);
         }
         else
         {
@@ -82,6 +105,12 @@ namespace
             comparison.ownedDelta == proof.comparison.ownedDelta &&
             comparison.commonEnemyCancelled == proof.comparison.commonEnemyCancelled &&
             comparison.reason == proof.comparison.reason;
+    }
+
+    std::optional<Coordinator::MilliFunds> effectiveCap(std::optional<Coordinator::MilliFunds> cap,
+                                                        const Coordinator::MasterAssignmentEvaluation & evaluation)
+    {
+        return cap && evaluation.quote() && *cap < evaluation.quote()->ours.upper ? cap : std::nullopt;
     }
 }
 
@@ -151,13 +180,14 @@ namespace Coordinator
         const auto structural = masterWorkProduct(graph, graph);
         const auto publication = structural ? repeatedWork(*structural, PUBLICATION_PASSES) : std::nullopt;
         const auto copies = repeatedWork(payload, PAYLOAD_COPY_PASSES);
+        const auto refusalsBefore = m_ledger.stats().refusals;
         const auto evaluation = m_evaluator.finalizationWork();
         m_publicationWork = publication.value_or(0);
         if (!publication || !copies || !evaluation ||
             !RelativeStockDetail::checkedAdd(m_publicationWork, *copies))
         {
-            m_status = m_ledger.lastRefusal() ? MasterInstallationStatus::BudgetExhausted
-                                            : MasterInstallationStatus::ArithmeticFailure;
+            m_status = m_ledger.stats().refusals != refusalsBefore
+                ? MasterInstallationStatus::BudgetExhausted : MasterInstallationStatus::ArithmeticFailure;
             return m_status;
         }
         m_reservedWork = m_publicationWork;
@@ -248,7 +278,7 @@ namespace Coordinator
             !m_evaluator.ownsRetainedEvaluation(retained->challenger) ||
             !std::equal(retained->incumbent.state.choices.begin(), retained->incumbent.state.choices.end(),
                         m_problem.incumbentChoices().begin(), m_problem.incumbentChoices().end()) ||
-            !recordedComparisonMatches(*retained))
+            !recordedComparisonMatches(*retained, m_evaluator))
         {
             return complete(MasterInstallationStatus::InvalidContext);
         }
@@ -260,6 +290,23 @@ namespace Coordinator
                 return complete(status == MasterObjectiveStatus::BudgetExhausted
                     ? MasterInstallationStatus::BudgetExhausted : MasterInstallationStatus::ProofFailure);
             }
+        }
+        if (m_evaluator.hasGuardedStock())
+        {
+            if (!retained->guardedProof)
+            {
+                return complete(MasterInstallationStatus::ProofFailure);
+            }
+            const auto status = m_evaluator.verifyGuarded(*retained->guardedProof, true);
+            if (status != GuardedRelationStatus::Verified)
+            {
+                return complete(status == GuardedRelationStatus::BudgetExhausted
+                    ? MasterInstallationStatus::BudgetExhausted : MasterInstallationStatus::ProofFailure);
+            }
+        }
+        else if (retained->guardedProof)
+        {
+            return complete(MasterInstallationStatus::InvalidContext);
         }
         auto incumbent = m_evaluator.evaluate(retained->incumbent.state);
         if (!verified(incumbent))
@@ -283,12 +330,27 @@ namespace Coordinator
         {
             return complete(MasterInstallationStatus::InvalidContext);
         }
-        const auto comparison = m_evaluator.compare(incumbent, challenger);
-        if (!verified(incumbent) || !verified(challenger) || !comparison.valid())
+        RelativeStockComparison comparison;
+        MasterGuardedComparison guarded;
+        if (m_evaluator.hasGuardedStock())
         {
+            guarded = m_evaluator.compareGuarded(incumbent, challenger);
+        }
+        else
+        {
+            comparison = m_evaluator.compareRecorded(incumbent, challenger,
+                                                     retained->incumbentOursCap, retained->challengerOursCap);
+        }
+        if (!verified(incumbent) || !verified(challenger) ||
+            (m_evaluator.hasGuardedStock() ? guarded.status != GuardedRelationStatus::Verified : !comparison.valid()))
+        {
+            if (m_evaluator.hasGuardedStock() && guarded.status == GuardedRelationStatus::BudgetExhausted)
+            {
+                return complete(MasterInstallationStatus::BudgetExhausted);
+            }
             return complete(MasterInstallationStatus::ProofFailure);
         }
-        if (!comparison.improves())
+        if (m_evaluator.hasGuardedStock() ? !guarded.improves() : !comparison.improves())
         {
             return complete(MasterInstallationStatus::NonImprovement);
         }
@@ -311,7 +373,9 @@ namespace Coordinator
         replacement.plan = challenger.replay->plan;
         replacement.executionOrder = challenger.replay->ordering.order;
         result.proof = MasterImprovementProof{
-            std::move(incumbent), std::move(challenger), comparison, m_ledger.stats().spent()};
+            std::move(incumbent), std::move(challenger), comparison, m_ledger.stats().spent(), guarded.proof};
+        result.proof->incumbentOursCap = effectiveCap(retained->incumbentOursCap, result.proof->incumbent);
+        result.proof->challengerOursCap = effectiveCap(retained->challengerOursCap, result.proof->challenger);
         static_assert(std::is_nothrow_move_assignable_v<AssignmentResult>);
         incoming = std::move(replacement);
         return complete(MasterInstallationStatus::Installed);

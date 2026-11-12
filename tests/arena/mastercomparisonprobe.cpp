@@ -10,17 +10,21 @@
 #include <QFile>
 #include <QJsonDocument>
 
+#include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/masterassignmentcapture.h"
 #include "ai/coordinator/masterassignmentstock.h"
 #include "ai/coordinator/masterassignmenttrace.h"
 #include "tests/coordinator_ai/masterassignmentoracle.h"
+#include "tests/arena/masterstockreference.h"
+#include "ai/coordinator/masterassignmentshadow.h"
 
 namespace
 {
     using namespace Coordinator;
     constexpr auto REQUEST_VARIABLE = "COW_MASTER_COMPARISON_REQUEST";
     constexpr auto OUTPUT_VARIABLE = "COW_MASTER_COMPARISON_OUTPUT";
+    constexpr auto STOCK_REFERENCE_VARIABLE = "COW_MASTER_STOCK_REFERENCE";
     constexpr auto CERTIFICATE_PREPARATION_KEY = "certificatePreparation";
     constexpr auto READINESS_AUDIT_KEY = "readinessAudit";
     constexpr auto WARM_START_AUDIT_KEY = "warmStartAudit";
@@ -766,6 +770,54 @@ namespace
 
 namespace ArenaMasterComparisonProbe
 {
+    StockReferenceResult recordStockReference(
+        const MasterShadowConfig & config, const AssignmentInput & input, const AssignmentResult & incumbent,
+        const PropertyStockField & field, const DecisionTraceIdentity & identity)
+    {
+        if (!ArenaMasterStockReference::enabled(config, qgetenv(STOCK_REFERENCE_VARIABLE)))
+        {
+            return StockReferenceResult::NotRequested;
+        }
+        const auto requestPath = QString::fromLocal8Bit(qgetenv(REQUEST_VARIABLE));
+        const auto outputPath = QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE));
+        QFile requestFile(requestPath);
+        if (!QDir::isAbsolutePath(requestPath) || !QDir::isAbsolutePath(outputPath) ||
+            !requestFile.open(QIODevice::ReadOnly) ||
+            requestFile.size() > ArenaMasterStockReference::MAXIMUM_REQUEST_BYTES)
+        {
+            return ArenaMasterStockReference::failure(
+                outputPath, {}, QStringLiteral("reference input path, size or read failure"));
+        }
+        const auto bytes = requestFile.readAll();
+        QString error;
+        const auto request = ArenaMasterStockReference::parse(bytes, identity, input.actors.size(), error);
+        if (!request)
+        {
+            return ArenaMasterStockReference::failure(outputPath, bytes, error);
+        }
+        RefinementLedger ledger;
+        if (!ledger.open(request->allowance))
+        {
+            return ArenaMasterStockReference::failure(outputPath, bytes, QStringLiteral("reference ledger refused"));
+        }
+        MasterAssignmentProfile profile;
+        auto capture = captureMasterAssignment(input, incumbent, identity.planSequence, ledger, &profile);
+        if (!capture.extraction.valid() || !ArenaMasterStockReference::matches(*request, *capture.extraction.problem))
+        {
+            return ArenaMasterStockReference::failure(
+                outputPath, bytes, QStringLiteral("reference extraction, model or incoming tuple mismatch"), &ledger.stats());
+        }
+        MasterAssignmentStockContext stock;
+        if (stock.prepare(field, input, ledger, &profile, SequentialTierAuditMode::Full) != MasterStockSetupStatus::Prepared)
+        {
+            return ArenaMasterStockReference::failure(
+                outputPath, bytes, QStringLiteral("cold reference stock preparation failed"), &ledger.stats());
+        }
+        MasterAssignmentEvaluator evaluator(*capture.extraction.problem, ledger, *stock.session(), stock.tariffs(), &profile);
+        return ArenaMasterStockReference::record(
+            *request, *capture.extraction.problem, evaluator, ledger, outputPath, &profile);
+    }
+
     void record(const AssignmentInput & input, const AssignmentResult & incumbent,
                 const PropertyStockField & field, const DecisionTraceIdentity & identity)
     {

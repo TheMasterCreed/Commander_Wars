@@ -46,4 +46,7 @@ namespace Coordinator
     MasterFuturePricing priceMasterFuture(
         const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
         RefinementLedger & ledger, RefinementWork category);
+    const MasterFutureAction* findMasterFutureAction(const MasterFutureCatalog & catalog,
+                                                     const CanonicalPlanActionKey & key);
+    std::int32_t futureNodeOfColumn(std::span<const PropertyStockColumn> columns, std::int32_t slot);
 }

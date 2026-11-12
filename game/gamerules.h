@@ -106,6 +106,14 @@ public:
     const Password & getPassword() const;
     spGameRule getSpGameRule(const QString & rule);
     spVictoryRule getSpVictoryRule(const QString & rule);
+    const QVector<QVector<qint32>> & getWeatherForecast() const
+    {
+        return m_WeatherDays;
+    }
+    qint32 getDayWeather() const
+    {
+        return m_DayWeather;
+    }
 signals:
     void sigVictory(qint32 team);
 public:

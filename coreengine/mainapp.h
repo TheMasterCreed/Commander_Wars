@@ -166,6 +166,7 @@ public:
     static QString qsTr(QString text);
 
     bool getNoUi() const;
+    bool getNoAudio() const;
     /**
      * @brief getLastCreateLineEdit
      * @return

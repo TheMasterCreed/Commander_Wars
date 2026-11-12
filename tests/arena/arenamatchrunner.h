@@ -24,6 +24,8 @@ class ArenaMatchRunner final : public QObject
     Q_OBJECT
 public:
     static bool shouldRun();
+    static spGameMap prepareFixture(const ArenaMatchConfig & config, QString & error);
+    static bool applyFixtureRuntime(const ArenaMatchConfig & config, QString & error);
 
     explicit ArenaMatchRunner(QObject* pParent = nullptr);
     void run();
@@ -39,10 +41,10 @@ private:
     static QString configPath();
 
     bool loadConfig();
-    bool loadMap();
-    bool applyPlayerSetup();
+    bool loadMap(QString & error);
+    bool applyPlayerSetup(QString & error);
     void setStockControlPrefixHold(bool held);
-    bool applyGameRules();
+    bool applyGameRules(QString & error);
     void addDefaultVictoryRules(GameRules* pRules);
     void startMenue();
     void spliceActionHandling();

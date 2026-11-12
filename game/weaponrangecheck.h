@@ -21,6 +21,11 @@ enum class RangeCheck : std::int32_t
 
 constexpr std::int32_t DIRECT_RANGE = 1;
 
+constexpr bool hasAmmo(std::int32_t current, std::int32_t maximum)
+{
+    return maximum < 0 || current > 0;
+}
+
 struct Slot
 {
     bool hasWeapon{false};

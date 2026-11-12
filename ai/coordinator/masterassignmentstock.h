@@ -24,6 +24,7 @@ namespace Coordinator
         MasterStockSetupStatus prepare(const PropertyStockField & source, const AssignmentInput & input,
                                        RefinementLedger & ledger, MasterAssignmentProfile* profile = nullptr,
                                        SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full);
+        MasterStockSetupStatus prepareOperationService();
         RelativeStockSession* session();
         MasterValuationTariffs tariffs() const;
         MasterStockSetupStatus status() const;

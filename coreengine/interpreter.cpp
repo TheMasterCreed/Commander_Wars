@@ -194,6 +194,7 @@ bool Interpreter::openScript(const QString & script, bool setup)
         // QJSEngine drops the name of a qrc script when the path starts with a doubled slash
         const QString scriptName = GlobalUtils::collapseDoubleSlashes(script);
         m_scriptFunctionSource->storeScriptText(scriptName, contents);
+        ++m_realmEntries;
         QJSValue value = evaluate(contents, scriptName);
         if (value.isError())
         {
@@ -216,6 +217,7 @@ bool Interpreter::loadScript(const QString & content, const QString & script)
     CONSOLE_PRINT_MODULE("Interpreter::loadScript: " + script, GameConsole::eDEBUG, GameConsole::eJavaScript);
     const QString scriptName = GlobalUtils::collapseDoubleSlashes(script);
     m_scriptFunctionSource->storeScriptText(scriptName, content);
+    ++m_realmEntries;
     QJSValue value = evaluate(content, scriptName);
     if (value.isError())
     {
@@ -235,6 +237,7 @@ QJSValue Interpreter::doString(const QString & task)
 {
     clearJsStack();
     ++m_inJsCall;
+    ++m_realmEntries;
     QJSValue value = evaluate(task, "GameCode");
     exitJsCall();
     if (value.isError())
@@ -246,21 +249,25 @@ QJSValue Interpreter::doString(const QString & task)
 
 void Interpreter::pushInt(const QString & name, qint32 value)
 {
+    ++m_realmEntries;
     globalObject().setProperty(name, value);
 }
 
 void Interpreter::pushDouble(const QString & name, double value)
 {
+    ++m_realmEntries;
     globalObject().setProperty(name, value);
 }
 
 void Interpreter::pushString(const QString & name, const QString & value)
 {
+    ++m_realmEntries;
     globalObject().setProperty(name, value);
 }
 
 void Interpreter::pushObject(const QString & name, QObject* object)
 {
+    ++m_realmEntries;
     QJSValue newQObj = newQObject(object);
     globalObject().setProperty(name, newQObj);
 }
@@ -336,12 +343,14 @@ QString Interpreter::getGlobalString(const QString & var)
 
 QJSValue Interpreter::getGlobal(const QString & var)
 {
+    ++m_realmEntries;
     QJSValue value = globalObject().property(var);
     return value;
 }
 
 void Interpreter::setGlobal(const QString & var, const QJSValue & obj)
 {
+    ++m_realmEntries;
     globalObject().setProperty(var, obj);
 }
 

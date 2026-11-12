@@ -20,6 +20,11 @@
 class CoordinatedAi;
 using spCoordinatedAi = std::shared_ptr<CoordinatedAi>;
 
+namespace Coordinator
+{
+    struct MasterShadowConfig;
+}
+
 class CoordinatedAi final : public NormalAi
 {
     Q_OBJECT
@@ -59,6 +64,9 @@ public:
 public slots:
     void process() override;
 
+signals:
+    void sigStockControlStopped(const QString & reason);
+
 private:
     static constexpr qint32 UNBUILT_DAY = -1;
 
@@ -66,6 +74,11 @@ private:
     void buildFactLayers();
     void ensureTurnPlan();
     void buildTurnPlan();
+    void stopStockControl(const Coordinator::MasterShadowConfig & config, const QString & reason);
+    bool playStockControlAvailable() const;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    void stopStockReference(const QString & reason);
+#endif
     Unit* plannableUnit(const Coordinator::KnownUnit & known) const;
     std::vector<Coordinator::KnownUnitLink> linkKnownUnits(
         const Coordinator::BattlefieldKnowledge & knowledge) const;
@@ -110,6 +123,7 @@ private:
     qint32 m_testRefinementScheduleDay{-1};
     Coordinator::SequentialTierAuditMode m_testTierAuditMode{Coordinator::SequentialTierAuditMode::Full};
     bool m_testStockControlHeld{false};
+    bool m_testStockReferenceStopped{false};
 #endif
 };
 

@@ -353,6 +353,8 @@ public:
     Q_INVOKABLE QString getPipeUuid();
     Q_INVOKABLE void setSpawnAiProcess(bool newSpawnAiProcess);
     Q_INVOKABLE bool getSpawnAiProcess();
+    Q_INVOKABLE bool getCoordinatedAiStockControl();
+    Q_INVOKABLE void setCoordinatedAiStockControl(bool newCoordinatedAiStockControl);
     Q_INVOKABLE bool getAutomaticUpdates();
     Q_INVOKABLE void setAutomaticUpdates(bool newAutomaticUpdates);
     Q_INVOKABLE QColor getMapFolderColor();
@@ -1061,6 +1063,7 @@ private:
     QString m_updateStep;
     QString m_pipeUuid;
     bool m_spawnAiProcess{DEFAULTAIPIPE};
+    bool m_coordinatedAiStockControl{false};
     bool m_aiSlave{false};
     bool m_syncEvents{true};
 

@@ -241,28 +241,29 @@ namespace
                "a retained witnessed floor is neither an exact search nor an improvement");
     }
 
-    void testIndependentEnemyAndReplay()
+    void testCapturedKeysShareEnemyAndReplay()
     {
         PropertyStockField field;
         PropertyStockInstance enemy;
         Session session(field, enemy, 100);
         session.plans[INCUMBENT] = {{{10, 10}, 10, 0}, {}, 0};
-        session.plans[CHALLENGER] = {{{10, 10}, 10, 0}, {1}, 0};
+        session.plans[CHALLENGER] = {{{11, 11}, 11, 0}, {1}, 0};
         session.enemies[{}] = {{0, 200}, 100, 3};
         session.enemies[{1}] = {{0, 100}, 40, 4};
         auto incumbent = session.quote(INCUMBENT, 0);
         auto challenger = session.quote(CHALLENGER, 0);
         Observer observer;
         const auto result = refineRelativeStock(session, incumbent, challenger, {.workLimit = 100}, observer);
-        expect(result.comparison.improves() && !result.comparison.commonEnemyCancelled,
-               "independent enemy terms are refined conservatively");
-        expect(observer.steps.front().target == RelativeStockTarget::IncumbentEnemy &&
-                   result.enemyStatesUsed == 7 && session.ourCalls == 0,
-               "only uncertain independent enemy contributors are searched");
+        expect(result.comparison.improves() && result.comparison.commonEnemyCancelled &&
+                   result.comparison.deltaLower == 1,
+               "different captured keys cancel the enemy and prove exactly +1");
+        expect(observer.steps.empty() && result.enemyStatesUsed == 0 && session.enemyCalls == 0 &&
+                   session.ourCalls == 0,
+               "uncertain enemy bounds under different captured keys receive no search");
         expect(replayRelativeStockProof(session, incumbent, challenger, incumbent, challenger),
                "complete matching decomposition and witnesses permit replay");
-        expect(session.ourReplayCalls == 2 && session.enemyReplayCalls == 2,
-               "independent replay verifies both our and both enemy witnesses");
+        expect(session.ourReplayCalls == 2 && session.enemyReplayCalls == 0,
+               "replay verifies both our witnesses and no cancelled enemy witness");
         auto changed = challenger;
         changed.key = INCUMBENT;
         expect(!replayRelativeStockProof(session, incumbent, challenger, incumbent, changed), "replay matches the key");
@@ -731,7 +732,7 @@ int main()
     testResumedRungs();
     testInvalidRefinement();
     testRetainedWitness();
-    testIndependentEnemyAndReplay();
+    testCapturedKeysShareEnemyAndReplay();
     testBoundedMixedRefundsAndLaterFittingKey();
     testMixedBoundaryYieldsAfterOneFittingKey();
     testVerifiedDualIntegration();

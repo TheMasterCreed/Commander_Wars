@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -226,6 +228,56 @@ namespace Coordinator
         std::int32_t actionCount() const
         {
             return static_cast<std::int32_t>(m_actions.size());
+        }
+
+        std::optional<std::int64_t> copyScanWork() const
+        {
+            const auto limit = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - 1);
+            if (m_actions.size() > limit || m_damageClaims.size() > limit - m_actions.size())
+            {
+                return std::nullopt;
+            }
+            return static_cast<std::int64_t>(m_actions.size() + m_damageClaims.size() + 1);
+        }
+
+        std::optional<std::int64_t> copyWorkUnits() const
+        {
+            std::int64_t work = sizeof(TurnPlan);
+            const auto add = [&](std::size_t count, std::size_t bytes)
+            {
+                const auto remaining = std::numeric_limits<std::int64_t>::max() - work;
+                if (bytes == 0 || count > static_cast<std::size_t>(remaining) / bytes)
+                {
+                    return false;
+                }
+                work += static_cast<std::int64_t>(count * bytes);
+                return true;
+            };
+            if (!add(m_actions.size(), sizeof(PlannedAction)) ||
+                !add(m_edges.size(), sizeof(PlanEdge)) ||
+                !add(m_destinationClaims.size(), sizeof(TileClaim)) ||
+                !add(m_captureClaims.size(), sizeof(TileClaim)) ||
+                !add(m_serviceClaims.size(), sizeof(ServiceClaim)) ||
+                !add(m_damageClaims.size(), sizeof(DamageClaim)))
+            {
+                return std::nullopt;
+            }
+            for (const auto & action : m_actions)
+            {
+                if (!add(action.path.size(), sizeof(TilePoint)) ||
+                    !add(static_cast<std::size_t>(action.actionId.size()), sizeof(QChar)))
+                {
+                    return std::nullopt;
+                }
+            }
+            for (const auto & claim : m_damageClaims)
+            {
+                if (!add(claim.contributions.size(), sizeof(DamageContribution)))
+                {
+                    return std::nullopt;
+                }
+            }
+            return work;
         }
 
         bool hasAction(std::int32_t index) const

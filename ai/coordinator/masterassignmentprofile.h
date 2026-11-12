@@ -72,6 +72,7 @@ namespace Coordinator
         MasterAssignmentProfile(const MasterAssignmentProfile &) = delete;
         MasterAssignmentProfile & operator=(const MasterAssignmentProfile &) = delete;
         void recordFirstImprovement();
+        std::optional<std::int64_t> elapsedNanos() const;
         std::array<MasterPhaseSample, MASTER_PHASE_NAMES.size()> samples{};
         std::optional<std::int64_t> firstImprovementNanos;
         SequentialCostAudit* friendlySequentialCost{nullptr};
@@ -133,18 +134,26 @@ namespace Coordinator
         std::int64_t m_nestedNanos{0};
     };
 
-    inline void MasterAssignmentProfile::recordFirstImprovement()
+    inline std::optional<std::int64_t> MasterAssignmentProfile::elapsedNanos() const
     {
-        if (firstImprovementNanos || m_active == nullptr)
+        if (m_active == nullptr)
         {
-            return;
+            return std::nullopt;
         }
         const auto* root = m_active;
         while (root->m_parent != nullptr)
         {
             root = root->m_parent;
         }
-        firstImprovementNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
             MasterProfileScope::Clock::now() - root->m_start).count();
+    }
+
+    inline void MasterAssignmentProfile::recordFirstImprovement()
+    {
+        if (!firstImprovementNanos)
+        {
+            firstImprovementNanos = elapsedNanos();
+        }
     }
 }

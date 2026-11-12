@@ -3,6 +3,8 @@
 #include <QCoreApplication>
 
 #include "ai/coordinator/masterassignmentsearch.h"
+#include "ai/coordinator/masteroperationservice.h"
+#include "ai/coordinator/propertystockfield.h"
 #include "tests/coordinator_ai/masterassignmenttestfixture.h"
 #include "tests/coordinator_ai/masterassignmenttestexport.h"
 
@@ -10,6 +12,138 @@ namespace
 {
     using namespace Coordinator;
     using namespace MasterAssignmentTest;
+
+    class RegistrySession final : public RelativeStockSession
+    {
+    public:
+        RegistrySession(const PropertyStockField & field, const PropertyStockInstance & enemy)
+            : RelativeStockSession(field, enemy)
+        {
+        }
+
+        RelativeStockIdentity scope() const { return identity(); }
+        RelativeStockQuote quote(const TurnPlan &, MilliFunds) override { return {}; }
+        RelativeStockQuote quote(const ContinuationKey &, MilliFunds) override { return {}; }
+        RelativeStockRefinedTerm refineOur(const ContinuationKey &, std::int64_t) override { return {}; }
+        RelativeStockRefinedTerm refineEnemy(const std::vector<std::int32_t> &, std::int64_t) override { return {}; }
+        bool replayOurWitness(const RelativeStockQuote &) override { return false; }
+        bool replayEnemyWitness(const RelativeStockQuote &) override { return false; }
+        std::int64_t remainingWork() const override { return 0; }
+        std::int64_t ourRerunWork() const override { return 0; }
+        std::int64_t enemyRerunWork(const std::vector<std::int32_t> &) const override { return 0; }
+    };
+
+    std::shared_ptr<MasterAssignmentEvaluation> registryEvaluation(
+        const MasterAssignmentProblem & problem, const RelativeStockIdentity & stock,
+        ContinuationKey key, std::vector<std::int32_t> mask)
+    {
+        auto result = std::make_shared<MasterAssignmentEvaluation>();
+        result->state.identity = problem.identity();
+        auto proof = std::make_shared<RelativeStockProofSnapshot>();
+        proof->quote.identity = stock;
+        proof->quote.key = std::move(key);
+        proof->quote.capturedColumns = std::move(mask);
+        result->proof = std::move(proof);
+        return result;
+    }
+
+    void operationRegistry()
+    {
+        Fixture fixture(1);
+        fixture.seat();
+        const auto problem = fixture.extract();
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        auto session = std::make_unique<RegistrySession>(field, enemy);
+        auto incoming = registryEvaluation(
+            problem, session->scope(), {CanonicalPlanActionKey::fromAction(0, 0, 0, false)}, {});
+        auto challenger = registryEvaluation(
+            problem, session->scope(), {CanonicalPlanActionKey::fromAction(0, 1, 0, false)}, {});
+        std::array<MasterOperationDescriptor, 5> roles{{
+            {incoming, MasterRefinementTerm::Friendly},
+            {challenger, MasterRefinementTerm::Friendly},
+            {incoming, MasterRefinementTerm::Enemy},
+            {challenger, MasterRefinementTerm::Enemy},
+            {incoming, MasterRefinementTerm::FutureDual}}};
+        RefinementLedger ledger;
+        require(ledger.open(1000000), "operation registry ledger");
+        MasterOperationRegistry registry;
+        std::array<std::size_t, 5> indices{};
+        require(registry.prepare(problem.identity(), roles, ledger, 128, 4096, indices),
+                "canonical registry preparation");
+        expect(registry.size() == 4 && indices[2] == indices[3] && indices[0] != indices[4],
+               "shared mask deduplicates but friendly search and dual remain separate");
+        expect(MasterOperationRegistry::credit(registry.at(indices[0]), 8440000) &&
+               registry.at(indices[2]).paidWork == 0 && registry.at(indices[4]).paidWork == 0,
+               "friendly debt never services enemy or dual");
+        expect(MasterOperationRegistry::credit(registry.at(indices[2]), 178165) &&
+               registry.at(indices[3]).paidWork == 178165,
+               "same enemy operation reached from another plan retains its paid history");
+        const auto beforeCredit = ledger.stats().spent();
+        MasterOperationRegistry::credit(registry.at(indices[1]), 100);
+        expect(ledger.stats().spent() == beforeCredit, "service attribution never debits the ledger again");
+        auto & friendly = registry.at(indices[0]);
+        require(MasterOperationRegistry::grow(friendly, ledger, 4, false, false, true),
+                "unadmitted operation leaves grant unchanged");
+        expect(friendly.allowance == 128, "no growth for unavailable or unfunded operation");
+        require(MasterOperationRegistry::grow(friendly, ledger, 4, true, false, true),
+                "admitted valid unfinished operation grows");
+        expect(friendly.allowance == 512 && ledger.stats().spent() - beforeCredit == MASTER_OPERATION_QUOTA_WORK,
+               "admitted no-progress work grows once with separately charged quota arithmetic");
+        require(MasterOperationRegistry::grow(friendly, ledger, 4, true, true, true), "completed native operation");
+        expect(friendly.allowance == 512, "completed native operation does not grow");
+        friendly.allowance = std::numeric_limits<std::int64_t>::max();
+        require(MasterOperationRegistry::grow(friendly, ledger, 4, true, false, true), "quota overflow parks operation");
+        expect(friendly.growthExhausted, "overflow does not wrap or clamp a grant");
+
+        auto sameKey = registryEvaluation(problem, session->scope(), incoming->proof->quote.key, {70});
+        const std::array<MasterOperationDescriptor, 1> sameFriendly{{{sameKey, MasterRefinementTerm::Friendly}}};
+        require(registry.prepare(problem.identity(), sameFriendly, ledger, 128, 4096, indices),
+                "friendly identity ignores independently owned enemy mask");
+        expect(registry.at(indices[0]).paidWork == 8440000 && registry.at(indices[0]).growthExhausted,
+               "full friendly key shares service and canonical grant");
+        std::vector<std::int32_t> wideMask;
+        for (std::int32_t column = 0; column < 71; ++column)
+        {
+            wideMask.push_back(column);
+        }
+        auto wide = registryEvaluation(problem, session->scope(), {}, wideMask);
+        wideMask.back() = 72;
+        auto distinct = registryEvaluation(problem, session->scope(), {}, wideMask);
+        const std::array<MasterOperationDescriptor, 2> wideRoles{{
+            {wide, MasterRefinementTerm::Enemy}, {distinct, MasterRefinementTerm::Enemy}}};
+        require(registry.prepare(problem.identity(), wideRoles, ledger, 128, 4096, indices), "wide enemy identities");
+        expect(indices[0] != indices[1], "columns beyond 64 participate in the complete mask identity");
+
+        session.reset();
+        expect(!incoming->proof->quote.identity.established(), "old operation context expires");
+        session = std::make_unique<RegistrySession>(field, enemy);
+        auto fresh = registryEvaluation(problem, session->scope(), {}, {});
+        const std::array<MasterOperationDescriptor, 1> freshRoles{{{fresh, MasterRefinementTerm::Enemy}}};
+        require(registry.prepare(problem.identity(), freshRoles, ledger, 128, 4096, indices), "replacement live context");
+        expect(registry.size() == 1 && registry.at(indices[0]).paidWork == 0 &&
+               registry.at(indices[0]).allowance == 128, "new context never inherits old service or grants");
+
+        const std::array<std::size_t, 5> callbackSizes{36, 36, 0, 3, 36};
+        expect(MasterOperationRegistry::tariff(5, callbackSizes) == 5356, "saved callback-51 registry arithmetic");
+        expect(17081 + 128 + 5 * 6699 + 4 * 31823 + 169 == 178165 &&
+               16171317 - 178165 - 5356 == 15987796, "saved displacement affordability, excluding new inspection fees");
+        const std::array<std::size_t, 1> huge{std::numeric_limits<std::size_t>::max()};
+        expect(!MasterOperationRegistry::tariff(1, huge), "registry size arithmetic fails closed");
+        const std::array<std::size_t, 1> emptyPayload{0};
+        const auto exactFee = *MasterOperationRegistry::tariff(0, emptyPayload) +
+            MASTER_OPERATION_REGISTRY_QUOTE_WORK;
+        for (const auto funding : {exactFee - 1, exactFee})
+        {
+            RefinementLedger limited;
+            require(limited.open(funding), "registry threshold ledger");
+            MasterOperationRegistry limitedRegistry;
+            const bool prepared = limitedRegistry.prepare(problem.identity(), freshRoles, limited, 128, 4096, indices);
+            expect(prepared == (funding == exactFee) && limited.stats().spent() <= funding,
+                   "exact registry funding threshold and safe refusal");
+            expect(prepared || limitedRegistry.size() == 0, "unfunded construction retains no partially inserted identity");
+        }
+    }
 
     MasterAssignmentSearchResult solve(const MasterAssignmentProblem & problem, std::int64_t work,
                                       std::int32_t dualRounds = 4, MasterAssignmentSearchObserver* observer = nullptr)
@@ -424,6 +558,124 @@ namespace
                "an earlier completion witness is reused when best-upper traversal reaches that exact tuple");
     }
 
+    MasterAssignmentSearchResult solveContributionCompletion(
+        const MasterAssignmentProblem & problem, std::int64_t allowance)
+    {
+        RefinementLedger ledger;
+        require(ledger.open(allowance), "contribution completion ledger");
+        MasterAssignmentEvaluator evaluator(problem, ledger);
+        MasterAssignmentSearchOptions options;
+        options.schedule.initialContributionCompletion = true;
+        options.retainDiagnostics = true;
+        return searchMasterAssignment(problem, evaluator, ledger, options);
+    }
+
+    void initialContributionCompletion()
+    {
+        Fixture independent(2);
+        for (auto & actor : independent.input.actors)
+        {
+            actor.candidates[0].valuation.ledger.enemyCapital = 0;
+        }
+        independent.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 7, 1));
+        independent.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 9, 1));
+        independent.seat();
+        const auto problem = independent.extract();
+        const auto exact = MasterAssignmentOracle::enumerate(problem, request());
+        const auto completed = solveContributionCompletion(problem, 1000000);
+        check(problem, exact, completed, 1000000);
+        expect(completed.globalOptimal && completed.lower == 16 &&
+                   completed.stats.firstImprovementLower == 16 && completed.stats.contributionCompletions == 1,
+               "the initial contribution descent produces one complete joint witness");
+        require(completed.stats.firstImprovementWork.has_value(), "contribution witness has a paid proof boundary");
+        for (const auto allowance : {std::int64_t{0}, std::int64_t{64},
+                                     *completed.stats.firstImprovementWork / 2,
+                                     *completed.stats.firstImprovementWork - 1})
+        {
+            const auto interrupted = solveContributionCompletion(problem, allowance);
+            check(problem, exact, interrupted, allowance);
+            expect(interrupted.domainAccounted && interrupted.stats.work.spent() <= allowance,
+                   "interrupted proposal construction preserves the original search region");
+        }
+
+        Fixture conflict(2);
+        for (auto & actor : conflict.input.actors)
+        {
+            actor.candidates[0].valuation.ledger.enemyCapital = 0;
+        }
+        conflict.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {1, 1}, 10, 1));
+        conflict.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 20, 1));
+        conflict.seat();
+        const auto conflictProblem = conflict.extract();
+        const auto conflictExact = MasterAssignmentOracle::enumerate(conflictProblem, request());
+        const auto improved = solveContributionCompletion(conflictProblem, 1000000);
+        check(conflictProblem, conflictExact, improved, 1000000);
+        expect(improved.globalOptimal && improved.lower == 20 && improved.stats.firstImprovementLower == 10,
+               "ordinary exploration can improve beyond the greedy witness");
+
+        Fixture cycle(3);
+        for (auto & actor : cycle.input.actors)
+        {
+            actor.candidates[0].valuation.ledger.enemyCapital = 0;
+        }
+        for (std::int32_t actor = 0; actor < 3; ++actor)
+        {
+            cycle.input.actors[actor].candidates.push_back(
+                moveCandidate(actor, {actor, 0}, {(actor + 1) % 3, 0}, 100, 1));
+        }
+        cycle.seat();
+        const auto cycleProblem = cycle.extract();
+        const auto cycleExact = MasterAssignmentOracle::enumerate(cycleProblem, request());
+        const auto rejected = solveContributionCompletion(cycleProblem, 1000000);
+        check(cycleProblem, cycleExact, rejected, 1000000);
+        expect(rejected.globalOptimal && rejected.lower == 0 && !rejected.improvement &&
+                   rejected.stats.contributionCompletions == 1 && rejected.stats.infeasible > 0,
+               "full replay rejects the greedy vacate cycle without discarding legal alternatives");
+    }
+
+    void priorAttemptRefusal()
+    {
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, 7, 1));
+        fixture.input.actors[1].candidates.push_back(moveCandidate(1, {1, 0}, {1, 1}, 9, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        for (const bool alternatives : {false, true})
+        {
+            std::optional<MasterAssignmentSearchResult> baseline;
+            for (const bool refused : {false, true})
+            {
+                RefinementLedger ledger;
+                require(ledger.open(1000000), "shared attempt ledger");
+                if (refused)
+                {
+                    RefinementLedger::WorkLimit limit(ledger, 0);
+                    require(!ledger.consume(1, RefinementWork::MasterPreparation), "earlier attempt refused");
+                }
+                MasterAssignmentEvaluator evaluator(problem, ledger);
+                MasterAssignmentSearchOptions options;
+                options.schedule.initialIncumbentAlternatives = alternatives;
+                const auto result = searchMasterAssignment(problem, evaluator, ledger, options);
+                expect(result.globalOptimal && result.improvement && result.lower == 16 &&
+                           ledger.stats().refusals == static_cast<int>(refused),
+                       "a previous attempt refusal preserves later search and aggregate accounting");
+                expect(!alternatives || result.stats.initialIncumbentAlternatives == 2,
+                       "initial alternatives visit each mutable actor's alternate candidate");
+                if (baseline)
+                {
+                    expect(result.best->state.choices == baseline->best->state.choices &&
+                               result.stats.work.spent() == baseline->stats.work.spent() &&
+                               result.stats.firstImprovementWork == baseline->stats.firstImprovementWork,
+                           "prior refusal changes neither discovery nor paid search work");
+                }
+                else
+                {
+                    baseline = result;
+                }
+            }
+        }
+    }
+
     void observerIsolation()
     {
         Fixture fixture(2);
@@ -552,9 +804,12 @@ int main(int argc, char** argv)
     scopedIdentitiesAndLargeResources();
     improvementBeforeGlobalProof();
     completionWitnessMemo();
+    initialContributionCompletion();
+    priorAttemptRefusal();
     observerIsolation();
     firstOwnedProofTiming();
     missingGenerationOrdering();
+    operationRegistry();
     std::printf("Master assignment search: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 4;
 }

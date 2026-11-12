@@ -34,7 +34,7 @@ IngameInfoBar::IngameInfoBar(GameMenue *pMenu, GameMap *pMap)
     setupJsThis(this);
     Interpreter * pInterpreter = Interpreter::getInstance();
     QJSValueList args({m_jsThis,
-                        JsThis::getJsThis(m_pMap)});
+                        JsThis::getJsThis(m_pMap.data())});
     QJSValue erg = pInterpreter->doFunction("IngameInfoBar", "preInitValues", args);
 
     UiFactory::getInstance().createUi("ui/game/ingameInfoBar.xml", this);
@@ -80,21 +80,21 @@ IngameInfoBar::IngameInfoBar(GameMenue *pMenu, GameMap *pMap)
 
 void IngameInfoBar::updatePlayerInfo()
 {
-    if (Mainapp::getInstance()->getNoUi())
+    if (Mainapp::getInstance()->getNoUi() || m_pMenu.isNull() || m_pMap.isNull())
     {
         return;
     }
     Mainapp::getInstance()->pauseRendering();
     Interpreter * pInterpreter = Interpreter::getInstance();
     QJSValueList args({m_jsThis,
-                       JsThis::getJsThis(m_pMap)});
+                       JsThis::getJsThis(m_pMap.data())});
     pInterpreter->doFunction("IngameInfoBar", "updatePlayerInfo", args);
     Mainapp::getInstance()->continueRendering();
 }
 
 void IngameInfoBar::updateMinimap()
 {
-    if (m_pMinimap)
+    if (m_pMinimap && !m_pMenu.isNull() && !m_pMap.isNull())
     {
         m_pMinimap->updateMinimap(m_pMap, true);
     }
@@ -102,6 +102,10 @@ void IngameInfoBar::updateMinimap()
 
 void IngameInfoBar::updateCursorInfo(qint32 x, qint32 y)
 {
+    if (m_pMenu.isNull() || m_pMap.isNull())
+    {
+        return;
+    }
     if (m_pMenu->getCursor()->getMapPointX() == x &&
         m_pMenu->getCursor()->getMapPointY() == y)
     {
@@ -111,7 +115,7 @@ void IngameInfoBar::updateCursorInfo(qint32 x, qint32 y)
 
 void IngameInfoBar::updateTerrainInfo(qint32 x, qint32 y, bool update)
 {
-    if (Mainapp::getInstance()->getNoUi())
+    if (Mainapp::getInstance()->getNoUi() || m_pMenu.isNull() || m_pMap.isNull())
     {
         return;
     }
@@ -141,12 +145,17 @@ void IngameInfoBar::updateTerrainInfo(qint32 x, qint32 y, bool update)
 
 void IngameInfoBar::updateTerrainInfoInternal()
 {
+    if (m_pMenu.isNull() || m_pMap.isNull())
+    {
+        m_debounceTimer.stop();
+        return;
+    }
     Mainapp::getInstance()->pauseRendering();
     m_LastX = m_newX;
     m_LastY = m_newY;
     Interpreter * pInterpreter = Interpreter::getInstance();
     QJSValueList args({m_jsThis,
-                       JsThis::getJsThis(m_pMap),
+                       JsThis::getJsThis(m_pMap.data()),
                        m_LastX,
                        m_LastY});
     auto erg = pInterpreter->doFunction("IngameInfoBar", "updateTerrainInfo", args);
@@ -291,7 +300,7 @@ void IngameInfoBar::updateDetailedView(qint32 x, qint32 y)
 
 void IngameInfoBar::syncMinimapPosition()
 {
-    if (m_pMap != nullptr &&
+    if (!m_pMenu.isNull() && !m_pMap.isNull() &&
         m_pMinimapSlider != nullptr &&
         m_pMinimap != nullptr)
     {

@@ -288,6 +288,7 @@ public:
      * @param Color
      */
     Q_INVOKABLE void setColor(QColor Color, qint32 table = -1);
+    qint32 getCachedPlayerID() const { return m_playerId; }
     /**
      * @brief getPlayerID player id of this player from 0 to n
      * @return

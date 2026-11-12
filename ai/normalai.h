@@ -155,6 +155,15 @@ public:
      */
     Q_INVOKABLE void hideFrontMap();
 protected:
+    enum class ScriptBinding
+    {
+        Immediate,
+        Deferred,
+    };
+
+    NormalAi(GameMap* pMap, const QString & configurationFile, GameEnums::AiTypes aiType,
+             const QString & jsName, ScriptBinding binding);
+
     bool holdForPause();
     bool performActionSteps(spQmlVectorUnit & pUnits, spQmlVectorUnit & pEnemyUnits,
                             spQmlVectorBuilding & pBuildings, spQmlVectorBuilding & pEnemyBuildings);

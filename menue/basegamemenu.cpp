@@ -70,7 +70,7 @@ BaseGamemenu::~BaseGamemenu()
     if (!m_jsName.isEmpty())
     {
         Interpreter* pInterpreter = Interpreter::getInstance();
-        if (pInterpreter != nullptr)
+        if (pInterpreter != nullptr && pInterpreter->getGlobal(m_jsName).toQObject() == this)
         {
             pInterpreter->deleteObject(m_jsName);
         }

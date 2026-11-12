@@ -687,6 +687,10 @@ public:
      * @return
      */
     Q_INVOKABLE QStringList getPerkList();
+    const QStringList & getEffectivePerkList() const
+    {
+        return m_perkList;
+    }
     /**
      * @brief setPerkList
      * @param perks

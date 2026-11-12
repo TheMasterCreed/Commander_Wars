@@ -21,6 +21,8 @@ namespace Coordinator
         bool lowerWitnessReplays{false};
         bool budgetExhausted{false};
         bool valid{false};
+        bool admitted{false};
+        bool completed{false};
     };
 
     struct RelativeStockDualTightening
@@ -32,6 +34,7 @@ namespace Coordinator
         std::uint64_t certificateId{0};
         std::int64_t optimizerWork{0};
         std::int64_t verifierWork{0};
+        std::int64_t hintWork{0};
         std::int64_t catalogWork{0};
         std::int64_t tariffWork{0};
         std::int64_t totalWork{0};
@@ -42,6 +45,8 @@ namespace Coordinator
         bool reused{false};
         bool locallyBudgetExhausted{false};
         bool globalFailure{false};
+        bool admitted{false};
+        bool completed{false};
 
         bool tightened() const
         {
@@ -63,6 +68,30 @@ namespace Coordinator
         RelativeStockPreparationStatus status{RelativeStockPreparationStatus::Invalid};
         std::int64_t readinessWork{0};
         std::int64_t scanWork{0};
+    };
+
+    struct RelativeStockOperationMetadata
+    {
+        RelativeStockIdentity identity;
+        std::uint64_t rowCacheRevision{0};
+        std::int64_t ourRerunWork{0};
+        std::int64_t enemyRerunWork{0};
+        std::int64_t certificateAdmissionWork{0};
+        std::int64_t certificateReadinessWork{0};
+        std::int64_t certificateEntryWork{0};
+        bool valid{false};
+    };
+
+    struct RelativeStockOperationPreparation
+    {
+        RelativeStockPreparationStatus status{RelativeStockPreparationStatus::Invalid};
+        RelativeStockIdentity identity;
+        std::uint64_t rowCacheRevision{0};
+        std::int64_t paidWork{0};
+        std::int64_t requiredPreparationWork{0};
+        std::int64_t scanWork{0};
+        std::int64_t minimumNativeWork{0};
+        bool readinessChecked{false};
     };
 
     enum class RelativeStockWitnessKind : std::int8_t
@@ -100,9 +129,23 @@ namespace Coordinator
         {
             return nullptr;
         }
+        // True only while futureCatalog() was built from the field the friendly solves read.
+        virtual bool futureCatalogMatchesSolver() const
+        {
+            return false;
+        }
         virtual RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t stateCap) = 0;
         virtual RelativeStockRefinedTerm refineEnemy(
             const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) = 0;
+        virtual RelativeStockRefinedTerm adoptOurWitness(
+            const ContinuationKey &, std::span<const SequentialRowWitness>, MilliFunds)
+        {
+            return {};
+        }
+        virtual bool hintOurUpperPrices(const ContinuationKey &, std::span<const MilliFunds>)
+        {
+            return false;
+        }
         virtual bool supportsVerifiedDual() const
         {
             return false;
@@ -110,6 +153,14 @@ namespace Coordinator
         virtual RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote &)
         {
             return {.status = RelativeStockPreparationStatus::Ready};
+        }
+        virtual RelativeStockOperationMetadata operationMetadata(const RelativeStockQuote &) const
+        {
+            return {};
+        }
+        virtual RelativeStockOperationPreparation prepareOurCertificateOperation(const RelativeStockQuote &)
+        {
+            return {};
         }
         virtual RelativeStockDualTightening
         tightenOurUpperWithVerifiedDual(

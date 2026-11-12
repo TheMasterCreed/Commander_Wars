@@ -44,6 +44,10 @@ public:
         return 1;
     }
     spScriptVariable getSpVariable(const QString & id);
+    const QVector<spScriptVariable> & getStoredVariables() const
+    {
+        return m_Variables;
+    }
     /**
      * @brief createScriptVariable
      * @param id identifier for the variable

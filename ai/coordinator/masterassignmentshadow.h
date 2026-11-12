@@ -21,6 +21,14 @@ namespace Coordinator
         StockControl,
     };
 
+    enum class MasterStockControlRuntime : std::int8_t
+    {
+        None,
+        Arena,
+        PlayableTrial,
+        Play,
+    };
+
     enum class MasterShadowConfigError : std::int8_t
     {
         None,
@@ -31,6 +39,16 @@ namespace Coordinator
         InvalidExport,
         MissingExplicitAllowance,
         StockControlOutsideArena,
+        InvalidTrialUserPath,
+        UnsupportedTrialProcess,
+        InvalidStaleProbe,
+    };
+
+    // Playable-trial only: changes one authenticated live fact between search and finalization.
+    enum class MasterStaleProbe : std::int8_t
+    {
+        None,
+        BattleAnimationSpeed,
     };
 
     enum class MasterShadowExportMode : std::int8_t
@@ -53,11 +71,14 @@ namespace Coordinator
     struct MasterShadowConfig
     {
         MasterAssignmentMode mode{MasterAssignmentMode::Disabled};
+        MasterStockControlRuntime runtime{MasterStockControlRuntime::None};
         std::int64_t allowance{MASTER_ASSIGNMENT_INITIAL_ALLOWANCE};
         QString outputPath;
         MasterShadowConfigError error{MasterShadowConfigError::None};
         SequentialTierAuditMode tierAuditMode{SequentialTierAuditMode::Full};
         MasterShadowExportMode exportMode{MasterShadowExportMode::Full};
+        MasterStaleProbe staleProbe{MasterStaleProbe::None};
+        MasterPlanNeighborAudit planNeighborAudit{MasterPlanNeighborAudit::Off};
 
         bool enabled() const
         {
@@ -104,6 +125,7 @@ namespace Coordinator
         const MasterAssignmentSearchResult* search{nullptr};
         const MasterFutureCatalog* future{nullptr};
         const RelativeStockSession* session{nullptr};
+        const MasterAssignmentEvaluator* evaluator{nullptr};
         std::optional<MasterStockSetupStatus> stockSetup;
         MasterShadowOutcome outcome{MasterShadowOutcome::Unresolved};
         bool legacyPlanUnchanged{true};
@@ -119,10 +141,15 @@ namespace Coordinator
 
     QString masterShadowOutcomeName(MasterShadowOutcome outcome);
     QJsonObject masterShadowRecord(const MasterShadowObservation & observation);
+    bool isolatedMasterTrialPath(const QString & applicationDirectory, const QString & explicitUserPath,
+                                 const QString & activeUserPath);
     MasterShadowConfig parseMasterShadowConfig(const QByteArray & mode, const QByteArray & work, const QString & output,
                                                const QByteArray & tierAudit = {}, const QByteArray & exportMode = {},
-                                               bool isolatedArena = false);
+                                               MasterStockControlRuntime runtime = MasterStockControlRuntime::None);
+    std::optional<MasterStaleProbe> parseMasterStaleProbe(const QByteArray & probe);
+    MasterPlanNeighborAudit parseMasterPlanNeighborAudit(const QByteArray & value, MasterStockControlRuntime runtime);
     MasterShadowConfig readMasterShadowConfig();
+    MasterShadowConfig playMasterStockControlConfig();
     void prepareMasterShadow(const MasterShadowConfig & config, AssignmentInput & input, RefinementLedger & ledger);
     MasterShadowTiming observeMasterAssignment(const MasterShadowConfig & config, const AssignmentInput & input,
                                         const AssignmentResult & incumbent, const PropertyStockField & field,

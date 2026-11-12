@@ -96,6 +96,7 @@ public:
      * @return
      */
     virtual ActionPerformer* getActionPerformer() override;
+    bool hasAnimationCompletionConnection() const;
     /**
      * @brief getIsMultiplayer
      * @param pGameAction
@@ -557,6 +558,7 @@ protected:
     quint8 m_terminated{0};
 
     ActionPerformer m_actionPerformer;
+    QMetaObject::Connection m_animationCompletionConnection;
     spMovementPlanner m_pMovementPlanner;
 
     bool m_gridVisible{false};

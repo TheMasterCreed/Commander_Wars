@@ -1561,7 +1561,8 @@ void GameMenue::loadGameMenue()
     connect(&m_autosaveTimer, &QTimer::timeout, this, &GameMenue::autosaveTimer, Qt::QueuedConnection);
     connect(&m_actionPerformer, &ActionPerformer::sigActionPerformed, this, &GameMenue::checkMovementPlanner, Qt::QueuedConnection);
 
-    connect(GameAnimationFactory::getInstance(), &GameAnimationFactory::animationsFinished, &m_actionPerformer, &ActionPerformer::actionPerformed, Qt::QueuedConnection);
+    m_animationCompletionConnection = connect(GameAnimationFactory::getInstance(), &GameAnimationFactory::animationsFinished,
+        &m_actionPerformer, &ActionPerformer::actionPerformed, Qt::QueuedConnection);
     connect(m_Cursor.get(), &Cursor::sigCursorMoved, m_IngameInfoBar.get(), &IngameInfoBar::updateCursorInfo, Qt::QueuedConnection);
     connect(m_Cursor.get(), &Cursor::sigCursorMoved, this, &GameMenue::cursorMoved, Qt::QueuedConnection);
 
@@ -1701,6 +1702,11 @@ void GameMenue::showChat()
 ActionPerformer* GameMenue::getActionPerformer()
 {
     return &m_actionPerformer;
+}
+
+bool GameMenue::hasAnimationCompletionConnection() const
+{
+    return bool(m_animationCompletionConnection);
 }
 
 NetworkInterface* GameMenue::getNetworkInterface()

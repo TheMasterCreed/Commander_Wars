@@ -85,6 +85,17 @@ ArenaMatchRunner::ArenaMatchRunner(QObject* pParent)
 {
 }
 
+spGameMap ArenaMatchRunner::prepareFixture(const ArenaMatchConfig & config, QString & error)
+{
+    ArenaMatchRunner fixture;
+    fixture.m_config = config;
+    if (!fixture.loadMap(error) || !fixture.applyPlayerSetup(error) || !fixture.applyGameRules(error))
+    {
+        return {};
+    }
+    return fixture.m_pMap;
+}
+
 void ArenaMatchRunner::run()
 {
     if (!loadConfig())
@@ -94,8 +105,10 @@ void ArenaMatchRunner::run()
     GlobalUtils::seed(m_config.masterSeed);
     GlobalUtils::setUseSeed(true);
     GameAction::pinActionSeeds(m_config.masterSeed);
-    if (!loadMap() || !applyPlayerSetup() || !applyGameRules())
+    QString error;
+    if (!loadMap(error) || !applyPlayerSetup(error) || !applyGameRules(error))
     {
+        failSetup(error);
         return;
     }
     setStockControlPrefixHold(m_actionPrefix && !m_actionPrefix->complete());
@@ -132,19 +145,18 @@ bool ArenaMatchRunner::loadConfig()
     return true;
 }
 
-bool ArenaMatchRunner::loadMap()
+bool ArenaMatchRunner::loadMap(QString & error)
 {
     m_pMap = MemoryManagement::create<GameMap>(m_config.mapPath, true, false, false);
-    QString error;
     if (m_pMap->getPlayerCount() <= 0 || !m_config.validatePlayerCount(m_pMap->getPlayerCount(), error))
     {
-        failSetup(error.isEmpty() ? "map loaded without players" : error);
+        error = error.isEmpty() ? "map loaded without players" : error;
         return false;
     }
     return true;
 }
 
-bool ArenaMatchRunner::applyPlayerSetup()
+bool ArenaMatchRunner::applyPlayerSetup(QString & error)
 {
     if (!m_config.coordinatedRefinementReceiptFile.isEmpty())
     {
@@ -152,11 +164,9 @@ bool ArenaMatchRunner::applyPlayerSetup()
             m_config.coordinatedFrontierReceipts, m_config.coordinatedFrontierDay);
         if (!m_config.coordinatedValuationFile.isEmpty())
         {
-            QString error;
             const auto path = QDir(Settings::getInstance()->getUserPath()).filePath(m_config.coordinatedValuationFile);
             if (!m_relativeStockProbe->loadValuations(path, error))
             {
-                failSetup(error);
                 return false;
             }
         }
@@ -168,7 +178,7 @@ bool ArenaMatchRunner::applyPlayerSetup()
         buildList = Filesupport::readList(path, "").items;
         if (buildList.isEmpty())
         {
-            failSetup("build list is unavailable or empty");
+            error = "build list is unavailable or empty";
             return false;
         }
     }
@@ -177,7 +187,7 @@ bool ArenaMatchRunner::applyPlayerSetup()
         const ArenaMatchPlayerConfig & playerConfig = m_config.players.at(i);
         if (!playerConfig.coId.isEmpty() && !COSpriteManager::getInstance()->exists(playerConfig.coId))
         {
-            failSetup("unknown co " + playerConfig.coId);
+            error = "unknown co " + playerConfig.coId;
             return false;
         }
         Player* pPlayer = m_pMap->getPlayer(i);
@@ -190,7 +200,7 @@ bool ArenaMatchRunner::applyPlayerSetup()
         BaseGameInputIF* pInput = pPlayer->getBaseGameInput();
         if (pInput == nullptr || dynamic_cast<DummyAi*>(pInput) != nullptr)
         {
-            failSetup("player " + QString::number(i) + " did not receive a local ai");
+            error = "player " + QString::number(i) + " did not receive a local ai";
             return false;
         }
         if (auto* pCoordinated = dynamic_cast<CoordinatedAi*>(pInput))
@@ -221,7 +231,7 @@ void ArenaMatchRunner::setStockControlPrefixHold(bool held)
     }
 }
 
-bool ArenaMatchRunner::applyGameRules()
+bool ArenaMatchRunner::applyGameRules(QString & error)
 {
     GameRules* pRules = m_pMap->getGameRules();
     if (m_config.rulesetFile.isEmpty())
@@ -235,7 +245,7 @@ bool ArenaMatchRunner::applyGameRules()
         QFile file(QDir(Settings::getInstance()->getUserPath()).filePath(m_config.rulesetFile));
         if (!file.open(QIODevice::ReadOnly))
         {
-            failSetup("saved ruleset cannot be read");
+            error = "saved ruleset cannot be read";
             return false;
         }
         QDataStream stream(&file);
@@ -243,18 +253,18 @@ bool ArenaMatchRunner::applyGameRules()
         pRules->deserializeObject(stream);
         if (stream.status() != QDataStream::Ok || pRules->getAiBehaviorMode() != m_config.aiBehaviorMode)
         {
-            failSetup("saved ruleset is invalid or aiBehaviorMode differs");
+            error = "saved ruleset is invalid or aiBehaviorMode differs";
             return false;
         }
         if (m_actionPrefix && pRules->getFogMode() != GameEnums::Fog_Off)
         {
-            failSetup("partial-path action prefix requires fog off");
+            error = "partial-path action prefix requires fog off";
             return false;
         }
         auto* turnLimit = pRules->getVictoryRule(TURN_LIMIT_RULE);
         if (m_config.turnLimit == 0 && turnLimit != nullptr && turnLimit->getRuleValue(TURN_LIMIT_ITEM) > 0)
         {
-            failSetup("saved ruleset contains an active turn limit");
+            error = "saved ruleset contains an active turn limit";
             return false;
         }
     }
@@ -264,7 +274,7 @@ bool ArenaMatchRunner::applyGameRules()
         VictoryRule* pTurnLimit = pRules->getVictoryRule(TURN_LIMIT_RULE);
         if (pTurnLimit == nullptr)
         {
-            failSetup("turn limit victory rule is unavailable");
+            error = "turn limit victory rule is unavailable";
             return false;
         }
         pTurnLimit->setRuleValue(m_config.turnLimit, TURN_LIMIT_ITEM);
@@ -273,14 +283,19 @@ bool ArenaMatchRunner::applyGameRules()
     {
         pRules->removeVictoryRule(TURN_LIMIT_RULE);
     }
-    if (m_config.deterministicCounterpointSeed)
+    return applyFixtureRuntime(m_config, error);
+}
+
+bool ArenaMatchRunner::applyFixtureRuntime(const ArenaMatchConfig & config, QString & error)
+{
+    if (config.deterministicCounterpointSeed)
     {
         const QJSValue result = Interpreter::getInstance()->doString(
             "typeof COUNTERPOINTAI !== 'undefined' && "
             "(COUNTERPOINTAI.PLANNER_DETERMINISTIC_SEED = true)");
         if (result.isError() || !result.toBool())
         {
-            failSetup("Counterpoint deterministic seed control is unavailable");
+            error = "Counterpoint deterministic seed control is unavailable";
             return false;
         }
     }

@@ -379,6 +379,21 @@ void AiArenaTestSupport::finish(ArenaExitCode exitCode)
     finish(static_cast<qint32>(exitCode));
 }
 
+bool AiArenaTestSupport::claimStandaloneStartup()
+{
+    if (m_standaloneStartup || m_exitQueued)
+    {
+        return false;
+    }
+    m_standaloneStartup = true;
+    return true;
+}
+
+bool AiArenaTestSupport::ownsStandaloneStartup() const
+{
+    return m_standaloneStartup;
+}
+
 QString AiArenaTestSupport::getOutputPath(const QString & fileName) const
 {
     if (fileName.isEmpty() ||

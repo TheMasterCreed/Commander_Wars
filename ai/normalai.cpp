@@ -32,6 +32,12 @@ const QString NormalAi::DEFAULT_INI_FILE = QStringLiteral("normal.ini");
 const QString NormalAi::DEFAULT_JS_NAME = QStringLiteral("NORMALAI");
 
 NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::AiTypes aiType, const QString &jsName)
+    : NormalAi(pMap, configurationFile, aiType, jsName, ScriptBinding::Immediate)
+{
+}
+
+NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::AiTypes aiType,
+                   const QString &jsName, ScriptBinding binding)
     : CoreAI(pMap, aiType, jsName),
     m_InfluenceFrontMap(pMap, m_IslandMaps),
     m_captureBuildingSelector(*this),
@@ -42,7 +48,10 @@ NormalAi::NormalAi(GameMap *pMap, const QString &configurationFile, GameEnums::A
 #endif
     CONSOLE_PRINT("Creating normal ai", GameConsole::eDEBUG);
     Interpreter::setCppOwnerShip(this);
-    setupJsThis(this);
+    if (binding == ScriptBinding::Immediate)
+    {
+        setupJsThis(this);
+    }
     m_timer.setSingleShot(false);
     connect(&m_timer, &QTimer::timeout, this, &NormalAi::process, Qt::QueuedConnection);
     m_iniData = {

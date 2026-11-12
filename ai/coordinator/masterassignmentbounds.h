@@ -45,6 +45,19 @@ namespace Coordinator
         }
     };
 
+    struct MasterCandidateTerm
+    {
+        std::int32_t candidate{0};
+        std::optional<MilliFunds> term;
+    };
+
+    struct MasterTermTable
+    {
+        MasterBoundStatus status{MasterBoundStatus::Unavailable};
+        MilliFunds upper{0};
+        std::vector<std::vector<MasterCandidateTerm>> actorTerms;
+    };
+
     struct MasterFutureCacheStats
     {
         std::uint64_t hits{0};
@@ -60,6 +73,10 @@ namespace Coordinator
                                   const MasterFutureCatalog* future = nullptr);
         MasterBoundResult bound(const MasterAssignmentState & state, MasterBoundFamily family,
                                 RefinementLedger & ledger) const;
+        MasterBoundResult boundAt(const MasterAssignmentState & state, MasterBoundFamily family,
+                                  std::vector<MilliFunds> prices, RefinementLedger & ledger) const;
+        MasterTermTable termsAt(const MasterAssignmentState & state, std::vector<MilliFunds> prices,
+                                RefinementLedger & ledger) const;
         MasterBoundResult verify(const MasterBoundCertificate & certificate,
                                  RefinementLedger & ledger) const;
         MasterBoundResult tighten(const MasterBoundCertificate & initial, std::int32_t rounds,
@@ -67,6 +84,8 @@ namespace Coordinator
 
         std::optional<MilliFunds> contribution(std::size_t actor, std::int32_t candidate) const;
         bool ready() const;
+        bool covers(const MasterAssignmentIdentity & problem, const CheapPricingModel* stock,
+                    const MasterFutureCatalog* future) const;
         MasterFutureCacheStats futureCacheStats() const;
 
     private:
@@ -107,16 +126,29 @@ namespace Coordinator
             ResourceScope scope{ResourceScope::Current};
         };
 
+        enum class FutureCache : std::int8_t
+        {
+            Shared,
+            Bypass,
+        };
+
+        using CandidateTerms = std::vector<std::vector<MasterCandidateTerm>>;
+
         ScanResult scan(const MasterBoundCertificate & certificate, RefinementLedger & ledger,
-                        RefinementWork category, bool collectDemand) const;
+                        RefinementWork category, bool collectDemand, FutureCache cache = FutureCache::Shared,
+                        CandidateTerms* terms = nullptr) const;
         PreparedOption prepareOption(const MasterActor & actor, const MasterCandidate & candidate,
                                      bool included, const CheapPricingModel* stock,
                                      RefinementLedger & ledger) const;
         MasterBoundStatus scanActors(const MasterBoundCertificate & certificate,
                                      const MasterFuturePricing & future, RefinementLedger & ledger,
-                                     RefinementWork category, bool collectDemand, ScanResult & result) const;
+                                     RefinementWork category, bool collectDemand, CandidateTerms* terms,
+                                     ScanResult & result) const;
+        MasterBoundStatus optionTerm(const Option & option, const MasterBoundCertificate & certificate,
+                                     const MasterFuturePricing & future, RefinementLedger & ledger,
+                                     RefinementWork category, MilliFunds & term) const;
         MasterFutureStatus futurePrices(std::span<const MilliFunds> prices, RefinementLedger & ledger,
-                                        RefinementWork category,
+                                        RefinementWork category, FutureCache cache,
                                         std::shared_ptr<const MasterFuturePricing> & result) const;
         bool matches(const MasterBoundCertificate & certificate) const;
 
@@ -126,6 +158,7 @@ namespace Coordinator
         std::shared_ptr<const std::uint8_t> m_basis;
         std::vector<std::vector<Option>> m_options;
         std::vector<Resource> m_resources;
+        const CheapPricingModel* m_stock{nullptr};
         const MasterFutureCatalog* m_future{nullptr};
         std::vector<bool> m_actorRows;
         MilliFunds m_ownedBaseline{0};

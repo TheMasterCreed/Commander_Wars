@@ -3023,7 +3023,7 @@ QJSValue & GameMap::getMapJsThis(GameMap * me)
     }
     else
     {
-        Interpreter::getInstance()->globalObject().setProperty("map", me->m_jsThis);
+        Interpreter::getInstance()->setGlobal("map", me->m_jsThis);
         return me->m_jsThis;
     }
 }

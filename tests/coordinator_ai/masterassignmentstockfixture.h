@@ -4,6 +4,7 @@
 #include <set>
 
 #include "ai/coordinator/masterassignmentsearch.h"
+#include "ai/coordinator/packingdualhint.h"
 #include "ai/coordinator/propertystockfield.h"
 #include "tests/coordinator_ai/masterassignmenttestfixture.h"
 
@@ -31,6 +32,30 @@ namespace MasterAssignmentTest
         SequentialInstance instance() const
         {
             return {input.horizon, input.columns, classes, input.rows, input.capturedNodes};
+        }
+
+        // Mirrors the valuer's open-node floor: the best one-node-per-row assignment of capture weights.
+        MilliFunds floorValue() const
+        {
+            std::vector<std::size_t> open;
+            for (std::size_t node = 0; node < input.capturedNodes.size(); ++node)
+            {
+                if (!input.capturedNodes[node])
+                {
+                    open.push_back(node);
+                }
+            }
+            std::vector<MilliFunds> weights;
+            for (const auto & row : input.rows)
+            {
+                for (const auto node : open)
+                {
+                    weights.push_back(row.weight[node]);
+                }
+            }
+            AssignmentSolver solver;
+            solver.solve(static_cast<std::int32_t>(input.rows.size()), static_cast<std::int32_t>(open.size()), weights);
+            return solver.optimum();
         }
 
         CheapRowTerms cheapRow(std::int32_t rowIndex) const
@@ -168,6 +193,12 @@ namespace MasterAssignmentTest
             return &m_future;
         }
 
+        // The catalog is built from the cases' own rows, so it describes what this session solves.
+        bool futureCatalogMatchesSolver() const override
+        {
+            return !catalogMismatch;
+        }
+
         void setQuoteFault(QuoteFault fault)
         {
             m_fault = fault;
@@ -180,28 +211,22 @@ namespace MasterAssignmentTest
 
         RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) override
         {
+            if (m_starveNextQuote)
+            {
+                m_starveNextQuote = false;
+                require(m_ledger.consume(m_ledger.balance(), RefinementWork::SearchSlice), "the starving quote spends the ledger");
+            }
             m_quotedKeys.insert(key);
-            const auto found = m_cases.find(key);
-            if (found == m_cases.end())
+            auto* priced = pricedEntry(key);
+            if (priced == nullptr || pricingFailure)
             {
                 return {};
             }
-            auto & entry = found->second;
-            auto state = m_model.initialState();
-            CheapInitialPrice cheap;
-            if (!m_model.price(key, state, cheap))
-            {
-                return {};
-            }
-            if (!entry.initialized)
-            {
-                entry.ours = cheap.ours;
-                entry.initialized = true;
-            }
+            auto & entry = *priced;
             const auto & enemy = m_enemies.at(entry.source.capturedColumns);
             RelativeStockQuote result{
                 .key = key, .capturedColumns = entry.source.capturedColumns, .identity = identity(),
-                .economic = economic, .owned = entry.source.owned,
+                .economic = economic, .owned = entry.source.owned + ownedOffset,
                 .ours = entry.ours, .enemy = enemy.bounds,
                 .ourLowerWitnessReplays = true, .enemyLowerWitnessReplays = true,
                 .ourSearchCompleted = entry.ours.exact(), .enemySearchCompleted = enemy.bounds.exact(), .valid = true};
@@ -301,7 +326,7 @@ namespace MasterAssignmentTest
             const auto found = m_cases.find(expected.key);
             if (!owns(expected) || found == m_cases.end() ||
                 found->second.source.capturedColumns != expected.capturedColumns ||
-                found->second.source.owned != expected.owned)
+                found->second.source.owned + ownedOffset != expected.owned)
             {
                 return false;
             }
@@ -346,7 +371,13 @@ namespace MasterAssignmentTest
                 return {.interval = entry.ours, .workUsed = 1, .lowerWitnessReplays = true,
                         .budgetExhausted = grant == NO_GRANT, .valid = grant != NO_GRANT};
             }
-            const auto result = refineModel(entry.model, entry.ours, entry.witness, cap);
+            std::optional<SequentialWarmStart> seed;
+            if (entry.refined && !entry.witness.empty())
+            {
+                seed = SequentialWarmStart{entry.witness, entry.ours.lower};
+            }
+            const auto result = refineModel(entry.model, entry.ours, entry.witness, cap, entry.model.floorValue(),
+                                            seed ? &*seed : nullptr);
             entry.refined = !entry.witness.empty();
             return result;
         }
@@ -355,7 +386,63 @@ namespace MasterAssignmentTest
                                             std::int64_t cap) override
         {
             auto & enemy = m_enemies.at(captured);
-            return refineModel(enemy.model, enemy.bounds, enemy.witness, cap);
+            return refineModel(enemy.model, enemy.bounds, enemy.witness, cap, 0, nullptr);
+        }
+
+        RelativeStockRefinedTerm adoptOurWitness(const ContinuationKey & key,
+            std::span<const SequentialRowWitness> witness, MilliFunds value) override
+        {
+            RelativeStockRefinedTerm result;
+            auto* entry = pricedEntry(key);
+            if (entry == nullptr)
+            {
+                return result;
+            }
+            result.interval = entry->ours;
+            result.searchCompleted = entry->ours.exact();
+            if (value <= entry->ours.lower)
+            {
+                result.valid = true;
+                return result;
+            }
+            const auto tariff = ourRerunWork();
+            if (remainingWork() < tariff || !m_ledger.consume(tariff, RefinementWork::MasterWitness))
+            {
+                result.budgetExhausted = true;
+                return result;
+            }
+            result.admitted = true;
+            result.workUsed = tariff;
+            if (!replaySequentialWitness(entry->model.instance(), witness, value) || value < entry->model.floorValue())
+            {
+                result.lowerWitnessReplays = true;
+                result.valid = true;
+                return result;
+            }
+            if (value > entry->ours.upper)
+            {
+                pricingFailure = true;
+                return result;
+            }
+            entry->ours.lower = value;
+            entry->witness.assign(witness.begin(), witness.end());
+            entry->refined = true;
+            result.interval = entry->ours;
+            result.searchCompleted = entry->ours.exact();
+            result.lowerWitnessReplays = true;
+            result.valid = true;
+            return result;
+        }
+
+        bool hintOurUpperPrices(const ContinuationKey & key, std::span<const MilliFunds> futureNodePrices) override
+        {
+            if (!wellFormedPackingDualHint(futureNodePrices, m_future.columns.size()) || pricedEntry(key) == nullptr)
+            {
+                return false;
+            }
+            m_priceHints[key].assign(futureNodePrices.begin(), futureNodePrices.end());
+            m_starveNextQuote = starveAfterHint;
+            return true;
         }
 
         std::int64_t remainingWork() const override
@@ -376,6 +463,42 @@ namespace MasterAssignmentTest
         bool supportsVerifiedDual() const override
         {
             return true;
+        }
+
+        RelativeStockOperationMetadata operationMetadata(const RelativeStockQuote & quote) const override
+        {
+            if (!operationServiceEnabled || !owns(quote))
+            {
+                return {};
+            }
+            return {.identity = identity(), .rowCacheRevision = operationRevision,
+                    .ourRerunWork = operationTariff, .enemyRerunWork = operationTariff,
+                    .certificateReadinessWork = operationPreparation.paidWork,
+                    .certificateEntryWork = operationEntryWork, .valid = true};
+        }
+
+        RelativeStockOperationPreparation prepareOurCertificateOperation(const RelativeStockQuote & quote) override
+        {
+            ++operationPreparationCalls;
+            if (!operationServiceEnabled || !owns(quote) || operationPreparation.paidWork < 0)
+            {
+                return {};
+            }
+            auto result = operationPreparation;
+            result.identity = identity();
+            result.rowCacheRevision = operationRevision;
+            if (!m_ledger.consume(result.paidWork, RefinementWork::MasterValuation))
+            {
+                result.status = RelativeStockPreparationStatus::BudgetExhausted;
+                result.requiredPreparationWork = result.paidWork;
+                result.paidWork = 0;
+            }
+            else if (result.status == RelativeStockPreparationStatus::Ready ||
+                     result.status == RelativeStockPreparationStatus::MissingRows)
+            {
+                result.readinessChecked = true;
+            }
+            return result;
         }
 
         RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote) override
@@ -411,6 +534,7 @@ namespace MasterAssignmentTest
                 result.locallyBudgetExhausted = true;
                 return result;
             }
+            result.admitted = true;
             std::int64_t spent = 0;
             auto & entry = m_cases.at(quote.key);
             const auto model = entry.model.instance();
@@ -418,6 +542,7 @@ namespace MasterAssignmentTest
             {
                 require(m_ledger.refund(grant, maximumWork - spent), "dual unused work refunded");
                 result.totalWork = spent;
+                result.completed = result.certificateValid && result.optimizerCompleted && result.verifierCompleted;
                 return result;
             };
             const auto tariff = static_cast<std::int64_t>((model.rows.size() + 1) *
@@ -441,7 +566,7 @@ namespace MasterAssignmentTest
             identity.usedNodes = PackingDualNodeMask(model.nodeCount());
             identity.economic = quote.economic;
             identity.owned = quote.owned;
-            identity.incumbentFloor = quote.ours.lower;
+            identity.incumbentFloor = entry.model.floorValue();
             for (const auto node : quote.capturedColumns)
             {
                 require(identity.usedNodes.set(node), "captured node identity");
@@ -483,41 +608,86 @@ namespace MasterAssignmentTest
                 result.locallyBudgetExhausted = true;
                 return finalize();
             }
-            const auto optimized = optimizePackingDualPrices(catalog, identity, maximumWork - spent - verificationWork);
+            const auto optimizerLimit = maximumWork - spent - verificationWork;
+            const auto optimized = optimizePackingDualPrices(catalog, identity, optimizerLimit);
             spent += optimized.workUsed;
             result.optimizerWork = optimized.workUsed;
             result.optimizerCompleted = optimized.completed;
-            const auto verified = verifyPackingDualCertificate(catalog, sources, identity,
-                optimized.nodePrices, maximumWork - spent);
+            if (!optimized.completed)
+            {
+                result.locallyBudgetExhausted = true;
+                return finalize();
+            }
+            auto verified = verifyPackingDualCertificate(catalog, sources, identity, optimized.nodePrices,
+                                                         verificationWork);
             spent += verified.workUsed;
             result.verifierWork = verified.workUsed;
             result.verifierCompleted = verified.completed;
             result.certificateValid = verified.valid;
-            if (verified.valid)
+            if (!verified.completed || !verified.valid)
             {
-                ++verifiedCertificates;
-                result.certificate = std::make_shared<const PackingDualCertificate>(verified.certificate);
-                result.certificateId = ++m_nextCertificate;
-                result.certifiedUpper = verified.certificate.dualObjective;
-                require(result.certifiedUpper >= entry.ours.lower, "verified dual contains replayed lower");
-                entry.ours.upper = std::min(entry.ours.upper, result.certifiedUpper);
-                result.intervalAfter = entry.ours;
-                m_certificates[quote.key] = {result.certificateId, result.certificate};
+                result.certificateValid = false;
+                result.globalFailure = true;
+                pricingFailure = true;
+                return finalize();
             }
+            const auto hint = m_certificates.contains(quote.key) ? m_priceHints.end() : m_priceHints.find(quote.key);
+            const auto hintLimit = maximumWork - spent - verificationWork;
+            if (hint != m_priceHints.end() && hintLimit > 0)
+            {
+                const auto hinted = hintedPackingDualPrices(identity, m_future.columns, hint->second, hintLimit);
+                spent += hinted.workUsed;
+                result.hintWork = hinted.workUsed;
+                if (hinted.completed)
+                {
+                    auto hintedVerified = verifyPackingDualCertificate(catalog, sources, identity, hinted.nodePrices,
+                                                                       verificationWork);
+                    spent += hintedVerified.workUsed;
+                    result.hintWork += hintedVerified.workUsed;
+                    if (hintedVerified.completed && hintedVerified.valid &&
+                        hintedVerified.certificate.dualObjective < verified.certificate.dualObjective)
+                    {
+                        verified = std::move(hintedVerified);
+                    }
+                }
+            }
+            ++verifiedCertificates;
+            result.certificate = std::make_shared<const PackingDualCertificate>(verified.certificate);
+            result.certificateId = ++m_nextCertificate;
+            result.certifiedUpper = verified.certificate.dualObjective;
+            require(result.certifiedUpper >= entry.ours.lower, "verified dual contains replayed lower");
+            entry.ours.upper = std::min(entry.ours.upper, result.certifiedUpper);
+            result.intervalAfter = entry.ours;
+            m_certificates[quote.key] = {result.certificateId, result.certificate};
             return finalize();
         }
 
         std::uint64_t certificateCalls{0};
+        std::uint64_t nativeRefinementCalls{0};
+        bool operationServiceEnabled{false};
+        std::uint64_t operationRevision{0};
+        std::uint64_t operationPreparationCalls{0};
+        std::int64_t operationTariff{NATIVE_SOLVE_TARIFF};
+        std::int64_t operationEntryWork{5};
+        RelativeStockOperationPreparation operationPreparation{
+            .status = RelativeStockPreparationStatus::Ready, .paidWork = 37, .scanWork = 42};
         std::uint64_t readinessCalls{0};
         RelativeStockCertificatePreparation preparation{.status = RelativeStockPreparationStatus::Ready};
         std::int64_t maximumCertificateAllowance{0};
         std::uint64_t proofCaptures{0};
         std::uint64_t verifiedCertificates{0};
+        bool pricingFailure{false};
+        bool catalogMismatch{false};
+        // Shifts the session's owned term away from the stock model's, as a disagreeing session would.
+        MilliFunds ownedOffset{0};
+        // The first quote after the incumbent hint spends the whole ledger, starving the comparison it serves.
+        bool starveAfterHint{false};
         std::optional<ContinuationKey> firstFriendlyRefinement;
         std::size_t distinctQuotesBeforeFirstRefinement{0};
 
     private:
         std::set<ContinuationKey> m_quotedKeys;
+        bool m_starveNextQuote{false};
         bool verifiedUpperMatches(const RelativeStockQuote & quote) const override
         {
             const auto found = m_certificates.find(quote.key);
@@ -535,7 +705,8 @@ namespace MasterAssignmentTest
         }
 
         RelativeStockRefinedTerm refineModel(const NativeSequentialModel & model, StockInterval & bounds,
-                                            std::vector<SequentialRowWitness> & witness, std::int64_t cap)
+                                            std::vector<SequentialRowWitness> & witness, std::int64_t cap,
+                                            MilliFunds floor, const SequentialWarmStart* pSeed)
         {
             if (!m_refine)
             {
@@ -546,9 +717,15 @@ namespace MasterAssignmentTest
             {
                 return {.budgetExhausted = true};
             }
-            const auto tier = solveSequentialPacking(model.instance(), 0, cap, nullptr, true,
-                SequentialWitnessPolicy::BookedValue);
+            ++nativeRefinementCalls;
+            const auto tier = solveSequentialPacking(model.instance(), floor, cap, nullptr, true,
+                SequentialWitnessPolicy::BookedValue, SequentialTierAuditMode::Full, pSeed);
             require(m_ledger.refund(grant, cap - tier.searchStates), "unused native work refunded");
+            if (pSeed != nullptr && !tier.warmStartAccepted)
+            {
+                pricingFailure = true;
+                return {.admitted = true};
+            }
             if (tier.bookedValue >= bounds.lower &&
                 replaySequentialWitness(model.instance(), tier.witness, tier.bookedValue))
             {
@@ -562,7 +739,8 @@ namespace MasterAssignmentTest
             }
             return {.interval = bounds, .statesUsed = tier.searchStates,
                     .workUsed = NATIVE_SOLVE_TARIFF + tier.searchStates,
-                    .searchCompleted = bounds.exact(), .lowerWitnessReplays = true, .valid = true};
+                    .searchCompleted = bounds.exact(), .lowerWitnessReplays = true, .valid = true,
+                    .admitted = true, .completed = tier.searchCompleted || tier.certificate};
         }
 
         struct Entry
@@ -588,6 +766,23 @@ namespace MasterAssignmentTest
             std::shared_ptr<const PackingDualCertificate> proof;
         };
 
+        Entry* pricedEntry(const ContinuationKey & key)
+        {
+            const auto found = m_cases.find(key);
+            auto state = m_model.initialState();
+            CheapInitialPrice cheap;
+            if (found == m_cases.end() || !m_model.price(key, state, cheap))
+            {
+                return nullptr;
+            }
+            if (!found->second.initialized)
+            {
+                found->second.ours = cheap.ours;
+                found->second.initialized = true;
+            }
+            return &found->second;
+        }
+
         static constexpr std::int64_t NATIVE_SOLVE_TARIFF = 128;
         RefinementLedger & m_ledger;
         QuoteFault m_fault;
@@ -598,6 +793,7 @@ namespace MasterAssignmentTest
         std::map<ContinuationKey, Entry> m_cases;
         std::map<std::vector<std::int32_t>, Enemy> m_enemies;
         std::map<ContinuationKey, Certificate> m_certificates;
+        std::map<ContinuationKey, std::vector<MilliFunds>> m_priceHints;
         std::uint64_t m_nextCertificate{0};
     };
 

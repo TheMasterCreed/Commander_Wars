@@ -34,9 +34,10 @@ namespace Coordinator
     bool decisionTraceEnabled();
     bool planningTimingAuditEnabled();
     std::unique_ptr<DecisionTrace> openDecisionTrace(const DecisionTraceIdentity & identity);
+    enum class PlanningTimingKind { Phases, Call };
     void writePlanningTimingAudit(
         const DecisionTraceIdentity & identity,
-        const QString & fields);
+        const QString & fields, PlanningTimingKind kind = PlanningTimingKind::Phases);
 
     inline QString traceBool(bool value)
     {

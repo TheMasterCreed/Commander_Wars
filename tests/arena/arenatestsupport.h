@@ -37,6 +37,8 @@ public:
     Q_INVOKABLE void cancelWatchdog();
     Q_INVOKABLE void finish(qint32 exitCode);
     void finish(ArenaExitCode exitCode);
+    bool claimStandaloneStartup();
+    bool ownsStandaloneStartup() const;
 
 private:
     QString getOutputPath(const QString & fileName) const;
@@ -44,4 +46,5 @@ private:
     QTimer m_watchdog;
     QString m_watchdogReason;
     bool m_exitQueued{false};
+    bool m_standaloneStartup{false};
 };

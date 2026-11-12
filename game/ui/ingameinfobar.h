@@ -2,6 +2,7 @@
 #define INGAMEINFOBAR_H
 
 #include <QObject>
+#include <QPointer>
 
 #include "3rd_party/oxygine-framework/oxygine/actor/SlidingActor.h"
 #include "3rd_party/oxygine-framework/oxygine/actor/Box9Sprite.h"
@@ -52,8 +53,8 @@ private:
     qint32 m_LastY{-1};
     qint32 m_newX{-1};
     qint32 m_newY{-1};
-    GameMap* m_pMap{nullptr};
-    GameMenue* m_pMenu{nullptr};
+    QPointer<GameMap> m_pMap;
+    QPointer<GameMenue> m_pMenu;
     QTimer m_debounceTimer;
 };
 

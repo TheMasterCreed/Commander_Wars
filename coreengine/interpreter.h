@@ -37,6 +37,10 @@ public:
     {
         return m_pInstance.get() != nullptr;
     }
+    static bool isCurrentThreadOwner()
+    {
+        return m_pOwner == QThread::currentThread() && exists();
+    }
     static Interpreter* createInstance();
     virtual ~Interpreter();
     static void release();
@@ -54,6 +58,11 @@ public:
     static bool reloadInterpreter(QString runtime);
 
     bool getInJsCall() const;
+    // Counts every interpreter path that runs script or writes or exposes a global binding.
+    quint64 getRealmEntries() const
+    {
+        return m_realmEntries;
+    }
     void trackJsObject(spQObject pObj);
 
     template<typename _TType, template<typename T> class _TVectorList>
@@ -90,6 +99,7 @@ public slots:
         clearJsStack();
         QJSValue funcPointer = globalObject().property(func);
         ++m_inJsCall;
+        ++m_realmEntries;
         QJSValue ret = funcPointer.call(args);
         exitJsCall();
         if (ret.isError())
@@ -112,6 +122,7 @@ public slots:
             if (funcPointer.isCallable())
             {
                 ++m_inJsCall;
+                ++m_realmEntries;
                 ret = funcPointer.call(args);
                 exitJsCall();
                 if (ret.isError())
@@ -229,6 +240,7 @@ private:
     std::vector<spQObject> m_jsObjects;
     std::list<JsThisData> m_ownedObjects;
     qint32 m_jsCallCount{0};
+    quint64 m_realmEntries{0};
     static QThread* m_pOwner;
 };
 

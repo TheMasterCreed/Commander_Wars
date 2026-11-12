@@ -236,6 +236,16 @@ void Settings::setSpawnAiProcess(bool newSpawnAiProcess)
     m_spawnAiProcess = newSpawnAiProcess;
 }
 
+bool Settings::getCoordinatedAiStockControl()
+{
+    return m_coordinatedAiStockControl;
+}
+
+void Settings::setCoordinatedAiStockControl(bool newCoordinatedAiStockControl)
+{
+    m_coordinatedAiStockControl = newCoordinatedAiStockControl;
+}
+
 bool Settings::getAutomaticUpdates()
 {
     return m_automaticUpdates;
@@ -1562,6 +1572,7 @@ void Settings::setup()
             MemoryManagement::create<Value<qint32>>("Game", "PauseAfterAction", &m_pauseAfterAction, 0, 0, 100),
             MemoryManagement::create<Value<QString>>("Game", "AiPipeUuid", &m_pipeUuid, "", "", ""),
             MemoryManagement::create<Value<bool>>("Game", "UseAiProcess", &m_spawnAiProcess, false, false, true),
+            MemoryManagement::create<Value<bool>>("Game", "CoordinatedAiStockControl", &m_coordinatedAiStockControl, false, false, true),
             MemoryManagement::create<Value<qint32>>("Game", "DebounceTime", &m_debounceTimeMs, 20, 0, std::numeric_limits<qint32>::max()),
 
             // network

@@ -125,6 +125,19 @@ public:
      * @return
      */
     Unit::ModdingFlags getModdingFlags() const;
+    bool hasTemporaryBonuses() const
+    {
+        return !m_OffensiveBonus.isEmpty() || !m_DefensiveBonus.isEmpty() ||
+               !m_VisionBonus.isEmpty() || !m_MovementBonus.isEmpty() || !m_FirerangeBonus.isEmpty();
+    }
+    bool hasMultiTurnPath() const
+    {
+        return !m_MultiTurnPath.isEmpty();
+    }
+    bool hasVirtualHp() const
+    {
+        return m_virtualHp > 0;
+    }
     /**
      * @brief applyMod
      */

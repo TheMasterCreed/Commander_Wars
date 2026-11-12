@@ -97,6 +97,10 @@ public:
     }
     Q_INVOKABLE QString getScriptFile() const;
     Q_INVOKABLE void setScriptFile(const QString & value);
+    bool hasLoadedScript() const
+    {
+        return m_loaded;
+    }
 
 private:
     /**

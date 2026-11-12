@@ -116,23 +116,12 @@ namespace Coordinator
             friend constexpr auto operator<=>(const MarginalKey &, const MarginalKey &) = default;
         };
 
-        struct EnemyKey
-        {
-            std::int32_t flippedColumn{NO_STOCK_COLUMN};
-            std::int32_t removedRow{NO_STOCK_ROW};
-
-            friend constexpr auto operator<=>(const EnemyKey &, const EnemyKey &) = default;
-        };
-
         const ArrivalVectors & arrivalsFrom(std::int32_t gridIdentity, std::int32_t movementPoints,
                                             const TilePoint & tile);
         JointActionFacts jointActionFacts(std::span<const PlanRowAction> actions) const;
         MilliFunds ourOpenOptimum(const JointActionFacts & facts);
         const MarginalTable & marginalFor(std::int32_t row, std::int32_t excludedColumn);
-        MilliFunds enemyOptimum(const PropertyStockOutcome & outcome);
-        MilliFunds enemyOptimumWith(std::int32_t flippedColumn, std::int32_t removedRow);
-        void flipColumnForEnemy(PropertyStockInstance & instance, std::int32_t flippedColumn) const;
-        MilliFunds jointEnemyOptimum(const std::vector<std::int32_t> & capturedColumns);
+        MilliFunds enemyOptimumWithout(std::int32_t removedRow);
         MilliFunds ourPositionalStock(const PropertyStockActor & actor, const PropertyStockOutcome & outcome);
         std::vector<MilliFunds> actingWeights(std::int32_t row, const PropertyStockActor & actor);
         std::vector<MilliFunds> rowWeights(const PropertyStockInstance & instance,
@@ -160,7 +149,6 @@ namespace Coordinator
         ActivationField m_reach;
         std::map<ArrivalKey, ArrivalVectors> m_arrivals;
         std::map<MarginalKey, MarginalTable> m_marginals;
-        std::map<EnemyKey, MilliFunds> m_enemyOptima;
-        std::map<std::vector<std::int32_t>, MilliFunds> m_jointEnemyOptima;
+        std::map<std::int32_t, MilliFunds> m_enemyOptimaWithoutRow;
     };
 }

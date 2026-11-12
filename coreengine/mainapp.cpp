@@ -740,6 +740,11 @@ bool Mainapp::getNoUi() const
     return m_noUi;
 }
 
+bool Mainapp::getNoAudio() const
+{
+    return m_noAudio;
+}
+
 bool Mainapp::getSlave()
 {
     return m_slave;

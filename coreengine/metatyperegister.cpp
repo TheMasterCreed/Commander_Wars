@@ -169,6 +169,7 @@ void MetaTypeRegister::registerInterfaceData()
     qRegisterMetaType<QVector<float>>("QVector<float>");
     qRegisterMetaType<QVector<qint32>>("QVector<qint32>");
     qRegisterMetaType<QVector<QPoint>>("QVector<QPoint>");
+    qmlRegisterAnonymousSequentialContainer<QVector<QPoint>>("CommanderWars", 1);
     qRegisterMetaType<QLocalSocket::LocalSocketError>("QLocalSocket::LocalSocketError");
     qRegisterMetaType<QAbstractSocket::SocketError>("QAbstractSocket::SocketError");
     qRegisterMetaType<QAbstractSocket::SocketState>("QAbstractSocket::SocketState");

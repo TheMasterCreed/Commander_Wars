@@ -84,17 +84,28 @@ namespace Coordinator
             return false;
         }
         m_tariffs.quote = *quote;
-        m_tariffs.witness = session.ourRerunWork();
+        const auto ours = session.ourRerunWork();
+        m_tariffs.witness = ours;
         if (m_tariffs.witness < 0)
         {
             return false;
         }
         const auto enemy = session.enemyRerunWork({});
         const auto capturedScan = masterWorkProduct(columns, columns);
-        return enemy >= 0 && capturedScan &&
+        const bool valid = enemy >= 0 && capturedScan &&
             RelativeStockDetail::checkedAdd(m_tariffs.witness, enemy) &&
             RelativeStockDetail::checkedAdd(m_tariffs.witness, *capturedScan) &&
             RelativeStockDetail::checkedAdd(m_tariffs.witness, *quote);
+        if (!valid)
+        {
+            return false;
+        }
+        auto admissionWork = m_tariffs.witness;
+        if (!RelativeStockDetail::checkedAdd(admissionWork, m_tariffs.quote))
+        {
+            admissionWork = -1;
+        }
+        return m_valuer->retainOperationBaseTariffs(ours, enemy, admissionWork);
     }
 
     MasterStockSetupStatus MasterAssignmentStockContext::prepare(
@@ -106,6 +117,7 @@ namespace Coordinator
         {
             return MasterStockSetupStatus::Invalid;
         }
+        const auto refusalsBefore = ledger.stats().refusals;
         if (!copyColdField(source, ledger))
         {
             if (m_status != MasterStockSetupStatus::ArithmeticFailure)
@@ -159,19 +171,28 @@ namespace Coordinator
         }
         if (!m_valuer->prepareMasterContinuationPricing(std::move(catalog), ledger, profile))
         {
-            m_status = ledger.stats().refusals == 0
+            m_status = ledger.stats().refusals == refusalsBefore
                 ? MasterStockSetupStatus::Invalid : MasterStockSetupStatus::BudgetExhausted;
             return m_status;
         }
         const auto* relative = m_valuer->relativeStockSession();
         if (relative == nullptr || !prepareTariffs(*relative, ledger))
         {
-            m_status = ledger.stats().refusals == 0
+            m_status = ledger.stats().refusals == refusalsBefore
                 ? MasterStockSetupStatus::ArithmeticFailure : MasterStockSetupStatus::BudgetExhausted;
             return m_status;
         }
         m_status = MasterStockSetupStatus::Prepared;
         return m_status;
+    }
+
+    MasterStockSetupStatus MasterAssignmentStockContext::prepareOperationService()
+    {
+        if (m_status != MasterStockSetupStatus::Prepared || !m_valuer || !m_valuer->prepareOperationService())
+        {
+            return MasterStockSetupStatus::Invalid;
+        }
+        return MasterStockSetupStatus::Prepared;
     }
 
     RelativeStockSession* MasterAssignmentStockContext::session()

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <utility>
 
 #include <QJsonDocument>
@@ -16,14 +17,19 @@
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
 
+#include "coreengine/mainapp.h"
 #include "coreengine/qmlvector.h"
+#include "coreengine/settings.h"
 
 #include "game/gamemap.h"
 #include "game/player.h"
 #include "game/unit.h"
+#include "menue/gamemenue.h"
+#include "objects/dialogs/dialogmessagebox.h"
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
 #include "tests/arena/masterassignmentprobe.h"
+#include "tests/arena/mastercomparisonprobe.h"
 #endif
 
 namespace
@@ -166,11 +172,13 @@ CoordinatedAi::CoordinatedAi(GameMap* pMap)
           pMap,
           NormalAi::DEFAULT_INI_FILE,
           GameEnums::AiTypes_Coordinated,
-          NormalAi::DEFAULT_JS_NAME)
+          NormalAi::DEFAULT_JS_NAME,
+          ScriptBinding::Deferred)
 {
 #ifdef GRAPHICSUPPORT
     setObjectName("CoordinatedAi");
 #endif
+    setupJsThis(this);
 }
 
 void CoordinatedAi::process()
@@ -215,6 +223,12 @@ void CoordinatedAi::process()
         }
         ensureTurnPlan();
     }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (m_testStockReferenceStopped)
+    {
+        return;
+    }
+#endif
     if (m_assignment.stockConstructionStatus != Coordinator::StockConstructionStatus::NotRequested &&
         m_assignment.stockConstructionStatus != Coordinator::StockConstructionStatus::Complete)
     {
@@ -296,9 +310,75 @@ void CoordinatedAi::ensureTurnPlan()
     {
         return;
     }
+    const bool timed = Coordinator::planningTimingAuditEnabled() || Coordinator::decisionTraceEnabled();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto preparationNanos = m_factLayersNanos + m_coPowerCheckNanos;
     buildTurnPlan();
     m_planDay = m_pMap->getCurrentDay();
+    if (timed)
+    {
+        const auto nanos = preparationNanos + planningNanosSince(started, true);
+        const Coordinator::DecisionTraceIdentity identity{
+            .day = m_planDay, .playerId = m_pPlayer->getPlayerID(),
+            .planSequence = m_planSequence, .horizonTurns = m_propertyStock.horizonTurns()};
+        const auto fields = QStringLiteral("planningCallNanos=%1 planSequence=%2").arg(nanos).arg(m_planSequence);
+        if (m_decisionTrace)
+        {
+            m_decisionTrace->record(QStringLiteral("PLANNING_CALL"), fields);
+            m_decisionTrace->flush();
+        }
+        Coordinator::writePlanningTimingAudit(identity, fields, Coordinator::PlanningTimingKind::Call);
+    }
 }
+
+void CoordinatedAi::stopStockControl(const Coordinator::MasterShadowConfig & config, const QString & reason)
+{
+    qCritical() << "StockControl stopped before plan execution:" << reason;
+    if (m_pMenu != nullptr)
+    {
+        m_pMenu->setGameStarted(false);
+    }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (config.runtime == Coordinator::MasterStockControlRuntime::Arena)
+    {
+        ArenaMasterAssignmentProbe::failStockControlSetup(reason);
+        emit sigStockControlStopped(reason);
+        return;
+    }
+#endif
+    if (m_pMenu != nullptr && !Mainapp::getInstance()->getNoUi())
+    {
+        auto dialog = MemoryManagement::create<DialogMessageBox>(
+            tr("StockControl could not construct a complete legal plan. This game has been stopped without "
+               "executing a partial plan or switching optimizers. You can save the game and exit.\n\n%1").arg(reason));
+        m_pMenu->addChild(dialog);
+    }
+    emit sigStockControlStopped(reason);
+}
+
+bool CoordinatedAi::playStockControlAvailable() const
+{
+    auto* settings = Settings::getInstance();
+    if (!settings->getCoordinatedAiStockControl() || settings->getSpawnAiProcess() || settings->getAiSlave() ||
+        Mainapp::getSlave())
+    {
+        return false;
+    }
+    auto* menu = dynamic_cast<GameMenue*>(m_pMenu);
+    return menu != nullptr && !menu->isNetworkGame() && !menu->getIsReplay();
+}
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+void CoordinatedAi::stopStockReference(const QString & reason)
+{
+    m_testStockReferenceStopped = true;
+    if (m_pMenu != nullptr)
+    {
+        m_pMenu->setGameStarted(false);
+    }
+    emit sigStockControlStopped(reason);
+}
+#endif
 
 void CoordinatedAi::buildTurnPlan()
 {
@@ -378,12 +458,35 @@ void CoordinatedAi::buildTurnPlan()
         }
     }
     auto masterShadow = Coordinator::readMasterShadowConfig();
+    if (masterShadow.mode == Coordinator::MasterAssignmentMode::Disabled &&
+        masterShadow.error == Coordinator::MasterShadowConfigError::None &&
+        masterShadow.runtime == Coordinator::MasterStockControlRuntime::None && playStockControlAvailable())
+    {
+        masterShadow = Coordinator::playMasterStockControlConfig();
+    }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     if (m_testStockControlHeld && masterShadow.controlsStock())
     {
         masterShadow.mode = Coordinator::MasterAssignmentMode::Disabled;
     }
 #endif
+    if (masterShadow.mode == Coordinator::MasterAssignmentMode::StockControl ||
+        (masterShadow.runtime == Coordinator::MasterStockControlRuntime::PlayableTrial &&
+         masterShadow.error != Coordinator::MasterShadowConfigError::None))
+    {
+        auto* menu = dynamic_cast<GameMenue*>(m_pMenu);
+        const bool unsupportedSession = masterShadow.runtime == Coordinator::MasterStockControlRuntime::PlayableTrial &&
+            (menu == nullptr || menu->isNetworkGame() || menu->getIsReplay());
+        if (masterShadow.error != Coordinator::MasterShadowConfigError::None || unsupportedSession)
+        {
+            m_assignment = Coordinator::AssignmentResult{};
+            m_assignment.stockConstructionStatus = Coordinator::StockConstructionStatus::InvalidInput;
+            stopStockControl(masterShadow, unsupportedSession
+                ? tr("The playable trial supports local single-player sessions only.")
+                : tr("Invalid StockControl configuration (%1).").arg(static_cast<int>(masterShadow.error)));
+            return;
+        }
+    }
     Coordinator::AssignmentInput input;
     input.actionIds = Coordinator::engineActionIds();
     input.unitLinks = linkKnownUnits(m_dayStartKnowledge);
@@ -391,9 +494,9 @@ void CoordinatedAi::buildTurnPlan()
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     tierAudit = m_testTierAuditMode;
 #endif
-    Coordinator::JointPlanStockValuer stockValuer(
-        m_propertyStock, input.unitLinks, tierAudit);
-    input.pStockValuer = &stockValuer;
+    std::optional<Coordinator::JointPlanStockValuer> stockValuer;
+    stockValuer.emplace(m_propertyStock, input.unitLinks, tierAudit);
+    input.pStockValuer = &*stockValuer;
     input.pTrace = m_decisionTrace.get();
     input.measureTimings = timed;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
@@ -523,7 +626,7 @@ void CoordinatedAi::buildTurnPlan()
         for (const Coordinator::AssignmentActor & actor :
              input.actors)
         {
-            if (stockValuer.affectsStock(
+            if (stockValuer->affectsStock(
                     actor.engineUnitId))
             {
                 ++stockCoupledActors;
@@ -541,6 +644,7 @@ void CoordinatedAi::buildTurnPlan()
     std::int64_t legacyAssignmentNanos = 0;
     std::int64_t arenaProbeNanos = 0;
     Clock::time_point phaseStart;
+    bool legacyPlanning = !masterShadow.controlsStock();
     if (masterShadow.controlsStock())
     {
         if (timed)
@@ -548,17 +652,40 @@ void CoordinatedAi::buildTurnPlan()
             phaseStart = Clock::now();
         }
         controlTiming = Coordinator::controlMasterAssignment(
-            masterShadow, input, m_assignment, m_propertyStock, traceIdentity);
+            masterShadow, *m_pMap, input, m_assignment, m_propertyStock, m_properties, traceIdentity);
         stockControlCallNanos = planningNanosSince(phaseStart, timed);
-#ifdef COW_COORDINATED_REFINEMENT_TESTING
-        if (!controlTiming.constructorComplete)
+        if (masterShadow.runtime == Coordinator::MasterStockControlRuntime::Play &&
+            controlTiming.status != Coordinator::MasterStockControlStatus::Installed)
         {
-            ArenaMasterAssignmentProbe::failStockControlSetup(
-                Coordinator::masterStockControlStatusName(controlTiming.status));
+            if (!controlTiming.constructorComplete)
+            {
+                qWarning() << "StockControl could not construct a plan:"
+                           << Coordinator::masterStockControlStatusName(controlTiming.status);
+            }
+            // A fresh valuer keeps the unproven attempt's cached pricing out of the standard planner.
+            stockValuer.emplace(m_propertyStock, input.unitLinks, tierAudit);
+            input.pStockValuer = &*stockValuer;
+            legacyPlanning = true;
+        }
+        else if (masterShadow.runtime != Coordinator::MasterStockControlRuntime::Play &&
+                 !controlTiming.constructorComplete)
+        {
+            stopStockControl(masterShadow, Coordinator::masterStockControlStatusName(controlTiming.status));
+        }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        else
+        {
+            const auto reference = ArenaMasterComparisonProbe::recordStockReference(
+                masterShadow, input, m_assignment, m_propertyStock, traceIdentity);
+            if (reference != ArenaMasterComparisonProbe::StockReferenceResult::NotRequested)
+            {
+                stopStockReference(ArenaMasterComparisonProbe::stockReferenceStopReason(reference));
+                return;
+            }
         }
 #endif
     }
-    else
+    if (legacyPlanning)
     {
         Clock::time_point continuationStart;
         if (timed)
@@ -572,15 +699,15 @@ void CoordinatedAi::buildTurnPlan()
         }
 #endif
         Coordinator::ContinuationPricingCatalog catalog =
-            stockValuer.continuationPricingCatalog(input);
+            stockValuer->continuationPricingCatalog(input);
         if (catalog.valid && ledger.open(catalog.ledgerTotal))
         {
             static_cast<void>(
-                stockValuer.prepareContinuationPricing(
+                stockValuer->prepareContinuationPricing(
                     std::move(catalog), ledger));
         }
         continuationPricingPrepareNanos = planningNanosSince(continuationStart, timed);
-        legacyPreparationNanos = planningNanosSince(planningStart, timed);
+        legacyPreparationNanos = planningNanosSince(planningStart, timed) - stockControlCallNanos;
         if (timed)
         {
             phaseStart = Clock::now();
@@ -725,7 +852,9 @@ void CoordinatedAi::buildTurnPlan()
         }
         if (masterShadow.controlsStock())
         {
-            phaseTimingFields += QStringLiteral(" stockControlCallNanos=%1").arg(stockControlCallNanos);
+            phaseTimingFields += QStringLiteral(" stockControlCallNanos=%1 stockControlAuthority=%2 stockControlGuardedPaymentShift=%3")
+                .arg(stockControlCallNanos).arg(Coordinator::masterStockAuthorityName(controlTiming.selectedAuthority))
+                .arg(optionalPlanningValue(controlTiming.guardedPaymentShift));
             phaseTimingFields += QStringLiteral(
                 " stockControlNanos=%1 stockControlConstructorNanos=%2 stockControlSearchNanos=%3 stockControlFinalizationNanos=%4 stockControlExportNanos=%5 stockControlWork=%6 stockControlAllowance=%7 stockControlReservedWork=%8 stockControlFinalizationWork=%9 stockControlConstructorComplete=%10 stockControlStatus=%11 stockControlInstallationStatus=%12 stockControlExportSucceeded=%13")
                 .arg(controlTiming.totalNanos).arg(controlTiming.constructorNanos).arg(controlTiming.searchNanos)
@@ -741,6 +870,7 @@ void CoordinatedAi::buildTurnPlan()
                 .arg(optionalPlanningValue(controlTiming.improvementLower)).arg(optionalPlanningValue(controlTiming.gap))
                 .arg(QString::fromUtf8(QJsonDocument(
                     Coordinator::masterWorkRecord(controlTiming.work)).toJson(QJsonDocument::Compact)));
+            phaseTimingFields += QStringLiteral(" stockControlFallback=%1").arg(legacyPlanning);
         }
     }
     if (m_decisionTrace != nullptr)

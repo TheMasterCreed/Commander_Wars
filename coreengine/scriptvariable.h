@@ -112,6 +112,15 @@ public:
      * @return
      */
     bool getModified() const;
+    const QString & getStoredId() const
+    {
+        return m_Id;
+    }
+    bool hasUsableStoredDataStream() const;
+    const QByteArray & getStoredData() const
+    {
+        return m_buffer.data();
+    }
 
 public slots:
     inline QString getId()

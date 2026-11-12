@@ -87,6 +87,7 @@ namespace Coordinator
         InvalidInterval,
         ContradictoryCommonEnemy,
         MissingOurWitness,
+        // Retired with start-of-turn enemy pricing; kept so recorded reason numbers stay stable.
         MissingEnemyWitness,
         ArithmeticOverflow,
         CertifiedPositive,
@@ -202,9 +203,9 @@ namespace Coordinator
             result.reason = RelativeStockReason::InvalidInterval;
             return result;
         }
-        const bool commonEnemy = incumbent.capturedColumns == challenger.capturedColumns;
-        if (commonEnemy && std::max(incumbent.enemy.lower, challenger.enemy.lower) >
-                               std::min(incumbent.enemy.upper, challenger.enemy.upper))
+        // One live model has one enemy value, so both intervals must bracket it and the term cancels.
+        if (std::max(incumbent.enemy.lower, challenger.enemy.lower) >
+            std::min(incumbent.enemy.upper, challenger.enemy.upper))
         {
             result.reason = RelativeStockReason::ContradictoryCommonEnemy;
             return result;
@@ -212,11 +213,6 @@ namespace Coordinator
         if (!incumbent.ourLowerWitnessReplays || !challenger.ourLowerWitnessReplays)
         {
             result.reason = RelativeStockReason::MissingOurWitness;
-            return result;
-        }
-        if (!commonEnemy && (!incumbent.enemyLowerWitnessReplays || !challenger.enemyLowerWitnessReplays))
-        {
-            result.reason = RelativeStockReason::MissingEnemyWitness;
             return result;
         }
         result.economicDelta = challenger.economic;
@@ -238,19 +234,14 @@ namespace Coordinator
         if (!RelativeStockDetail::checkedAdd(lower, challenger.ours.lower) ||
             !RelativeStockDetail::checkedSubtract(lower, incumbent.ours.upper) ||
             !RelativeStockDetail::checkedAdd(upper, challenger.ours.upper) ||
-            !RelativeStockDetail::checkedSubtract(upper, incumbent.ours.lower) ||
-            (!commonEnemy &&
-             (!RelativeStockDetail::checkedSubtract(lower, challenger.enemy.upper) ||
-              !RelativeStockDetail::checkedAdd(lower, incumbent.enemy.lower) ||
-              !RelativeStockDetail::checkedSubtract(upper, challenger.enemy.lower) ||
-              !RelativeStockDetail::checkedAdd(upper, incumbent.enemy.upper))))
+            !RelativeStockDetail::checkedSubtract(upper, incumbent.ours.lower))
         {
             result.reason = RelativeStockReason::ArithmeticOverflow;
             return result;
         }
         result.deltaLower = lower;
         result.deltaUpper = upper;
-        result.commonEnemyCancelled = commonEnemy;
+        result.commonEnemyCancelled = true;
         result.reason = lower > 0 ? RelativeStockReason::CertifiedPositive :
             upper <= 0 ? RelativeStockReason::CertifiedNonImprovement : RelativeStockReason::Overlap;
         return result;

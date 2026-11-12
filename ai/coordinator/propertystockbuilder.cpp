@@ -15,6 +15,7 @@
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/masterassignmentfuture.h"
 #include "ai/coordinator/masterassignmentprofile.h"
+#include "ai/coordinator/packingdualhint.h"
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coreai.h"
 
@@ -57,6 +58,18 @@ namespace
             product *= factor;
         }
         return addWork(total, product);
+    }
+
+    bool addCertificateOptionWork(const Coordinator::SequentialDetail::RowOption & option,
+                                  std::int64_t & catalog, std::int64_t & records, std::int64_t & incidences)
+    {
+        if (!std::in_range<std::int64_t>(option.nodes.size()))
+        {
+            return false;
+        }
+        const auto nodes = static_cast<std::int64_t>(option.nodes.size());
+        return addWork(catalog, std::max<std::int64_t>(1, nodes)) &&
+            addWork(records, 1) && addWork(incidences, nodes);
     }
 
     bool sameWitness(
@@ -287,76 +300,22 @@ namespace Coordinator
         return m_marginals.emplace(key, std::move(table)).first->second;
     }
 
-    void PropertyStockField::flipColumnForEnemy(PropertyStockInstance & instance,
-                                                std::int32_t flippedColumn) const
+    MilliFunds PropertyStockField::enemyOptimumWithout(std::int32_t removedRow)
     {
-        const std::size_t columnCount = instance.columns.size();
-        const std::size_t column = static_cast<std::size_t>(flippedColumn);
-        instance.columns[column].ownerBefore = mirroredSign(STOCK_OWNER_AFTER);
-        for (std::size_t row = 0; row < instance.rows.size(); ++row)
+        if (removedRow == NO_STOCK_ROW)
         {
-            const std::size_t offset = row * columnCount + column;
-            const ArrivalFacts arrival{
-                .arrivalActivations = m_enemyArrivals[offset],
-                .carriedPoints = carriedFor(instance.rows[row], flippedColumn),
-                .ratePerTurn = instance.rows[row].captureRate,
-            };
-            instance.weights[offset] = columnWeight(instance.columns[column], arrival,
-                                                    m_capturePointsToCapture, m_horizonTurns);
+            return m_enemyOptimum;
         }
-    }
-
-    MilliFunds PropertyStockField::enemyOptimumWith(std::int32_t flippedColumn, std::int32_t removedRow)
-    {
-        PropertyStockInstance instance = m_theirs;
-        if (flippedColumn != NO_STOCK_COLUMN)
+        const auto known = m_enemyOptimaWithoutRow.find(removedRow);
+        if (known != m_enemyOptimaWithoutRow.end())
         {
-            flipColumnForEnemy(instance, flippedColumn);
+            return known->second;
         }
-        const AssignmentSubInstance sub = subInstanceWithout(instance, removedRow, NO_STOCK_COLUMN);
+        const AssignmentSubInstance sub = subInstanceWithout(m_theirs, removedRow, NO_STOCK_COLUMN);
         AssignmentSolver solver;
         solver.solve(sub.rowCount, sub.columnCount, sub.weights);
-        return solver.optimum();
-    }
-
-    MilliFunds PropertyStockField::jointEnemyOptimum(const std::vector<std::int32_t> & capturedColumns)
-    {
-        if (capturedColumns.empty())
-        {
-            return m_enemyOptimum;
-        }
-        const auto known = m_jointEnemyOptima.find(capturedColumns);
-        if (known != m_jointEnemyOptima.end())
-        {
-            return known->second;
-        }
-        PropertyStockInstance instance = m_theirs;
-        for (const std::int32_t flipped : capturedColumns)
-        {
-            flipColumnForEnemy(instance, flipped);
-        }
-        AssignmentSolver solver;
-        solver.solve(instance.rowCount(), instance.columnCount(), instance.weights);
         const MilliFunds optimum = solver.optimum();
-        m_jointEnemyOptima.emplace(capturedColumns, optimum);
-        return optimum;
-    }
-
-    MilliFunds PropertyStockField::enemyOptimum(const PropertyStockOutcome & outcome)
-    {
-        const std::int32_t removedRow = enemyRowOf(outcome.destroyedKnowledgeIndex);
-        if (outcome.capturedColumn == NO_STOCK_COLUMN && removedRow == NO_STOCK_ROW)
-        {
-            return m_enemyOptimum;
-        }
-        const EnemyKey key{outcome.capturedColumn, removedRow};
-        const auto known = m_enemyOptima.find(key);
-        if (known != m_enemyOptima.end())
-        {
-            return known->second;
-        }
-        const MilliFunds optimum = enemyOptimumWith(outcome.capturedColumn, removedRow);
-        m_enemyOptima.emplace(key, optimum);
+        m_enemyOptimaWithoutRow.emplace(removedRow, optimum);
         return optimum;
     }
 
@@ -382,7 +341,8 @@ namespace Coordinator
             owned += ownershipFlipSwing(m_ours.columns[static_cast<std::size_t>(outcome.capturedColumn)],
                                         m_horizonTurns);
         }
-        return owned + ourPositionalStock(actor, outcome) - enemyOptimum(outcome);
+        return owned + ourPositionalStock(actor, outcome) -
+            enemyOptimumWithout(enemyRowOf(outcome.destroyedKnowledgeIndex));
     }
 
     PropertyStockField::JointActionFacts PropertyStockField::jointActionFacts(
@@ -476,8 +436,7 @@ namespace Coordinator
                 m_horizonTurns);
         }
         result.ourOpenOptimum = ourOpenOptimum(facts);
-        result.jointEnemyOptimum =
-            jointEnemyOptimum(facts.capturedColumns);
+        result.jointEnemyOptimum = m_enemyOptimum;
         result.stockAbsolute =
             result.ownedBaseline +
             result.ownershipFlipSwingTotal +
@@ -684,6 +643,29 @@ namespace Coordinator
         return prepareContinuationPricing(std::move(catalog), ledger, 0, PricingBudgetPolicy::Shared);
     }
 
+    bool JointPlanStockValuer::retainOperationBaseTariffs(
+        std::int64_t ours, std::int64_t enemy, std::int64_t certificateAdmissionWork)
+    {
+        if (ours < 0 || enemy < 0 || !m_masterFutureCatalog ||
+            !m_refinedOurWitnesses.empty() || !m_refinedEnemyWitnesses.empty())
+        {
+            return false;
+        }
+        m_operationBaseTariffs = OperationBaseTariffs{ours, enemy, certificateAdmissionWork};
+        return true;
+    }
+
+    bool JointPlanStockValuer::prepareOperationService()
+    {
+        if (!m_operationBaseTariffs || m_operationBaseTariffs->certificateAdmissionWork < 0 ||
+            !m_masterFutureCatalog || !livePairSwapIntervals())
+        {
+            return false;
+        }
+        m_operationServiceEnabled = true;
+        return true;
+    }
+
     bool JointPlanStockValuer::prepareContinuationPricing(
         ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget,
         PricingBudgetPolicy policy)
@@ -840,6 +822,10 @@ namespace Coordinator
 
     std::int64_t JointPlanStockValuer::ourRerunTariff() const
     {
+        if (m_operationServiceEnabled)
+        {
+            return m_operationBaseTariffs->ours;
+        }
         const std::int64_t rows =
             static_cast<std::int64_t>(m_field.m_ours.rows.size());
         const std::int64_t horizon =
@@ -888,6 +874,18 @@ namespace Coordinator
     std::int64_t JointPlanStockValuer::enemyRerunTariff(
         const std::vector<std::int32_t> & capturedColumns) const
     {
+        if (m_operationServiceEnabled)
+        {
+            auto tariff = m_operationBaseTariffs->enemy;
+            if (!std::in_range<std::int64_t>(m_field.m_theirs.columns.size()) ||
+                !std::in_range<std::int64_t>(capturedColumns.size()) ||
+                !addProduct(tariff, {static_cast<std::int64_t>(m_field.m_theirs.columns.size()),
+                                     static_cast<std::int64_t>(capturedColumns.size())}))
+            {
+                return -1;
+            }
+            return tariff;
+        }
         const std::int64_t rows =
             static_cast<std::int64_t>(m_field.m_theirs.rows.size());
         const std::int64_t columns =
@@ -1037,24 +1035,12 @@ namespace Coordinator
         return terms;
     }
 
-    MilliFunds JointPlanStockValuer::enemyUnionCeiling(
-        PropertyStockField & field,
-        std::span<const std::int32_t> admissibleCapturedColumns) const
+    MilliFunds JointPlanStockValuer::enemyRowCeiling(PropertyStockField & field) const
     {
         const std::int32_t columnCount = field.m_theirs.columnCount();
         if (columnCount == 0 || field.m_theirs.rowCount() == 0)
         {
             return 0;
-        }
-        std::vector<bool> canFlip(
-            static_cast<std::size_t>(columnCount), false);
-        for (const std::int32_t column : admissibleCapturedColumns)
-        {
-            if (column < 0 || column >= columnCount)
-            {
-                return -1;
-            }
-            canFlip[static_cast<std::size_t>(column)] = true;
         }
 
         std::vector<std::int32_t> nodeSlots;
@@ -1065,8 +1051,7 @@ namespace Coordinator
         {
             const std::size_t slot = static_cast<std::size_t>(column);
             if (field.m_theirs.columns[slot].ownerBefore ==
-                    STOCK_OWNER_AFTER &&
-                !canFlip[slot])
+                STOCK_OWNER_AFTER)
             {
                 continue;
             }
@@ -1082,46 +1067,22 @@ namespace Coordinator
         }
 
         const std::int32_t horizon = field.m_horizonTurns;
-        std::vector<MilliFunds> unionPrizes(
+        std::vector<MilliFunds> prizes(
             static_cast<std::size_t>(nodeCount) *
                 static_cast<std::size_t>(std::max(horizon, 0)),
             0);
         for (std::int32_t node = 0; node < nodeCount; ++node)
         {
-            const std::int32_t column =
-                nodeSlots[static_cast<std::size_t>(node)];
-            const std::size_t columnSlot =
-                static_cast<std::size_t>(column);
             const PropertyStockColumn & base =
-                field.m_theirs.columns[columnSlot];
-            PropertyStockColumn flipped = base;
-            flipped.ownerBefore = mirroredSign(STOCK_OWNER_AFTER);
+                field.m_theirs.columns[static_cast<std::size_t>(
+                    nodeSlots[static_cast<std::size_t>(node)])];
             for (std::int32_t turn = 0; turn < horizon; ++turn)
             {
-                bool hasPrize = false;
-                MilliFunds prize = 0;
-                if (base.ownerBefore != STOCK_OWNER_AFTER)
-                {
-                    prize = columnStreamValue(base, turn, horizon);
-                    hasPrize = true;
-                }
-                if (canFlip[columnSlot])
-                {
-                    const MilliFunds candidate =
-                        columnStreamValue(flipped, turn, horizon);
-                    if (!hasPrize || candidate > prize)
-                    {
-                        prize = candidate;
-                    }
-                    hasPrize = true;
-                }
-                if (hasPrize)
-                {
-                    unionPrizes[
-                        static_cast<std::size_t>(node) *
-                            static_cast<std::size_t>(horizon) +
-                        static_cast<std::size_t>(turn)] = prize;
-                }
+                prizes[
+                    static_cast<std::size_t>(node) *
+                        static_cast<std::size_t>(horizon) +
+                    static_cast<std::size_t>(turn)] =
+                    columnStreamValue(base, turn, horizon);
             }
         }
 
@@ -1157,7 +1118,7 @@ namespace Coordinator
             SequentialClassTable table;
             table.buildFromPrizes(
                 nodeCount,
-                unionPrizes,
+                prizes,
                 arrivals,
                 captureTurnsFor(0,
                                 row.captureRate,
@@ -1213,35 +1174,9 @@ namespace Coordinator
                         ? 0
                         : std::max<MilliFunds>(
                               table.valueAt(node, owned), 0);
-                if (field.m_theirs.columns[columnSlot].ownerBefore !=
-                    STOCK_OWNER_AFTER)
-                {
-                    rowCeiling = std::max(
-                        rowCeiling,
-                        baseWeights[columnSlot] + continuation);
-                }
-                if (canFlip[columnSlot])
-                {
-                    PropertyStockColumn flipped =
-                        field.m_theirs.columns[columnSlot];
-                    flipped.ownerBefore =
-                        mirroredSign(STOCK_OWNER_AFTER);
-                    const ArrivalFacts arrival{
-                        .arrivalActivations =
-                            arrivals.activations[columnSlot],
-                        .carriedPoints =
-                            field.carriedFor(row, column),
-                        .ratePerTurn = row.captureRate,
-                    };
-                    rowCeiling = std::max(
-                        rowCeiling,
-                        columnWeight(
-                            flipped,
-                            arrival,
-                            field.m_capturePointsToCapture,
-                            horizon) +
-                            continuation);
-                }
+                rowCeiling = std::max(
+                    rowCeiling,
+                    baseWeights[columnSlot] + continuation);
             }
             ceiling += std::max<MilliFunds>(rowCeiling, 0);
         }
@@ -1360,7 +1295,6 @@ namespace Coordinator
         }
 
         std::vector<CheapActionTerms> actions;
-        std::vector<std::int32_t> admissibleCapturedColumns;
         actions.reserve(catalogActions.size());
         for (const PlanRowAction & action : catalogActions)
         {
@@ -1386,7 +1320,6 @@ namespace Coordinator
                         pricingField->m_capturePointsToCapture)
                     {
                         capturedColumn = column;
-                        admissibleCapturedColumns.push_back(column);
                     }
                 }
             }
@@ -1425,13 +1358,6 @@ namespace Coordinator
                 .rowTerms = std::move(terms),
             });
         }
-        std::sort(admissibleCapturedColumns.begin(),
-                  admissibleCapturedColumns.end());
-        admissibleCapturedColumns.erase(
-            std::unique(admissibleCapturedColumns.begin(),
-                        admissibleCapturedColumns.end()),
-            admissibleCapturedColumns.end());
-
         std::vector<MilliFunds> capturedSwing;
         capturedSwing.reserve(pricingField->m_ours.columns.size());
         for (const PropertyStockColumn & column :
@@ -1442,14 +1368,7 @@ namespace Coordinator
                     column,
                     pricingField->m_horizonTurns));
         }
-        const MilliFunds enemyCeiling =
-            enemyUnionCeiling(
-                *pricingField,
-                admissibleCapturedColumns);
-        if (enemyCeiling < 0)
-        {
-            return false;
-        }
+        const MilliFunds enemyCeiling = enemyRowCeiling(*pricingField);
         CheapPricingModel model;
         if (!model.install(
                 pricingField->m_ours.rowCount(),
@@ -1710,8 +1629,7 @@ namespace Coordinator
                                SEQUENTIAL_SEARCH_STATE_CAP,
                                true);
         const EnemySequentialSolve enemy =
-            solveEnemySequential(ours.capturedColumns,
-                                 SEQUENTIAL_SEARCH_STATE_CAP,
+            solveEnemySequential(SEQUENTIAL_SEARCH_STATE_CAP,
                                  true);
         PlanStockAudit result{
             .capturedColumns = floor.capturedColumns,
@@ -1800,8 +1718,9 @@ namespace Coordinator
         {
             return;
         }
+        m_ourStateSource = &continuationField();
         const std::vector<PropertyStockColumn> & columns =
-            continuationField().m_ours.columns;
+            m_ourStateSource->m_ours.columns;
         m_ourNodeOfColumn.assign(columns.size(), NO_SEQUENTIAL_NODE);
         for (std::size_t slot = 0; slot < columns.size(); ++slot)
         {
@@ -1949,7 +1868,6 @@ namespace Coordinator
 
     JointPlanStockValuer::EnemySequentialSolve
     JointPlanStockValuer::solveEnemySequential(
-        const std::vector<std::int32_t> & capturedColumns,
         std::int64_t stateCap,
         bool captureWitness,
         const RefinedWitness* pReplay,
@@ -1958,36 +1876,32 @@ namespace Coordinator
         MasterProfileScope setupTiming(m_masterProfile, MasterPhase::EnemySetup);
         PropertyStockField & field = continuationField();
         EnemySequentialSolve solved;
-        const MilliFunds enemyFloor =
-            field.jointEnemyOptimum(capturedColumns);
-        PropertyStockInstance flipped = field.m_theirs;
-        for (const std::int32_t column : capturedColumns)
-        {
-            field.flipColumnForEnemy(flipped, column);
-        }
+        // Start-of-turn ownership prices the enemy, so our captures this turn leave its instance unchanged.
+        const PropertyStockInstance & theirs = field.m_theirs;
+        const MilliFunds enemyFloor = field.m_enemyOptimum;
 
         std::vector<std::int32_t> nodeSlots;
         std::vector<PropertyStockColumn> nodeColumns;
-        for (std::size_t slot = 0; slot < flipped.columns.size(); ++slot)
+        for (std::size_t slot = 0; slot < theirs.columns.size(); ++slot)
         {
-            if (flipped.columns[slot].ownerBefore == STOCK_OWNER_AFTER)
+            if (theirs.columns[slot].ownerBefore == STOCK_OWNER_AFTER)
             {
                 continue;
             }
             nodeSlots.push_back(static_cast<std::int32_t>(slot));
-            nodeColumns.push_back(flipped.columns[slot]);
+            nodeColumns.push_back(theirs.columns[slot]);
         }
 
         std::vector<SequentialClassKey> classKeys;
         std::vector<SequentialClassTable> classTables;
         std::vector<std::int32_t> classIndices(
-            flipped.rows.size(),
+            theirs.rows.size(),
             NO_SEQUENTIAL_CLASS);
         for (std::size_t rowIndex = 0;
-             rowIndex < flipped.rows.size();
+             rowIndex < theirs.rows.size();
              ++rowIndex)
         {
-            const PropertyStockRow & row = flipped.rows[rowIndex];
+            const PropertyStockRow & row = theirs.rows[rowIndex];
             const SequentialClassKey key{
                 row.gridIdentity,
                 row.movementPoints,
@@ -2032,15 +1946,15 @@ namespace Coordinator
         instance.classes =
             std::span<const SequentialClassTable>(classTables);
         instance.capturedNodes.assign(nodeSlots.size(), false);
-        instance.rows.reserve(flipped.rows.size());
+        instance.rows.reserve(theirs.rows.size());
         for (std::size_t rowIndex = 0;
-             rowIndex < flipped.rows.size();
+             rowIndex < theirs.rows.size();
              ++rowIndex)
         {
             instance.rows.push_back(sequentialRowFor(
                 field,
-                flipped,
-                flipped.rows[rowIndex],
+                theirs,
+                theirs.rows[rowIndex],
                 static_cast<std::int32_t>(rowIndex),
                 nullptr,
                 nodeSlots,
@@ -2078,23 +1992,14 @@ namespace Coordinator
         return solved;
     }
 
-    MilliFunds JointPlanStockValuer::enemySequentialOptimum(
-        const std::vector<std::int32_t> & capturedColumns) const
+    MilliFunds JointPlanStockValuer::enemySequentialOptimum() const
     {
-        const auto known =
-            m_enemySequentialOptima.find(capturedColumns);
-        if (known != m_enemySequentialOptima.end())
+        if (!m_enemySequentialOptimum)
         {
-            return known->second;
+            m_enemySequentialOptimum =
+                solveEnemySequential(SEQUENTIAL_SEARCH_STATE_CAP, false).tier.bookedValue;
         }
-        const EnemySequentialSolve solved =
-            solveEnemySequential(capturedColumns,
-                                 SEQUENTIAL_SEARCH_STATE_CAP,
-                                 false);
-        m_enemySequentialOptima.emplace(
-            capturedColumns,
-            solved.tier.bookedValue);
-        return solved.tier.bookedValue;
+        return *m_enemySequentialOptimum;
     }
 
     const PropertyStockActor* JointPlanStockValuer::sequentialMover(
@@ -2136,7 +2041,8 @@ namespace Coordinator
         return entry;
     }
 
-    std::int64_t JointPlanStockValuer::certificateReadinessTariff(const RelativeStockQuote & quote) const
+    std::int64_t JointPlanStockValuer::certificateReadinessTariff(
+        const RelativeStockQuote & quote, bool pendingAdmission) const
     {
         const auto & field = continuationField();
         if (!std::in_range<std::int32_t>(field.m_ours.rows.size()) ||
@@ -2151,7 +2057,16 @@ namespace Coordinator
         const auto actions = static_cast<std::int64_t>(quote.key.size());
         const auto keyWidth = static_cast<std::int64_t>(ROW_ENUM_KEY_PREFIX) + columns;
         const auto lookupDepth = 2 * static_cast<std::int64_t>(std::bit_width(m_rowOptionCache.size())) + 1;
-        const auto entryDepth = 2 * static_cast<std::int64_t>(std::bit_width(m_continuationStore.entryCount())) + 1;
+        auto entries = m_continuationStore.entryCount();
+        if (pendingAdmission)
+        {
+            if (entries == std::numeric_limits<std::size_t>::max())
+            {
+                return -1;
+            }
+            ++entries;
+        }
+        const auto entryDepth = 2 * static_cast<std::int64_t>(std::bit_width(entries)) + 1;
         std::int64_t work = 1;
         // Both readiness and native setup look up the same immutable row domains.
         if (!addProduct(work, {actions + 1, actions + 1}) ||
@@ -2225,6 +2140,132 @@ namespace Coordinator
         }
         result.scanWork = scanWork;
         result.status = RelativeStockPreparationStatus::Ready;
+        return result;
+    }
+
+    std::optional<std::int64_t> JointPlanStockValuer::certificateMinimumWork(const RelativeStockQuote & quote) const
+    {
+        const auto & field = continuationField();
+        const auto facts = field.jointActionFacts(planActions(quote.key));
+        std::int64_t catalogWork = 0;
+        std::int64_t optionRecords = 0;
+        std::int64_t incidences = 0;
+        for (std::size_t row = 0; row < field.m_ours.rows.size(); ++row)
+        {
+            const auto rowIndex = static_cast<std::int32_t>(row);
+            const auto key = sequentialRowKey(rowIndex, sequentialMover(facts, rowIndex), facts.capturedColumns);
+            const auto cached = m_rowOptionCache.find(key);
+            if (cached == m_rowOptionCache.end())
+            {
+                return std::nullopt;
+            }
+            for (const auto & option : cached->second.options)
+            {
+                if (!addCertificateOptionWork(option, catalogWork, optionRecords, incidences))
+                {
+                    return std::nullopt;
+                }
+            }
+        }
+        auto minimum = m_operationBaseTariffs->ours;
+        if (!std::in_range<std::int64_t>(m_masterFutureCatalog->columns.size()) ||
+            !addWork(minimum, catalogWork) || !addWork(minimum, optionRecords) ||
+            !addWork(minimum, incidences) ||
+            !addWork(minimum, static_cast<std::int64_t>(m_masterFutureCatalog->columns.size())))
+        {
+            return std::nullopt;
+        }
+        return minimum;
+    }
+
+    bool JointPlanStockValuer::prepareOperationEntry(const RelativeStockQuote & quote)
+    {
+        if (!quote.valid || !RelativeStockDetail::canonical(quote) || !RelativeStockDetail::coherent(quote))
+        {
+            return false;
+        }
+        const auto* entry = m_continuationStore.find(quote.key);
+        if (entry != nullptr && certificateEntry(quote) == nullptr)
+        {
+            return false;
+        }
+        const auto knownUpper = m_verifiedOurUppers.find(quote.key);
+        std::uint64_t certificateId = 0;
+        if (knownUpper != m_verifiedOurUppers.end())
+        {
+            certificateId = knownUpper->second.id;
+        }
+        const auto* enemy = m_continuationStore.enemyFor(quote.capturedColumns);
+        if (certificateId != quote.ourUpperCertificateId || enemy == nullptr ||
+            enemy->bounds.lower != quote.enemy.lower || enemy->bounds.upper != quote.enemy.upper ||
+            enemy->searchCompleted != quote.enemySearchCompleted)
+        {
+            return false;
+        }
+        CheapInitialPrice initial;
+        return priceCheap(quote.key, initial);
+    }
+
+    RelativeStockOperationPreparation JointPlanStockValuer::prepareOurCertificateOperation(
+        const RelativeStockQuote & quote)
+    {
+        RelativeStockOperationPreparation result;
+        if (!m_operationServiceEnabled || !livePairSwapIntervals())
+        {
+            return result;
+        }
+        const auto before = m_pRefinementLedger->balance();
+        if (!m_pRefinementLedger->consume(m_operationBaseTariffs->certificateAdmissionWork,
+                                         RefinementWork::MasterValuation))
+        {
+            result.status = RelativeStockPreparationStatus::BudgetExhausted;
+            result.requiredPreparationWork = m_operationBaseTariffs->certificateAdmissionWork;
+            return result;
+        }
+        result.paidWork = before - m_pRefinementLedger->balance();
+        if (!prepareOperationEntry(quote))
+        {
+            m_pricingFailure = true;
+            return result;
+        }
+        const auto preparation = prepareOurCertificate(quote);
+        result.status = preparation.status;
+        result.readinessChecked = preparation.status == RelativeStockPreparationStatus::Ready ||
+            preparation.status == RelativeStockPreparationStatus::MissingRows;
+        result.paidWork = before - m_pRefinementLedger->balance();
+        result.scanWork = preparation.scanWork;
+        if (preparation.status == RelativeStockPreparationStatus::BudgetExhausted)
+        {
+            result.requiredPreparationWork = certificateReadinessTariff(quote);
+        }
+        if (preparation.status != RelativeStockPreparationStatus::Ready)
+        {
+            return result;
+        }
+        auto minimumScanWork = preparation.readinessWork;
+        if (!addWork(minimumScanWork, preparation.scanWork))
+        {
+            m_pricingFailure = true;
+            result.status = RelativeStockPreparationStatus::Invalid;
+            return result;
+        }
+        // The second lookup and option-metadata pass prices the native admission minimum.
+        if (m_pRefinementLedger->balance() < minimumScanWork ||
+            !m_pRefinementLedger->consume(minimumScanWork, RefinementWork::MasterValuation))
+        {
+            result.status = RelativeStockPreparationStatus::BudgetExhausted;
+            result.requiredPreparationWork = minimumScanWork;
+            return result;
+        }
+        result.paidWork = before - m_pRefinementLedger->balance();
+        const auto minimum = certificateMinimumWork(quote);
+        if (!minimum)
+        {
+            m_pricingFailure = true;
+            result.status = RelativeStockPreparationStatus::Invalid;
+            return result;
+        }
+        result.minimumNativeWork = *minimum;
         return result;
     }
 
@@ -2448,6 +2489,7 @@ namespace Coordinator
             result.optimizerCompleted = true;
             result.verifierCompleted = true;
             result.reused = true;
+            result.completed = true;
             return result;
         }
 
@@ -2472,17 +2514,7 @@ namespace Coordinator
             for (const auto & option :
                  cached->second.options)
             {
-                if (!addWork(
-                        expectedCatalogWork,
-                        std::max<std::int64_t>(
-                            1,
-                            static_cast<std::int64_t>(
-                                option.nodes.size()))) ||
-                    !addWork(expectedOptionRecords, 1) ||
-                    !addWork(
-                        expectedIncidences,
-                        static_cast<std::int64_t>(
-                            option.nodes.size())))
+                if (!addCertificateOptionWork(option, expectedCatalogWork, expectedOptionRecords, expectedIncidences))
                 {
                     failGlobal();
                     return result;
@@ -2536,6 +2568,7 @@ namespace Coordinator
             result.locallyBudgetExhausted = true;
             return result;
         }
+        result.admitted = true;
         result.tariffWork = ourRerunTariff();
         const auto finishGrant =
             [&](std::int64_t spent) -> bool
@@ -2632,19 +2665,44 @@ namespace Coordinator
             verified.completed;
         result.certificateValid =
             verified.valid;
+        const bool optimizerCertified =
+            verified.completed && verified.valid && result.verifierWork == verifierWork;
+        const auto hint = m_verifiedOurUppers.contains(quote.key)
+            ? m_ourUpperPriceHints.end() : m_ourUpperPriceHints.find(quote.key);
+        // Untrusted hinted prices only compete with the optimizer's certificate inside the remaining allowance.
+        const std::int64_t hintLimit = optimizerLimit - result.optimizerWork - verifierWork;
+        if (optimizerCertified && hint != m_ourUpperPriceHints.end() && m_masterFutureCatalog && hintLimit > 0)
+        {
+            MasterProfileScope timing(m_masterProfile, MasterPhase::NativeCertificateVerification);
+            const auto hinted =
+                hintedPackingDualPrices(identity, m_masterFutureCatalog->columns, hint->second, hintLimit);
+            result.hintWork = hinted.workUsed;
+            if (hinted.completed)
+            {
+                auto hintedVerified =
+                    verifyPackingDualCertificate(catalog, sources, identity, hinted.nodePrices, verifierWork);
+                if (!addWork(result.hintWork, hintedVerified.workUsed))
+                {
+                    failGlobal();
+                }
+                else if (hintedVerified.completed && hintedVerified.valid && hintedVerified.workUsed == verifierWork &&
+                         hintedVerified.certificate.dualObjective < verified.certificate.dualObjective)
+                {
+                    verified = std::move(hintedVerified);
+                }
+            }
+        }
         if (!finishWork({
                 result.tariffWork,
                 result.catalogWork,
                 result.optimizerWork,
                 result.verifierWork,
+                result.hintWork,
             }))
         {
             failGlobal();
         }
-        if (result.globalFailure ||
-            !verified.completed ||
-            !verified.valid ||
-            result.verifierWork != verifierWork)
+        if (result.globalFailure || !optimizerCertified)
         {
             result.certificateValid = false;
             failGlobal();
@@ -2700,6 +2758,7 @@ namespace Coordinator
                 result.certifiedUpper;
         }
         result.intervalAfter = pEntry->ours;
+        result.completed = true;
         return result;
     }
 
@@ -2759,6 +2818,7 @@ namespace Coordinator
         OurSequentialSolve solved;
         solved.capturedColumns = problem.capturedColumns;
         solved.owned = problem.owned;
+        solved.floorValue = problem.floorValue;
         setupTiming.finish();
 
         if (pReplay != nullptr)
@@ -2887,8 +2947,7 @@ namespace Coordinator
             solveOurSequential(actions,
                                SEQUENTIAL_SEARCH_STATE_CAP,
                                false);
-        const MilliFunds enemyBooked =
-            enemySequentialOptimum(ours.capturedColumns);
+        const MilliFunds enemyBooked = enemySequentialOptimum();
         return ours.owned + ours.tier.bookedValue - enemyBooked;
     }
 
@@ -2921,7 +2980,8 @@ namespace Coordinator
         ContinuationEntry & entry,
         GrantId grant,
         std::int64_t stateCap,
-        RefinementSchedule schedule)
+        RefinementSchedule schedule,
+        bool* pCompleted)
     {
         std::int64_t expectedCap = 0;
         if (m_pRefinementLedger == nullptr ||
@@ -3017,7 +3077,38 @@ namespace Coordinator
         entry.sliceRung = nextRung;
         entry.exact = entry.ours.exact();
         entry.searchCompleted = entry.searchCompleted || solved.tier.searchCompleted;
+        if (pCompleted != nullptr)
+        {
+            *pCompleted = solved.tier.searchCompleted || solved.tier.certificate;
+        }
         return true;
+    }
+
+    JointPlanStockValuer::WitnessAdoption JointPlanStockValuer::adoptOurWitness(
+        ContinuationEntry & entry, std::span<const SequentialRowWitness> witness, MilliFunds value)
+    {
+        RefinedWitness candidate{.rows = {witness.begin(), witness.end()}, .value = value, .replays = true};
+        const OurSequentialSolve solved = solveOurSequential(planActions(entry.key), 0, false, &candidate);
+        if (solved.capturedColumns != entry.capturedColumns)
+        {
+            m_pricingFailure = true;
+            return WitnessAdoption::Failed;
+        }
+        // A stored witness below the floor would be refused as the next refinement's warm start.
+        if (!solved.witnessReplays || value < solved.floorValue)
+        {
+            return WitnessAdoption::Declined;
+        }
+        if (value > entry.ours.upper)
+        {
+            m_pricingFailure = true;
+            return WitnessAdoption::Failed;
+        }
+        entry.ours.lower = value;
+        m_refinedOurWitnesses[entry.key] = std::move(candidate);
+        entry.storeBacked = true;
+        entry.exact = entry.ours.exact();
+        return WitnessAdoption::Adopted;
     }
 
     bool JointPlanStockValuer::refineEnemy(
@@ -3025,7 +3116,8 @@ namespace Coordinator
         const std::vector<std::int32_t> & capturedColumns,
         GrantId grant,
         std::int64_t stateCap,
-        RefinementSchedule schedule)
+        RefinementSchedule schedule,
+        bool* pCompleted)
     {
         std::int64_t expectedCap = 0;
         if (m_pRefinementLedger == nullptr ||
@@ -3049,7 +3141,6 @@ namespace Coordinator
         }
         EnemySequentialSolve solved =
             solveEnemySequential(
-                capturedColumns,
                 stateCap,
                 true,
                 nullptr,
@@ -3117,6 +3208,10 @@ namespace Coordinator
         enemy.sliceRung = nextRung;
         enemy.exact = enemy.bounds.exact();
         enemy.searchCompleted = enemy.searchCompleted || solved.tier.searchCompleted;
+        if (pCompleted != nullptr)
+        {
+            *pCompleted = solved.tier.searchCompleted || solved.tier.certificate;
+        }
         return true;
     }
 

@@ -1,6 +1,8 @@
 #include "ai/coordinator/propertystockbuilder.h"
 
+#include "ai/coordinator/masterassignmentfuture.h"
 #include "ai/coordinator/masterassignmentprofile.h"
+#include "ai/coordinator/packingdualhint.h"
 
 namespace Coordinator
 {
@@ -43,6 +45,13 @@ namespace Coordinator
     const MasterFutureCatalog* JointPlanStockValuer::RelativeSession::futureCatalog() const
     {
         return m_owner.m_masterFutureCatalog.get();
+    }
+
+    bool JointPlanStockValuer::RelativeSession::futureCatalogMatchesSolver() const
+    {
+        // Node slots and class tables are cached once; they must come from the copy the catalog was built from.
+        return m_owner.m_masterFutureCatalog && m_owner.m_pricingField &&
+               (!m_owner.m_ourStateBuilt || m_owner.m_ourStateSource == m_owner.m_pricingField.get());
     }
 
     RelativeStockQuote JointPlanStockValuer::RelativeSession::quote(
@@ -188,7 +197,8 @@ namespace Coordinator
             result.budgetExhausted = true;
             return result;
         }
-        result.valid = m_owner.refineOur(*entry, granted, stateCap, RefinementSchedule::Relative);
+        result.admitted = true;
+        result.valid = m_owner.refineOur(*entry, granted, stateCap, RefinementSchedule::Relative, &result.completed);
         result.workUsed = before - m_owner.m_pRefinementLedger->balance();
         result.statesUsed = result.workUsed - tariff;
         if (m_owner.m_masterFutureCatalog && result.statesUsed < 0)
@@ -226,7 +236,9 @@ namespace Coordinator
             result.budgetExhausted = true;
             return result;
         }
-        result.valid = m_owner.refineEnemy(*enemy, capturedColumns, granted, stateCap, RefinementSchedule::Relative);
+        result.admitted = true;
+        result.valid = m_owner.refineEnemy(*enemy, capturedColumns, granted, stateCap,
+                                         RefinementSchedule::Relative, &result.completed);
         result.workUsed = before - m_owner.m_pRefinementLedger->balance();
         result.statesUsed = result.workUsed - tariff;
         result.interval = enemy->bounds;
@@ -237,6 +249,63 @@ namespace Coordinator
              witness->second.value == enemy->bounds.lower);
         result.valid = result.valid && result.lowerWitnessReplays;
         return result;
+    }
+
+    RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::adoptOurWitness(
+        const ContinuationKey & key, std::span<const SequentialRowWitness> witness, MilliFunds value)
+    {
+        RelativeStockRefinedTerm result;
+        CheapInitialPrice initial;
+        if (!m_owner.livePairSwapIntervals() || m_owner.m_pRefinementLedger == nullptr ||
+            !m_owner.priceCheap(key, initial))
+        {
+            return result;
+        }
+        auto* entry = m_owner.m_continuationStore.find(key);
+        if (entry == nullptr)
+        {
+            return result;
+        }
+        result.interval = entry->ours;
+        result.searchCompleted = entry->searchCompleted;
+        if (value <= entry->ours.lower)
+        {
+            result.valid = true;
+            return result;
+        }
+        const auto tariff = ourRerunWork();
+        if (tariff < 0)
+        {
+            return result;
+        }
+        // Checking the balance first keeps a declined suggestion out of the ledger's refusal record.
+        if (remainingWork() < tariff || !m_owner.m_pRefinementLedger->consume(tariff, RefinementWork::MasterWitness))
+        {
+            result.budgetExhausted = true;
+            return result;
+        }
+        result.admitted = true;
+        result.workUsed = tariff;
+        result.valid = m_owner.adoptOurWitness(*entry, witness, value) != WitnessAdoption::Failed;
+        result.interval = entry->ours;
+        const auto refreshed = quote(key, 0);
+        result.lowerWitnessReplays = refreshed.valid && refreshed.ourLowerWitnessReplays;
+        result.valid = result.valid && result.lowerWitnessReplays;
+        return result;
+    }
+
+    bool JointPlanStockValuer::RelativeSession::hintOurUpperPrices(
+        const ContinuationKey & key, std::span<const MilliFunds> futureNodePrices)
+    {
+        const auto & catalog = m_owner.m_masterFutureCatalog;
+        CheapInitialPrice initial;
+        if (!m_owner.livePairSwapIntervals() || !catalog ||
+            !wellFormedPackingDualHint(futureNodePrices, catalog->columns.size()) || !m_owner.priceCheap(key, initial))
+        {
+            return false;
+        }
+        m_owner.m_ourUpperPriceHints[key].assign(futureNodePrices.begin(), futureNodePrices.end());
+        return true;
     }
 
     RelativeStockDualTightening
@@ -267,6 +336,40 @@ namespace Coordinator
             return {};
         }
         return m_owner.prepareOurCertificate(quote);
+    }
+
+    RelativeStockOperationMetadata JointPlanStockValuer::RelativeSession::operationMetadata(
+        const RelativeStockQuote & quote) const
+    {
+        RelativeStockOperationMetadata result;
+        if (!m_owner.m_operationServiceEnabled || !m_owner.livePairSwapIntervals() || !quote.valid || !owns(quote))
+        {
+            return result;
+        }
+        result.identity = identity();
+        result.rowCacheRevision = m_owner.m_rowOptionCache.size();
+        result.ourRerunWork = ourRerunWork();
+        result.enemyRerunWork = enemyRerunWork(quote.capturedColumns);
+        result.certificateAdmissionWork = m_owner.m_operationBaseTariffs->certificateAdmissionWork;
+        result.certificateReadinessWork = m_owner.certificateReadinessTariff(quote, true);
+        result.certificateEntryWork = m_owner.certificateReadinessTariff(quote);
+        result.valid = result.ourRerunWork >= 0 && result.enemyRerunWork >= 0 &&
+            result.certificateAdmissionWork >= 0 && result.certificateReadinessWork >= 0 &&
+            result.certificateEntryWork >= 0;
+        return result;
+    }
+
+    RelativeStockOperationPreparation JointPlanStockValuer::RelativeSession::prepareOurCertificateOperation(
+        const RelativeStockQuote & quote)
+    {
+        if (!m_owner.m_operationServiceEnabled || !owns(quote))
+        {
+            return {};
+        }
+        auto result = m_owner.prepareOurCertificateOperation(quote);
+        result.identity = identity();
+        result.rowCacheRevision = m_owner.m_rowOptionCache.size();
+        return result;
     }
 
     bool JointPlanStockValuer::RelativeSession::
@@ -311,7 +414,7 @@ namespace Coordinator
         }
         const auto witness = m_owner.m_refinedEnemyWitnesses.find(expected.capturedColumns);
         return witness != m_owner.m_refinedEnemyWitnesses.end() && witness->second.value == expected.enemy.lower &&
-            m_owner.solveEnemySequential(expected.capturedColumns, 0, false, &witness->second).witnessReplays;
+            m_owner.solveEnemySequential(0, false, &witness->second).witnessReplays;
     }
 
     std::shared_ptr<const RelativeStockProofSnapshot> JointPlanStockValuer::RelativeSession::captureProof(
@@ -414,6 +517,6 @@ namespace Coordinator
         MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
         const RefinedWitness enemy{proof.enemyWitness, expected.enemy.lower, true};
         copyTiming.finish();
-        return m_owner.solveEnemySequential(expected.capturedColumns, 0, false, &enemy).witnessReplays;
+        return m_owner.solveEnemySequential(0, false, &enemy).witnessReplays;
     }
 }

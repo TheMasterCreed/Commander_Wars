@@ -147,6 +147,18 @@ namespace Coordinator
 #endif
 
     private:
+        friend class MasterAssignmentStockContext;
+
+        struct OperationBaseTariffs
+        {
+            std::int64_t ours{0};
+            std::int64_t enemy{0};
+            std::int64_t certificateAdmissionWork{0};
+        };
+
+        bool retainOperationBaseTariffs(std::int64_t ours, std::int64_t enemy, std::int64_t certificateAdmissionWork);
+        bool prepareOperationService();
+
         enum class PricingBudgetPolicy : std::int8_t
         {
             Dedicated,
@@ -172,14 +184,20 @@ namespace Coordinator
             RelativeStockQuote quote(const ContinuationKey & key, MilliFunds economic) override;
             const CheapPricingModel* pricingModel() const override;
             const MasterFutureCatalog* futureCatalog() const override;
+            bool futureCatalogMatchesSolver() const override;
             RelativeStockRefinedTerm refineOur(const ContinuationKey & key, std::int64_t stateCap) override;
             RelativeStockRefinedTerm refineEnemy(
                 const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) override;
+            RelativeStockRefinedTerm adoptOurWitness(const ContinuationKey & key,
+                std::span<const SequentialRowWitness> witness, MilliFunds value) override;
+            bool hintOurUpperPrices(const ContinuationKey & key, std::span<const MilliFunds> futureNodePrices) override;
             bool supportsVerifiedDual() const override
             {
                 return true;
             }
             RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote) override;
+            RelativeStockOperationMetadata operationMetadata(const RelativeStockQuote & quote) const override;
+            RelativeStockOperationPreparation prepareOurCertificateOperation(const RelativeStockQuote & quote) override;
             RelativeStockDualTightening
             tightenOurUpperWithVerifiedDual(
                 const RelativeStockQuote & quote,
@@ -208,6 +226,7 @@ namespace Coordinator
         struct OurSequentialSolve
         {
             MilliFunds owned{0};
+            MilliFunds floorValue{0};
             std::vector<std::int32_t> capturedColumns;
             SequentialTierResult tier;
             bool witnessReplays{false};
@@ -227,6 +246,13 @@ namespace Coordinator
             std::vector<SequentialRowWitness> rows;
             MilliFunds value{0};
             bool replays{false};
+        };
+
+        enum class WitnessAdoption : std::int8_t
+        {
+            Adopted,
+            Declined,
+            Failed,
         };
 
         std::int32_t rowOf(std::int32_t engineUnitId) const;
@@ -253,10 +279,7 @@ namespace Coordinator
             const SequentialRow & row,
             std::int32_t rowIndex,
             std::span<const std::int32_t> nodeSlots) const;
-        MilliFunds enemyUnionCeiling(
-            PropertyStockField & field,
-            std::span<const std::int32_t>
-                admissibleCapturedColumns) const;
+        MilliFunds enemyRowCeiling(PropertyStockField & field) const;
         bool priceCheap(const ContinuationKey & key,
                         CheapInitialPrice & price) const;
         LivePlanStockQuote liveQuote(
@@ -266,13 +289,17 @@ namespace Coordinator
         bool refineOur(ContinuationEntry & entry,
                        GrantId grant,
                        std::int64_t stateCap,
-                       RefinementSchedule schedule = RefinementSchedule::Rung);
+                       RefinementSchedule schedule = RefinementSchedule::Rung,
+                       bool* pCompleted = nullptr);
         bool refineEnemy(
             EnemySetBounds & enemy,
             const std::vector<std::int32_t> & capturedColumns,
             GrantId grant,
             std::int64_t stateCap,
-            RefinementSchedule schedule = RefinementSchedule::Rung);
+            RefinementSchedule schedule = RefinementSchedule::Rung,
+            bool* pCompleted = nullptr);
+        WitnessAdoption adoptOurWitness(ContinuationEntry & entry, std::span<const SequentialRowWitness> witness,
+                                        MilliFunds value);
         MilliFunds sequentialJointStock(std::span<const PlanRowAction> actions) const;
         OurSequentialSolve solveOurSequential(
             std::span<const PlanRowAction> actions,
@@ -287,8 +314,11 @@ namespace Coordinator
         static std::vector<std::int64_t> sequentialRowKey(
             std::int32_t row, const PropertyStockActor* mover, std::span<const std::int32_t> capturedColumns);
         ContinuationEntry* certificateEntry(const RelativeStockQuote & quote) const;
-        std::int64_t certificateReadinessTariff(const RelativeStockQuote & quote) const;
+        std::int64_t certificateReadinessTariff(const RelativeStockQuote & quote, bool pendingAdmission = false) const;
+        bool prepareOperationEntry(const RelativeStockQuote & quote);
         RelativeStockCertificatePreparation prepareOurCertificate(const RelativeStockQuote & quote);
+        RelativeStockOperationPreparation prepareOurCertificateOperation(const RelativeStockQuote & quote);
+        std::optional<std::int64_t> certificateMinimumWork(const RelativeStockQuote & quote) const;
         const PackingDualFieldIdentity &
         packingDualFieldIdentity() const;
         PackingDualProblemIdentity packingDualProblemIdentity(
@@ -318,10 +348,8 @@ namespace Coordinator
             const PropertyStockActor* pMover,
             const std::vector<std::int32_t> & nodeSlots,
             std::int32_t classIndex) const;
-        MilliFunds enemySequentialOptimum(
-            const std::vector<std::int32_t> & capturedColumns) const;
+        MilliFunds enemySequentialOptimum() const;
         EnemySequentialSolve solveEnemySequential(
-            const std::vector<std::int32_t> & capturedColumns,
             std::int64_t stateCap,
             bool captureWitness,
             const RefinedWitness* pReplay = nullptr,
@@ -331,13 +359,13 @@ namespace Coordinator
         const SequentialTierAuditMode m_tierAuditMode;
         std::map<std::int32_t, std::int32_t> m_knowledgeOf;
         mutable bool m_ourStateBuilt{false};
+        mutable const PropertyStockField* m_ourStateSource{nullptr};
         mutable std::vector<std::int32_t> m_ourNodeSlots;
         mutable std::vector<std::int32_t> m_ourNodeOfColumn;
         mutable std::vector<PropertyStockColumn> m_ourNodeColumns;
         mutable std::vector<SequentialClassKey> m_ourClassKeys;
         mutable std::vector<SequentialClassTable> m_ourClassTables;
-        mutable std::map<std::vector<std::int32_t>, MilliFunds>
-            m_enemySequentialOptima;
+        mutable std::optional<MilliFunds> m_enemySequentialOptimum;
         std::optional<PlanStockAudit> m_auditOrigin;
         mutable bool m_originCached{false};
         mutable MilliFunds m_sequentialOrigin{0};
@@ -357,6 +385,8 @@ namespace Coordinator
         std::optional<RelativeSession> m_relativeSession;
         CheapPricingModel m_cheapModel;
         std::shared_ptr<const MasterFutureCatalog> m_masterFutureCatalog;
+        std::optional<OperationBaseTariffs> m_operationBaseTariffs;
+        bool m_operationServiceEnabled{false};
         MasterAssignmentProfile* m_masterProfile{nullptr};
         mutable CheapUpperState m_cheapState;
         ContinuationPricingState m_pricingState{
@@ -378,6 +408,8 @@ namespace Coordinator
         };
         std::map<ContinuationKey, VerifiedOurUpper>
             m_verifiedOurUppers;
+        std::map<ContinuationKey, std::vector<MilliFunds>>
+            m_ourUpperPriceHints;
         std::uint64_t m_nextCertificateId{1};
         mutable std::optional<PackingDualFieldIdentity>
             m_packingDualFieldIdentity;

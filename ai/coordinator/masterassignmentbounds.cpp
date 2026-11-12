@@ -174,6 +174,7 @@ namespace Coordinator
         }
         m_options.clear();
         m_resources.clear();
+        m_stock = stock;
         m_future = futureCatalog != nullptr && futureCatalog->complete ? futureCatalog : nullptr;
         if (m_future != nullptr && (stock == nullptr || m_future->dayRows.size() != stock->dayRows().size()))
         {
@@ -291,18 +292,35 @@ namespace Coordinator
         return m_ready && m_problemIdentity.sameLiveProblem(m_problem.identity());
     }
 
+    bool MasterAssignmentBounds::covers(const MasterAssignmentIdentity & problem, const CheapPricingModel* stock,
+                                        const MasterFutureCatalog* future) const
+    {
+        return ready() && m_problemIdentity.sameLiveProblem(problem) && stock != nullptr && stock == m_stock &&
+               future != nullptr && future == m_future;
+    }
+
     MasterFutureCacheStats MasterAssignmentBounds::futureCacheStats() const
     {
         return m_futureCacheStats;
     }
 
     MasterFutureStatus MasterAssignmentBounds::futurePrices(
-        std::span<const MilliFunds> prices, RefinementLedger & ledger, RefinementWork category,
+        std::span<const MilliFunds> prices, RefinementLedger & ledger, RefinementWork category, FutureCache cache,
         std::shared_ptr<const MasterFuturePricing> & result) const
     {
         if (!chargeMasterWork(ledger, prices.size() + 1, 2, category))
         {
             return MasterFutureStatus::BudgetExhausted;
+        }
+        if (cache == FutureCache::Bypass)
+        {
+            auto computed = priceMasterFuture(*m_future, prices, ledger, category);
+            const auto status = computed.status;
+            if (status == MasterFutureStatus::Valid)
+            {
+                result = std::make_shared<const MasterFuturePricing>(std::move(computed));
+            }
+            return status;
         }
         if (m_cachedFuturePricing &&
             std::equal(prices.begin(), prices.end(), m_cachedFuturePrices.begin(), m_cachedFuturePrices.end()))
@@ -345,7 +363,7 @@ namespace Coordinator
 
     MasterAssignmentBounds::ScanResult MasterAssignmentBounds::scan(
         const MasterBoundCertificate & certificate, RefinementLedger & ledger,
-        RefinementWork category, bool collectDemand) const
+        RefinementWork category, bool collectDemand, FutureCache cache, CandidateTerms* terms) const
     {
         ScanResult result;
         if (!chargeMasterWork(ledger, m_problem.actors().size() + m_resources.size() + 1,
@@ -375,7 +393,7 @@ namespace Coordinator
                 return result;
             }
             const auto prices = std::span<const MilliFunds>(certificate.prices).subspan(m_problem.resources().size());
-            const auto status = futurePrices(prices, ledger, category, priced);
+            const auto status = futurePrices(prices, ledger, category, cache, priced);
             if (status != MasterFutureStatus::Valid)
             {
                 result.status = boundStatus(status);
@@ -434,16 +452,53 @@ namespace Coordinator
                 return result;
             }
         }
-        result.status = scanActors(certificate, future, ledger, category, collectDemand, result);
+        result.status = scanActors(certificate, future, ledger, category, collectDemand, terms, result);
         return result;
+    }
+
+    MasterBoundStatus MasterAssignmentBounds::optionTerm(
+        const Option & option, const MasterBoundCertificate & certificate, const MasterFuturePricing & future,
+        RefinementLedger & ledger, RefinementWork category, MilliFunds & term) const
+    {
+        const bool pricedFuture = certificate.family == MasterBoundFamily::CombinedCurrentFuture;
+        const bool combined = certificate.family == MasterBoundFamily::EndpointCoupled || pricedFuture;
+        auto value = combined ? option.combined : option.economic;
+        if (pricedFuture)
+        {
+            value = option.economic;
+            if (value && (!RelativeStockDetail::checkedAdd(*value, option.captureUpper) ||
+                (option.futureAction &&
+                 !RelativeStockDetail::checkedAdd(*value, future.actions[*option.futureAction].upper))))
+            {
+                return MasterBoundStatus::ArithmeticFailure;
+            }
+        }
+        if (!value)
+        {
+            return MasterBoundStatus::Unavailable;
+        }
+        if (!chargeMasterWork(ledger, option.resources.size(), 1, category))
+        {
+            return MasterBoundStatus::BudgetExhausted;
+        }
+        for (const auto resource : option.resources)
+        {
+            if (!RelativeStockDetail::checkedSubtract(
+                    *value, certificate.prices[static_cast<std::size_t>(resource)]))
+            {
+                return MasterBoundStatus::ArithmeticFailure;
+            }
+        }
+        term = *value;
+        return MasterBoundStatus::Valid;
     }
 
     MasterBoundStatus MasterAssignmentBounds::scanActors(
         const MasterBoundCertificate & certificate, const MasterFuturePricing & future,
-        RefinementLedger & ledger, RefinementWork category, bool collectDemand, ScanResult & result) const
+        RefinementLedger & ledger, RefinementWork category, bool collectDemand, CandidateTerms* terms,
+        ScanResult & result) const
     {
         const bool pricedFuture = certificate.family == MasterBoundFamily::CombinedCurrentFuture;
-        const bool combined = certificate.family == MasterBoundFamily::EndpointCoupled || pricedFuture;
         for (std::size_t slot = 0; slot < m_options.size(); ++slot)
         {
             const auto selected = certificate.state.choices[slot];
@@ -459,39 +514,28 @@ namespace Coordinator
                 {
                     return MasterBoundStatus::BudgetExhausted;
                 }
-                if (selected != MASTER_UNASSIGNED && choice != selected)
+                const bool chosen = selected == MASTER_UNASSIGNED || choice == selected;
+                if (!chosen && terms == nullptr)
                 {
                     continue;
                 }
                 const auto & option = m_options[slot][static_cast<std::size_t>(choice)];
-                auto value = combined ? option.combined : option.economic;
-                if (pricedFuture)
+                MilliFunds value = 0;
+                const auto status = optionTerm(option, certificate, future, ledger, category, value);
+                if (status == MasterBoundStatus::BudgetExhausted || (chosen && status != MasterBoundStatus::Valid))
                 {
-                    value = option.economic;
-                    if (value && (!RelativeStockDetail::checkedAdd(*value, option.captureUpper) ||
-                        (option.futureAction &&
-                         !RelativeStockDetail::checkedAdd(*value, future.actions[*option.futureAction].upper))))
-                    {
-                        return MasterBoundStatus::ArithmeticFailure;
-                    }
+                    return status;
                 }
-                if (!value)
+                if (terms != nullptr)
                 {
-                    return MasterBoundStatus::Unavailable;
+                    (*terms)[slot].push_back({choice, status == MasterBoundStatus::Valid
+                        ? std::optional<MilliFunds>{value} : std::nullopt});
                 }
-                if (!chargeMasterWork(ledger, option.resources.size(), 1, category))
+                if (!chosen)
                 {
-                    return MasterBoundStatus::BudgetExhausted;
+                    continue;
                 }
-                for (const auto resource : option.resources)
-                {
-                    if (!RelativeStockDetail::checkedSubtract(
-                            *value, certificate.prices[static_cast<std::size_t>(resource)]))
-                    {
-                        return MasterBoundStatus::ArithmeticFailure;
-                    }
-                }
-                if (!maximum || *value > *maximum)
+                if (!maximum || value > *maximum)
                 {
                     maximum = value;
                     maximizing = &option;
@@ -537,7 +581,14 @@ namespace Coordinator
         {
             return {MasterBoundStatus::BudgetExhausted, {}};
         }
-        MasterBoundCertificate certificate{state, m_basis, family, std::vector<MilliFunds>(m_resources.size())};
+        return boundAt(state, family, std::vector<MilliFunds>(m_resources.size()), ledger);
+    }
+
+    MasterBoundResult MasterAssignmentBounds::boundAt(
+        const MasterAssignmentState & state, MasterBoundFamily family, std::vector<MilliFunds> prices,
+        RefinementLedger & ledger) const
+    {
+        MasterBoundCertificate certificate{state, m_basis, family, std::move(prices)};
         const auto result = scan(certificate, ledger, RefinementWork::MasterBoundScan, false);
         if (result.status != MasterBoundStatus::Valid)
         {
@@ -545,6 +596,29 @@ namespace Coordinator
         }
         certificate.upper = result.upper;
         return {MasterBoundStatus::Valid, std::move(certificate)};
+    }
+
+    MasterTermTable MasterAssignmentBounds::termsAt(
+        const MasterAssignmentState & state, std::vector<MilliFunds> prices, RefinementLedger & ledger) const
+    {
+        MasterTermTable table;
+        if (!state.complete())
+        {
+            table.status = MasterBoundStatus::InvalidCertificate;
+            return table;
+        }
+        const MasterBoundCertificate certificate{state, m_basis, MasterBoundFamily::CombinedCurrentFuture, std::move(prices)};
+        table.actorTerms.resize(state.choices.size());
+        const auto result = scan(certificate, ledger, RefinementWork::MasterBoundScan, false,
+                                 FutureCache::Bypass, &table.actorTerms);
+        table.status = result.status;
+        if (result.status != MasterBoundStatus::Valid)
+        {
+            table.actorTerms.clear();
+            return table;
+        }
+        table.upper = result.upper;
+        return table;
     }
 
     MasterBoundResult MasterAssignmentBounds::verify(

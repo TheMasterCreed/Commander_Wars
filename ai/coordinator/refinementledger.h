@@ -1,11 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace Coordinator
@@ -76,9 +78,37 @@ namespace Coordinator
     class RefinementLedger
     {
     public:
+        class WorkLimit final
+        {
+        public:
+            WorkLimit(RefinementLedger & ledger, std::int64_t maximum)
+                : m_ledger(ledger), m_previous(ledger.m_workLimit)
+            {
+                auto allowed = std::max<std::int64_t>(maximum, 0);
+                if (m_previous)
+                {
+                    allowed = std::min(allowed, m_previous->second -
+                        (ledger.m_stats.granted - m_previous->first));
+                }
+                ledger.m_workLimit = std::pair{ledger.m_stats.granted, allowed};
+            }
+
+            ~WorkLimit()
+            {
+                m_ledger.m_workLimit = m_previous;
+            }
+
+            WorkLimit(const WorkLimit &) = delete;
+            WorkLimit & operator=(const WorkLimit &) = delete;
+
+        private:
+            RefinementLedger & m_ledger;
+            std::optional<std::pair<std::int64_t, std::int64_t>> m_previous;
+        };
+
         bool open(std::int64_t total)
         {
-            if (total < 0)
+            if (total < 0 || m_workLimit)
             {
                 return false;
             }
@@ -190,6 +220,8 @@ namespace Coordinator
                 return false;
             }
             if (states > m_balance ||
+                (m_workLimit && states > m_workLimit->second -
+                    (m_stats.granted - m_workLimit->first)) ||
                 states > std::numeric_limits<std::int64_t>::max() - m_stats.granted ||
                 (needsRecord && m_grants.size() > static_cast<std::size_t>(std::numeric_limits<GrantId>::max())))
             {
@@ -210,7 +242,9 @@ namespace Coordinator
         void recordRefusal(std::int64_t states, RefinementWork work, bool refundable)
         {
             auto reason = RefinementRefusalReason::GrantCapacity;
-            if (states > m_balance)
+            if (states > m_balance ||
+                (m_workLimit && states > m_workLimit->second -
+                    (m_stats.granted - m_workLimit->first)))
             {
                 reason = RefinementRefusalReason::Balance;
             }
@@ -260,5 +294,6 @@ namespace Coordinator
         std::vector<GrantRecord> m_grants;
         RefinementLedgerStats m_stats;
         std::optional<RefinementRefusal> m_lastRefusal;
+        std::optional<std::pair<std::int64_t, std::int64_t>> m_workLimit;
     };
 }

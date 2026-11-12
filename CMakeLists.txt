@@ -12,6 +12,7 @@ project (Commander_Wars LANGUAGES CXX C)
 
 # Find includes in corresponding build directories
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
+include(ai/coordinator/guardednativecode.cmake)
 
 # set tool chain info
 set(CMAKE_CXX_STANDARD 20)
@@ -37,6 +38,7 @@ option(ENABLE_UBSAN "Enable Undefined Behavior Sanitizer (Linux/GCC only)" OFF)
 option(ENABLE_ASAN "Enable Address Sanitizer for memory leak detection (Linux/GCC only)" OFF)
 option(ENABLE_VALGRIND "Enable Valgrind instrumentation for memory debugging (Linux/GCC only)" OFF)
 option(BUILD_TESTING "Builds the game as test variant" OFF)
+option(MASTERASSIGNMENTTRIAL "Enables explicit isolated playable stock-control trials" OFF)
 option(SCRIPTSOURCESUPPORT "Exposes script function source text to JS. Needs the QtQml private headers and is disabled when they are missing" ON)
 
 set(UPDATE_FILE "Commander_Wars-Win10_x64"  CACHE STRING "UPDATE File")
@@ -845,9 +847,25 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
+    ai/coordinator/guardedstockrelation.h ai/coordinator/guardedstockrelation.cpp
+    ai/coordinator/guardedstockfamily.h ai/coordinator/guardedstockfamily.cpp
+    ai/coordinator/guardednativeinventory.h ai/coordinator/guardednativeinventory.cpp ai/coordinator/guardednativeplan.cpp
+    ai/coordinator/guardednativecalendar.h ai/coordinator/guardednativecalendar.cpp
+    ai/coordinator/guardedcommandpolicy.h ai/coordinator/guardedcommandpolicy.cpp
+    ai/coordinator/guardedcommanddeclarations.h ai/coordinator/guardedcommandfunctions.cpp
+    ai/coordinator/guardedcommandfunctions_p.h
+    ai/coordinator/guardedmovementdeclarations.h ai/coordinator/guardedmovementfunctions.cpp
+    ai/coordinator/guardedactiondeclarations.h ai/coordinator/guardedactionfunctions.cpp ai/coordinator/guardedactionpolicy.cpp
+    ai/coordinator/guardednativepresentation.h ai/coordinator/guardednativepresentation.cpp
+    ai/coordinator/guardedscriptfunction.h ai/coordinator/guardedscriptfunction.cpp
+    ai/coordinator/guardednativecode.h ai/coordinator/guardednativecode.cpp
+    ai/coordinator/masterguardedstock.h ai/coordinator/masterguardedstock.cpp
+    ai/coordinator/masternativesource.h ai/coordinator/masternativesource.cpp
     ai/coordinator/masterassignmentstate.h ai/coordinator/masterassignmentstate.cpp
     ai/coordinator/masterassignmentbounds.h ai/coordinator/masterassignmentbounds.cpp
     ai/coordinator/masterassignmentfuture.h ai/coordinator/masterassignmentfuture.cpp
+    ai/coordinator/masterplanpricing.h ai/coordinator/masterplanpricing.cpp
+    ai/coordinator/masterplanpricingadapter.h ai/coordinator/masterplanpricingadapter.cpp
     ai/coordinator/masterassignmentevaluator.h ai/coordinator/masterassignmentevaluator.cpp
     ai/coordinator/masterassignmentsearch.h ai/coordinator/masterassignmentsearch.cpp
     ai/coordinator/masterassignmentstock.h ai/coordinator/masterassignmentstock.cpp
@@ -1323,7 +1341,16 @@ qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION
     ${WIN_ICON}
 )
 
+if (MASTERASSIGNMENTTRIAL)
+    if (NOT BUILD_TESTING OR NOT GRAPHICSUPPORT OR NOT AUDIOSUPPORT)
+        message(FATAL_ERROR "MASTERASSIGNMENTTRIAL requires BUILD_TESTING, GRAPHICSUPPORT and AUDIOSUPPORT")
+    endif()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL)
+endif()
+
 if (BUILD_TESTING)
+    # QJSEngine has no QML module imports; scanning archived run trees adds no dependencies.
+    set_property(TARGET ${PROJECT_NAME} PROPERTY QT_QML_MODULE_NO_IMPORT_SCAN TRUE)
     enable_testing()
     function(cow_set_arena_test_path testName)
         if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
@@ -1517,10 +1544,17 @@ if (BUILD_TESTING)
     cow_set_arena_test_path(CoordinatorAiMasterAssignmentOracleTests)
 
     set(MASTER_ASSIGNMENT_SEARCH_SRCS
+        ai/coordinator/guardedstockrelation.cpp
+        ai/coordinator/guardedstockfamily.cpp
+        ai/coordinator/guardednativeplan.cpp
+        ai/coordinator/guardednativecalendar.cpp
+        ai/coordinator/masterguardedstock.cpp
         ai/coordinator/masterassignmentproblem.cpp
         ai/coordinator/masterassignmentstate.cpp
         ai/coordinator/masterassignmentbounds.cpp
         ai/coordinator/masterassignmentfuture.cpp
+        ai/coordinator/masterplanpricing.cpp
+        ai/coordinator/masterplanpricingadapter.cpp
         ai/coordinator/masterassignmentevaluator.cpp
         ai/coordinator/masterassignmentsearch.cpp
         ai/coordinator/masterassignmenttrace.cpp
@@ -1549,6 +1583,9 @@ if (BUILD_TESTING)
 
     add_executable(CoordinatorAiMasterAssignmentIntegrationTests
         tests/coordinator_ai/masterintegrationtests.cpp
+        tests/coordinator_ai/masterstockreferencetests.cpp
+        tests/coordinator_ai/masterstockimport.cpp
+        tests/arena/masterstockreference.cpp
         ai/coordinator/masterassignmentcapture.cpp
         ai/coordinator/masterassignmentshadowconfig.cpp
         ai/coordinator/masterassignmentinstallation.cpp
@@ -1927,6 +1964,8 @@ if (BUILD_TESTING)
         tests/arena/masterassignmentoracleprobe.h
         tests/arena/mastercomparisonprobe.cpp
         tests/arena/mastercomparisonprobe.h
+        tests/arena/masterstockreference.cpp
+        tests/arena/masterstockreference.h
         tests/arena/masterstockadmissionprobe.cpp
         ${MASTER_ASSIGNMENT_ORACLE_SRCS}
         tests/arena/relativestockprobe.h
@@ -2000,6 +2039,15 @@ if (BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     cow_set_arena_test_path(ArenaMatchConfigTests)
+
+    if (MASTERASSIGNMENTTRIAL)
+        target_sources(${PROJECT_NAME} PRIVATE
+            tests/arena/playabletrialconfig.cpp
+            tests/arena/playabletrialconfig.h
+            tests/arena/playabletrialrunner.cpp
+            tests/arena/playabletrialrunner.h
+        )
+    endif()
 
     add_executable(ArenaMatchResultSchemaTests
         tests/arena/arenamatchresultschematests.cpp
@@ -2402,6 +2450,8 @@ if (BUILD_TESTING)
     endfunction()
     cow_add_configured_match_test(ArenaConfiguredMatchSmoke 1 null null)
     cow_add_configured_match_test(ArenaConfiguredMatchStopBoundary 3 1 0)
+    # Developer-only tests that are kept out of the repository register themselves here.
+    include(tests/localtests.cmake OPTIONAL)
 endif()
 
 if (BUILD_TESTING AND GRAPHICSUPPORT)
@@ -2411,13 +2461,18 @@ if (BUILD_TESTING AND GRAPHICSUPPORT)
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE COW_BUILD_TESTING)
     enable_testing()
+    set(OXYGINE_LIFETIME_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/tests/oxygine-lifetime)
+    file(MAKE_DIRECTORY ${OXYGINE_LIFETIME_RUN_DIR})
     add_test(
         NAME OxygineLifetimeSelftest
         COMMAND ${CMAKE_COMMAND} -E env
             "COW_OXYGINE_SELFTEST=1"
-            $<TARGET_FILE:${PROJECT_NAME}> -noAudio
+            $<TARGET_FILE:${PROJECT_NAME}> --noAudio --spawnAiProcess 0 --mods=
+            --userPath ${OXYGINE_LIFETIME_RUN_DIR}/
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    set_tests_properties(OxygineLifetimeSelftest PROPERTIES TIMEOUT 120)
+    cow_set_arena_test_path(OxygineLifetimeSelftest)
 endif()
 
 if (BUILD_TESTING)

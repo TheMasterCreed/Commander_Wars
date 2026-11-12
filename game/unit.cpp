@@ -2228,14 +2228,7 @@ qint32 Unit::getAmmo2() const
 
 bool Unit::hasAmmo2() const
 {
-    if ((m_maxAmmo2 < 0) || (m_ammo2 > 0))
-    {
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    return WeaponRangeCheck::hasAmmo(m_ammo2, m_maxAmmo2);
 }
 
 QString Unit::getWeapon2ID() const
@@ -2350,14 +2343,7 @@ void Unit::setAmmo1(const qint32 value)
 
 bool Unit::hasAmmo1() const
 {
-    if ((m_maxAmmo1 < 0) || (m_ammo1 > 0))
-    {
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    return WeaponRangeCheck::hasAmmo(m_ammo1, m_maxAmmo1);
 }
 
 void Unit::reduceAmmo1(qint32 value)

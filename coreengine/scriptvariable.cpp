@@ -46,6 +46,15 @@ void ScriptVariable::deserializeObject(QDataStream& pStream)
     }
 }
 
+bool ScriptVariable::hasUsableStoredDataStream() const
+{
+    // QBuffer adds Unbuffered to the requested access mode. A previous failed read persists on QDataStream.
+    const auto access = m_buffer.openMode() & ~QIODevice::OpenMode(QIODevice::Unbuffered);
+    return access == QIODevice::ReadWrite && m_actionData.status() == QDataStream::Ok &&
+           m_actionData.device() == &m_buffer && m_actionData.byteOrder() == QDataStream::BigEndian &&
+           m_actionData.version() == QDataStream::Qt_6_5;
+}
+
 bool ScriptVariable::getModified() const
 {
     return m_modified;

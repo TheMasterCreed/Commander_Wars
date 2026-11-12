@@ -99,7 +99,7 @@ namespace
                "contradictory common enemy bounds fail closed");
     }
 
-    void testIndependentEnemy(FixtureSession & session)
+    void testEnemyCancelsAcrossCapturedSets(FixtureSession & session)
     {
         auto incumbent = session.makeQuote({10, 15}, {20, 30});
         auto challenger = session.makeQuote({12, 19}, {18, 27});
@@ -109,31 +109,26 @@ namespace
         challenger.owned = 8;
         challenger.capturedColumns = {1};
         const auto result = compareRelativeStock(incumbent, challenger);
-        expect(result.valid() && !result.commonEnemyCancelled, "different captured keys refuse cancellation");
+        expect(result.valid() && result.commonEnemyCancelled, "different captured keys share one enemy value");
         expect(result.economicDelta == 5 && result.ownedDelta == 2, "economic and owned deltas retained");
-        expect(result.deltaLower == -3 && result.deltaUpper == 28, "independent conservative subtraction");
-        expect(result.unresolved() && !result.improves(), "relative overlap does not authorize replacement");
+        expect(result.deltaLower == 4 && result.deltaUpper == 16, "only our intervals widen the relative bound");
+        expect(result.improves(), "a positive lower bound across captured keys authorizes replacement");
         for (const bool challengerSide : {false, true})
         {
             auto left = incumbent;
             auto right = challenger;
             auto & changed = challengerSide ? right : left;
             changed.enemyLowerWitnessReplays = false;
-            expect(compareRelativeStock(left, right).reason == RelativeStockReason::MissingEnemyWitness,
-                   "each independent enemy lower bound needs its own witness");
+            expect(compareRelativeStock(left, right).improves(), "cancelled enemy needs no lower witness");
             changed.enemyLowerWitnessReplays = true;
             changed.ourLowerWitnessReplays = false;
             expect(compareRelativeStock(left, right).reason == RelativeStockReason::MissingOurWitness,
                    "each our lower bound needs its own witness");
         }
-        challenger.capturedColumns.clear();
-        challenger.enemy = incumbent.enemy;
-        incumbent.enemyLowerWitnessReplays = false;
-        challenger.enemyLowerWitnessReplays = false;
-        expect(compareRelativeStock(incumbent, challenger).valid(), "cancelled enemy needs no lower witness");
-        challenger.ourLowerWitnessReplays = false;
-        expect(compareRelativeStock(incumbent, challenger).reason == RelativeStockReason::MissingOurWitness,
-               "enemy cancellation never removes our witness obligation");
+        challenger.enemy = {31, 40};
+        expect(compareRelativeStock(incumbent, challenger).reason ==
+                   RelativeStockReason::ContradictoryCommonEnemy,
+               "disjoint enemy bounds fail closed across captured keys");
     }
 
     void testIdentity()
@@ -344,7 +339,7 @@ int main()
     PropertyStockInstance enemy;
     FixtureSession session(field, enemy);
     testSharedEnemy(session);
-    testIndependentEnemy(session);
+    testEnemyCancelsAcrossCapturedSets(session);
     testIdentity();
     testValidation(session);
     testThresholdsAndOverflow(session);

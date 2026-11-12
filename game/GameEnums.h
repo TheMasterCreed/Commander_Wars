@@ -443,6 +443,10 @@ public:
     Q_ENUM(EditorPlacementSize)
 
     static void registerEnums();
+    static const GameEnums & nativeInstance()
+    {
+        return m_instance;
+    }
 private:
     GameEnums();
 

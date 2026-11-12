@@ -44,11 +44,17 @@
 
 #include "ui_reader/uifactory.h"
 
+#if defined(COW_BUILD_TESTING) || defined(COW_AI_ARENA_TESTING)
+#include "tests/arena/arenatestsupport.h"
+#endif
 #ifdef COW_BUILD_TESTING
 #include "tests/oxygine_lifetime/oxyginelifetimetests.h"
 #endif
 #ifdef COW_AI_ARENA_TESTING
 #include "tests/arena/arenamatchrunner.h"
+#endif
+#ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
+#include "tests/arena/playabletrialrunner.h"
 #endif
 
 WorkerThread::WorkerThread()
@@ -229,6 +235,14 @@ void WorkerThread::start()
     }
     pLoadingScreen->hide();
     m_started = true;
+#ifdef COW_AI_ARENA_TESTING
+    auto* pTestSupport = pInterpreter->findChild<AiArenaTestSupport*>();
+    if (pTestSupport != nullptr && pTestSupport->ownsStandaloneStartup())
+    {
+        CONSOLE_PRINT("Standalone arena owns startup", GameConsole::eDEBUG);
+        return;
+    }
+#endif
     CONSOLE_PRINT("WorkerThread::start Finalizing", GameConsole::eDEBUG);
     emit pApp->sigNextStartUpStep(Mainapp::StartupPhase::Finalizing);
 }
@@ -238,12 +252,16 @@ void WorkerThread::showMainwindow()
 #ifdef COW_BUILD_TESTING
     if (qEnvironmentVariableIsSet("COW_OXYGINE_SELFTEST"))
     {
-        Mainapp::getInstance()->setRendering(false);
-        qint32 failures = OxygineLifetimeTests::runAll();
-        Mainapp::getInstance()->setRendering(true);
-        QMetaObject::invokeMethod(QCoreApplication::instance(), [failures]()
+        auto* app = Mainapp::getInstance();
+        QMetaObject::invokeMethod(app, [app]()
         {
-            QCoreApplication::exit(failures == 0 ? 0 : 1);
+            app->setRendering(false);
+        }, Qt::BlockingQueuedConnection);
+        qint32 failures = OxygineLifetimeTests::runAll();
+        QMetaObject::invokeMethod(app, [app, failures]()
+        {
+            app->setRendering(true);
+            QCoreApplication::exit(static_cast<qint32>(failures == 0 ? ArenaExitCode::Ok : ArenaExitCode::AssertFailed));
         }, Qt::QueuedConnection);
         return;
     }
@@ -287,6 +305,13 @@ void WorkerThread::showMainwindow()
 
     auto window = MemoryManagement::create<Mainwindow>("ui/menu/mainmenu.xml");
     oxygine::Stage::getStage()->addChild(window);
+#ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
+    if (PlayableTrialRunner::shouldRun())
+    {
+        auto* runner = new PlayableTrialRunner(window, this);
+        runner->run();
+    }
+#endif
 }
 
 bool WorkerThread::getStarted() const
