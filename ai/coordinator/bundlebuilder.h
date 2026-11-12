@@ -136,6 +136,55 @@ namespace Coordinator
         return NO_SHOT_DISTANCE;
     }
 
+    constexpr std::int32_t NO_ATTACKER_SLOT = -1;
+
+    struct EnemyShot
+    {
+        std::int32_t slot{NO_ATTACKER_SLOT};
+        std::int32_t unitIndex{NO_UNIT};
+        TilePoint tile{INVALID_TILE};
+        std::int32_t hpSteps{0};
+        std::int32_t distance{NO_SHOT_DISTANCE};
+    };
+
+    // Visits every reaching enemy still alive, including those whose distance is NO_SHOT_DISTANCE.
+    template <typename Visit>
+    void forEachEnemyShot(std::span<const KnownUnit> units, const AttackOpportunityField & enemyReach,
+                          const TilePoint & target, std::int32_t damagedUnitIndex, std::int32_t damagedHpSteps,
+                          Visit && visit)
+    {
+        for (const std::int32_t slot : enemyReach.attackerSlotsAt(target.x, target.y))
+        {
+            const AttackerSpec & spec = enemyReach.attacker(slot);
+            std::int32_t hpSteps = units[static_cast<std::size_t>(spec.unitIndex)].hpRounded;
+            if (spec.unitIndex == damagedUnitIndex)
+            {
+                hpSteps = damagedHpSteps;
+            }
+            if (hpSteps <= 0)
+            {
+                continue;
+            }
+            const TilePoint tile{spec.x, spec.y};
+            std::int32_t distance = stationaryShotDistance(tile, target, spec.minRange, spec.maxRange);
+            if (spec.canMoveAndFire)
+            {
+                distance = movedShotDistance(enemyReach.reach(slot), spec.movementPoints, spec.minRange, spec.maxRange,
+                                             target);
+            }
+            visit(EnemyShot{.slot = slot, .unitIndex = spec.unitIndex, .tile = tile, .hpSteps = hpSteps,
+                            .distance = distance});
+        }
+    }
+
+    // Next turn terrain is unknown, so a shot is base damage scaled by the shooter's hp.
+    inline double scaledBaseDamage(DamageOracle & oracle, Unit & shooter, std::int32_t shooterHpSteps,
+                                   std::int32_t minRange, std::int32_t maxRange, Unit & victim, std::int32_t distance)
+    {
+        const double baseDamage = oracle.baseDamageAgainst(shooter, victim, distance, minRange, maxRange);
+        return baseDamage * shooterHpSteps / UNIT_HP_STEPS;
+    }
+
     // The current owner's rate stands in for both sides; owner modifiers are not re-derived.
     constexpr PropertyIncome captureIncome(const PropertyFacts & facts)
     {

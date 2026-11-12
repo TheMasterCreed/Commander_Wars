@@ -39,20 +39,6 @@ namespace
     // GameAction::canBePerformed asks whether the action targets an empty field.
     constexpr bool EMPTY_FIELD_ACTION = false;
 
-    QString ownerSignName(Coordinator::OwnerSign owner)
-    {
-        switch (owner)
-        {
-            case Coordinator::OwnerSign::Enemy:
-                return QStringLiteral("ENEMY");
-            case Coordinator::OwnerSign::Neutral:
-                return QStringLiteral("NEUTRAL");
-            case Coordinator::OwnerSign::Ours:
-                return QStringLiteral("OURS");
-        }
-        return QStringLiteral("UNKNOWN");
-    }
-
     QString candidateActionId(
         Coordinator::PlanBundleKind kind)
     {
@@ -277,14 +263,12 @@ namespace
                                               shooter.maxRange, target);
     }
 
-    // Next turn terrain is unknown, so every span entry is base damage scaled by the shooter's hp.
     std::int32_t CandidateBuilder::estimatedShotSteps(const ShotSource & shooter, Unit & victim,
                                                       std::int32_t victimHpSteps, std::int32_t distance)
     {
-        const double baseDamage = m_context.oracle.baseDamageAgainst(*shooter.pUnit, victim, distance,
-                                                                     shooter.minRange, shooter.maxRange);
-        const double scaled = baseDamage * shooter.hpSteps / Coordinator::UNIT_HP_STEPS;
-        return Coordinator::damageStepsFrom(victimHpSteps, scaled);
+        return Coordinator::damageStepsFrom(
+            victimHpSteps, Coordinator::scaledBaseDamage(m_context.oracle, *shooter.pUnit, shooter.hpSteps,
+                                                         shooter.minRange, shooter.maxRange, victim, distance));
     }
 
     std::vector<MilliFunds> CandidateBuilder::nextShotSpan(const ShotSource & shooter, const VictimOverride & changed,
@@ -349,42 +333,22 @@ namespace
             return span;
         }
         const MilliFunds actorCost = replacementCost(actor.unitIndex, *actor.pUnit);
-        const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
-        for (const std::int32_t slot : m_context.enemyReach.attackerSlotsAt(actor.tile.x, actor.tile.y))
-        {
-            const Coordinator::AttackerSpec & spec = m_context.enemyReach.attacker(slot);
-            std::int32_t enemyHpSteps = units[static_cast<std::size_t>(spec.unitIndex)].hpRounded;
-            if (spec.unitIndex == damaged.unitIndex)
+        Coordinator::forEachEnemyShot(
+            m_context.knowledge.units(), m_context.enemyReach, actor.tile, damaged.unitIndex, damaged.hpSteps,
+            [&](const Coordinator::EnemyShot & shot)
             {
-                enemyHpSteps = damaged.hpSteps;
-            }
-            if (enemyHpSteps <= 0)
-            {
-                continue;
-            }
-            ShotSource enemy;
-            if (!describeShooter(spec.unitIndex, enemyHpSteps, TilePoint{spec.x, spec.y}, enemy))
-            {
-                continue;
-            }
-            std::int32_t distance = Coordinator::stationaryShotDistance(enemy.tile, actor.tile, spec.minRange,
-                                                                        spec.maxRange);
-            if (spec.canMoveAndFire)
-            {
-                distance = Coordinator::movedShotDistance(m_context.enemyReach.reach(slot), spec.movementPoints,
-                                                          spec.minRange, spec.maxRange, actor.tile);
-            }
-            if (distance == NO_SHOT_DISTANCE)
-            {
-                continue;
-            }
-            const std::int32_t steps = estimatedShotSteps(enemy, *actor.pUnit, actor.hpSteps, distance);
-            if (steps <= 0)
-            {
-                continue;
-            }
-            span.push_back(Coordinator::bookDamage(actorCost, steps));
-        }
+                ShotSource enemy;
+                if (!describeShooter(shot.unitIndex, shot.hpSteps, shot.tile, enemy) ||
+                    shot.distance == NO_SHOT_DISTANCE)
+                {
+                    return;
+                }
+                const std::int32_t steps = estimatedShotSteps(enemy, *actor.pUnit, actor.hpSteps, shot.distance);
+                if (steps > 0)
+                {
+                    span.push_back(Coordinator::bookDamage(actorCost, steps));
+                }
+            });
         return span;
     }
 
@@ -585,8 +549,8 @@ namespace
                         " property=%1 stockColumn=%2 ownerBefore=%3 ownerAfter=%4 incomeOurs=%5 incomeEnemy=%6 existingCapturePoints=%7 captureRate=%8 turnsUntilOwned=%9")
                         .arg(pCapture->propertyIndex)
                         .arg(pCapture->stockColumn)
-                        .arg(ownerSignName(pComponent->capture.ownerBefore))
-                        .arg(ownerSignName(pComponent->capture.ownerAfter))
+                        .arg(Coordinator::traceOwnerSign(pComponent->capture.ownerBefore))
+                        .arg(Coordinator::traceOwnerSign(pComponent->capture.ownerAfter))
                         .arg(pComponent->capture.income.oursPerTurn)
                         .arg(pComponent->capture.income.enemyPerTurn)
                         .arg(pCapture->existingPoints)

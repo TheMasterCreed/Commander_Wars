@@ -132,6 +132,11 @@ namespace
     };
 }
 
+bool Coordinator::appendTraceRecords(const QString & path, const QStringList & lines)
+{
+    return writeTraceLines(path, lines);
+}
+
 bool Coordinator::decisionTraceEnabled()
 {
 #ifdef GAMEDEBUG

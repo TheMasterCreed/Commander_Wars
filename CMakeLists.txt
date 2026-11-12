@@ -845,6 +845,9 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/coordinator/decisiontrace.h ai/coordinator/decisiontrace.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
+    ai/coordinator/capturedanger.h ai/coordinator/capturedangerstream.h ai/coordinator/capturedangerdecisions.h
+    ai/coordinator/capturedangerrecord.h ai/coordinator/capturedangeraudit.h ai/coordinator/capturedangeraudit.cpp
+    ai/coordinator/capturedangerauditmode.h
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
     ai/coordinator/guardedstockrelation.h ai/coordinator/guardedstockrelation.cpp

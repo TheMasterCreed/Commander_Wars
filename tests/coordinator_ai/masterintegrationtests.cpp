@@ -5480,6 +5480,23 @@ namespace
                    MasterAssignmentSchedule{}.planNeighborAudit == MasterPlanNeighborAudit::Off,
                "the audit defaults off");
     }
+
+    void captureDangerAuditConfig()
+    {
+        expect(parseCaptureDangerAudit("1", MasterStockControlRuntime::Arena) == CaptureDangerAudit::Recorded &&
+                   parseCaptureDangerAudit("1", MasterStockControlRuntime::PlayableTrial) == CaptureDangerAudit::Recorded,
+               "the danger audit switch is honoured in the arena and the playable trial");
+        expect(parseCaptureDangerAudit("1", MasterStockControlRuntime::Play) == CaptureDangerAudit::Off &&
+                   parseCaptureDangerAudit("1", MasterStockControlRuntime::None) == CaptureDangerAudit::Off,
+               "the danger audit switch is refused in ordinary play");
+        expect(parseCaptureDangerAudit({}, MasterStockControlRuntime::Arena) == CaptureDangerAudit::Off &&
+                   parseCaptureDangerAudit("0", MasterStockControlRuntime::PlayableTrial) == CaptureDangerAudit::Off &&
+                   parseCaptureDangerAudit("true", MasterStockControlRuntime::Arena) == CaptureDangerAudit::Off,
+               "only the exact switch value turns the danger audit on");
+        expect(playMasterStockControlConfig().captureDangerAudit == CaptureDangerAudit::Off &&
+                   MasterShadowConfig{}.captureDangerAudit == CaptureDangerAudit::Off,
+               "the danger audit defaults off");
+    }
 }
 
 int main(int argc, char** argv)
@@ -5539,6 +5556,7 @@ int main(int argc, char** argv)
     planNeighborAuditGuards();
     planNeighborAuditMidLoop();
     planNeighborAuditConfig();
+    captureDangerAuditConfig();
     testMasterStockReference();
     MasterAssignmentTest::testOfflineStockReference();
     std::printf("Master assignment integration: %d checks, %d failures\n", checks, failures);

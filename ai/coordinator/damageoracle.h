@@ -49,6 +49,7 @@ namespace Coordinator
         std::int32_t damageSteps{0};
         std::int32_t counterSteps{0};
         bool possible{false};
+        double reportedDamage{0};
     };
 
     class DamageOracle
@@ -66,6 +67,9 @@ namespace Coordinator
         // Position free apart from the range gate, for a shot whose terrain is not decided yet.
         double baseDamageAgainst(Unit & attacker, Unit & defender, std::int32_t distance,
                                  std::int32_t minRange, std::int32_t maxRange);
+        // As baseDamageAgainst with both slots loaded, for a shooter that may resupply before it fires.
+        double baseDamageWithAmmo(Unit & attacker, Unit & defender, std::int32_t distance,
+                                  std::int32_t minRange, std::int32_t maxRange);
         void clear();
 
         // Requests asked, and the share the memo answered without an engine call.
@@ -102,6 +106,8 @@ namespace Coordinator
         };
 
         double weaponBaseDamage(const QString & weaponId, Unit & defender);
+        double bestSlotDamage(Unit & attacker, Unit & defender, std::int32_t distance, std::int32_t minRange,
+                              std::int32_t maxRange, bool firstHasAmmo, bool secondHasAmmo);
         double slotBaseDamage(const WeaponSlot & slot, Unit & defender, std::int32_t distance,
                               std::int32_t minRange, std::int32_t maxRange);
 

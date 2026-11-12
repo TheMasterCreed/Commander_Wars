@@ -6,8 +6,10 @@
 #include <vector>
 
 #include <QString>
+#include <QStringList>
 
 #include "ai/coordinator/coordinatorcommon.h"
+#include "ai/coordinator/ownershipschedule.h"
 #include "ai/coordinator/turnplan.h"
 
 namespace Coordinator
@@ -31,6 +33,8 @@ namespace Coordinator
         virtual bool flush() = 0;
     };
 
+    // The first write of a process truncates the file, later writes append.
+    bool appendTraceRecords(const QString & path, const QStringList & lines);
     bool decisionTraceEnabled();
     bool planningTimingAuditEnabled();
     std::unique_ptr<DecisionTrace> openDecisionTrace(const DecisionTraceIdentity & identity);
@@ -99,6 +103,20 @@ namespace Coordinator
                 return QStringLiteral("MOVE_AND_SERVICE");
             case PlanBundleKind::Compound:
                 return QStringLiteral("COMPOUND");
+        }
+        return QStringLiteral("UNKNOWN");
+    }
+
+    inline QString traceOwnerSign(OwnerSign owner)
+    {
+        switch (owner)
+        {
+            case OwnerSign::Enemy:
+                return QStringLiteral("ENEMY");
+            case OwnerSign::Neutral:
+                return QStringLiteral("NEUTRAL");
+            case OwnerSign::Ours:
+                return QStringLiteral("OURS");
         }
         return QStringLiteral("UNKNOWN");
     }

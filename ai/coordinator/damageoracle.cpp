@@ -53,6 +53,7 @@ namespace Coordinator
         result.possible = report.x() >= 0;
         if (result.possible)
         {
+            result.reportedDamage = report.x();
             result.damageSteps = damageStepsFrom(defender.getHp(), report.x());
             result.counterSteps = damageStepsFrom(attacker.getHp(), report.width());
         }
@@ -89,9 +90,22 @@ namespace Coordinator
     double DamageOracle::baseDamageAgainst(Unit & attacker, Unit & defender, std::int32_t distance,
                                            std::int32_t minRange, std::int32_t maxRange)
     {
-        const WeaponSlot first{attacker.getWeapon1ID(), attacker.hasAmmo1(),
+        return bestSlotDamage(attacker, defender, distance, minRange, maxRange, attacker.hasAmmo1(),
+                              attacker.hasAmmo2());
+    }
+
+    double DamageOracle::baseDamageWithAmmo(Unit & attacker, Unit & defender, std::int32_t distance,
+                                            std::int32_t minRange, std::int32_t maxRange)
+    {
+        return bestSlotDamage(attacker, defender, distance, minRange, maxRange, true, true);
+    }
+
+    double DamageOracle::bestSlotDamage(Unit & attacker, Unit & defender, std::int32_t distance, std::int32_t minRange,
+                                        std::int32_t maxRange, bool firstHasAmmo, bool secondHasAmmo)
+    {
+        const WeaponSlot first{attacker.getWeapon1ID(), firstHasAmmo,
                                static_cast<std::int32_t>(attacker.getTypeOfWeapon1())};
-        const WeaponSlot second{attacker.getWeapon2ID(), attacker.hasAmmo2(),
+        const WeaponSlot second{attacker.getWeapon2ID(), secondHasAmmo,
                                 static_cast<std::int32_t>(attacker.getTypeOfWeapon2())};
         return std::max(slotBaseDamage(first, defender, distance, minRange, maxRange),
                         slotBaseDamage(second, defender, distance, minRange, maxRange));

@@ -76,6 +76,7 @@ private:
     void buildTurnPlan();
     void stopStockControl(const Coordinator::MasterShadowConfig & config, const QString & reason);
     bool playStockControlAvailable() const;
+    bool localSessionMenu() const;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     void stopStockReference(const QString & reason);
 #endif
@@ -116,6 +117,8 @@ private:
     std::int64_t m_factLayersNanos{0};
     std::int64_t m_propertyStockBuildNanos{0};
     std::int64_t m_coPowerCheckNanos{0};
+    // Subtracted from planningCallNanos so the measure-only audit never counts as planning time.
+    std::int64_t m_captureDangerAuditNanos{0};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     std::int64_t m_testRefinementWorkLimit{Coordinator::DEFAULT_RELATIVE_STOCK_WORK_LIMIT};
     std::shared_ptr<Coordinator::RelativeStockObserver> m_testRefinementObserver;

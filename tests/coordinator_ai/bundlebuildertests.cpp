@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <span>
@@ -250,6 +251,102 @@ namespace
         expect(sawShot && sawMiss, "the differential covers both answers");
     }
 
+    constexpr TilePoint SHOT_TARGET{4, 4};
+    constexpr TilePoint INDIRECT_SHOOTER_TILE{4, 1};
+    constexpr TilePoint MOBILE_SHOOTER_TILE{6, 5};
+    constexpr TilePoint DEAD_SHOOTER_TILE{4, 6};
+    constexpr TilePoint DAMAGED_SHOOTER_TILE{2, 4};
+    constexpr std::int32_t MOBILE_UNIT = 0;
+    constexpr std::int32_t DEAD_UNIT = 1;
+    constexpr std::int32_t INDIRECT_UNIT = 2;
+    constexpr std::int32_t DAMAGED_UNIT = 3;
+    constexpr std::int32_t IN_RANGE_MOBILE_UNIT = 4;
+    constexpr std::int32_t SHOOTER_UNIT_COUNT = 5;
+    constexpr TilePoint IN_RANGE_MOBILE_TILE{4, 2};
+    constexpr std::int32_t IN_RANGE_MOBILE_SLOT = 4;
+    constexpr std::size_t DAMAGED_ENTRY = 2;
+    constexpr std::int32_t MOBILE_HP = 7;
+    constexpr std::int32_t DAMAGED_HP = 9;
+    constexpr std::int32_t DAMAGED_HP_OVERRIDE = 4;
+    constexpr std::int32_t FAR_MIN_RANGE = 2;
+    constexpr std::int32_t FAR_MAX_RANGE = 3;
+    constexpr std::int32_t INDIRECT_DISTANCE = 3;
+    constexpr std::int32_t RING_DISTANCE = 2;
+    constexpr std::int32_t DAMAGED_SLOT = 3;
+
+    struct VisitedShot
+    {
+        std::int32_t slot;
+        std::int32_t unitIndex;
+        TilePoint tile;
+        std::int32_t hpSteps;
+        std::int32_t distance;
+
+        friend bool operator==(const VisitedShot &, const VisitedShot &) = default;
+    };
+
+    void testEnemyShotEnumeration()
+    {
+        MobilityCostGrid grid(FIELD_SIZE, FIELD_SIZE);
+        for (std::int32_t y = 0; y < FIELD_SIZE; ++y)
+        {
+            for (std::int32_t x = 0; x < FIELD_SIZE; ++x)
+            {
+                grid.setTileCost(x, y, STEP_COST);
+            }
+        }
+        const auto stationary = [&](std::int32_t unitIndex, TilePoint tile, std::int32_t minRange, std::int32_t maxRange)
+        {
+            return AttackerSpec{.unitIndex = unitIndex, .x = tile.x, .y = tile.y, .movementPoints = 0,
+                                .minRange = minRange, .maxRange = maxRange, .canMoveAndFire = false, .grid = &grid};
+        };
+        const std::vector<AttackerSpec> specs{
+            stationary(INDIRECT_UNIT, INDIRECT_SHOOTER_TILE, FAR_MIN_RANGE, FAR_MAX_RANGE),
+            AttackerSpec{.unitIndex = MOBILE_UNIT, .x = MOBILE_SHOOTER_TILE.x, .y = MOBILE_SHOOTER_TILE.y,
+                         .movementPoints = SPEC_MOVEMENT_POINTS, .minRange = 1, .maxRange = 1, .canMoveAndFire = true,
+                         .grid = &grid},
+            stationary(DEAD_UNIT, DEAD_SHOOTER_TILE, 1, FAR_MIN_RANGE),
+            stationary(DAMAGED_UNIT, DAMAGED_SHOOTER_TILE, FAR_MIN_RANGE, FAR_MIN_RANGE),
+            AttackerSpec{.unitIndex = IN_RANGE_MOBILE_UNIT, .x = IN_RANGE_MOBILE_TILE.x, .y = IN_RANGE_MOBILE_TILE.y,
+                         .movementPoints = SPEC_MOVEMENT_POINTS, .minRange = 1, .maxRange = FAR_MIN_RANGE,
+                         .canMoveAndFire = true, .grid = &grid},
+        };
+        const AttackOpportunityField field = AttackOpportunityField::build(FIELD_SIZE, FIELD_SIZE, specs);
+        std::vector<Coordinator::KnownUnit> units(SHOOTER_UNIT_COUNT);
+        units[MOBILE_UNIT].hpRounded = MOBILE_HP;
+        units[DEAD_UNIT].hpRounded = 0;
+        units[INDIRECT_UNIT].hpRounded = UNIT_HP_STEPS;
+        units[DAMAGED_UNIT].hpRounded = DAMAGED_HP;
+        units[IN_RANGE_MOBILE_UNIT].hpRounded = UNIT_HP_STEPS;
+        const auto visitAll = [&](std::int32_t damagedUnit, std::int32_t damagedHp)
+        {
+            std::vector<VisitedShot> visited;
+            Coordinator::forEachEnemyShot(units, field, SHOT_TARGET, damagedUnit, damagedHp,
+                                          [&](const Coordinator::EnemyShot & shot)
+                                          {
+                                              visited.push_back(VisitedShot{shot.slot, shot.unitIndex, shot.tile,
+                                                                            shot.hpSteps, shot.distance});
+                                          });
+            return visited;
+        };
+        const std::vector<VisitedShot> expected{
+            {0, INDIRECT_UNIT, INDIRECT_SHOOTER_TILE, UNIT_HP_STEPS, INDIRECT_DISTANCE},
+            {1, MOBILE_UNIT, MOBILE_SHOOTER_TILE, MOBILE_HP, 1},
+            {DAMAGED_SLOT, DAMAGED_UNIT, DAMAGED_SHOOTER_TILE, DAMAGED_HP_OVERRIDE, RING_DISTANCE},
+            {IN_RANGE_MOBILE_SLOT, IN_RANGE_MOBILE_UNIT, IN_RANGE_MOBILE_TILE, UNIT_HP_STEPS, 1},
+        };
+        expect(field.attackerSlotsAt(SHOT_TARGET.x, SHOT_TARGET.y).size() == specs.size(),
+               "every hand built shooter reaches the target");
+        expect(stationaryShotDistance(IN_RANGE_MOBILE_TILE, SHOT_TARGET, 1, FAR_MIN_RANGE) == RING_DISTANCE,
+               "the in range move and fire shooter could already fire from where it stands");
+        expect(visitAll(DAMAGED_UNIT, DAMAGED_HP_OVERRIDE) == expected,
+               "shots come in slot order, skip the dead shooter, apply the override and keep each distance");
+        std::vector<VisitedShot> unchanged = expected;
+        unchanged[DAMAGED_ENTRY].hpSteps = DAMAGED_HP;
+        expect(visitAll(Coordinator::NO_UNIT, 0) == unchanged, "without an override every shooter keeps its known hp");
+        expect(visitAll(MOBILE_UNIT, 0).size() == expected.size() - 1, "an override to zero hp removes that shooter");
+    }
+
     CandidateBundle spannedCandidate()
     {
         CandidateBundle candidate;
@@ -310,6 +407,7 @@ int main()
     testPositionFactsAliasTheOwnedVectors();
     testCaptureIncomePricesEveryOwner();
     testMovingACandidateKeepsItsSpansValid();
+    testEnemyShotEnumeration();
     testMovedShotDistanceMatchesTheAttackField(DIRECT_MIN_RANGE, DIRECT_MAX_RANGE, "direct reach matches the field");
     testMovedShotDistanceMatchesTheAttackField(INDIRECT_MIN_RANGE, INDIRECT_MAX_RANGE,
                                                "indirect reach matches the field");

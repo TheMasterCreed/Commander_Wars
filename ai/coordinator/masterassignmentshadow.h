@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QString>
 
+#include "ai/coordinator/capturedangerauditmode.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/masterassignmentcapture.h"
 #include "ai/coordinator/masterassignmentsearch.h"
@@ -79,6 +80,7 @@ namespace Coordinator
         MasterShadowExportMode exportMode{MasterShadowExportMode::Full};
         MasterStaleProbe staleProbe{MasterStaleProbe::None};
         MasterPlanNeighborAudit planNeighborAudit{MasterPlanNeighborAudit::Off};
+        CaptureDangerAudit captureDangerAudit{CaptureDangerAudit::Off};
 
         bool enabled() const
         {
@@ -148,6 +150,7 @@ namespace Coordinator
                                                MasterStockControlRuntime runtime = MasterStockControlRuntime::None);
     std::optional<MasterStaleProbe> parseMasterStaleProbe(const QByteArray & probe);
     MasterPlanNeighborAudit parseMasterPlanNeighborAudit(const QByteArray & value, MasterStockControlRuntime runtime);
+    CaptureDangerAudit parseCaptureDangerAudit(const QByteArray & value, MasterStockControlRuntime runtime);
     MasterShadowConfig readMasterShadowConfig();
     MasterShadowConfig playMasterStockControlConfig();
     void prepareMasterShadow(const MasterShadowConfig & config, AssignmentInput & input, RefinementLedger & ledger);

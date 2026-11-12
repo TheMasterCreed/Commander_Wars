@@ -9,6 +9,7 @@
 
 #include "ai/coordinator/attackopportunitybuilder.h"
 #include "ai/coordinator/bundlebuilder.h"
+#include "ai/coordinator/capturedangeraudit.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/engineactionbuilder.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
@@ -317,7 +318,7 @@ void CoordinatedAi::ensureTurnPlan()
     m_planDay = m_pMap->getCurrentDay();
     if (timed)
     {
-        const auto nanos = preparationNanos + planningNanosSince(started, true);
+        const auto nanos = preparationNanos + planningNanosSince(started, true) - m_captureDangerAuditNanos;
         const Coordinator::DecisionTraceIdentity identity{
             .day = m_planDay, .playerId = m_pPlayer->getPlayerID(),
             .planSequence = m_planSequence, .horizonTurns = m_propertyStock.horizonTurns()};
@@ -364,6 +365,11 @@ bool CoordinatedAi::playStockControlAvailable() const
     {
         return false;
     }
+    return localSessionMenu();
+}
+
+bool CoordinatedAi::localSessionMenu() const
+{
     auto* menu = dynamic_cast<GameMenue*>(m_pMenu);
     return menu != nullptr && !menu->isNetworkGame() && !menu->getIsReplay();
 }
@@ -393,6 +399,7 @@ void CoordinatedAi::buildTurnPlan()
     };
 
     Clock::time_point planningStart;
+    m_captureDangerAuditNanos = 0;
     m_executionCursor = 0;
     ++m_planSequence;
     const Coordinator::DecisionTraceIdentity traceIdentity{
@@ -474,9 +481,8 @@ void CoordinatedAi::buildTurnPlan()
         (masterShadow.runtime == Coordinator::MasterStockControlRuntime::PlayableTrial &&
          masterShadow.error != Coordinator::MasterShadowConfigError::None))
     {
-        auto* menu = dynamic_cast<GameMenue*>(m_pMenu);
         const bool unsupportedSession = masterShadow.runtime == Coordinator::MasterStockControlRuntime::PlayableTrial &&
-            (menu == nullptr || menu->isNetworkGame() || menu->getIsReplay());
+            !localSessionMenu();
         if (masterShadow.error != Coordinator::MasterShadowConfigError::None || unsupportedSession)
         {
             m_assignment = Coordinator::AssignmentResult{};
@@ -911,6 +917,23 @@ void CoordinatedAi::buildTurnPlan()
     Coordinator::writePlanningTimingAudit(
         traceIdentity,
         phaseTimingFields);
+    // Network peers would not run the audit's extra script hooks, so it is local sessions only.
+    if (masterShadow.captureDangerAudit == Coordinator::CaptureDangerAudit::Recorded && localSessionMenu())
+    {
+        const auto auditStart = Clock::now();
+        Coordinator::recordCaptureDangerAudit({
+            .map = *m_pMap,
+            .knowledge = m_dayStartKnowledge,
+            .enemyReach = m_attackOpportunities,
+            .properties = m_properties,
+            .propertyStock = m_propertyStock,
+            .actors = input.actors,
+            .unitLinks = input.unitLinks,
+            .plan = m_assignment.plan,
+            .identity = traceIdentity,
+        });
+        m_captureDangerAuditNanos = planningNanosSince(auditStart, true);
+    }
 }
 
 Unit* CoordinatedAi::plannableUnit(

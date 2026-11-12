@@ -20,10 +20,18 @@ namespace
     constexpr auto TIER_AUDIT_VARIABLE = "COW_MASTER_ASSIGNMENT_TIER_AUDIT";
     constexpr auto EXPORT_VARIABLE = "COW_MASTER_ASSIGNMENT_EXPORT";
     constexpr auto NEIGHBOR_AUDIT_VARIABLE = "COW_MASTER_PLAN_NEIGHBOR_AUDIT";
-    constexpr auto NEIGHBOR_AUDIT_RECORDED = "1";
+    constexpr auto DANGER_AUDIT_VARIABLE = "COW_COORDINATED_DANGER_AUDIT";
+    constexpr auto AUDIT_RECORDED = "1";
     constexpr auto STOCK_CONTROL_MODE = "stockControl";
     constexpr auto BATTLE_ANIMATION_SPEED_PROBE = "battleAnimationSpeed";
     constexpr std::int64_t PLAY_STOCK_CONTROL_ALLOWANCE = 60000000;
+
+    bool auditRecorded(const QByteArray & value, Coordinator::MasterStockControlRuntime runtime)
+    {
+        const bool measuredRuntime = runtime == Coordinator::MasterStockControlRuntime::Arena ||
+                                     runtime == Coordinator::MasterStockControlRuntime::PlayableTrial;
+        return measuredRuntime && value == AUDIT_RECORDED;
+    }
 }
 
 namespace Coordinator
@@ -43,10 +51,12 @@ namespace Coordinator
 
     MasterPlanNeighborAudit parseMasterPlanNeighborAudit(const QByteArray & value, MasterStockControlRuntime runtime)
     {
-        const bool measuredRuntime = runtime == MasterStockControlRuntime::Arena ||
-                                     runtime == MasterStockControlRuntime::PlayableTrial;
-        return measuredRuntime && value == NEIGHBOR_AUDIT_RECORDED ? MasterPlanNeighborAudit::Recorded
-                                                                   : MasterPlanNeighborAudit::Off;
+        return auditRecorded(value, runtime) ? MasterPlanNeighborAudit::Recorded : MasterPlanNeighborAudit::Off;
+    }
+
+    CaptureDangerAudit parseCaptureDangerAudit(const QByteArray & value, MasterStockControlRuntime runtime)
+    {
+        return auditRecorded(value, runtime) ? CaptureDangerAudit::Recorded : CaptureDangerAudit::Off;
     }
 
     bool isolatedMasterTrialPath(const QString & applicationDirectory, const QString & explicitUserPath,
@@ -154,6 +164,7 @@ namespace Coordinator
             QString::fromLocal8Bit(qgetenv(OUTPUT_VARIABLE)), qgetenv(TIER_AUDIT_VARIABLE),
             qgetenv(EXPORT_VARIABLE), runtime);
         result.planNeighborAudit = parseMasterPlanNeighborAudit(qgetenv(NEIGHBOR_AUDIT_VARIABLE), runtime);
+        result.captureDangerAudit = parseCaptureDangerAudit(qgetenv(DANGER_AUDIT_VARIABLE), runtime);
 #ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
         if (result.controlsStock() && runtime == MasterStockControlRuntime::PlayableTrial)
         {
