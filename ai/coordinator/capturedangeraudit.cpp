@@ -26,6 +26,7 @@
 #include "ai/coordinator/capturedangerrecord.h"
 #include "ai/coordinator/capturedangerstream.h"
 #include "ai/coordinator/damageoracle.h"
+#include "ai/coordinator/masterplanpricing.h"
 #include "ai/coordinator/replycheck.h"
 #include "ai/coordinator/replyfacts.h"
 #include "ai/coordinator/replyfactsbuilder.h"
@@ -52,7 +53,14 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 11;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 12;
+    constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
+    constexpr Coordinator::DiagnosticRefinementLimits STOCK_REPLY_REFINEMENT_LIMITS{
+        .stateCap = STOCK_REPLY_REFINEMENT_STATE_CAP,
+        .dualRounds = Coordinator::MASTER_PLAN_PRICING_ROUNDS,
+        .dualWork = Coordinator::MASTER_PLAN_PRICING_WORK,
+        .dualWitnessWork = Coordinator::MASTER_PLAN_PRICING_WITNESS_WORK,
+    };
     constexpr auto DANGER_AUDIT_FILE = "coordinated-ai-danger.jsonl";
 
     constexpr auto KEY_SCHEMA = "schema";
@@ -263,6 +271,20 @@ namespace
     constexpr auto KEY_PREPARATION_NANOS = "preparationNanos";
     constexpr auto KEY_PRICING_NANOS = "pricingNanos";
     constexpr auto KEY_REPLAY_NANOS = "replayNanos";
+    constexpr auto KEY_CHEAP_OURS = "cheapOurs";
+    constexpr auto KEY_SEARCH_STATES = "searchStates";
+    constexpr auto KEY_REFINEMENT_COMPLETED = "refinementCompleted";
+    constexpr auto KEY_REFINEMENT_NANOS = "refinementNanos";
+    constexpr auto KEY_REFINEMENT_STATE_CAP = "refinementStateCap";
+    constexpr auto KEY_DUAL_ROUND_LIMIT = "dualRoundLimit";
+    constexpr auto KEY_DUAL_WORK_LIMIT = "dualWorkLimit";
+    constexpr auto KEY_DUAL_WITNESS_WORK_LIMIT = "dualWitnessWorkLimit";
+    constexpr auto KEY_DUAL_CEILING = "dualCeiling";
+    constexpr auto KEY_DUAL_STATUS = "dualStatus";
+    constexpr auto KEY_DUAL_ROUNDS = "dualRounds";
+    constexpr auto KEY_DUAL_WITNESS_REPLAYS = "dualWitnessReplays";
+    constexpr auto KEY_DUAL_WITNESS_VALUE = "dualWitnessValue";
+    constexpr auto KEY_DUAL_NANOS = "dualNanos";
     constexpr auto KEY_CHAIN_NANOS = "chainNanos";
     constexpr auto KEY_PLAN_REPLAY = "planReplay";
     constexpr auto KEY_PRESENT = "present";
@@ -2224,7 +2246,7 @@ namespace
         bool replayValid = false;
         if (fieldAvailable && chainUsable)
         {
-            quotes = JointPlanStockValuer::diagnosticQuotes(m_view.propertyStock, keys);
+            quotes = JointPlanStockValuer::diagnosticQuotes(m_view.propertyStock, keys, STOCK_REPLY_REFINEMENT_LIMITS);
             replayValid = quotes.quotes.size() == keys.size() &&
                 std::all_of(quotes.quotes.begin(), quotes.quotes.end(),
                     [](const DiagnosticStockQuote & quote) { return quote.valid && quote.witnessReplays; });
@@ -2247,6 +2269,10 @@ namespace
             {KEY_ACTIONS, static_cast<qint64>(quotes.actions)},
             {KEY_CLASSES_BUILT, static_cast<qint64>(quotes.classesBuilt)},
             {KEY_NANOS, static_cast<qint64>(quotes.nanos)},
+            {KEY_REFINEMENT_STATE_CAP, static_cast<qint64>(quotes.limits.stateCap)},
+            {KEY_DUAL_ROUND_LIMIT, quotes.limits.dualRounds},
+            {KEY_DUAL_WORK_LIMIT, static_cast<qint64>(quotes.limits.dualWork)},
+            {KEY_DUAL_WITNESS_WORK_LIMIT, static_cast<qint64>(quotes.limits.dualWitnessWork)},
         };
         const std::array names{KEY_TODAY, KEY_AFTER_OWN_ACTIONS, KEY_AFTER_REPLY};
         for (std::size_t index = 0; index < keys.size(); ++index)
@@ -2261,6 +2287,22 @@ namespace
                 quoteRecord.insert(KEY_REPLAY_NANOS, static_cast<qint64>(quote.replayNanos));
                 quoteRecord.insert(KEY_VALID, quote.valid);
                 quoteRecord.insert(KEY_WITNESS_REPLAYS, quote.witnessReplays);
+                quoteRecord.insert(KEY_SEARCH_STATES, static_cast<qint64>(quote.searchStates));
+                quoteRecord.insert(KEY_REFINEMENT_COMPLETED, quote.refinementCompleted);
+                quoteRecord.insert(KEY_REFINEMENT_NANOS, static_cast<qint64>(quote.refinementNanos));
+                quoteRecord.insert(KEY_DUAL_STATUS, quote.dualStatus ? QJsonValue(QLatin1String(
+                    MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(*quote.dualStatus)])) : QJsonValue());
+                quoteRecord.insert(KEY_DUAL_CEILING,
+                    quote.dualCeiling ? QJsonValue(static_cast<qint64>(*quote.dualCeiling)) : QJsonValue());
+                quoteRecord.insert(KEY_DUAL_ROUNDS, quote.dualRounds);
+                quoteRecord.insert(KEY_DUAL_WITNESS_REPLAYS, quote.dualWitnessReplays);
+                quoteRecord.insert(KEY_DUAL_WITNESS_VALUE,
+                    quote.dualWitnessValue ? QJsonValue(static_cast<qint64>(*quote.dualWitnessValue)) : QJsonValue());
+                quoteRecord.insert(KEY_DUAL_NANOS, static_cast<qint64>(quote.dualNanos));
+                if (quote.valid || quote.status == DiagnosticStockStatus::RefinementFailed)
+                {
+                    quoteRecord.insert(KEY_CHEAP_OURS, intervalRecord(quote.cheapOurs));
+                }
                 if (quote.valid)
                 {
                     quoteRecord.insert(KEY_OURS, intervalRecord(quote.ours));

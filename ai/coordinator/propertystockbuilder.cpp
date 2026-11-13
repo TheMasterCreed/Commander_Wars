@@ -277,68 +277,6 @@ namespace Coordinator
             enemyOptimumWithout(enemyRowOf(outcome.destroyedKnowledgeIndex));
     }
 
-    PropertyStockField::JointActionFacts PropertyStockField::jointActionFacts(
-        std::span<const PlanRowAction> actions) const
-    {
-        JointActionFacts facts;
-        for (const PlanRowAction & entry : actions)
-        {
-            std::int32_t capturedColumn = NO_STOCK_COLUMN;
-            facts.movers.push_back(actionMover(entry, capturedColumn));
-            facts.moverRows.push_back(entry.row);
-            if (capturedColumn != NO_STOCK_COLUMN)
-            {
-                facts.capturedColumns.push_back(capturedColumn);
-            }
-        }
-        std::sort(facts.capturedColumns.begin(), facts.capturedColumns.end());
-        facts.capturedColumns.erase(
-            std::unique(facts.capturedColumns.begin(), facts.capturedColumns.end()),
-            facts.capturedColumns.end());
-        return facts;
-    }
-
-    MilliFunds PropertyStockField::ourOpenOptimum(const JointActionFacts & facts)
-    {
-        std::vector<std::int32_t> openColumns;
-        for (std::int32_t column = 0; column < m_ours.columnCount(); ++column)
-        {
-            if (std::find(facts.capturedColumns.begin(),
-                          facts.capturedColumns.end(),
-                          column) == facts.capturedColumns.end())
-            {
-                openColumns.push_back(column);
-            }
-        }
-        std::vector<MilliFunds> weights;
-        weights.reserve(static_cast<std::size_t>(m_ours.rowCount()) * openColumns.size());
-        for (std::int32_t row = 0; row < m_ours.rowCount(); ++row)
-        {
-            const auto mover =
-                std::find(facts.moverRows.begin(), facts.moverRows.end(), row);
-            if (mover == facts.moverRows.end())
-            {
-                const std::span<const MilliFunds> source = m_ours.weightRow(row);
-                for (const std::int32_t column : openColumns)
-                {
-                    weights.push_back(source[static_cast<std::size_t>(column)]);
-                }
-                continue;
-            }
-            const std::size_t moverSlot =
-                static_cast<std::size_t>(mover - facts.moverRows.begin());
-            const std::vector<MilliFunds> acting =
-                actingWeights(row, facts.movers[moverSlot]);
-            for (const std::int32_t column : openColumns)
-            {
-                weights.push_back(acting[static_cast<std::size_t>(column)]);
-            }
-        }
-        AssignmentSolver solver;
-        solver.solve(m_ours.rowCount(), static_cast<std::int32_t>(openColumns.size()), weights);
-        return solver.optimum();
-    }
-
     JointStockDecomposition PropertyStockField::jointStockDecomposition(
         std::span<const PlanRowAction> actions)
     {
@@ -2580,12 +2518,11 @@ namespace Coordinator
             m_diagnosticLastOurRefinement = solved.tier;
         }
 #endif
+        const SequentialIntervalRefinement refined =
+            refineSequentialInterval(entry.ours, solved.tier, solved.witnessReplays, stateCap);
         if ((seed && !solved.tier.warmStartAccepted) ||
             solved.capturedColumns != entry.capturedColumns ||
-            solved.tier.searchStates < 0 ||
-            solved.tier.searchStates > stateCap ||
-            solved.tier.bookedValue >
-                solved.tier.relaxedValue)
+            refined.status == SequentialIntervalStatus::Inconsistent)
         {
             m_pricingFailure = true;
             return false;
@@ -2598,21 +2535,7 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
-        MilliFunds lower = entry.ours.lower;
-        const bool adoptWitness =
-            solved.tier.bookedValue > lower &&
-            solved.witnessReplays;
-        if (adoptWitness)
-        {
-            lower = solved.tier.bookedValue;
-        }
-        const MilliFunds solvedUpper =
-            solved.tier.searchCompleted
-                ? solved.tier.bookedValue
-                : solved.tier.relaxedValue;
-        const MilliFunds upper =
-            std::min(entry.ours.upper, solvedUpper);
-        if (upper < lower)
+        if (refined.status == SequentialIntervalStatus::Crossed)
         {
             m_pricingFailure = true;
             return false;
@@ -2623,13 +2546,13 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
-        entry.ours = StockInterval{lower, upper};
-        if (adoptWitness)
+        entry.ours = refined.interval;
+        if (refined.adoptWitness)
         {
             m_refinedOurWitnesses[entry.key] =
                 RefinedWitness{
                     std::move(solved.tier.witness),
-                    lower,
+                    refined.interval.lower,
                     true,
                 };
         }
@@ -2710,11 +2633,10 @@ namespace Coordinator
                         m_field.m_theirs.rows.size(), m_field.m_theirs.columns.size(),
                         seed, solved.tier, solved.witnessReplays);
 #endif
+        const SequentialIntervalRefinement refined =
+            refineSequentialInterval(enemy.bounds, solved.tier, solved.witnessReplays, stateCap);
         if ((seed && !solved.tier.warmStartAccepted) ||
-            solved.tier.searchStates < 0 ||
-            solved.tier.searchStates > stateCap ||
-            solved.tier.bookedValue >
-                solved.tier.relaxedValue ||
+            refined.status == SequentialIntervalStatus::Inconsistent ||
             solved.tier.relaxedValue >
                 m_cheapModel.enemyCeiling())
         {
@@ -2729,21 +2651,7 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
-        MilliFunds lower = enemy.bounds.lower;
-        const bool adoptWitness =
-            solved.tier.bookedValue > lower &&
-            solved.witnessReplays;
-        if (adoptWitness)
-        {
-            lower = solved.tier.bookedValue;
-        }
-        const MilliFunds solvedUpper =
-            solved.tier.searchCompleted
-                ? solved.tier.bookedValue
-                : solved.tier.relaxedValue;
-        const MilliFunds upper =
-            std::min(enemy.bounds.upper, solvedUpper);
-        if (upper < lower)
+        if (refined.status == SequentialIntervalStatus::Crossed)
         {
             m_pricingFailure = true;
             return false;
@@ -2754,13 +2662,13 @@ namespace Coordinator
             m_pricingFailure = true;
             return false;
         }
-        enemy.bounds = StockInterval{lower, upper};
-        if (adoptWitness)
+        enemy.bounds = refined.interval;
+        if (refined.adoptWitness)
         {
             m_refinedEnemyWitnesses[capturedColumns] =
                 RefinedWitness{
                     std::move(solved.tier.witness),
-                    lower,
+                    refined.interval.lower,
                     true,
                 };
         }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -91,22 +92,36 @@ namespace Coordinator
         PreparationFailed,
         PricingFailed,
         ReplayFailed,
+        RefinementFailed,
     };
 
     inline constexpr std::array DIAGNOSTIC_STOCK_STATUS_NAMES{
-        "VALID", "INVALID_KEY", "PREPARATION_FAILED", "PRICING_FAILED", "REPLAY_FAILED",
+        "VALID", "INVALID_KEY", "PREPARATION_FAILED", "PRICING_FAILED", "REPLAY_FAILED", "REFINEMENT_FAILED",
     };
+
+    enum class MasterPlanPricingStatus : std::int8_t;
 
     struct DiagnosticStockQuote
     {
         DiagnosticStockStatus status{DiagnosticStockStatus::InvalidKey};
         std::int64_t pricingNanos{0};
         std::int64_t replayNanos{0};
+        std::int64_t refinementNanos{0};
+        std::int64_t searchStates{0};
+        std::int64_t dualNanos{0};
+        std::int32_t dualRounds{0};
+        StockInterval cheapOurs;
         StockInterval ours;
         MilliFunds owned{0};
+        std::optional<MasterPlanPricingStatus> dualStatus;
+        std::optional<MilliFunds> dualCeiling;
+        std::optional<MilliFunds> dualWitnessValue;
+        std::vector<std::int32_t> capturedColumns;
         std::vector<RowWitness> witness;
         bool valid{false};
         bool witnessReplays{false};
+        bool refinementCompleted{false};
+        bool dualWitnessReplays{false};
     };
 
     class CheapPricingModel
@@ -668,8 +683,10 @@ namespace Coordinator
             quote.status = DiagnosticStockStatus::PricingFailed;
             if (quote.valid)
             {
+                quote.cheapOurs = price.ours;
                 quote.ours = price.ours;
                 quote.owned = price.owned;
+                quote.capturedColumns = std::move(price.capturedColumns);
                 quote.witness = std::move(price.witness);
                 const auto replayStarted = std::chrono::steady_clock::now();
                 quote.witnessReplays = model.replayWitness(state, quote.witness, quote.ours.lower);

@@ -1684,6 +1684,8 @@ if (BUILD_TESTING)
     add_executable(CoordinatorAiPropertyStockTests
         tests/coordinator_ai/propertystocktests.cpp
         ai/coordinator/propertystockpricing.cpp
+        ai/coordinator/masterassignmentfuture.cpp
+        ai/coordinator/masterplanpricing.cpp
     )
     target_compile_definitions(CoordinatorAiPropertyStockTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_include_directories(CoordinatorAiPropertyStockTests PRIVATE

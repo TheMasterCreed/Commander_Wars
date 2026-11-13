@@ -5,6 +5,132 @@
 #include <set>
 
 #include "ai/coordinator/masterassignmentfuture.h"
+#include "ai/coordinator/masterplanpricing.h"
+#include "ai/coordinator/relativestockcomparison.h"
+
+namespace
+{
+    using namespace Coordinator;
+
+    bool dualFailure(MasterPlanPricingStatus status)
+    {
+        return status == MasterPlanPricingStatus::ArithmeticFailure || status == MasterPlanPricingStatus::Invalid ||
+            status == MasterPlanPricingStatus::Inconsistent;
+    }
+
+    std::optional<MasterPlanPricingModel> dualModel(const MasterFutureCatalog & catalog,
+                                                    const CheapPricingModel & cheap, const ContinuationKey & key,
+                                                    const SequentialInstance & instance)
+    {
+        MasterPlanPricingModel model;
+        model.catalog.horizon = catalog.horizon;
+        model.catalog.columns = catalog.columns;
+        model.catalog.classes = catalog.classes;
+        model.catalog.dayRows = catalog.dayRows;
+        model.catalog.complete = true;
+        model.rowActors.assign(catalog.dayRows.size(), MASTER_PLAN_NO_ACTOR);
+        std::vector<bool> capturedNodes(catalog.columns.size(), false);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const MasterFutureAction* pFuture = findMasterFutureAction(catalog, action);
+            const CheapActionTerms* pTerms = cheap.actionTerms(action);
+            if (pFuture == nullptr || pTerms == nullptr)
+            {
+                return std::nullopt;
+            }
+            MasterPlanPricingCandidate candidate;
+            candidate.key = action;
+            candidate.row = pFuture->row;
+            if (pTerms->capturedColumn != NO_STOCK_COLUMN)
+            {
+                candidate.capturedNode = futureNodeOfColumn(catalog.columns, pTerms->capturedColumn);
+            }
+            if (candidate.capturedNode != NO_SEQUENTIAL_NODE)
+            {
+                const auto node = static_cast<std::size_t>(candidate.capturedNode);
+                // The ceiling refunds each captured node price once, so a second capturer of it would be unsound.
+                if (capturedNodes[node])
+                {
+                    return std::nullopt;
+                }
+                capturedNodes[node] = true;
+                removeCapturedNode(candidate.row, candidate.capturedNode);
+            }
+            model.rowActors[static_cast<std::size_t>(action.row())] = static_cast<std::int32_t>(model.actors.size());
+            model.actors.push_back(MasterPlanPricingActor{action.row(), {std::move(candidate)}});
+        }
+        if (capturedNodes != instance.capturedNodes || !indexMasterPlanActions(model))
+        {
+            return std::nullopt;
+        }
+        return model;
+    }
+
+    bool tightenWithDual(const MasterFutureCatalog & catalog, const CheapPricingModel & cheap,
+                         const ContinuationKey & key, const SequentialInstance & instance,
+                         const DiagnosticRefinementLimits & limits, DiagnosticStockQuote & quote)
+    {
+        quote.dualStatus = MasterPlanPricingStatus::Invalid;
+        const auto model = dualModel(catalog, cheap, key, instance);
+        std::int64_t ledgerTotal = limits.dualWork;
+        RefinementLedger ledger;
+        // The final evaluation draws on what tuning leaves, so it gets a reserve as large as the tuning budget.
+        if (!model || !RelativeStockDetail::checkedAdd(ledgerTotal, limits.dualWork) || !ledger.open(ledgerTotal))
+        {
+            return false;
+        }
+        const MasterPlanPricingResult tuned = tuneMasterPlanPrices(
+            *model, MasterPlanPricingLimits{limits.dualRounds, limits.dualWork, limits.dualWitnessWork}, ledger);
+        quote.dualRounds = tuned.rounds;
+        quote.dualStatus = tuned.status;
+        if (dualFailure(tuned.status))
+        {
+            return false;
+        }
+        StockInterval interval = quote.ours;
+        if (!tuned.prices.empty())
+        {
+            const MasterPlanCeiling checked = priceMasterPlan(*model, tuned.prices, ledger);
+            quote.dualStatus = checked.status;
+            if (dualFailure(checked.status))
+            {
+                return false;
+            }
+            if (checked.status == MasterPlanPricingStatus::Valid)
+            {
+                quote.dualCeiling = checked.ceiling;
+                interval.upper = std::min(interval.upper, checked.ceiling);
+            }
+        }
+        if (tuned.witness.valid)
+        {
+            std::vector<SequentialRowWitness> rows;
+            MilliFunds value = 0;
+            bool summed = true;
+            for (const SequentialRowWitness & row : tuned.witness.rows)
+            {
+                if (row.steps.empty())
+                {
+                    continue;
+                }
+                summed = summed && RelativeStockDetail::checkedAdd(value, row.value);
+                rows.push_back(row);
+            }
+            quote.dualWitnessValue = value;
+            quote.dualWitnessReplays = summed && replaySequentialWitness(instance, rows, value);
+            if (quote.dualWitnessReplays && value > interval.lower)
+            {
+                interval.lower = value;
+            }
+        }
+        if (interval.upper < interval.lower)
+        {
+            return false;
+        }
+        quote.ours = interval;
+        return true;
+    }
+}
 
 namespace Coordinator
 {
@@ -88,6 +214,68 @@ namespace Coordinator
         return mover;
     }
 
+    PropertyStockField::JointActionFacts PropertyStockField::jointActionFacts(
+        std::span<const PlanRowAction> actions) const
+    {
+        JointActionFacts facts;
+        for (const PlanRowAction & entry : actions)
+        {
+            std::int32_t capturedColumn = NO_STOCK_COLUMN;
+            facts.movers.push_back(actionMover(entry, capturedColumn));
+            facts.moverRows.push_back(entry.row);
+            if (capturedColumn != NO_STOCK_COLUMN)
+            {
+                facts.capturedColumns.push_back(capturedColumn);
+            }
+        }
+        std::sort(facts.capturedColumns.begin(), facts.capturedColumns.end());
+        facts.capturedColumns.erase(
+            std::unique(facts.capturedColumns.begin(), facts.capturedColumns.end()),
+            facts.capturedColumns.end());
+        return facts;
+    }
+
+    MilliFunds PropertyStockField::ourOpenOptimum(const JointActionFacts & facts)
+    {
+        std::vector<std::int32_t> openColumns;
+        for (std::int32_t column = 0; column < m_ours.columnCount(); ++column)
+        {
+            if (std::find(facts.capturedColumns.begin(),
+                          facts.capturedColumns.end(),
+                          column) == facts.capturedColumns.end())
+            {
+                openColumns.push_back(column);
+            }
+        }
+        std::vector<MilliFunds> weights;
+        weights.reserve(static_cast<std::size_t>(m_ours.rowCount()) * openColumns.size());
+        for (std::int32_t row = 0; row < m_ours.rowCount(); ++row)
+        {
+            const auto mover =
+                std::find(facts.moverRows.begin(), facts.moverRows.end(), row);
+            if (mover == facts.moverRows.end())
+            {
+                const std::span<const MilliFunds> source = m_ours.weightRow(row);
+                for (const std::int32_t column : openColumns)
+                {
+                    weights.push_back(source[static_cast<std::size_t>(column)]);
+                }
+                continue;
+            }
+            const std::size_t moverSlot =
+                static_cast<std::size_t>(mover - facts.moverRows.begin());
+            const std::vector<MilliFunds> acting =
+                actingWeights(row, facts.movers[moverSlot]);
+            for (const std::int32_t column : openColumns)
+            {
+                weights.push_back(acting[static_cast<std::size_t>(column)]);
+            }
+        }
+        AssignmentSolver solver;
+        solver.solve(m_ours.rowCount(), static_cast<std::int32_t>(openColumns.size()), weights);
+        return solver.optimum();
+    }
+
     std::vector<PlanRowAction> JointPlanStockValuer::planActions(
         const ContinuationKey & key)
     {
@@ -160,10 +348,12 @@ namespace Coordinator
     }
 
     DiagnosticStockQuotes JointPlanStockValuer::diagnosticQuotes(
-        const PropertyStockField & field, std::span<const ContinuationKey> keys)
+        const PropertyStockField & field, std::span<const ContinuationKey> keys,
+        const DiagnosticRefinementLimits & limits)
     {
         const auto started = std::chrono::steady_clock::now();
         DiagnosticStockQuotes result;
+        result.limits = limits;
         result.quotes.resize(keys.size());
         std::set<CanonicalPlanActionKey> uniqueActions;
         std::vector<ContinuationKey> validKeys;
@@ -188,8 +378,8 @@ namespace Coordinator
         }
         const ContinuationKey catalog(uniqueActions.begin(), uniqueActions.end());
         result.actions = catalog.size();
-        const auto scratch = validKeys.empty() ? std::nullopt :
-            buildCheapModelFor(field, planActions(catalog), false, &result.classesBuilt, nullptr);
+        auto scratch = validKeys.empty() ? std::nullopt :
+            buildCheapModelFor(field, planActions(catalog), true, &result.classesBuilt, nullptr);
         result.preparationNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
         if (scratch)
@@ -197,12 +387,87 @@ namespace Coordinator
             auto quotes = diagnosticStockPrices(scratch->model, validKeys);
             for (std::size_t index = 0; index < quotes.size(); ++index)
             {
-                result.quotes[validIndices[index]] = std::move(quotes[index]);
+                auto & quote = quotes[index];
+                if (quote.valid)
+                {
+                    const auto refinementStarted = std::chrono::steady_clock::now();
+                    quote.valid = refineDiagnosticQuote(*scratch, validKeys[index], limits, quote);
+                    quote.refinementNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - refinementStarted).count();
+                    if (!quote.valid)
+                    {
+                        quote.status = DiagnosticStockStatus::RefinementFailed;
+                    }
+                }
+                result.quotes[validIndices[index]] = std::move(quote);
             }
         }
         result.nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
         return result;
+    }
+
+    bool JointPlanStockValuer::refineDiagnosticQuote(
+        CheapModelBuild & build, const ContinuationKey & key, const DiagnosticRefinementLimits & limits,
+        DiagnosticStockQuote & quote)
+    {
+        const std::int64_t stateCap = limits.stateCap;
+        if (!build.future || stateCap <= 0)
+        {
+            return false;
+        }
+        const MasterFutureCatalog & catalog = *build.future;
+        PropertyStockField & field = *build.field;
+        const std::vector<PlanRowAction> actions = planActions(key);
+        const PropertyStockField::JointActionFacts facts = field.jointActionFacts(actions);
+        if (facts.capturedColumns != quote.capturedColumns)
+        {
+            return false;
+        }
+        SequentialInstance instance;
+        instance.horizonTurns = catalog.horizon;
+        instance.nodeColumns = catalog.columns;
+        instance.classes = catalog.classes;
+        instance.rows = catalog.dayRows;
+        instance.capturedNodes.assign(catalog.columns.size(), false);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const MasterFutureAction* pAction = findMasterFutureAction(catalog, action);
+            if (pAction == nullptr)
+            {
+                return false;
+            }
+            instance.rows[static_cast<std::size_t>(action.row())] = pAction->row;
+        }
+        for (const std::int32_t column : facts.capturedColumns)
+        {
+            const std::int32_t node = futureNodeOfColumn(catalog.columns, column);
+            if (node != NO_SEQUENTIAL_NODE)
+            {
+                instance.capturedNodes[static_cast<std::size_t>(node)] = true;
+            }
+        }
+        const SequentialTierResult tier = solveSequentialPacking(
+            instance, field.ourOpenOptimum(facts), stateCap, nullptr, true, SequentialWitnessPolicy::BookedValue,
+            SequentialTierAuditMode::CountersOnly, nullptr, nullptr, SequentialPackingPolicy::CompatibleRows);
+        quote.searchStates = tier.searchStates;
+        quote.refinementCompleted = tier.searchCompleted || tier.certificate;
+        const SequentialIntervalRefinement refined = refineSequentialInterval(
+            quote.ours, tier, replaySequentialWitness(instance, tier.witness, tier.bookedValue), stateCap);
+        if (refined.status != SequentialIntervalStatus::Tightened)
+        {
+            return false;
+        }
+        quote.ours = refined.interval;
+        if (limits.dualRounds <= 0)
+        {
+            return true;
+        }
+        const auto dualStarted = std::chrono::steady_clock::now();
+        const bool dualSound = tightenWithDual(catalog, build.model, key, instance, limits, quote);
+        quote.dualNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - dualStarted).count();
+        return dualSound;
     }
 
     SequentialClassTable JointPlanStockValuer::buildOurClassTable(

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -12,6 +13,9 @@ namespace Coordinator
 {
     constexpr std::int32_t MASTER_PLAN_UNRESTRICTED = -1;
     constexpr std::int32_t MASTER_PLAN_NO_ACTOR = -1;
+    constexpr std::int32_t MASTER_PLAN_PRICING_ROUNDS = 200;
+    constexpr std::int64_t MASTER_PLAN_PRICING_WORK = 8000000;
+    constexpr std::int64_t MASTER_PLAN_PRICING_WITNESS_WORK = 250000;
 
     struct MasterPlanPricingCandidate
     {
@@ -46,6 +50,10 @@ namespace Coordinator
         ArithmeticFailure,
         Invalid,
         Inconsistent,
+    };
+
+    inline constexpr std::array MASTER_PLAN_PRICING_STATUS_NAMES{
+        "VALID", "UNAVAILABLE", "LIMIT_REACHED", "ARITHMETIC_FAILURE", "INVALID", "INCONSISTENT",
     };
 
     struct MasterPlanCeiling

@@ -1,33 +1,12 @@
 #include "ai/coordinator/masterassignmentstate.h"
 
 #include <algorithm>
-#include <limits>
 
 namespace Coordinator
 {
     bool MasterAssignmentState::complete() const
     {
         return std::find(choices.begin(), choices.end(), MASTER_UNASSIGNED) == choices.end();
-    }
-
-    std::optional<std::int64_t> masterWorkProduct(
-        std::size_t count, std::size_t units)
-    {
-        constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
-        if (count > static_cast<std::uint64_t>(maximum) ||
-            units > static_cast<std::uint64_t>(maximum) ||
-            (units != 0 && count > static_cast<std::uint64_t>(maximum) / units))
-        {
-            return std::nullopt;
-        }
-        return static_cast<std::int64_t>(count) * static_cast<std::int64_t>(units);
-    }
-
-    bool chargeMasterWork(RefinementLedger & ledger, std::size_t count,
-                          std::size_t units, RefinementWork category)
-    {
-        const auto work = masterWorkProduct(count, units);
-        return work && ledger.consume(*work, category);
     }
 
     std::optional<MasterAssignmentState> masterRootState(

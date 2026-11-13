@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "ai/coordinator/masterassignmentstate.h"
 #include "ai/coordinator/propertystocksequential.h"
 
@@ -46,7 +48,18 @@ namespace Coordinator
     MasterFuturePricing priceMasterFuture(
         const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
         RefinementLedger & ledger, RefinementWork category);
-    const MasterFutureAction* findMasterFutureAction(const MasterFutureCatalog & catalog,
-                                                     const CanonicalPlanActionKey & key);
-    std::int32_t futureNodeOfColumn(std::span<const PropertyStockColumn> columns, std::int32_t slot);
+    inline const MasterFutureAction* findMasterFutureAction(const MasterFutureCatalog & catalog,
+                                                            const CanonicalPlanActionKey & key)
+    {
+        const auto found = std::lower_bound(catalog.actions.begin(), catalog.actions.end(), key,
+            [](const MasterFutureAction & action, const CanonicalPlanActionKey & sought) { return action.key < sought; });
+        return found == catalog.actions.end() || found->key != key ? nullptr : &*found;
+    }
+
+    inline std::int32_t futureNodeOfColumn(std::span<const PropertyStockColumn> columns, std::int32_t slot)
+    {
+        const auto found = std::find_if(columns.begin(), columns.end(),
+            [&](const PropertyStockColumn & column) { return column.slot == slot; });
+        return found == columns.end() ? NO_SEQUENTIAL_NODE : static_cast<std::int32_t>(found - columns.begin());
+    }
 }

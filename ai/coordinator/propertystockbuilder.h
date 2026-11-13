@@ -57,11 +57,50 @@ namespace Coordinator
         return key;
     }
 
+    enum class SequentialIntervalStatus : std::int8_t
+    {
+        Tightened,
+        Inconsistent,
+        Crossed,
+    };
+
+    struct SequentialIntervalRefinement
+    {
+        SequentialIntervalStatus status{SequentialIntervalStatus::Inconsistent};
+        StockInterval interval;
+        bool adoptWitness{false};
+    };
+
+    inline SequentialIntervalRefinement refineSequentialInterval(
+        const StockInterval & current, const SequentialTierResult & tier, bool witnessReplays, std::int64_t stateCap)
+    {
+        SequentialIntervalRefinement result;
+        if (tier.searchStates < 0 || tier.searchStates > stateCap || tier.bookedValue > tier.relaxedValue)
+        {
+            return result;
+        }
+        result.adoptWitness = tier.bookedValue > current.lower && witnessReplays;
+        result.interval.lower = result.adoptWitness ? tier.bookedValue : current.lower;
+        result.interval.upper = std::min(current.upper, tier.searchCompleted ? tier.bookedValue : tier.relaxedValue);
+        result.status = result.interval.upper < result.interval.lower ? SequentialIntervalStatus::Crossed
+                                                                       : SequentialIntervalStatus::Tightened;
+        return result;
+    }
+
+    struct DiagnosticRefinementLimits
+    {
+        std::int64_t stateCap{0};
+        std::int32_t dualRounds{0};
+        std::int64_t dualWork{0};
+        std::int64_t dualWitnessWork{0};
+    };
+
     struct DiagnosticStockQuotes
     {
         std::vector<DiagnosticStockQuote> quotes;
         std::size_t actions{0};
         std::size_t classesBuilt{0};
+        DiagnosticRefinementLimits limits;
         std::int64_t preparationNanos{0};
         std::int64_t nanos{0};
     };
@@ -115,7 +154,8 @@ namespace Coordinator
     {
     public:
         static DiagnosticStockQuotes diagnosticQuotes(
-            const PropertyStockField & field, std::span<const ContinuationKey> keys);
+            const PropertyStockField & field, std::span<const ContinuationKey> keys,
+            const DiagnosticRefinementLimits & limits);
 
         JointPlanStockValuer(PropertyStockField & field, std::span<const KnownUnitLink> unitLinks,
                             SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full);
@@ -305,6 +345,8 @@ namespace Coordinator
         static std::optional<CheapModelBuild> buildCheapModelFor(
             const PropertyStockField & source, std::span<const PlanRowAction> actions, bool retainSequentialRows,
             std::size_t* classesBuilt, EnemyCeiling priceEnemy);
+        static bool refineDiagnosticQuote(CheapModelBuild & build, const ContinuationKey & key,
+                                          const DiagnosticRefinementLimits & limits, DiagnosticStockQuote & quote);
         static CheapRowTerms cheapRowTerms(const SequentialInstance & instance, const SequentialRow & row,
                                            std::int32_t rowIndex, std::span<const std::int32_t> nodeSlots);
         static SequentialClassTable buildOurClassTable(

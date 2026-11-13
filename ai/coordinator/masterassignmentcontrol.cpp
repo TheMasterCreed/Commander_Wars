@@ -8,6 +8,7 @@
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/masterassignmentstock.h"
 #include "ai/coordinator/masterassignmenttrace.h"
+#include "ai/coordinator/masterplanpricing.h"
 
 #ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
 #include "coreengine/settings.h"
@@ -16,10 +17,6 @@
 namespace
 {
     using namespace Coordinator;
-
-    constexpr std::int32_t MASTER_PLAN_PRICING_ROUNDS = 200;
-    constexpr std::int64_t MASTER_PLAN_PRICING_WORK = 8000000;
-    constexpr std::int64_t MASTER_PLAN_PRICING_WITNESS_WORK = 250000;
 
 #ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
     class StaleProbeScope final

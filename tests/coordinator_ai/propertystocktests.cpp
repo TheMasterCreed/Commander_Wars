@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "ai/coordinator/masterplanpricing.h"
 #include "ai/coordinator/propertystock.h"
 #include "ai/coordinator/propertystockbuilder.h"
 
@@ -19,6 +20,23 @@ namespace Coordinator
         static constexpr std::int32_t WIDTH = 3;
         static constexpr std::int32_t POINTS = 4;
         static constexpr std::int32_t RATE = 2;
+
+        struct ReplyKeys
+        {
+            CanonicalPlanActionKey today;
+            CanonicalPlanActionKey damaged;
+            CanonicalPlanActionKey dead;
+        };
+
+        static ReplyKeys replyKeys()
+        {
+            return ReplyKeys{
+                .today = CanonicalPlanActionKey::fromAction(0, 0, 0, true),
+                .damaged = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, false),
+                // Destruction also removes a capture-rate bonus that would remain after hp loss.
+                .dead = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, true),
+            };
+        }
 
         struct Snapshot
         {
@@ -147,6 +165,17 @@ namespace
     };
     constexpr std::uint64_t RANDOM_MULTIPLIER = 6364136223846793005ULL;
     constexpr std::uint64_t RANDOM_INCREMENT = 1442695040888963407ULL;
+    constexpr Coordinator::DiagnosticRefinementLimits SEQUENTIAL_ONLY{
+        .stateCap = Coordinator::SEQUENTIAL_SEARCH_STATE_CAP,
+    };
+    constexpr std::int64_t TRUNCATING_STATE_CAP = 1;
+    constexpr Coordinator::DiagnosticRefinementLimits TRUNCATED_SEQUENTIAL_ONLY{.stateCap = TRUNCATING_STATE_CAP};
+    constexpr Coordinator::DiagnosticRefinementLimits TRUNCATED_WITH_DUAL{
+        .stateCap = TRUNCATING_STATE_CAP,
+        .dualRounds = Coordinator::MASTER_PLAN_PRICING_ROUNDS,
+        .dualWork = Coordinator::MASTER_PLAN_PRICING_WORK,
+        .dualWitnessWork = Coordinator::MASTER_PLAN_PRICING_WITNESS_WORK,
+    };
 
     int failures = 0;
     int checks = 0;
@@ -419,16 +448,13 @@ namespace
     {
         using namespace Coordinator;
         using Fixture = PropertyStockDiagnosticFixture;
-        const auto today = CanonicalPlanActionKey::fromAction(0, 0, 0, true);
-        const auto damaged = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, false);
-        // Destruction also removes a capture-rate bonus that would remain after hp loss.
-        const auto dead = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, true);
+        const auto [today, damaged, dead] = Fixture::replyKeys();
         const auto zero = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, Fixture::RATE, false);
         const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead},
                               ContinuationKey{zero}, ContinuationKey{today}};
         const auto field = Fixture::make();
         const auto before = Fixture::snapshot(field);
-        const auto batch = JointPlanStockValuer::diagnosticQuotes(field, keys);
+        const auto batch = JointPlanStockValuer::diagnosticQuotes(field, keys, SEQUENTIAL_ONLY);
         constexpr std::size_t UNIQUE_ACTIONS = 4;
         constexpr std::size_t UNIQUE_CLASSES = 3;
         constexpr MilliFunds TODAY_FLOOR = 18;
@@ -437,8 +463,9 @@ namespace
         expect(batch.quotes.size() == keys.size() && batch.actions == UNIQUE_ACTIONS &&
                batch.classesBuilt == UNIQUE_CLASSES && batch.nanos >= 0,
                "field diagnostic builds only the union of actions and effective-rate classes");
-        expect(batch.quotes[0].ours.lower == TODAY_FLOOR && batch.quotes[0].ours.upper == TODAY_CEILING &&
-               batch.quotes[1].ours.lower == DAMAGED_VALUE && batch.quotes[1].ours.upper == DAMAGED_VALUE,
+        expect(batch.limits.stateCap == SEQUENTIAL_SEARCH_STATE_CAP && batch.limits.dualRounds == 0 &&
+               batch.quotes[0].cheapOurs.lower == TODAY_FLOOR && batch.quotes[0].cheapOurs.upper == TODAY_CEILING &&
+               batch.quotes[1].cheapOurs.lower == DAMAGED_VALUE && batch.quotes[1].cheapOurs.upper == DAMAGED_VALUE,
                "field diagnostic decodes damage and slows both the unfinished and second capture");
         for (const auto & quote : batch.quotes)
         {
@@ -449,7 +476,7 @@ namespace
                "destroyed unfinished and zero-rate rows have no future contribution");
         auto reversed = keys;
         std::reverse(reversed.begin(), reversed.end());
-        const auto other = JointPlanStockValuer::diagnosticQuotes(field, reversed);
+        const auto other = JointPlanStockValuer::diagnosticQuotes(field, reversed, SEQUENTIAL_ONLY);
         for (std::size_t index = 0; index < keys.size(); ++index)
         {
             const auto & quote = other.quotes[keys.size() - 1 - index];
@@ -461,18 +488,22 @@ namespace
         const auto invalid = CanonicalPlanActionKey::fromAction(1, 0, 0, false);
         const std::array partialKeys{ContinuationKey{today}, ContinuationKey{invalid}, ContinuationKey{damaged},
                                      ContinuationKey{today, damaged}};
-        const auto partial = JointPlanStockValuer::diagnosticQuotes(field, partialKeys);
+        const auto partial = JointPlanStockValuer::diagnosticQuotes(field, partialKeys, SEQUENTIAL_ONLY);
         expect(partial.quotes[0].valid && partial.quotes[2].valid && partial.actions == 2 &&
                partial.quotes[1].status == DiagnosticStockStatus::InvalidKey &&
                partial.quotes.back().status == DiagnosticStockStatus::InvalidKey &&
-               partial.quotes[0].ours.lower == TODAY_FLOOR && partial.quotes[2].ours.lower == DAMAGED_VALUE &&
+               partial.quotes[0].cheapOurs.lower == TODAY_FLOOR && partial.quotes[2].cheapOurs.lower == DAMAGED_VALUE &&
+               partial.quotes[0].refinementCompleted && partial.quotes[2].refinementCompleted &&
+               !partial.quotes[1].refinementCompleted && partial.quotes[1].searchStates == 0 &&
+               partial.quotes[1].refinementNanos == 0 && partial.quotes[0].refinementNanos >= 0 &&
                partial.quotes[1].pricingNanos == 0 && partial.quotes[1].replayNanos == 0 &&
                partial.preparationNanos >= 0 && partial.quotes[0].pricingNanos >= 0 &&
                partial.quotes[0].replayNanos >= 0, invalidIndependent);
         expect(Fixture::unchanged(field, before), "field diagnostic leaves the field and warmed caches unchanged");
         const auto completedField = Fixture::make(1, Fixture::RATE);
         const std::array completedKeys{ContinuationKey{today}, ContinuationKey{dead}};
-        const auto completed = JointPlanStockValuer::diagnosticQuotes(completedField, completedKeys);
+        const auto completed =
+            JointPlanStockValuer::diagnosticQuotes(completedField, completedKeys, SEQUENTIAL_ONLY);
         expect(completed.quotes[0].valid && completed.quotes[1].valid &&
                completed.quotes[1].owned == Fixture::HORIZON * 2 &&
                completed.quotes[0].owned == completed.quotes[1].owned && completed.quotes[1].ours.upper == 0,
@@ -481,11 +512,87 @@ namespace
         const auto mixedBefore = Fixture::snapshot(mixedField);
         const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
         const std::array mixedKeys{ContinuationKey{damaged, second}, ContinuationKey{dead, second}};
-        const auto mixed = JointPlanStockValuer::diagnosticQuotes(mixedField, mixedKeys);
+        const auto mixed = JointPlanStockValuer::diagnosticQuotes(mixedField, mixedKeys, SEQUENTIAL_ONLY);
         expect(mixed.quotes[0].valid && mixed.quotes[1].valid && mixed.quotes[1].ours.lower > 0 &&
                std::none_of(mixed.quotes[1].witness.begin(), mixed.quotes[1].witness.end(),
                    [](const RowWitness & witness) { return witness.row == 0; }) && Fixture::unchanged(mixedField, mixedBefore),
                "mixed field diagnostic keeps an undamaged row and never revives its destroyed neighbour");
+    }
+
+    void stockFieldRefinementIsExact()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t ROWS = 2;
+        constexpr MilliFunds TODAY_CHEAP_LOWER = 18;
+        constexpr MilliFunds TODAY_CHEAP_UPPER = 32;
+        constexpr MilliFunds TODAY_EXACT = 20;
+        constexpr MilliFunds DAMAGED_CHEAP_LOWER = 13;
+        constexpr MilliFunds DAMAGED_CHEAP_UPPER = 25;
+        constexpr MilliFunds DAMAGED_EXACT = 18;
+        constexpr MilliFunds DEAD_EXACT = 12;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead}};
+        const std::array cheap{
+            StockInterval{TODAY_CHEAP_LOWER, TODAY_CHEAP_UPPER},
+            StockInterval{DAMAGED_CHEAP_LOWER, DAMAGED_CHEAP_UPPER},
+            StockInterval{DEAD_EXACT, DEAD_EXACT},
+        };
+        const std::array exact{TODAY_EXACT, DAMAGED_EXACT, DEAD_EXACT};
+        const auto field = Fixture::make(ROWS);
+        const auto batch = JointPlanStockValuer::diagnosticQuotes(field, keys, SEQUENTIAL_ONLY);
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            const auto & quote = batch.quotes[index];
+            expect(quote.valid && quote.status == DiagnosticStockStatus::Valid && quote.refinementCompleted &&
+                       quote.cheapOurs.lower == cheap[index].lower && quote.cheapOurs.upper == cheap[index].upper &&
+                       quote.ours.lower == exact[index] && quote.ours.upper == exact[index] &&
+                       quote.searchStates >= 0 && quote.searchStates <= SEQUENTIAL_SEARCH_STATE_CAP &&
+                       !quote.dualStatus && !quote.dualCeiling,
+                   "a generous cap closes the sequential optimum inside the cheap interval");
+        }
+
+        const std::array truncatedKeys{ContinuationKey{today}};
+        const auto truncated = JointPlanStockValuer::diagnosticQuotes(field, truncatedKeys, TRUNCATED_SEQUENTIAL_ONLY);
+        const auto & partial = truncated.quotes.front();
+        expect(truncated.limits.stateCap == TRUNCATING_STATE_CAP && partial.valid && !partial.refinementCompleted &&
+                   partial.searchStates == TRUNCATING_STATE_CAP && partial.ours.lower == TODAY_CHEAP_LOWER &&
+                   partial.ours.upper == TODAY_CHEAP_UPPER,
+               "an unfinished refinement keeps the witnessed lower and the relaxed upper");
+    }
+
+    void stockFieldDualCeilingIsSound()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t ROWS = 2;
+        constexpr std::array CHEAP_LOWER{MilliFunds{18}, MilliFunds{13}, MilliFunds{12}};
+        constexpr std::array CHEAP_UPPER{MilliFunds{32}, MilliFunds{25}, MilliFunds{12}};
+        constexpr std::array EXACT{MilliFunds{20}, MilliFunds{18}, MilliFunds{12}};
+        constexpr std::size_t DEAD_INDEX = 2;
+        constexpr MilliFunds COMPLETED_EXACT = 5;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead}};
+        const auto batch = JointPlanStockValuer::diagnosticQuotes(Fixture::make(ROWS), keys, TRUNCATED_WITH_DUAL);
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            const auto & quote = batch.quotes[index];
+            expect(quote.valid && quote.dualCeiling.has_value() &&
+                       quote.dualStatus == MasterPlanPricingStatus::Valid && quote.dualRounds > 0 &&
+                       quote.cheapOurs.lower == CHEAP_LOWER[index] && quote.cheapOurs.upper == CHEAP_UPPER[index] &&
+                       quote.ours.lower >= CHEAP_LOWER[index] && quote.ours.lower <= EXACT[index] &&
+                       quote.ours.upper >= EXACT[index] &&
+                       (index == DEAD_INDEX || (!quote.refinementCompleted && quote.ours.upper < CHEAP_UPPER[index])),
+                   "the dual ceiling tightens an unfinished search and still brackets the exact optimum");
+        }
+        const std::array completedKeys{ContinuationKey{today}};
+        const auto completed =
+            JointPlanStockValuer::diagnosticQuotes(Fixture::make(1, Fixture::RATE), completedKeys, TRUNCATED_WITH_DUAL);
+        const auto & captured = completed.quotes.front();
+        expect(completed.limits.dualRounds == MASTER_PLAN_PRICING_ROUNDS && captured.valid &&
+                   captured.dualCeiling.has_value() && captured.ours.lower <= COMPLETED_EXACT &&
+                   captured.ours.upper >= COMPLETED_EXACT,
+               "a capture completed this turn keeps the dual ceiling above the exact optimum");
     }
 
     void testReadSetOnlyBoundsWork()
@@ -517,6 +624,8 @@ int main()
     testActivationScheduleUsesTurnBoundaries();
     testReadSetOnlyBoundsWork();
     stockFieldDiagnosticChecks();
+    stockFieldRefinementIsExact();
+    stockFieldDualCeilingIsSound();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
