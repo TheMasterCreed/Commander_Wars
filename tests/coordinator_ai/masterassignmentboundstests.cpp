@@ -198,6 +198,18 @@ namespace
         root->choices[0] = 1;
         checkNode(problem, *root, bounds, ledger);
         expect(!problem.incompatible({0, 1}, {1, 1}), "clipped damage is not additive capacity conflict");
+        constexpr auto fixedPreparation = "fixed clipped-damage bound prepares";
+        constexpr auto fixedUpper = "fixed damage growth is covered by the challenger bound";
+        fixture.seat(std::vector<std::int32_t>{1, 1});
+        fixture.selections[1].role = MasterActorRole::Fixed;
+        const auto fixedProblem = fixture.extract();
+        MasterAssignmentBounds fixedBounds(fixedProblem);
+        require(fixedBounds.prepare(nullptr, ledger) == MasterBoundStatus::Valid, fixedPreparation);
+        const MasterAssignmentState challenger{fixedProblem.identity(), {0, 1}};
+        const auto replay = replayMasterAssignment(fixedProblem, challenger.choices);
+        const auto upper = fixedBounds.bound(challenger, MasterBoundFamily::Immediate, ledger);
+        expect(replay.complete() && upper.valid() && upper.certificate->upper >= replay.seatedEconomicTotal,
+               fixedUpper);
     }
 }
 

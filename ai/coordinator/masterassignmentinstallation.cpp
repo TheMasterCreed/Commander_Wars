@@ -357,13 +357,18 @@ namespace Coordinator
         AssignmentResult replacement = incoming;
         for (const auto & actor : m_problem.actors())
         {
-            if (!m_problem.canChangeActor(actor.canonicalSlot))
-            {
-                continue;
-            }
             auto selected = std::find_if(replacement.selections.begin(), replacement.selections.end(),
                 [&](const auto & entry) { return entry.engineUnitId == actor.engineUnitId; });
             const auto slot = static_cast<std::size_t>(actor.canonicalSlot);
+            if (!m_problem.canChangeActor(actor.canonicalSlot))
+            {
+                if (actor.actionIndex != NO_ACTION &&
+                    isLiveState(challenger.replay->plan.action(actor.actionIndex).state))
+                {
+                    selected->seatedValue = challenger.replay->seatedValues[slot];
+                }
+                continue;
+            }
             selected->candidateIndex = challenger.state.choices[slot];
             selected->actionIndex = challenger.replay->actionIndices[slot];
             selected->seatedValue = challenger.replay->seatedValues[slot];

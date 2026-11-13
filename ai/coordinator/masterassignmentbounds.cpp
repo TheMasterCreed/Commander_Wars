@@ -10,7 +10,7 @@ namespace
     using namespace Coordinator;
 
     std::optional<MilliFunds> seatedUpper(const MasterCandidate & candidate,
-                                         RefinementLedger & ledger)
+                                         RefinementLedger & ledger, std::int32_t minimumGrant = 0)
     {
         if (!candidate.plannable)
         {
@@ -20,7 +20,7 @@ namespace
         const auto damage = components.size() == 1 && components.front().kind == ComponentKind::Fire
             ? std::min(components.front().fire.damageSteps, components.front().fire.targetHpSteps) : 0;
         std::optional<MilliFunds> upper;
-        for (std::int32_t grant = 0; grant <= damage; ++grant)
+        for (std::int32_t grant = minimumGrant; grant <= damage; ++grant)
         {
             if (!chargeMasterWork(ledger, 1, 1, RefinementWork::MasterPreparation))
             {
@@ -84,6 +84,15 @@ namespace Coordinator
         const auto refusals = ledger.stats().refusals;
         option.economic = m_problem.canChangeActor(actor.canonicalSlot)
             ? seatedUpper(candidate, ledger) : std::optional<MilliFunds>{actor.incumbentSeatedValue};
+        const auto & components = candidate.source.bundle.components;
+        if (!m_problem.canChangeActor(actor.canonicalSlot) &&
+            candidate.identity.originalCandidateIndex == actor.incumbentCandidateIndex &&
+            actor.actionIndex != NO_ACTION &&
+            isLiveState(m_problem.actionTemplates()[actor.actionIndex].state) &&
+            components.size() == 1 && components.front().kind == ComponentKind::Fire)
+        {
+            option.economic = seatedUpper(candidate, ledger, actor.incumbentDamageSteps);
+        }
         if (ledger.stats().refusals != refusals ||
             !chargeMasterWork(ledger, candidate.resources.size(), 1, RefinementWork::MasterPreparation))
         {

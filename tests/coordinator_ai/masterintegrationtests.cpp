@@ -1140,6 +1140,65 @@ namespace
         return true;
     }
 
+    void sharedTargetInstallation()
+    {
+        constexpr std::int32_t mutableDamage = 4;
+        constexpr std::int32_t fixedDamage = 9;
+        constexpr std::int32_t incumbentGrant = 6;
+        constexpr std::int32_t targetHp = 10;
+        constexpr std::int32_t targetUnitId = 999;
+        constexpr MilliFunds targetCost = 1000;
+        constexpr MilliFunds moveValue = 500;
+        constexpr std::int64_t budget = 1000000;
+        constexpr auto opened = "shared-target installation ledger opens";
+        constexpr auto reserved = "shared-target finalization is reserved";
+        constexpr auto incumbent = "installation fixture starts with a reduced fixed grant";
+        constexpr auto improved = "shared-target search finds the partner's move";
+        constexpr auto installed = "shared-target challenger is actually installed";
+        constexpr auto repriced = "installed fixed shooter receives its larger grant and seated value";
+        constexpr auto provenance = "fixed shooter installation preserves candidate, action and phase";
+        constexpr auto total = "installed shared-target economics equal the challenger replay total";
+        constexpr auto recaptured = "installed shared-target result rebuilds without an incumbent economic mismatch";
+        Fixture fixture(2);
+        fixture.input.unitLinks.push_back({targetUnitId, {2, 1}});
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, moveValue, 1));
+        for (std::size_t slot = 0; slot < fixture.input.actors.size(); ++slot)
+        {
+            const auto damage = slot == 0 ? mutableDamage : fixedDamage;
+            auto & candidate = fixture.input.actors[slot].candidates[0];
+            candidate.bundle.components.push_back(fireComponent({
+                .targetUnitId = 2, .targetReplacementCost = targetCost, .targetHpSteps = targetHp, .damageSteps = damage,
+            }));
+            candidate.valuation.ledger.enemyCapital = bookDamage(targetCost, damage);
+        }
+        fixture.seat();
+        fixture.selections[1].role = MasterActorRole::Fixed;
+        const auto problem = fixture.extract();
+        auto incoming = installationIncoming(fixture, problem);
+        incoming.selections[1].phase = AssignmentResult::SelectionPhase::Settling;
+        const auto fixedBefore = incoming.selections[1];
+        require(incoming.plan.action(fixedBefore.actionIndex).plannedDamageSteps == incumbentGrant &&
+                    fixedBefore.seatedValue == bookDamage(targetCost, incumbentGrant), incumbent);
+        RefinementLedger ledger;
+        require(ledger.open(budget), opened);
+        MasterAssignmentEvaluator evaluator(problem, ledger);
+        MasterAssignmentInstallation installation(problem, evaluator, ledger);
+        require(installation.prepare(incoming) == MasterInstallationStatus::Reserved, reserved);
+        const auto result = searchMasterAssignment(problem, evaluator, ledger);
+        require(result.improvement.has_value(), improved);
+        const auto finalized = installation.finish(result.improvement, incoming);
+        require(finalized.status == MasterInstallationStatus::Installed && finalized.proof, installed);
+        const auto & fixedAfter = incoming.selections[1];
+        expect(incoming.plan.action(fixedAfter.actionIndex).plannedDamageSteps == fixedDamage &&
+                   fixedAfter.seatedValue == bookDamage(targetCost, fixedDamage) &&
+                   fixedAfter.seatedValue > fixedBefore.seatedValue, repriced);
+        expect(fixedAfter.candidateIndex == fixedBefore.candidateIndex &&
+                   fixedAfter.actionIndex == fixedBefore.actionIndex && fixedAfter.phase == fixedBefore.phase, provenance);
+        expect(checkedAssignmentEconomicTotal(incoming) == finalized.proof->challenger.replay->seatedEconomicTotal, total);
+        const auto rebuilt = buildMasterAssignmentProblem(fixture.input, incoming, problem.identity().session());
+        expect(rebuilt.valid() && rebuilt.error != MasterAssignmentProblemError::IncumbentEconomicMismatch, recaptured);
+    }
+
     void transactionalInstallation()
     {
         Fixture fixture(3);
@@ -5528,6 +5587,7 @@ int main(int argc, char** argv)
     tenStockActors();
     shadowControlsAndCapture();
     transactionalInstallation();
+    sharedTargetInstallation();
     stockInstallationAuthentication();
     stockFinalizationBudgets();
     ownedCertificateSerialization();

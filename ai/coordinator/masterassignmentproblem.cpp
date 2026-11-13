@@ -1199,6 +1199,48 @@ namespace Coordinator
             }
         }
 
+        if (!incumbentTuple)
+        {
+            std::sort(claimOrder.begin(), claimOrder.end(),
+                [&](const MasterActor* left, const MasterActor* right)
+                {
+                    return result.actionIndices[static_cast<std::size_t>(left->canonicalSlot)] <
+                           result.actionIndices[static_cast<std::size_t>(right->canonicalSlot)];
+                });
+            for (const MasterActor* actor : claimOrder)
+            {
+                if (problem.canChangeActor(actor->canonicalSlot))
+                {
+                    continue;
+                }
+                const auto slot = static_cast<std::size_t>(actor->canonicalSlot);
+                const auto choice = choices[slot];
+                const auto & candidate = actor->candidates[static_cast<std::size_t>(choice)];
+                const auto* component = singleComponentOf(candidate.source.bundle);
+                if (component == nullptr || component->kind != ComponentKind::Fire)
+                {
+                    continue;
+                }
+                const auto actionIndex = result.actionIndices[slot];
+                // A full target leaves nothing to absorb, and a repeat claim on it would be refused.
+                if (result.plan.plannedDamageOn(result.plan.action(actionIndex).targetUnitId) >=
+                    component->fire.targetHpSteps)
+                {
+                    continue;
+                }
+                const auto claim = claimCandidate(result.plan, actionIndex, candidate, component->fire.damageSteps);
+                if (claim != ReservationResult::Granted ||
+                    result.plan.action(actionIndex).plannedDamageSteps < actor->incumbentDamageSteps)
+                {
+                    result.error = MasterAssignmentReplayError::ClaimRejected;
+                    result.actorSlot = actor->canonicalSlot;
+                    result.candidateIndex = choice;
+                    result.actionIndex = actionIndex;
+                    return result;
+                }
+            }
+        }
+
         const auto sameIntent = [](const PlannedAction & left, const PlannedAction & right)
         {
             return left.kind == right.kind && left.actionId == right.actionId && left.path == right.path &&
@@ -1289,9 +1331,26 @@ namespace Coordinator
         }
         for (const auto & actor : problem.m_actors)
         {
-            if (!problem.canChangeActor(actor.canonicalSlot) && actor.actionIndex != NO_ACTION &&
-                (result.plan.action(actor.actionIndex) != problem.m_actionTemplates[actor.actionIndex] ||
-                 result.plan.actionReservations(actor.actionIndex) != actor.incumbentReservations))
+            if (problem.canChangeActor(actor.canonicalSlot) || actor.actionIndex == NO_ACTION)
+            {
+                continue;
+            }
+            auto expected = problem.m_actionTemplates[actor.actionIndex];
+            auto reservations = actor.incumbentReservations;
+            const auto & actual = result.plan.action(actor.actionIndex);
+            if (!incumbentTuple && isLiveState(expected.state) &&
+                actual.plannedDamageSteps > expected.plannedDamageSteps)
+            {
+                for (auto & damage : reservations.damage)
+                {
+                    if (damage.targetUnitId == expected.targetUnitId)
+                    {
+                        damage.damageSteps = actual.plannedDamageSteps;
+                    }
+                }
+                expected.plannedDamageSteps = actual.plannedDamageSteps;
+            }
+            if (actual != expected || result.plan.actionReservations(actor.actionIndex) != reservations)
             {
                 result.error = MasterAssignmentReplayError::FixedStateChanged;
                 result.actorSlot = actor.canonicalSlot;

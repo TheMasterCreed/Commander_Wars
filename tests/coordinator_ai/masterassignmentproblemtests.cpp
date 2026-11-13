@@ -63,7 +63,8 @@ namespace
     };
 
     Fixture planFrom(const AssignmentInput & input,
-                     std::span<const std::int32_t> choices = {})
+                     std::span<const std::int32_t> choices = {},
+                     std::span<const std::int32_t> grants = {})
     {
         Fixture result;
         for (std::size_t slot = 0; slot < input.actors.size(); ++slot)
@@ -74,7 +75,8 @@ namespace
             const auto action = plannedActionFrom(input.actionIds, input.unitLinks, actor.engineUnitId, selected);
             const auto index = result.plan.addAction(action);
             expect(index != NO_ACTION, "fixture action is accepted");
-            expect(claimFor(result.plan, index, selected) == ReservationResult::Granted,
+            expect(claimFor(result.plan, index, selected,
+                            grants.empty() ? std::nullopt : std::optional{grants[slot]}) == ReservationResult::Granted,
                    "fixture claims are accepted");
             result.selections.push_back({actor.engineUnitId, index, choice, MasterActorRole::Mutable});
         }
@@ -360,10 +362,14 @@ namespace
         return action;
     }
 
-    void addFire(CandidateBundle & choice, std::int32_t damage)
+    constexpr std::int32_t SHARED_TARGET_HP_STEPS = 10;
+    constexpr MilliFunds SHARED_TARGET_COST = 1000;
+
+    void addFire(CandidateBundle & choice, std::int32_t damage, std::int32_t target = 2)
     {
         choice.bundle.components.push_back(fireComponent({
-            .targetUnitId = 2, .targetReplacementCost = 1000, .targetHpSteps = 10, .damageSteps = damage,
+            .targetUnitId = target, .targetReplacementCost = SHARED_TARGET_COST,
+            .targetHpSteps = SHARED_TARGET_HP_STEPS, .damageSteps = damage,
         }));
     }
 
@@ -394,6 +400,117 @@ namespace
         expect(replay.complete() && replay.plan.equivalentState(expected) &&
                    replay.plan.action(1) == fixture.plan.action(1),
                "new attacker cannot steal a fixed attacker's reserved damage");
+    }
+
+    void testFixedShareAbsorbsUnclaimedDamage(PlanBundleKind kind = PlanBundleKind::Fire)
+    {
+        constexpr std::int32_t mutableDamage = 4;
+        constexpr std::int32_t fixedDamage = 9;
+        constexpr std::int32_t incumbentGrant = 6;
+        constexpr std::int32_t targetUnitId = 999;
+        constexpr auto extracts = "fixed leftover-damage fixture extracts";
+        constexpr auto incumbentExact = "incumbent replay preserves the fixed grant and seated value";
+        constexpr auto challengerGrant = "fixed shooter absorbs unclaimed damage and receives its full seated value";
+        constexpr auto challengerTotal = "challenger economic total sums the replayed seated values";
+        constexpr auto sharedGrant = "a different firing candidate preserves the fixed incumbent grant";
+        constexpr auto movingGrant = "fixed moving shooter absorbs unclaimed damage at its full seated value";
+        constexpr auto actionKind = "fixed-share fixture uses the requested fire action kind";
+        auto input = inputWith(2);
+        input.unitLinks.push_back({targetUnitId, {2, 1}});
+        input.actors[0].candidates.push_back(input.actors[0].candidates[0]);
+        addFire(input.actors[0].candidates[0], mutableDamage);
+        input.actors[0].candidates.push_back(input.actors[0].candidates[0]);
+        if (kind == PlanBundleKind::MoveAndFire)
+        {
+            input.actors[1].candidates[0] = candidate(1, {1, 0}, {1, 1}, 2);
+        }
+        addFire(input.actors[1].candidates[0], fixedDamage);
+        auto fixture = planFrom(input);
+        expect(fixture.plan.action(1).kind == kind, actionKind);
+        fixture.selections[1].role = MasterActorRole::Fixed;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto & fixedCandidate = problem.actors()[1].candidates[0].source;
+        const auto incumbent = replayMasterAssignment(problem, problem.incumbentChoices());
+        expect(incumbent.complete() && incumbent.plan.equivalentState(fixture.plan) &&
+                   incumbent.plan.action(1).plannedDamageSteps == incumbentGrant &&
+                   incumbent.seatedValues[1] == checkedSeatedCandidateValue(fixedCandidate, incumbentGrant),
+               incumbentExact);
+        const auto challenger = replayMasterAssignment(problem, std::vector<std::int32_t>{1, 0});
+        expect(challenger.complete() && challenger.plan.action(1).plannedDamageSteps == fixedDamage &&
+                   challenger.seatedValues[1] == checkedSeatedCandidateValue(fixedCandidate, fixedDamage),
+               kind == PlanBundleKind::MoveAndFire ? movingGrant : challengerGrant);
+        if (challenger.complete())
+        {
+            expect(challenger.seatedEconomicTotal == challenger.seatedValues[0] + challenger.seatedValues[1],
+                   challengerTotal);
+        }
+        const auto shared = replayMasterAssignment(problem, std::vector<std::int32_t>{2, 0});
+        expect(shared.complete() && shared.plan.action(1).plannedDamageSteps == incumbentGrant &&
+                   shared.seatedValues[1] == checkedSeatedCandidateValue(fixedCandidate, incumbentGrant),
+               sharedGrant);
+    }
+
+    void testFixedZeroDamageOnFullTarget()
+    {
+        constexpr std::int32_t actorCount = 3;
+        constexpr std::int32_t targetUnitId = 999;
+        constexpr auto extracts = "zero-damage fixed shot on a full target extracts";
+        constexpr auto unchanged = "unrelated move preserves both fixed grants on a full target";
+        auto input = inputWith(actorCount);
+        input.unitLinks.push_back({targetUnitId, {actorCount, 1}});
+        addFire(input.actors[0].candidates[0], 0, actorCount);
+        addFire(input.actors[1].candidates[0], SHARED_TARGET_HP_STEPS, actorCount);
+        input.actors[2].candidates.push_back(candidate(2, {2, 0}, {2, 1}, 1));
+        auto fixture = planFrom(input);
+        fixture.selections[0].role = MasterActorRole::Fixed;
+        fixture.selections[1].role = MasterActorRole::Fixed;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto replay = replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{0, 0, 1});
+        expect(replay.complete() && replay.plan.action(0).plannedDamageSteps == 0 &&
+                   replay.plan.action(1).plannedDamageSteps == SHARED_TARGET_HP_STEPS &&
+                   replay.plan.actionReservations(0) == fixture.plan.actionReservations(0) &&
+                   replay.plan.actionReservations(1) == fixture.plan.actionReservations(1) &&
+                   replay.plan.action(2).destination == TilePoint{2, 1}, unchanged);
+    }
+
+    void testFixedZeroGrantAbsorbsUnclaimedDamage()
+    {
+        constexpr std::int32_t fixedDamage = 9;
+        constexpr std::int32_t targetUnitId = 999;
+        constexpr auto extracts = "positive-damage fixed shooter with a historical zero grant extracts";
+        constexpr auto reservation = "a zero incumbent grant retains its target damage reservation";
+        constexpr auto grows = "a fixed zero grant grows and reprices when its partner leaves";
+        auto input = inputWith(2);
+        input.unitLinks.push_back({targetUnitId, {2, 1}});
+        input.actors[1].candidates.push_back(input.actors[1].candidates[0]);
+        addFire(input.actors[0].candidates[0], fixedDamage);
+        addFire(input.actors[1].candidates[0], SHARED_TARGET_HP_STEPS);
+        const std::vector<std::int32_t> grants{0, SHARED_TARGET_HP_STEPS};
+        auto fixture = planFrom(input, {}, grants);
+        fixture.selections[0].role = MasterActorRole::Fixed;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & actor = extracted.problem->actors()[0];
+        expect(actor.incumbentDamageSteps == 0 && actor.incumbentReservations.damage ==
+                   std::vector<ActionDamageReservation>{{targetUnitId, SHARED_TARGET_HP_STEPS, 0}}, reservation);
+        const auto replay = replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{0, 1});
+        expect(replay.complete() && replay.plan.action(0).plannedDamageSteps == fixedDamage &&
+                   replay.seatedValues[0] == checkedSeatedCandidateValue(actor.candidates[0].source, fixedDamage), grows);
     }
 
     void testChangedMutableAllocation()
@@ -893,6 +1010,10 @@ int main()
     testInactiveAndLegacySelections();
     testMalformedInputs();
     testFixedShareAgainstNewAttacker();
+    testFixedShareAbsorbsUnclaimedDamage();
+    testFixedShareAbsorbsUnclaimedDamage(PlanBundleKind::MoveAndFire);
+    testFixedZeroDamageOnFullTarget();
+    testFixedZeroGrantAbsorbsUnclaimedDamage();
     testChangedMutableAllocation();
     testUnassignedAndRevivedActors();
     testNonVacateDependencies();
