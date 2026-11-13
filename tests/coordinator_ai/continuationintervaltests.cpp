@@ -133,6 +133,19 @@ namespace
                         expect(action.row() == row && action.x() == x && action.y() == y &&
                                    action.captures() == captures,
                                "canonical action key round-trips");
+                        const auto zero = CanonicalPlanActionKey::checkedFromAction(row, x, y, captures, 0, false);
+                        constexpr std::int32_t LIMB_COORDINATE_SHIFT = 32;
+                        const std::array<std::uint64_t, 2> oldBits{
+                            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(row)) << LIMB_COORDINATE_SHIFT) |
+                                static_cast<std::uint32_t>(x),
+                            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y)) << 1) | (captures ? 1ULL : 0ULL),
+                        };
+                        constexpr std::uint64_t HASH_SALT = UINT64_C(0x9e3779b97f4a7c15);
+                        constexpr std::int32_t HASH_SHIFT = 6;
+                        expect(zero && *zero == action && std::bit_cast<decltype(oldBits)>(action) == oldBits &&
+                                   action.hashValue() == (oldBits[0] ^ (oldBits[1] + HASH_SALT +
+                                       (oldBits[0] << HASH_SHIFT) + (oldBits[0] >> 2))),
+                               "zero reply fields retain legacy bits and hash");
                         ordered.insert(action);
                         hashed.insert(action);
                     }
@@ -152,6 +165,40 @@ namespace
         expect(CanonicalPlanActionKey::fromAction(0, 0, 0, false) <
                    CanonicalPlanActionKey::fromAction(0, 0, 0, true),
                "capture state orders last");
+    }
+
+    void testReplyKeyVariants()
+    {
+        constexpr std::size_t KEY_BYTES = 16;
+        static_assert(sizeof(CanonicalPlanActionKey) == KEY_BYTES);
+        std::set<CanonicalPlanActionKey> variants;
+        for (std::int32_t steps = 0; steps <= CanonicalPlanActionKey::MAX_STEPS_LOST; ++steps)
+        {
+            for (const bool destroyed : {false, true})
+            {
+                const auto key = CanonicalPlanActionKey::checkedFromAction(0, -1, 1, true, steps, destroyed);
+                expect(key && key->stepsLost() == steps && key->destroyed() == destroyed,
+                       "reply fields round-trip");
+                variants.insert(*key);
+            }
+        }
+        expect(variants.size() == 2 * (CanonicalPlanActionKey::MAX_STEPS_LOST + 1),
+               "ordered container distinguishes all reply variants");
+        expect(!CanonicalPlanActionKey::checkedFromAction(0, 0, 0, false, -1, false) &&
+               !CanonicalPlanActionKey::checkedFromAction(0, 0, 0, false,
+                   CanonicalPlanActionKey::MAX_STEPS_LOST + 1, false), "invalid reply steps rejected");
+        CheapPricingModel model;
+        std::vector<CheapActionTerms> actions;
+        for (const auto & key : variants)
+        {
+            actions.push_back({key, 0, -1, CheapRowTerms{0, {}}});
+        }
+        expect(model.install(1, 0, 0, {}, {CheapRowTerms{0, {}}}, std::move(actions), 0),
+               "same-row catalog variants are distinct");
+        auto state = model.initialState();
+        CheapInitialPrice price;
+        expect(!model.price({*variants.begin(), *variants.rbegin()}, state, price),
+               "a plan cannot select two variants of one row");
     }
 
     void testContinuationKeyOrder()
@@ -803,6 +850,7 @@ namespace
 int main()
 {
     testCanonicalActionKey();
+    testReplyKeyVariants();
     testContinuationKeyOrder();
     testLivePairBudgets();
     testStockIntervals();

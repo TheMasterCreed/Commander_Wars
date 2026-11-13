@@ -71,6 +71,19 @@ namespace Coordinator
             return m_occupants[slot(x, y)];
         }
 
+        PlannedOccupancy withoutUnits(std::span<const std::int32_t> units) const
+        {
+            PlannedOccupancy result = *this;
+            for (auto & occupant : result.m_occupants)
+            {
+                if (std::find(units.begin(), units.end(), occupant) != units.end())
+                {
+                    occupant = NO_UNIT;
+                }
+            }
+            return result;
+        }
+
     private:
         std::size_t slot(std::int32_t x, std::int32_t y) const
         {
@@ -242,6 +255,24 @@ namespace Coordinator
         return planHpSteps <= 0 ? 0 : pricedShooterHpSteps(planHpSteps, onOwnBuilding);
     }
 
+    enum class ActionCounterSource : std::int8_t
+    {
+        Isolated,
+        Repriced,
+        Unavailable,
+    };
+
+    struct ActionCounterDamage
+    {
+        std::int32_t steps{0};
+        ActionCounterSource source{ActionCounterSource::Unavailable};
+    };
+
+    inline ActionCounterDamage isolatedActionCounter(const FireFacts & fire, std::int32_t, std::int32_t)
+    {
+        return {fire.counterSteps, ActionCounterSource::Isolated};
+    }
+
     // victimIndex is the last fire target, NO_UNIT without one; its hp after our shots is what it replies with.
     struct ActionHpOutcome
     {
@@ -256,7 +287,9 @@ namespace Coordinator
     };
 
     // valueBundle's hp walk on a target chain the caller may share across bundles; booking stops at death.
-    inline ActionHpOutcome hpAfterActionOn(const ActionBundle & bundle, std::int32_t actorHpSteps, TargetHpChain & chain)
+    template <typename CounterAt>
+    ActionHpOutcome hpAfterActionOn(const ActionBundle & bundle, std::int32_t actorHpSteps, TargetHpChain & chain,
+                                    CounterAt && counterAt)
     {
         ActionHpOutcome outcome{.hpSteps = actorHpSteps};
         for (const BundleComponent & component : bundle.components)
@@ -273,15 +306,17 @@ namespace Coordinator
                     PlanWideHp & target =
                         chain.emplace(fire.targetUnitId, PlanWideHp{fire.targetHpSteps, fire.targetHpSteps}).first->second;
                     const std::int32_t dealt = std::min(fire.damageSteps, target.after);
+                    const auto counter = counterAt(fire, target.after - dealt, outcome.hpSteps);
                     if (dealt < target.after)
                     {
-                        const std::int32_t taken = std::min(fire.counterSteps, outcome.hpSteps);
+                        const std::int32_t taken = std::min(counter.steps, outcome.hpSteps);
                         outcome.hpSteps -= taken;
                         outcome.counterApplied = outcome.counterApplied || taken > 0;
                         outcome.realHpFromSteps = outcome.realHpFromSteps || taken > 0;
                         const std::int32_t isolatedAfter = fire.targetHpSteps - std::min(fire.damageSteps, fire.targetHpSteps);
                         outcome.counterFromIsolatedView =
-                            outcome.counterFromIsolatedView || (taken > 0 && target.after - dealt < isolatedAfter);
+                            outcome.counterFromIsolatedView || (counter.source == ActionCounterSource::Isolated &&
+                                taken > 0 && target.after - dealt < isolatedAfter);
                     }
                     target.after -= dealt;
                     outcome.victimIndex = fire.targetUnitId;
@@ -301,6 +336,11 @@ namespace Coordinator
             }
         }
         return outcome;
+    }
+
+    inline ActionHpOutcome hpAfterActionOn(const ActionBundle & bundle, std::int32_t actorHpSteps, TargetHpChain & chain)
+    {
+        return hpAfterActionOn(bundle, actorHpSteps, chain, isolatedActionCounter);
     }
 
     // The per-candidate view the planner prices: the bundle alone, from each target's start-of-day hp.

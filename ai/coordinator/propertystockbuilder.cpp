@@ -161,15 +161,6 @@ namespace
 #endif
     };
 
-    std::int32_t tileSlot(std::int32_t width, std::int32_t height, std::int32_t x, std::int32_t y)
-    {
-        if (x < 0 || y < 0 || x >= width || y >= height)
-        {
-            return Coordinator::NO_STOCK_COLUMN;
-        }
-        return y * width + x;
-    }
-
     bool isRowCandidate(const Coordinator::KnownUnit & known)
     {
         return known.carrier == Coordinator::KnownUnit::NO_CARRIER && known.canCapture;
@@ -186,16 +177,6 @@ namespace Coordinator
             return NO_PROPERTY_INDEX;
         }
         return m_propertyAtTile[static_cast<std::size_t>(slot)];
-    }
-
-    std::int32_t PropertyStockField::columnSlotAt(const TilePoint & tile) const
-    {
-        const std::int32_t slot = tileSlot(m_width, m_height, tile.x, tile.y);
-        if (slot == NO_STOCK_COLUMN)
-        {
-            return NO_STOCK_COLUMN;
-        }
-        return m_columnAtTile[static_cast<std::size_t>(slot)];
     }
 
     std::int32_t PropertyStockField::ourRowOf(std::int32_t knowledgeIndex) const
@@ -222,37 +203,6 @@ namespace Coordinator
         return NO_STOCK_ROW;
     }
 
-    std::int32_t PropertyStockField::carriedFor(const PropertyStockRow & row, std::int32_t slot) const
-    {
-        const std::size_t index = static_cast<std::size_t>(slot);
-        if (m_columnCapturer[index] != row.knowledgeIndex || m_columnTiles[index] != row.tile)
-        {
-            return 0;
-        }
-        return m_columnCapturePoints[index];
-    }
-
-    const PropertyStockField::ArrivalVectors & PropertyStockField::arrivalsFrom(std::int32_t gridIdentity,
-                                                                                std::int32_t movementPoints,
-                                                                                const TilePoint & tile)
-    {
-        const ArrivalKey key{gridIdentity, movementPoints, tile.x, tile.y};
-        const auto known = m_arrivals.find(key);
-        if (known != m_arrivals.end())
-        {
-            return known->second;
-        }
-        const MobilityCostGrid & grid = m_grids[static_cast<std::size_t>(gridIdentity)];
-        m_reach.build(grid, tile, movementPoints, m_horizonTurns, m_columnTiles);
-        ArrivalVectors arrivals;
-        arrivals.activations.reserve(m_columnTiles.size());
-        for (const TilePoint & column : m_columnTiles)
-        {
-            arrivals.activations.push_back(m_reach.activations(column.x, column.y));
-        }
-        return m_arrivals.emplace(key, std::move(arrivals)).first->second;
-    }
-
     std::vector<MilliFunds> PropertyStockField::rowWeights(const PropertyStockInstance & instance,
                                                            std::span<const std::int32_t> arrivals,
                                                            const PropertyStockRow & row) const
@@ -266,24 +216,6 @@ namespace Coordinator
                 .ratePerTurn = row.captureRate,
             };
             weights[slot] = columnWeight(instance.columns[slot], arrival, m_capturePointsToCapture, m_horizonTurns);
-        }
-        return weights;
-    }
-
-    std::vector<MilliFunds> PropertyStockField::actingWeights(std::int32_t row, const PropertyStockActor & actor)
-    {
-        const PropertyStockRow & source = m_ours.rows[static_cast<std::size_t>(row)];
-        const ArrivalVectors & arrivals = arrivalsFrom(source.gridIdentity, actor.movementPoints, actor.tile);
-        std::vector<MilliFunds> weights(m_ours.columns.size(), 0);
-        for (std::size_t slot = 0; slot < m_ours.columns.size(); ++slot)
-        {
-            const std::int32_t carried = m_columnTiles[slot] == actor.tile ? actor.carriedCapturePoints : 0;
-            const ArrivalFacts arrival{
-                .arrivalActivations = arrivals.activations[slot],
-                .carriedPoints = carried,
-                .ratePerTurn = source.captureRate,
-            };
-            weights[slot] = columnWeight(m_ours.columns[slot], arrival, m_capturePointsToCapture, m_horizonTurns);
         }
         return weights;
     }
@@ -351,29 +283,13 @@ namespace Coordinator
         JointActionFacts facts;
         for (const PlanRowAction & entry : actions)
         {
-            const PropertyStockRow & row = m_ours.rows[static_cast<std::size_t>(entry.row)];
-            std::int32_t carried = 0;
-            const std::int32_t slot = columnSlotAt(entry.destination);
-            if (slot != NO_STOCK_COLUMN)
-            {
-                carried = carriedFor(row, slot);
-                if (entry.captures)
-                {
-                    carried += row.captureRate;
-                    if (carried >= m_capturePointsToCapture)
-                    {
-                        facts.capturedColumns.push_back(slot);
-                    }
-                }
-            }
+            std::int32_t capturedColumn = NO_STOCK_COLUMN;
+            facts.movers.push_back(actionMover(entry, capturedColumn));
             facts.moverRows.push_back(entry.row);
-            facts.movers.push_back(PropertyStockActor{
-                .knowledgeIndex = row.knowledgeIndex,
-                .tile = entry.destination,
-                .movementPoints = row.movementPoints,
-                .carriedCapturePoints = carried,
-                .survival = ActorSurvival::Alive,
-            });
+            if (capturedColumn != NO_STOCK_COLUMN)
+            {
+                facts.capturedColumns.push_back(capturedColumn);
+            }
         }
         std::sort(facts.capturedColumns.begin(), facts.capturedColumns.end());
         facts.capturedColumns.erase(
@@ -620,7 +536,7 @@ namespace Coordinator
     bool JointPlanStockValuer::prepareDiagnosticContinuationPricing(
         ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit)
     {
-        if (m_pricingState != ContinuationPricingState::Unprepared || diagnosticWorkLimit <= 0)
+        if (m_pricingState != ContinuationPricingState::Unprepared || diagnosticWorkLimit <= 0 || catalog.hasReplyActions())
         {
             return false;
         }
@@ -670,6 +586,10 @@ namespace Coordinator
         ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t refinementBudget,
         PricingBudgetPolicy policy)
     {
+        if (catalog.hasReplyActions())
+        {
+            return false;
+        }
         const ContinuationKey catalogKey =
             canonicalPlanKey(catalog.actions);
         if (m_pricingState == ContinuationPricingState::Prepared)
@@ -799,22 +719,6 @@ namespace Coordinator
                 .destination = action.destination,
                 .captures = action.kind == PlanBundleKind::Capture ||
                             action.kind == PlanBundleKind::MoveAndCapture,
-            });
-        }
-        return actions;
-    }
-
-    std::vector<PlanRowAction> JointPlanStockValuer::planActions(
-        const ContinuationKey & key)
-    {
-        std::vector<PlanRowAction> actions;
-        actions.reserve(key.size());
-        for (const CanonicalPlanActionKey & action : key)
-        {
-            actions.push_back(PlanRowAction{
-                .row = action.row(),
-                .destination = TilePoint{action.x(), action.y()},
-                .captures = action.captures(),
             });
         }
         return actions;
@@ -982,60 +886,7 @@ namespace Coordinator
         return sequentialJointStock(actions);
     }
 
-    CheapRowTerms JointPlanStockValuer::cheapRowTerms(
-        const SequentialInstance & instance,
-        const SequentialRow & row,
-        std::int32_t rowIndex,
-        std::span<const std::int32_t> nodeSlots) const
-    {
-        CheapRowTerms terms;
-        terms.row = rowIndex;
-        for (std::int32_t head = 0;
-             head < instance.nodeCount();
-             ++head)
-        {
-            const std::size_t slot = static_cast<std::size_t>(head);
-            const MilliFunds enriched =
-                row.weight[slot] +
-                SequentialDetail::continuationGain(instance, row, head);
-            if (enriched <= 0)
-            {
-                continue;
-            }
-            const std::vector<SequentialDetail::WitnessStep> realized =
-                SequentialDetail::realizeWitness(instance, row, head);
-            CheapChain chain;
-            chain.steps.reserve(realized.size());
-            for (std::size_t step = 0;
-                 step < realized.size();
-                 ++step)
-            {
-                const SequentialDetail::WitnessStep & source =
-                    realized[step];
-                const MilliFunds gain =
-                    step == 0
-                        ? row.weight[
-                              static_cast<std::size_t>(source.node)]
-                        : SequentialDetail::chainPrize(
-                              instance, source.node, source.turn);
-                chain.steps.push_back(CheapChainStep{
-                    .column =
-                        nodeSlots[static_cast<std::size_t>(source.node)],
-                    .turn = source.turn,
-                    .gain = gain,
-                });
-                chain.value += gain;
-            }
-            if (chain.value != enriched)
-            {
-                return CheapRowTerms{};
-            }
-            terms.chains.push_back(std::move(chain));
-        }
-        return terms;
-    }
-
-    MilliFunds JointPlanStockValuer::enemyRowCeiling(PropertyStockField & field) const
+    MilliFunds JointPlanStockValuer::enemyRowCeiling(PropertyStockField & field)
     {
         const std::int32_t columnCount = field.m_theirs.columnCount();
         if (columnCount == 0 || field.m_theirs.rowCount() == 0)
@@ -1186,208 +1037,17 @@ namespace Coordinator
     bool JointPlanStockValuer::buildCheapModel(
         std::span<const PlanRowAction> catalogActions, bool retainSequentialRows)
     {
-        std::unique_ptr<PropertyStockField> pricingField =
-            std::make_unique<PropertyStockField>(m_field);
-        std::vector<std::int32_t> nodeSlots;
-        std::vector<PropertyStockColumn> nodeColumns;
-        for (std::size_t slot = 0;
-             slot < pricingField->m_ours.columns.size();
-             ++slot)
-        {
-            const PropertyStockColumn & column =
-                pricingField->m_ours.columns[slot];
-            if (column.ownerBefore == STOCK_OWNER_AFTER)
-            {
-                continue;
-            }
-            nodeSlots.push_back(static_cast<std::int32_t>(slot));
-            nodeColumns.push_back(column);
-        }
-
-        std::vector<SequentialClassKey> classKeys;
-        std::vector<SequentialClassTable> classTables;
-        std::vector<std::int32_t> classOfRow(
-            pricingField->m_ours.rows.size(),
-            NO_SEQUENTIAL_CLASS);
-        for (std::size_t rowIndex = 0;
-             rowIndex < pricingField->m_ours.rows.size();
-             ++rowIndex)
-        {
-            const PropertyStockRow & row =
-                pricingField->m_ours.rows[rowIndex];
-            const SequentialClassKey key{
-                row.gridIdentity,
-                row.movementPoints,
-                row.captureRate,
-            };
-            const auto known =
-                std::find(classKeys.begin(), classKeys.end(), key);
-            if (known != classKeys.end())
-            {
-                classOfRow[rowIndex] =
-                    static_cast<std::int32_t>(known -
-                                              classKeys.begin());
-                continue;
-            }
-            const std::vector<std::int32_t> arrivals =
-                nodeArrivalsFor(*pricingField,
-                                row.gridIdentity,
-                                row.movementPoints,
-                                nodeSlots);
-            SequentialClassTable table;
-            table.build(
-                nodeColumns,
-                arrivals,
-                captureTurnsFor(
-                    0,
-                    row.captureRate,
-                    pricingField->m_capturePointsToCapture),
-                pricingField->m_horizonTurns);
-            classKeys.push_back(key);
-            classTables.push_back(std::move(table));
-            classOfRow[rowIndex] =
-                static_cast<std::int32_t>(classKeys.size()) - 1;
-        }
-
-        SequentialInstance templateInstance;
-        templateInstance.horizonTurns =
-            pricingField->m_horizonTurns;
-        templateInstance.nodeColumns = nodeColumns;
-        templateInstance.classes = classTables;
-        templateInstance.capturedNodes.assign(
-            nodeSlots.size(), false);
-        std::shared_ptr<MasterFutureCatalog> future;
-        if (retainSequentialRows)
-        {
-            future = std::make_shared<MasterFutureCatalog>();
-            future->horizon = pricingField->m_horizonTurns;
-            future->columns = nodeColumns;
-            future->classes = classTables;
-        }
-        std::vector<CheapRowTerms> dayRows;
-        dayRows.reserve(pricingField->m_ours.rows.size());
-        for (std::size_t rowIndex = 0;
-             rowIndex < pricingField->m_ours.rows.size();
-             ++rowIndex)
-        {
-            const SequentialRow row = sequentialRowFor(
-                *pricingField,
-                pricingField->m_ours,
-                pricingField->m_ours.rows[rowIndex],
-                static_cast<std::int32_t>(rowIndex),
-                nullptr,
-                nodeSlots,
-                classOfRow[rowIndex]);
-            if (future)
-            {
-                future->dayRows.push_back(row);
-            }
-            CheapRowTerms terms = cheapRowTerms(
-                templateInstance,
-                row,
-                static_cast<std::int32_t>(rowIndex),
-                nodeSlots);
-            if (terms.row != static_cast<std::int32_t>(rowIndex))
-            {
-                return false;
-            }
-            dayRows.push_back(std::move(terms));
-        }
-
-        std::vector<CheapActionTerms> actions;
-        actions.reserve(catalogActions.size());
-        for (const PlanRowAction & action : catalogActions)
-        {
-            if (action.row < 0 ||
-                action.row >= pricingField->m_ours.rowCount())
-            {
-                return false;
-            }
-            const PropertyStockRow & source =
-                pricingField->m_ours.rows[
-                    static_cast<std::size_t>(action.row)];
-            std::int32_t capturedColumn = NO_STOCK_COLUMN;
-            std::int32_t carried = 0;
-            const std::int32_t column =
-                pricingField->columnSlotAt(action.destination);
-            if (column != NO_STOCK_COLUMN)
-            {
-                carried = pricingField->carriedFor(source, column);
-                if (action.captures)
-                {
-                    carried += source.captureRate;
-                    if (carried >=
-                        pricingField->m_capturePointsToCapture)
-                    {
-                        capturedColumn = column;
-                    }
-                }
-            }
-            const PropertyStockActor mover{
-                .knowledgeIndex = source.knowledgeIndex,
-                .tile = action.destination,
-                .movementPoints = source.movementPoints,
-                .carriedCapturePoints = carried,
-                .survival = ActorSurvival::Alive,
-            };
-            const SequentialRow row = sequentialRowFor(
-                *pricingField,
-                pricingField->m_ours,
-                source,
-                action.row,
-                &mover,
-                nodeSlots,
-                classOfRow[static_cast<std::size_t>(action.row)]);
-            if (future)
-            {
-                future->actions.push_back({canonicalPlanActionKey(action), row});
-            }
-            CheapRowTerms terms =
-                cheapRowTerms(templateInstance,
-                              row,
-                              action.row,
-                              nodeSlots);
-            if (terms.row != action.row)
-            {
-                return false;
-            }
-            actions.push_back(CheapActionTerms{
-                .key = canonicalPlanActionKey(action),
-                .row = action.row,
-                .capturedColumn = capturedColumn,
-                .rowTerms = std::move(terms),
-            });
-        }
-        std::vector<MilliFunds> capturedSwing;
-        capturedSwing.reserve(pricingField->m_ours.columns.size());
-        for (const PropertyStockColumn & column :
-             pricingField->m_ours.columns)
-        {
-            capturedSwing.push_back(
-                ownershipFlipSwing(
-                    column,
-                    pricingField->m_horizonTurns));
-        }
-        const MilliFunds enemyCeiling = enemyRowCeiling(*pricingField);
-        CheapPricingModel model;
-        if (!model.install(
-                pricingField->m_ours.rowCount(),
-                pricingField->m_ours.columnCount(),
-                pricingField->m_ownedBaseline,
-                std::move(capturedSwing),
-                std::move(dayRows),
-                std::move(actions),
-                enemyCeiling))
+        auto built = buildCheapModelFor(m_field, catalogActions, retainSequentialRows, nullptr, &enemyRowCeiling);
+        if (!built)
         {
             return false;
         }
-        m_pricingField = std::move(pricingField);
-        m_cheapModel = std::move(model);
+        m_pricingField = std::move(built->field);
+        m_cheapModel = std::move(built->model);
         m_cheapState = m_cheapModel.initialState();
-        if (future)
+        if (built->future)
         {
-            future->complete = true;
-            m_masterFutureCatalog = std::move(future);
+            m_masterFutureCatalog = std::move(built->future);
         }
         return m_cheapState.pModel == &m_cheapModel;
     }
@@ -1736,34 +1396,6 @@ namespace Coordinator
         m_ourStateBuilt = true;
     }
 
-    std::vector<std::int32_t> JointPlanStockValuer::nodeArrivalsFor(
-        PropertyStockField & field,
-        std::int32_t gridIdentity,
-        std::int32_t movementPoints,
-        const std::vector<std::int32_t> & nodeSlots) const
-    {
-        const std::size_t nodeCount = nodeSlots.size();
-        std::vector<std::int32_t> arrivals(
-            nodeCount * nodeCount,
-            UNREACHABLE);
-        for (std::size_t from = 0; from < nodeCount; ++from)
-        {
-            const PropertyStockField::ArrivalVectors & anchored =
-                field.arrivalsFrom(
-                    gridIdentity,
-                    movementPoints,
-                    field.m_columnTiles[
-                        static_cast<std::size_t>(nodeSlots[from])]);
-            for (std::size_t to = 0; to < nodeCount; ++to)
-            {
-                arrivals[from * nodeCount + to] =
-                    anchored.activations[
-                        static_cast<std::size_t>(nodeSlots[to])];
-            }
-        }
-        return arrivals;
-    }
-
     std::int32_t JointPlanStockValuer::ourClassIndexFor(
         const PropertyStockRow & row) const
     {
@@ -1780,90 +1412,10 @@ namespace Coordinator
                 return static_cast<std::int32_t>(index);
             }
         }
-        const std::vector<std::int32_t> arrivals =
-            nodeArrivalsFor(field,
-                            row.gridIdentity,
-                            row.movementPoints,
-                            m_ourNodeSlots);
-        SequentialClassTable table;
-        table.build(
-            std::span<const PropertyStockColumn>(m_ourNodeColumns),
-            std::span<const std::int32_t>(arrivals),
-            captureTurnsFor(0,
-                            row.captureRate,
-                            field.m_capturePointsToCapture),
-            field.m_horizonTurns);
+        auto table = buildOurClassTable(field, row, m_ourNodeSlots, m_ourNodeColumns);
         m_ourClassKeys.push_back(key);
         m_ourClassTables.push_back(std::move(table));
         return static_cast<std::int32_t>(m_ourClassKeys.size()) - 1;
-    }
-
-    SequentialRow JointPlanStockValuer::sequentialRowFor(
-        PropertyStockField & field,
-        const PropertyStockInstance & instance,
-        const PropertyStockRow & row,
-        std::int32_t rowIndex,
-        const PropertyStockActor* pMover,
-        const std::vector<std::int32_t> & nodeSlots,
-        std::int32_t classIndex) const
-    {
-        SequentialRow result;
-        result.classIndex = classIndex;
-        const std::size_t nodeCount = nodeSlots.size();
-        result.weight.assign(nodeCount, 0);
-        result.ownedTurn.assign(nodeCount, NO_CAPTURE_TURNS);
-        const std::int32_t horizon = field.m_horizonTurns;
-        const std::int32_t points = field.m_capturePointsToCapture;
-        if (pMover == nullptr)
-        {
-            const PropertyStockField::ArrivalVectors & arrivals =
-                field.arrivalsFrom(row.gridIdentity,
-                                     row.movementPoints,
-                                     row.tile);
-            const std::span<const MilliFunds> weights =
-                instance.weightRow(rowIndex);
-            for (std::size_t node = 0; node < nodeCount; ++node)
-            {
-                const std::size_t slot =
-                    static_cast<std::size_t>(nodeSlots[node]);
-                result.weight[node] = weights[slot];
-                const std::int32_t owned = ownedTurnsUntil(
-                    arrivals.activations[slot],
-                    field.carriedFor(row, nodeSlots[node]),
-                    row.captureRate,
-                    points,
-                    horizon);
-                result.ownedTurn[node] =
-                    sequentialFirstOwnedTurn(owned, horizon);
-            }
-            return result;
-        }
-
-        const std::vector<MilliFunds> acting =
-            field.actingWeights(rowIndex, *pMover);
-        const PropertyStockField::ArrivalVectors & arrivals =
-            field.arrivalsFrom(row.gridIdentity,
-                                 pMover->movementPoints,
-                                 pMover->tile);
-        for (std::size_t node = 0; node < nodeCount; ++node)
-        {
-            const std::size_t slot =
-                static_cast<std::size_t>(nodeSlots[node]);
-            result.weight[node] = acting[slot];
-            const std::int32_t carried =
-                field.m_columnTiles[slot] == pMover->tile
-                    ? pMover->carriedCapturePoints
-                    : 0;
-            const std::int32_t owned = ownedTurnsUntil(
-                arrivals.activations[slot],
-                carried,
-                row.captureRate,
-                points,
-                horizon);
-            result.ownedTurn[node] =
-                sequentialFirstOwnedTurn(owned, horizon);
-        }
-        return result;
     }
 
     JointPlanStockValuer::EnemySequentialSolve
@@ -2024,7 +1576,10 @@ namespace Coordinator
         key.push_back(mover != nullptr ? mover->tile.x : NO_STOCK_COLUMN);
         key.push_back(mover != nullptr ? mover->tile.y : NO_STOCK_COLUMN);
         key.push_back(mover != nullptr ? mover->carriedCapturePoints : 0);
-        key.push_back(mover != nullptr ? static_cast<std::int64_t>(mover->survival) : 0);
+        constexpr std::int64_t REPLY_STEPS_STRIDE = 2;
+        constexpr std::int64_t REPLY_DESTROYED_BIT = 32;
+        key.push_back(mover != nullptr ? static_cast<std::int64_t>(mover->survival) +
+            REPLY_STEPS_STRIDE * mover->stepsLost + (mover->destroyed ? REPLY_DESTROYED_BIT : 0) : 0);
         key.insert(key.end(), capturedColumns.begin(), capturedColumns.end());
         return key;
     }
@@ -2295,8 +1850,13 @@ namespace Coordinator
              rowIndex < field.m_ours.rows.size();
              ++rowIndex)
         {
-            classIndices[rowIndex] =
-                ourClassIndexFor(field.m_ours.rows[rowIndex]);
+            PropertyStockRow row = field.m_ours.rows[rowIndex];
+            const auto* mover = sequentialMover(facts, static_cast<std::int32_t>(rowIndex));
+            if (mover != nullptr)
+            {
+                row.captureRate = mover->effectiveCaptureRate(row.captureRate);
+            }
+            classIndices[rowIndex] = ourClassIndexFor(row);
         }
 
         problem.instance.horizonTurns = field.m_horizonTurns;
@@ -3516,7 +3076,7 @@ namespace Coordinator
             const PropertyIncome income = captureIncome(facts);
             const OwnerSign owner = captureOwnerBefore(facts.ownerId, knowledge.relation(facts.ownerId));
             holdings.push_back(PropertyStockHolding{income, owner});
-            const std::int32_t tile = tileSlot(field.m_width, field.m_height, facts.x, facts.y);
+            const std::int32_t tile = PropertyStockField::tileSlot(field.m_width, field.m_height, facts.x, facts.y);
             if (tile == NO_STOCK_COLUMN)
             {
                 continue;

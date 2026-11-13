@@ -37,11 +37,11 @@ namespace Coordinator
     inline CanonicalPlanActionKey canonicalPlanActionKey(
         const PlanRowAction & action)
     {
-        return CanonicalPlanActionKey::fromAction(
+        return CanonicalPlanActionKey::checkedFromAction(
             action.row,
             action.destination.x,
             action.destination.y,
-            action.captures);
+            action.captures, action.stepsLost, action.destroyed).value();
     }
 
     inline ContinuationKey canonicalPlanKey(
@@ -57,6 +57,15 @@ namespace Coordinator
         return key;
     }
 
+    struct DiagnosticStockQuotes
+    {
+        std::vector<DiagnosticStockQuote> quotes;
+        std::size_t actions{0};
+        std::size_t classesBuilt{0};
+        std::int64_t preparationNanos{0};
+        std::int64_t nanos{0};
+    };
+
     struct ContinuationPricingCatalog
     {
         std::vector<PlanRowAction> actions;
@@ -64,6 +73,14 @@ namespace Coordinator
         std::int64_t refinementBudget{0};
         std::int64_t ledgerTotal{0};
         bool valid{false};
+
+        bool hasReplyActions() const
+        {
+            return std::any_of(actions.begin(), actions.end(), [](const PlanRowAction & action)
+            {
+                return action.stepsLost != 0 || action.destroyed;
+            });
+        }
     };
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
@@ -97,6 +114,9 @@ namespace Coordinator
     class JointPlanStockValuer final : public PlanStockValuer
     {
     public:
+        static DiagnosticStockQuotes diagnosticQuotes(
+            const PropertyStockField & field, std::span<const ContinuationKey> keys);
+
         JointPlanStockValuer(PropertyStockField & field, std::span<const KnownUnitLink> unitLinks,
                             SequentialTierAuditMode auditMode = SequentialTierAuditMode::Full);
         MilliFunds planStock(const TurnPlan & plan) override;
@@ -273,13 +293,29 @@ namespace Coordinator
         static std::int64_t warmStartTariff(std::size_t witnesses, std::size_t keyWidth,
                                            std::size_t rows, std::size_t columns);
         std::int32_t liveDemandCapacity() const;
+        using EnemyCeiling = MilliFunds (*)(PropertyStockField &);
+
+        struct CheapModelBuild
+        {
+            std::unique_ptr<PropertyStockField> field;
+            CheapPricingModel model;
+            std::shared_ptr<MasterFutureCatalog> future;
+        };
+
+        static std::optional<CheapModelBuild> buildCheapModelFor(
+            const PropertyStockField & source, std::span<const PlanRowAction> actions, bool retainSequentialRows,
+            std::size_t* classesBuilt, EnemyCeiling priceEnemy);
+        static CheapRowTerms cheapRowTerms(const SequentialInstance & instance, const SequentialRow & row,
+                                           std::int32_t rowIndex, std::span<const std::int32_t> nodeSlots);
+        static SequentialClassTable buildOurClassTable(
+            PropertyStockField & field, const PropertyStockRow & row,
+            const std::vector<std::int32_t> & nodeSlots, const std::vector<PropertyStockColumn> & nodeColumns);
+        static std::int32_t cheapClassIndexFor(
+            PropertyStockField & field, const PropertyStockRow & row,
+            const std::vector<std::int32_t> & nodeSlots, const std::vector<PropertyStockColumn> & nodeColumns,
+            std::vector<SequentialClassKey> & classKeys, std::vector<SequentialClassTable> & classTables);
         bool buildCheapModel(std::span<const PlanRowAction> actions, bool retainSequentialRows = false);
-        CheapRowTerms cheapRowTerms(
-            const SequentialInstance & instance,
-            const SequentialRow & row,
-            std::int32_t rowIndex,
-            std::span<const std::int32_t> nodeSlots) const;
-        MilliFunds enemyRowCeiling(PropertyStockField & field) const;
+        static MilliFunds enemyRowCeiling(PropertyStockField & field);
         bool priceCheap(const ContinuationKey & key,
                         CheapInitialPrice & price) const;
         LivePlanStockQuote liveQuote(
@@ -335,19 +371,19 @@ namespace Coordinator
         PropertyStockField & continuationField() const;
         void ensureOurSequentialState() const;
         std::int32_t ourClassIndexFor(const PropertyStockRow & row) const;
-        std::vector<std::int32_t> nodeArrivalsFor(
+        static std::vector<std::int32_t> nodeArrivalsFor(
             PropertyStockField & field,
             std::int32_t gridIdentity,
             std::int32_t movementPoints,
-            const std::vector<std::int32_t> & nodeSlots) const;
-        SequentialRow sequentialRowFor(
+            const std::vector<std::int32_t> & nodeSlots);
+        static SequentialRow sequentialRowFor(
             PropertyStockField & field,
             const PropertyStockInstance & instance,
             const PropertyStockRow & row,
             std::int32_t rowIndex,
             const PropertyStockActor* pMover,
             const std::vector<std::int32_t> & nodeSlots,
-            std::int32_t classIndex) const;
+            std::int32_t classIndex);
         MilliFunds enemySequentialOptimum() const;
         EnemySequentialSolve solveEnemySequential(
             std::int64_t stateCap,

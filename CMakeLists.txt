@@ -842,6 +842,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/propertystock.h
     ai/coordinator/propertystockfield.h
     ai/coordinator/propertystockbuilder.h ai/coordinator/propertystockbuilder.cpp
+    ai/coordinator/propertystockpricing.cpp
     ai/coordinator/damageoracle.h ai/coordinator/damageoracle.cpp
     ai/coordinator/decisiontrace.h ai/coordinator/decisiontrace.cpp
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
@@ -1682,7 +1683,9 @@ if (BUILD_TESTING)
 
     add_executable(CoordinatorAiPropertyStockTests
         tests/coordinator_ai/propertystocktests.cpp
+        ai/coordinator/propertystockpricing.cpp
     )
+    target_compile_definitions(CoordinatorAiPropertyStockTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_include_directories(CoordinatorAiPropertyStockTests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )

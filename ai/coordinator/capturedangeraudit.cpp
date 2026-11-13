@@ -1,4 +1,5 @@
 #include "ai/coordinator/capturedangeraudit.h"
+#include "ai/coordinator/propertystockbuilder.h"
 
 #include <algorithm>
 #include <array>
@@ -51,7 +52,7 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 10;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 11;
     constexpr auto DANGER_AUDIT_FILE = "coordinated-ai-danger.jsonl";
 
     constexpr auto KEY_SCHEMA = "schema";
@@ -225,6 +226,44 @@ namespace
     constexpr auto OMITTED_DESTINATION_TAKEN = "DESTINATION_TAKEN";
     constexpr auto OMITTED_TARGET_GONE = "TARGET_GONE";
     constexpr auto OMITTED_BREAKS_LATER_ACTION = "BREAKS_LATER_ACTION";
+    constexpr auto KEY_STOCK_REPLY_QUOTE = "stockReplyQuote";
+    constexpr auto KEY_TODAY = "today";
+    constexpr auto KEY_AFTER_OWN_ACTIONS = "afterOwnActions";
+    constexpr auto KEY_AFTER_REPLY = "afterReply";
+    constexpr auto KEY_COUNTER_LOSS = "counterLoss";
+    constexpr auto KEY_REPLY_LOSS = "replyLoss";
+    constexpr auto KEY_COUNTER_STEPS = "counterSteps";
+    constexpr auto KEY_REPLY_STEPS = "replySteps";
+    constexpr auto KEY_DEATH_CAUSE = "deathCause";
+    constexpr auto KEY_COMPLETED_CAPTURE = "completedCapture";
+    constexpr auto KEY_DIED_ATTACKING = "diedAttacking";
+    constexpr auto KEY_KILLED_BY_REPLY = "killedByReply";
+    constexpr auto KEY_DAMAGED_ALIVE = "damagedAlive";
+    constexpr auto KEY_ROW = "row";
+    constexpr auto KEY_KEY = "key";
+    constexpr auto KEY_OURS = "ours";
+    constexpr auto KEY_OWNED = "owned";
+    constexpr auto KEY_VALID = "valid";
+    constexpr auto KEY_WITNESS_REPLAYS = "witnessReplays";
+    constexpr auto KEY_AVAILABLE = "available";
+    constexpr auto KEY_ACTIONS = "actions";
+    constexpr auto KEY_CLASSES_BUILT = "classesBuilt";
+    constexpr auto KEY_OWN_ACTIONS = "ownActions";
+    constexpr auto KEY_OWN_ACTION_KNOWN = "ownActionKnown";
+    constexpr auto KEY_ISOLATED_COUNTER_STEPS = "isolatedCounterSteps";
+    constexpr auto KEY_COUNTER_STEPS_USED = "counterStepsUsed";
+    constexpr auto KEY_COUNTER_SCALED = "counterScaled";
+    constexpr auto KEY_CERTAIN_COUNTER_UNITS = "certainCounterUnits";
+    constexpr auto KEY_SCALED_COUNTER_UNITS = "scaledCounterUnits";
+    constexpr auto KEY_SCALED_COUNTER_SURVIVAL_DIFFERENCES = "scaledCounterSurvivalDifferences";
+    constexpr auto KEY_OWN_HP_DIFFERENCES = "ownHpDifferences";
+    constexpr auto KEY_REPLY_OUTCOME_DIFFERENCES = "replyOutcomeDifferences";
+    constexpr auto KEY_OWN_HP_COMPARISONS = "ownHpComparisons";
+    constexpr auto KEY_REPLY_OUTCOME_COMPARISONS = "replyOutcomeComparisons";
+    constexpr auto KEY_PREPARATION_NANOS = "preparationNanos";
+    constexpr auto KEY_PRICING_NANOS = "pricingNanos";
+    constexpr auto KEY_REPLAY_NANOS = "replayNanos";
+    constexpr auto KEY_CHAIN_NANOS = "chainNanos";
     constexpr auto KEY_PLAN_REPLAY = "planReplay";
     constexpr auto KEY_PRESENT = "present";
     constexpr auto KEY_COMPLETE = "complete";
@@ -646,6 +685,12 @@ namespace
         }
     }
 
+    enum class PlanOccupancyView : std::int8_t
+    {
+        Legacy,
+        Live,
+    };
+
     class DangerAuditRecorder
     {
     public:
@@ -693,7 +738,8 @@ namespace
 
         std::vector<Coordinator::OccupantAt> standingOccupants();
         Coordinator::PlannedOccupancy plannedOccupancy(std::int32_t movedUnitId = Coordinator::NO_UNIT,
-                                                       const TilePoint & movedTo = Coordinator::INVALID_TILE) const;
+                                                       const TilePoint & movedTo = Coordinator::INVALID_TILE,
+                                                       PlanOccupancyView scope = PlanOccupancyView::Legacy) const;
         Unit* liveUnit(std::int32_t knowledgeIndex);
         FiringCapacity firingCapacity(const std::vector<Shooter> & shooters) const;
         std::vector<Shooter> shootersAt(const TilePoint & property, std::int32_t victimIndex = Coordinator::NO_UNIT,
@@ -759,6 +805,11 @@ namespace
         std::vector<std::optional<ReplyCheckLayer>> secondRunLayers(
             std::span<const Coordinator::PlanReplyAction> actions, const ReplyPairing & pairing) const;
         QJsonObject planReplayRecord() const;
+        Record::StockPlanMeasurement stockPlanMeasurement();
+        void prepareStockReply(const Record::StockPlanMeasurement & measurement,
+                               std::vector<Coordinator::PlanReplyEntry> & replies,
+                               std::span<Coordinator::ReplyTargetFacts> targets);
+        QJsonObject stockReplyQuoteRecord(const QJsonArray & plan);
 
         const Coordinator::CaptureDangerAuditView & m_view;
         Coordinator::DamageOracle m_oracle;
@@ -794,12 +845,16 @@ namespace
 
     // movedUnitId ends on movedTo instead of its planned destination.
     Coordinator::PlannedOccupancy DangerAuditRecorder::plannedOccupancy(std::int32_t movedUnitId,
-                                                                        const TilePoint & movedTo) const
+                                                                        const TilePoint & movedTo, PlanOccupancyView scope) const
     {
         std::vector<Coordinator::PlannedMove> moves;
         for (std::int32_t action = 0; action < m_view.plan.actionCount(); ++action)
         {
             const Coordinator::PlannedAction & planned = m_view.plan.action(action);
+            if (scope == PlanOccupancyView::Live && !Coordinator::isLiveState(planned.state))
+            {
+                continue;
+            }
             const std::int32_t mover = knowledgeIndexOf(planned.unitId);
             if (mover != Coordinator::NO_UNIT)
             {
@@ -1961,6 +2016,266 @@ namespace
         };
         result.insert(KEY_REPLY_PRICING, replyPricingRecord());
         result.insert(KEY_PLAN_REPLAY, planReplayRecord());
+        result.insert(KEY_STOCK_REPLY_QUOTE, stockReplyQuoteRecord(plan));
+        return result;
+    }
+
+    Record::StockPlanMeasurement DangerAuditRecorder::stockPlanMeasurement()
+    {
+        using namespace Coordinator;
+        if (!orderingAcyclic(m_view.plan.executionOrder()))
+        {
+            return {.status = Record::StockQuoteStatus::CyclicOrdering};
+        }
+        const auto count = static_cast<std::size_t>(m_view.plan.actionCount());
+        std::vector<PlanChainEntry> entries(count);
+        std::vector<ReplyTargetFacts> targets(count);
+        std::vector<PlanReplyEntry> replies(count);
+        for (std::size_t slot = 0; slot < count; ++slot)
+        {
+            entries[slot].actorHpSteps = Record::UNKNOWN_ACTION_HP;
+            if (!isLiveState(m_view.plan.action(static_cast<std::int32_t>(slot)).state))
+            {
+                continue;
+            }
+            const auto old = std::find_if(m_replyEntries.begin(), m_replyEntries.end(),
+                [slot](const ReplyEntry & entry) { return entry.planSlot == static_cast<qsizetype>(slot); });
+            if (old == m_replyEntries.end())
+            {
+                continue;
+            }
+            const auto facts = m_facts.factsFor(old->knowledgeIndex, *old->pActor, old->destination);
+            entries[slot] = PlanChainEntry{old->pCandidate == nullptr ? nullptr : &old->pCandidate->bundle,
+                                           known(old->knowledgeIndex).hpRounded};
+            targets[slot].target = OneActionTarget{old->unitId, facts->actorRealHp, old->cost};
+            auto & reply = replies[slot];
+            reply.pFacts = facts.get();
+            reply.destination = old->destination;
+        }
+        return Record::measureStockPlan(m_view.plan, entries, targets,
+            [&](const Record::StockPlanMeasurement & measurement, std::span<ReplyTargetFacts> orderedTargets)
+            {
+                prepareStockReply(measurement, replies, orderedTargets);
+            },
+            [&](std::int32_t shooter) { return known(shooter).hpRounded; },
+            [&](std::int32_t target, std::size_t slot, std::int32_t shooterHp, std::int32_t hp)
+            {
+                return pricedTerrainDamage(replies[target].pFacts->terrain, replies[target].shots[slot], shooterHp, hp);
+            });
+    }
+
+    void DangerAuditRecorder::prepareStockReply(const Record::StockPlanMeasurement & measurement,
+                                                std::vector<Coordinator::PlanReplyEntry> & replies,
+                                                std::span<Coordinator::ReplyTargetFacts> orderedTargets)
+    {
+        using namespace Coordinator;
+        const auto occupancy = Record::stockReplyOccupancy(
+            plannedOccupancy(NO_UNIT, INVALID_TILE, PlanOccupancyView::Live), measurement,
+            [&](std::int32_t slot) { return knowledgeIndexOf(m_view.plan.action(slot).unitId); });
+        for (std::size_t index = 0; index < measurement.planSlots.size(); ++index)
+        {
+            if (orderedTargets[index].target.hp <= 0)
+            {
+                continue;
+            }
+            auto & reply = replies[measurement.planSlots[index]];
+            const auto & facts = *reply.pFacts;
+            for (std::size_t shooter = 0; shooter < facts.tile->shooters.size(); ++shooter)
+            {
+                const auto & source = facts.tile->shooters[shooter];
+                const auto firingTile = replyFiringTile(source, occupancy);
+                reply.shots.push_back(resolveReplyShot(source, facts.shots[shooter], source.dayStartHpSteps,
+                                                       firingTile, reply.destination));
+                orderedTargets[index].shooters.push_back(replySlotFacts(source, reply.shots.back()));
+            }
+        }
+    }
+
+    void addCounterRecord(QJsonObject & record, const Record::MeasuredCounter & counter)
+    {
+        record.insert(KEY_ISOLATED_COUNTER_STEPS, counter.isolatedSteps);
+        record.insert(KEY_COUNTER_STEPS_USED, counter.steps);
+        record.insert(KEY_COUNTER_SCALED, counter.counterScaled);
+    }
+
+    QJsonObject DangerAuditRecorder::stockReplyQuoteRecord(const QJsonArray & plan)
+    {
+        using namespace Coordinator;
+        const auto intervalRecord = [](const StockInterval & interval)
+        {
+            return QJsonArray{static_cast<qint64>(interval.lower), static_cast<qint64>(interval.upper)};
+        };
+        const auto keyRecord = [](const ContinuationKey & key)
+        {
+            QJsonArray encoded;
+            for (const auto & action : key)
+            {
+                encoded.append(QJsonArray{action.row(), action.x(), action.y(), action.captures(),
+                                           action.stepsLost(), action.destroyed()});
+            }
+            return encoded;
+        };
+        ContinuationKey today;
+        ContinuationKey afterOwnActions;
+        ContinuationKey afterReply;
+        QJsonArray units;
+        std::int32_t diedAttacking = 0;
+        std::int32_t killedByReply = 0;
+        std::int32_t damagedAlive = 0;
+        const bool fieldAvailable = m_view.propertyStock.horizonTurns() > 0 &&
+                                    m_view.propertyStock.capturePointsToCapture() > 0;
+        const auto chainStarted = std::chrono::steady_clock::now();
+        const auto measurement = fieldAvailable ? stockPlanMeasurement() :
+            Record::StockPlanMeasurement{.status = Record::StockQuoteStatus::MissingField};
+        const auto chainNanos = Coordinator::nanosSince(chainStarted);
+        bool chainUsable = measurement.status == Record::StockQuoteStatus::Available;
+        QJsonArray ownActions;
+        std::int32_t ownDifferences = 0;
+        std::int32_t replyDifferences = 0;
+        std::int32_t ownComparisons = 0;
+        std::int32_t replyComparisons = 0;
+        for (std::size_t index = 0; index < measurement.planSlots.size(); ++index)
+        {
+            const auto slot = measurement.planSlots[index];
+            const auto & action = m_view.plan.action(slot);
+            const bool knownOwn = index < measurement.ownStatus.size() &&
+                measurement.ownStatus[index] == Record::StockQuoteStatus::Available;
+            const auto status = knownOwn ? Record::StockQuoteStatus::Available :
+                index < measurement.ownStatus.size() ? measurement.ownStatus[index] : measurement.status;
+            QJsonObject ownAction{
+                {KEY_UNIT, action.unitId}, {KEY_SLOT, slot}, {KEY_OWN_ACTION_KNOWN, knownOwn},
+                {KEY_REASON, QLatin1String(Record::stockQuoteStatusName(status))},
+                {KEY_HP_AFTER_ACTION, knownOwn ? QJsonValue(measurement.chain.outcomes[index].hpSteps) : QJsonValue()},
+                {KEY_HP_REAL_AFTER_ACTION, knownOwn ? QJsonValue(measurement.hpAfterActions[index]) : QJsonValue()},
+            };
+            if (index < measurement.counters.size())
+            {
+                addCounterRecord(ownAction, measurement.counters[index]);
+            }
+            ownActions.append(ownAction);
+            const auto legacy = plan.at(slot).toObject();
+            if (knownOwn && legacy.contains(KEY_HP_AFTER_ACTION_PLAN))
+            {
+                ++ownComparisons;
+                ownDifferences += measurement.chain.outcomes[index].hpSteps != legacy.value(KEY_HP_AFTER_ACTION_PLAN).toInt() ||
+                    (legacy.contains(KEY_HP_REAL_AFTER_ACTION_PLAN) && measurement.hpAfterActions[index] !=
+                        legacy.value(KEY_HP_REAL_AFTER_ACTION_PLAN).toDouble()) ? 1 : 0;
+            }
+            const auto old = std::find_if(m_replyEntries.begin(), m_replyEntries.end(),
+                [slot](const ReplyEntry & entry) { return entry.planSlot == slot; });
+            if (chainUsable && old != m_replyEntries.end())
+            {
+                const auto oldIndex = static_cast<std::size_t>(old - m_replyEntries.begin());
+                if (oldIndex < m_recordedOutcomes.size())
+                {
+                    ++replyComparisons;
+                    replyDifferences += measurement.reply.reply.outcomes[index] != m_recordedOutcomes[oldIndex] ? 1 : 0;
+                }
+            }
+        }
+        for (std::size_t index = 0; index < measurement.planSlots.size() && chainUsable; ++index)
+        {
+            const auto slot = measurement.planSlots[index];
+            const auto & action = m_view.plan.action(slot);
+            const auto knowledge = knowledgeIndexOf(action.unitId);
+            const auto row = m_view.propertyStock.ourRowOf(knowledge);
+            if (row == NO_STOCK_ROW)
+            {
+                continue;
+            }
+            const auto & outcome = measurement.reply.reply.outcomes[index];
+            const auto dayStartSteps = known(knowledge).hpRounded;
+            const auto ownHp = measurement.chain.outcomes[index].hpSteps;
+            const auto counterSteps = dayStartSteps - ownHp;
+            const auto replySteps = ownHp - outcome.hpSteps;
+            const auto key = CanonicalPlanActionKey::fromAction(row, action.destination.x, action.destination.y,
+                                                               capturesInPlan(action.kind));
+            const auto variants = Record::stockReplyKeys(key, dayStartSteps, counterSteps, replySteps);
+            if (!variants)
+            {
+                chainUsable = false;
+                break;
+            }
+            today.push_back(key);
+            afterOwnActions.push_back(variants->afterOwnActions);
+            afterReply.push_back(variants->afterReply);
+            if (counterSteps == 0 && replySteps == 0 && variants->death == Record::StockDeathCause::None)
+            {
+                continue;
+            }
+            diedAttacking += variants->death == Record::StockDeathCause::OwnAction ? 1 : 0;
+            killedByReply += variants->death == Record::StockDeathCause::Reply ? 1 : 0;
+            damagedAlive += variants->death == Record::StockDeathCause::None ? 1 : 0;
+            QJsonObject unit{
+                {KEY_UNIT, action.unitId}, {KEY_ROW, row},
+                {KEY_COUNTER_STEPS, counterSteps}, {KEY_REPLY_STEPS, replySteps},
+                {KEY_DEATH_CAUSE, QLatin1String(Record::STOCK_DEATH_CAUSE_NAMES[static_cast<std::size_t>(variants->death)])},
+                {KEY_COMPLETED_CAPTURE, m_view.propertyStock.actionCompletesCapture(
+                    PlanRowAction{row, action.destination, capturesInPlan(action.kind)})},
+            };
+            addCounterRecord(unit, measurement.counters[index]);
+            units.append(unit);
+        }
+        std::sort(today.begin(), today.end());
+        std::sort(afterOwnActions.begin(), afterOwnActions.end());
+        std::sort(afterReply.begin(), afterReply.end());
+        const std::array keys{today, afterOwnActions, afterReply};
+        DiagnosticStockQuotes quotes;
+        bool replayValid = false;
+        if (fieldAvailable && chainUsable)
+        {
+            quotes = JointPlanStockValuer::diagnosticQuotes(m_view.propertyStock, keys);
+            replayValid = quotes.quotes.size() == keys.size() &&
+                std::all_of(quotes.quotes.begin(), quotes.quotes.end(),
+                    [](const DiagnosticStockQuote & quote) { return quote.valid && quote.witnessReplays; });
+        }
+        const auto status = fieldAvailable && measurement.status != Record::StockQuoteStatus::Available
+            ? measurement.status : Record::stockQuoteStatus(fieldAvailable, chainUsable, replayValid);
+        QJsonObject result{
+            {KEY_AVAILABLE, status == Record::StockQuoteStatus::Available},
+            {KEY_REASON, QLatin1String(Record::stockQuoteStatusName(status))},
+            {KEY_OWN_ACTIONS, ownActions},
+            {KEY_CERTAIN_COUNTER_UNITS, measurement.certainCounterUnits},
+            {KEY_SCALED_COUNTER_UNITS, measurement.scaledCounterUnits},
+            {KEY_SCALED_COUNTER_SURVIVAL_DIFFERENCES, measurement.scaledCounterSurvivalDifferences},
+            {KEY_OWN_HP_DIFFERENCES, ownDifferences}, {KEY_REPLY_OUTCOME_DIFFERENCES, replyDifferences},
+            {KEY_OWN_HP_COMPARISONS, ownComparisons}, {KEY_REPLY_OUTCOME_COMPARISONS, replyComparisons},
+            {KEY_CHAIN_NANOS, static_cast<qint64>(chainNanos)},
+            {KEY_PREPARATION_NANOS, static_cast<qint64>(quotes.preparationNanos)},
+            {KEY_UNITS, units}, {KEY_DIED_ATTACKING, diedAttacking},
+            {KEY_KILLED_BY_REPLY, killedByReply}, {KEY_DAMAGED_ALIVE, damagedAlive},
+            {KEY_ACTIONS, static_cast<qint64>(quotes.actions)},
+            {KEY_CLASSES_BUILT, static_cast<qint64>(quotes.classesBuilt)},
+            {KEY_NANOS, static_cast<qint64>(quotes.nanos)},
+        };
+        const std::array names{KEY_TODAY, KEY_AFTER_OWN_ACTIONS, KEY_AFTER_REPLY};
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            QJsonObject quoteRecord{{KEY_KEY, keyRecord(keys[index])}, {KEY_VALID, false},
+                                    {KEY_WITNESS_REPLAYS, false}};
+            if (index < quotes.quotes.size())
+            {
+                const auto & quote = quotes.quotes[index];
+                quoteRecord.insert(KEY_REASON, QLatin1String(DIAGNOSTIC_STOCK_STATUS_NAMES[static_cast<std::size_t>(quote.status)]));
+                quoteRecord.insert(KEY_PRICING_NANOS, static_cast<qint64>(quote.pricingNanos));
+                quoteRecord.insert(KEY_REPLAY_NANOS, static_cast<qint64>(quote.replayNanos));
+                quoteRecord.insert(KEY_VALID, quote.valid);
+                quoteRecord.insert(KEY_WITNESS_REPLAYS, quote.witnessReplays);
+                if (quote.valid)
+                {
+                    quoteRecord.insert(KEY_OURS, intervalRecord(quote.ours));
+                    quoteRecord.insert(KEY_OWNED, static_cast<qint64>(quote.owned));
+                }
+            }
+            result.insert(names[index], quoteRecord);
+        }
+        if (replayValid)
+        {
+            result.insert(KEY_COUNTER_LOSS, intervalRecord(Record::stockQuoteLoss(
+                quotes.quotes[0].ours, quotes.quotes[1].ours)));
+            result.insert(KEY_REPLY_LOSS, intervalRecord(Record::stockQuoteLoss(
+                quotes.quotes[1].ours, quotes.quotes[2].ours)));
+        }
         return result;
     }
 

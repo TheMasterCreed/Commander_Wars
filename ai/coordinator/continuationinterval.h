@@ -8,6 +8,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -20,6 +21,32 @@ namespace Coordinator
     class CanonicalPlanActionKey
     {
     public:
+        static constexpr std::int32_t MAX_STEPS_LOST = 10;
+
+        static constexpr std::optional<CanonicalPlanActionKey> checkedFromAction(
+            std::int32_t row, std::int32_t x, std::int32_t y, bool captures,
+            std::int32_t stepsLost, bool destroyed)
+        {
+            if (stepsLost < 0 || stepsLost > MAX_STEPS_LOST)
+            {
+                return std::nullopt;
+            }
+            auto key = fromAction(row, x, y, captures);
+            key.m_limbs[1] |= static_cast<std::uint64_t>(stepsLost) << STEPS_LOST_SHIFT;
+            key.m_limbs[1] |= static_cast<std::uint64_t>(destroyed) << DESTROYED_SHIFT;
+            return key;
+        }
+
+        constexpr std::int32_t stepsLost() const
+        {
+            return static_cast<std::int32_t>((m_limbs[1] >> STEPS_LOST_SHIFT) & STEPS_LOST_MASK);
+        }
+
+        constexpr bool destroyed() const
+        {
+            return ((m_limbs[1] >> DESTROYED_SHIFT) & 1ULL) != 0;
+        }
+
         static constexpr CanonicalPlanActionKey fromAction(std::int32_t row, std::int32_t x, std::int32_t y,
                                                            bool captures)
         {
@@ -67,11 +94,15 @@ namespace Coordinator
         friend constexpr std::strong_ordering operator<=>(const CanonicalPlanActionKey & lhs,
                                                            const CanonicalPlanActionKey & rhs)
         {
-            return std::tuple{lhs.row(), lhs.x(), lhs.y(), lhs.captures()} <=>
-                   std::tuple{rhs.row(), rhs.x(), rhs.y(), rhs.captures()};
+            return std::tuple{lhs.row(), lhs.x(), lhs.y(), lhs.captures(), lhs.stepsLost(), lhs.destroyed()} <=>
+                   std::tuple{rhs.row(), rhs.x(), rhs.y(), rhs.captures(), rhs.stepsLost(), rhs.destroyed()};
         }
 
     private:
+        static constexpr std::int32_t STEPS_LOST_SHIFT = 33;
+        static constexpr std::int32_t DESTROYED_SHIFT = 37;
+        static constexpr std::uint64_t STEPS_LOST_MASK = 15;
+
         constexpr CanonicalPlanActionKey(std::uint64_t first, std::uint64_t second)
             : m_limbs{first, second}
         {

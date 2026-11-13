@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -81,6 +82,31 @@ namespace Coordinator
         StockInterval enemy;
         StockInterval stock;
         std::vector<RowWitness> witness;
+    };
+
+    enum class DiagnosticStockStatus : std::int8_t
+    {
+        Valid,
+        InvalidKey,
+        PreparationFailed,
+        PricingFailed,
+        ReplayFailed,
+    };
+
+    inline constexpr std::array DIAGNOSTIC_STOCK_STATUS_NAMES{
+        "VALID", "INVALID_KEY", "PREPARATION_FAILED", "PRICING_FAILED", "REPLAY_FAILED",
+    };
+
+    struct DiagnosticStockQuote
+    {
+        DiagnosticStockStatus status{DiagnosticStockStatus::InvalidKey};
+        std::int64_t pricingNanos{0};
+        std::int64_t replayNanos{0};
+        StockInterval ours;
+        MilliFunds owned{0};
+        std::vector<RowWitness> witness;
+        bool valid{false};
+        bool witnessReplays{false};
     };
 
     class CheapPricingModel
@@ -626,4 +652,34 @@ namespace Coordinator
         MilliFunds m_enemyCeiling{0};
         bool m_installed{false};
     };
+    inline std::vector<DiagnosticStockQuote> diagnosticStockPrices(
+        const CheapPricingModel & model, std::span<const ContinuationKey> keys)
+    {
+        std::vector<DiagnosticStockQuote> quotes(keys.size());
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            const auto pricingStarted = std::chrono::steady_clock::now();
+            auto state = model.initialState();
+            CheapInitialPrice price;
+            auto & quote = quotes[index];
+            quote.valid = model.price(keys[index], state, price);
+            quote.pricingNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - pricingStarted).count();
+            quote.status = DiagnosticStockStatus::PricingFailed;
+            if (quote.valid)
+            {
+                quote.ours = price.ours;
+                quote.owned = price.owned;
+                quote.witness = std::move(price.witness);
+                const auto replayStarted = std::chrono::steady_clock::now();
+                quote.witnessReplays = model.replayWitness(state, quote.witness, quote.ours.lower);
+                quote.replayNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - replayStarted).count();
+                quote.valid = quote.witnessReplays;
+                quote.status = quote.valid ? DiagnosticStockStatus::Valid : DiagnosticStockStatus::ReplayFailed;
+            }
+        }
+        return quotes;
+    }
+
 }

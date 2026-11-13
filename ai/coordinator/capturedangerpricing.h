@@ -294,13 +294,15 @@ namespace Coordinator
         });
     }
 
-    inline PlanChainRun planChain(std::span<const PlanChainEntry> entries)
+    template <typename CounterAt>
+    PlanChainRun planChain(std::span<const PlanChainEntry> entries, CounterAt && counterAt)
     {
         PlanChainRun run;
         run.outcomes.reserve(entries.size());
         run.targetsAlive.reserve(entries.size());
-        for (const PlanChainEntry & entry : entries)
+        for (std::size_t index = 0; index < entries.size(); ++index)
         {
+            const PlanChainEntry & entry = entries[index];
             if (entry.pBundle == nullptr)
             {
                 run.outcomes.push_back(ActionHpOutcome{.hpSteps = entry.actorHpSteps});
@@ -308,9 +310,21 @@ namespace Coordinator
                 continue;
             }
             run.targetsAlive.push_back(targetsAliveIn(fireTargetsOf(*entry.pBundle), run.chain));
-            run.outcomes.push_back(hpAfterActionOn(*entry.pBundle, entry.actorHpSteps, run.chain));
+            run.outcomes.push_back(hpAfterActionOn(*entry.pBundle, entry.actorHpSteps, run.chain,
+                [&](const FireFacts & fire, std::int32_t targetHp, std::int32_t actorHp)
+                {
+                    return counterAt(index, fire, targetHp, actorHp);
+                }));
         }
         return run;
+    }
+
+    inline PlanChainRun planChain(std::span<const PlanChainEntry> entries)
+    {
+        return planChain(entries, [](std::size_t, const FireFacts & fire, std::int32_t targetHp, std::int32_t actorHp)
+        {
+            return isolatedActionCounter(fire, targetHp, actorHp);
+        });
     }
 
     // A later entry breaks only when its target was alive for it in the installed plan.

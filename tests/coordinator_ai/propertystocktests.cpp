@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -7,6 +9,117 @@
 #include <vector>
 
 #include "ai/coordinator/propertystock.h"
+#include "ai/coordinator/propertystockbuilder.h"
+
+namespace Coordinator
+{
+    struct PropertyStockDiagnosticFixture
+    {
+        static constexpr std::int32_t HORIZON = 8;
+        static constexpr std::int32_t WIDTH = 3;
+        static constexpr std::int32_t POINTS = 4;
+        static constexpr std::int32_t RATE = 2;
+
+        struct Snapshot
+        {
+            PropertyStockField value;
+            std::array<unsigned char, sizeof(PropertyStockField)> bytes;
+        };
+
+        static PropertyStockField make(std::int32_t rowCount = 1, std::int32_t carried = 0)
+        {
+            PropertyStockField field;
+            field.m_horizonTurns = HORIZON;
+            field.m_width = WIDTH;
+            field.m_height = 1;
+            field.m_capturePointsToCapture = POINTS;
+            field.m_columnAtTile = {0, NO_STOCK_COLUMN, 1};
+            field.m_propertyAtTile = {0, NO_PROPERTY_INDEX, 1};
+            field.m_columnTiles = {{0, 0}, {WIDTH - 1, 0}};
+            field.m_columnCapturer = {0, NO_UNIT};
+            field.m_columnCapturePoints = {carried, 0};
+            field.m_ours.columns = {
+                PropertyStockColumn{.slot = 0, .tile = field.m_columnTiles[0], .income = {2, 2}},
+                PropertyStockColumn{.slot = 1, .tile = field.m_columnTiles[1], .income = {1, 1}},
+            };
+            MobilityCostGrid grid(WIDTH, 1);
+            for (std::int32_t x = 0; x < WIDTH; ++x)
+            {
+                grid.setCost(x, 0, EntryDirection::East, 1);
+                grid.setCost(x, 0, EntryDirection::West, 1);
+            }
+            field.m_grids.push_back(std::move(grid));
+            for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
+            {
+                const TilePoint tile{rowIndex == 0 ? (carried > 0 ? 0 : 1) : WIDTH - 1, 0};
+                field.m_ours.rows.push_back(PropertyStockRow{
+                    .knowledgeIndex = rowIndex, .gridIdentity = 0, .movementPoints = 1,
+                    .capturePoints = carried, .captureRate = RATE, .tile = tile,
+                });
+                field.arrivalsFrom(0, 1, tile);
+                constexpr std::array<MilliFunds, 2> CENTER_WEIGHTS{12, 6};
+                constexpr std::array<MilliFunds, 2> CARRIED_WEIGHTS{14, 5};
+                constexpr std::array<MilliFunds, 2> SECOND_WEIGHTS{10, 6};
+                const auto & weights = rowIndex == 0 ? (carried > 0 ? CARRIED_WEIGHTS : CENTER_WEIGHTS) : SECOND_WEIGHTS;
+                field.m_ours.weights.insert(field.m_ours.weights.end(), weights.begin(), weights.end());
+            }
+            field.m_marginals.emplace(PropertyStockField::MarginalKey{0, NO_STOCK_COLUMN},
+                                      buildMarginalTable(field.m_ours, 0, NO_STOCK_COLUMN));
+            return field;
+        }
+
+        static Snapshot snapshot(const PropertyStockField & field)
+        {
+            Snapshot result{field, {}};
+            std::memcpy(result.bytes.data(), &field, sizeof(field));
+            return result;
+        }
+
+        static bool unchanged(const PropertyStockField & field, const Snapshot & before)
+        {
+            const auto & old = before.value;
+            if (std::memcmp(before.bytes.data(), &field, sizeof(field)) != 0 ||
+                field.m_ours.rows != old.m_ours.rows || field.m_ours.columns != old.m_ours.columns ||
+                field.m_ours.weights != old.m_ours.weights || field.m_theirs.rows != old.m_theirs.rows ||
+                field.m_theirs.columns != old.m_theirs.columns || field.m_theirs.weights != old.m_theirs.weights ||
+                field.m_grids != old.m_grids || field.m_columnAtTile != old.m_columnAtTile ||
+                field.m_propertyAtTile != old.m_propertyAtTile || field.m_columnTiles != old.m_columnTiles ||
+                field.m_columnCapturer != old.m_columnCapturer || field.m_columnCapturePoints != old.m_columnCapturePoints ||
+                field.m_enemyArrivals != old.m_enemyArrivals || field.m_enemyOptimaWithoutRow != old.m_enemyOptimaWithoutRow ||
+                field.m_arrivals.size() != old.m_arrivals.size() || field.m_marginals.size() != old.m_marginals.size())
+            {
+                return false;
+            }
+            for (const auto & [key, value] : field.m_arrivals)
+            {
+                const auto found = old.m_arrivals.find(key);
+                if (found == old.m_arrivals.end() || value.activations != found->second.activations)
+                {
+                    return false;
+                }
+            }
+            for (const auto & [key, value] : field.m_marginals)
+            {
+                const auto found = old.m_marginals.find(key);
+                if (found == old.m_marginals.end() || value.unmatched != found->second.unmatched ||
+                    value.withoutColumn != found->second.withoutColumn || value.solves != found->second.solves ||
+                    value.augmentations != found->second.augmentations)
+                {
+                    return false;
+                }
+            }
+            for (std::int32_t x = 0; x < WIDTH; ++x)
+            {
+                if (field.m_reach.activations(x, 0) != old.m_reach.activations(x, 0) ||
+                    field.m_reach.routeCost(x, 0) != old.m_reach.routeCost(x, 0))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+    };
+}
 
 namespace
 {
@@ -302,6 +415,79 @@ namespace
                "a tile costing more than one allowance is unreachable");
     }
 
+    void stockFieldDiagnosticChecks()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        const auto today = CanonicalPlanActionKey::fromAction(0, 0, 0, true);
+        const auto damaged = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, false);
+        // Destruction also removes a capture-rate bonus that would remain after hp loss.
+        const auto dead = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, 1, true);
+        const auto zero = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, Fixture::RATE, false);
+        const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead},
+                              ContinuationKey{zero}, ContinuationKey{today}};
+        const auto field = Fixture::make();
+        const auto before = Fixture::snapshot(field);
+        const auto batch = JointPlanStockValuer::diagnosticQuotes(field, keys);
+        constexpr std::size_t UNIQUE_ACTIONS = 4;
+        constexpr std::size_t UNIQUE_CLASSES = 3;
+        constexpr MilliFunds TODAY_FLOOR = 18;
+        constexpr MilliFunds TODAY_CEILING = 20;
+        constexpr MilliFunds DAMAGED_VALUE = 13;
+        expect(batch.quotes.size() == keys.size() && batch.actions == UNIQUE_ACTIONS &&
+               batch.classesBuilt == UNIQUE_CLASSES && batch.nanos >= 0,
+               "field diagnostic builds only the union of actions and effective-rate classes");
+        expect(batch.quotes[0].ours.lower == TODAY_FLOOR && batch.quotes[0].ours.upper == TODAY_CEILING &&
+               batch.quotes[1].ours.lower == DAMAGED_VALUE && batch.quotes[1].ours.upper == DAMAGED_VALUE,
+               "field diagnostic decodes damage and slows both the unfinished and second capture");
+        for (const auto & quote : batch.quotes)
+        {
+            expect(quote.valid && quote.witnessReplays, "field diagnostic witnesses replay");
+        }
+        expect(batch.quotes[2].ours.upper == 0 && batch.quotes[2].witness.empty() &&
+               batch.quotes[2].owned == 0 && batch.quotes[3].ours.upper == 0,
+               "destroyed unfinished and zero-rate rows have no future contribution");
+        auto reversed = keys;
+        std::reverse(reversed.begin(), reversed.end());
+        const auto other = JointPlanStockValuer::diagnosticQuotes(field, reversed);
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            const auto & quote = other.quotes[keys.size() - 1 - index];
+            expect(batch.quotes[index].ours.lower == quote.ours.lower &&
+                   batch.quotes[index].ours.upper == quote.ours.upper && batch.quotes[index].owned == quote.owned,
+                   "field diagnostic batch is independent of key order including duplicate keys");
+        }
+        constexpr auto invalidIndependent = "invalid batch keys cannot invalidate valid quotes or enter the catalog";
+        const auto invalid = CanonicalPlanActionKey::fromAction(1, 0, 0, false);
+        const std::array partialKeys{ContinuationKey{today}, ContinuationKey{invalid}, ContinuationKey{damaged},
+                                     ContinuationKey{today, damaged}};
+        const auto partial = JointPlanStockValuer::diagnosticQuotes(field, partialKeys);
+        expect(partial.quotes[0].valid && partial.quotes[2].valid && partial.actions == 2 &&
+               partial.quotes[1].status == DiagnosticStockStatus::InvalidKey &&
+               partial.quotes.back().status == DiagnosticStockStatus::InvalidKey &&
+               partial.quotes[0].ours.lower == TODAY_FLOOR && partial.quotes[2].ours.lower == DAMAGED_VALUE &&
+               partial.quotes[1].pricingNanos == 0 && partial.quotes[1].replayNanos == 0 &&
+               partial.preparationNanos >= 0 && partial.quotes[0].pricingNanos >= 0 &&
+               partial.quotes[0].replayNanos >= 0, invalidIndependent);
+        expect(Fixture::unchanged(field, before), "field diagnostic leaves the field and warmed caches unchanged");
+        const auto completedField = Fixture::make(1, Fixture::RATE);
+        const std::array completedKeys{ContinuationKey{today}, ContinuationKey{dead}};
+        const auto completed = JointPlanStockValuer::diagnosticQuotes(completedField, completedKeys);
+        expect(completed.quotes[0].valid && completed.quotes[1].valid &&
+               completed.quotes[1].owned == Fixture::HORIZON * 2 &&
+               completed.quotes[0].owned == completed.quotes[1].owned && completed.quotes[1].ours.upper == 0,
+               "field diagnostic preserves a capture completed this turn when its capturer is destroyed");
+        const auto mixedField = Fixture::make(2);
+        const auto mixedBefore = Fixture::snapshot(mixedField);
+        const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
+        const std::array mixedKeys{ContinuationKey{damaged, second}, ContinuationKey{dead, second}};
+        const auto mixed = JointPlanStockValuer::diagnosticQuotes(mixedField, mixedKeys);
+        expect(mixed.quotes[0].valid && mixed.quotes[1].valid && mixed.quotes[1].ours.lower > 0 &&
+               std::none_of(mixed.quotes[1].witness.begin(), mixed.quotes[1].witness.end(),
+                   [](const RowWitness & witness) { return witness.row == 0; }) && Fixture::unchanged(mixedField, mixedBefore),
+               "mixed field diagnostic keeps an undamaged row and never revives its destroyed neighbour");
+    }
+
     void testReadSetOnlyBoundsWork()
     {
         constexpr TilePoint origin{0, 0};
@@ -330,6 +516,7 @@ int main()
     testInjectivityAndPositionalDelta();
     testActivationScheduleUsesTurnBoundaries();
     testReadSetOnlyBoundsWork();
+    stockFieldDiagnosticChecks();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

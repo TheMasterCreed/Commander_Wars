@@ -23,6 +23,19 @@ namespace Coordinator
         Destroyed,
     };
 
+    constexpr std::int32_t replyCaptureRate(std::int32_t originalRate, std::int32_t stepsLost, bool destroyed)
+    {
+        if (destroyed)
+        {
+            return 0;
+        }
+        if (stepsLost == 0)
+        {
+            return originalRate;
+        }
+        return originalRate > stepsLost ? originalRate - stepsLost : 0;
+    }
+
     struct PropertyStockActor
     {
         std::int32_t knowledgeIndex{NO_UNIT};
@@ -30,6 +43,13 @@ namespace Coordinator
         std::int32_t movementPoints{0};
         std::int32_t carriedCapturePoints{0};
         ActorSurvival survival{ActorSurvival::Alive};
+        std::int32_t stepsLost{0};
+        bool destroyed{false};
+
+        std::int32_t effectiveCaptureRate(std::int32_t originalRate) const
+        {
+            return replyCaptureRate(originalRate, stepsLost, destroyed);
+        }
     };
 
     struct PropertyStockOutcome
@@ -43,7 +63,33 @@ namespace Coordinator
         std::int32_t row{NO_STOCK_ROW};
         TilePoint destination{INVALID_TILE};
         bool captures{false};
+        std::int32_t stepsLost{0};
+        bool destroyed{false};
     };
+
+    inline ArrivalFacts planRowArrival(const PropertyStockActor & mover, std::int32_t originalRate,
+                                       const TilePoint & columnTile, std::int32_t arrivalActivations)
+    {
+        return ArrivalFacts{
+            .arrivalActivations = arrivalActivations,
+            .carriedPoints = columnTile == mover.tile ? mover.carriedCapturePoints : 0,
+            .ratePerTurn = mover.effectiveCaptureRate(originalRate),
+        };
+    }
+
+    inline PropertyStockActor planRowMover(const PropertyStockRow & row, const PlanRowAction & action,
+                                           std::int32_t carried, bool onColumn)
+    {
+        return PropertyStockActor{
+            .knowledgeIndex = row.knowledgeIndex,
+            .tile = action.destination,
+            .movementPoints = row.movementPoints,
+            .carriedCapturePoints = onColumn ? carried + (action.captures ? row.captureRate : 0) : 0,
+            .survival = action.destroyed ? ActorSurvival::Destroyed : ActorSurvival::Alive,
+            .stepsLost = action.stepsLost,
+            .destroyed = action.destroyed,
+        };
+    }
 
     struct JointStockDecomposition
     {
@@ -61,6 +107,13 @@ namespace Coordinator
         MilliFunds originStock() const
         {
             return m_originStock;
+        }
+
+        bool actionCompletesCapture(const PlanRowAction & action) const
+        {
+            std::int32_t capturedColumn = NO_STOCK_COLUMN;
+            actionMover(action, capturedColumn);
+            return capturedColumn != NO_STOCK_COLUMN;
         }
 
         MilliFunds destinationStock(const PropertyStockActor & actor, const PropertyStockOutcome & outcome);
@@ -98,10 +151,15 @@ namespace Coordinator
         friend PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,
                                                           std::span<const PropertyFacts> properties,
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        friend struct PropertyStockDiagnosticFixture;
+#endif
         friend class JointPlanStockValuer;
         friend class MasterAssignmentStockContext;
 
     private:
+        static std::int32_t tileSlot(std::int32_t width, std::int32_t height, std::int32_t x, std::int32_t y);
+
         struct JointActionFacts
         {
             std::vector<std::int32_t> capturedColumns;
@@ -134,6 +192,7 @@ namespace Coordinator
 
         const ArrivalVectors & arrivalsFrom(std::int32_t gridIdentity, std::int32_t movementPoints,
                                             const TilePoint & tile);
+        PropertyStockActor actionMover(const PlanRowAction & action, std::int32_t & capturedColumn) const;
         JointActionFacts jointActionFacts(std::span<const PlanRowAction> actions) const;
         MilliFunds ourOpenOptimum(const JointActionFacts & facts);
         const MarginalTable & marginalFor(std::int32_t row, std::int32_t excludedColumn);

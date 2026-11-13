@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/propertystockfield.h"
 #include "ai/coordinator/sequentialthreshold.h"
 
 namespace
@@ -461,6 +462,61 @@ namespace
         };
         visit(0, 0);
         return best;
+    }
+
+    void testReplyRatesAndMonotonicity()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t POINTS = 4;
+        constexpr std::int32_t RATE = 4;
+        constexpr std::int32_t RATE_CASES = 4;
+        constexpr std::int32_t INCOME_CASES = 3;
+        constexpr std::array<MilliFunds, INCOME_CASES> INCOMES{0, 1, 2};
+        const auto exact = [&](std::int32_t rate, std::int32_t rowCount, const std::vector<PropertyStockColumn> & columns)
+        {
+            std::array<SequentialClassTable, 2> classes;
+            classes[0].build(columns, unitArrivals(), captureTurnsFor(0, rate, POINTS), HORIZON_TURNS);
+            classes[1].build(columns, unitArrivals(), captureTurnsFor(0, RATE, POINTS), HORIZON_TURNS);
+            SequentialInstance instance{.horizonTurns = HORIZON_TURNS, .nodeColumns = columns, .classes = classes,
+                                         .capturedNodes = std::vector<bool>(columns.size(), false)};
+            for (std::int32_t rowIndex = 0; rowIndex < rowCount; ++rowIndex)
+            {
+                const PropertyStockRow source{.captureRate = RATE, .tile = {rowIndex, 0}};
+                const PlanRowAction action{rowIndex, source.tile, false, rowIndex == 0 ? RATE - rate : 0};
+                const auto mover = planRowMover(source, action, 0, true);
+                SequentialRow row{.classIndex = rowIndex};
+                for (const auto & property : columns)
+                {
+                    const auto arrival = planRowArrival(mover, RATE, property.tile, 1);
+                    row.weight.push_back(columnWeight(property, arrival, POINTS, HORIZON_TURNS));
+                    row.ownedTurn.push_back(sequentialFirstOwnedTurn(ownedTurnsUntil(1, arrival.carriedPoints,
+                        arrival.ratePerTurn, POINTS, HORIZON_TURNS), HORIZON_TURNS));
+                }
+                instance.rows.push_back(std::move(row));
+            }
+            return exhaustivePacking(instance, 0);
+        };
+        for (const auto first : INCOMES)
+        {
+            for (const auto second : INCOMES)
+            {
+                for (const auto third : INCOMES)
+                {
+                    const std::vector<PropertyStockColumn> columns{column(0, first), column(1, second), column(2, third)};
+                    for (std::int32_t rate = 0; rate < RATE_CASES; ++rate)
+                    {
+                        const auto baseline = exact(rate, 1, columns);
+                        expect(exact(rate + 1, 1, columns) >= baseline,
+                               "raising a row's rate preserves the nonnegative exact optimum");
+                        expect(exact(rate, 2, columns) >= baseline,
+                               "adding an undamaged row preserves the nonnegative exact optimum");
+                    }
+                }
+            }
+        }
+        const std::vector<PropertyStockColumn> columns{column(0, 1), column(1, 1), column(2, 1)};
+        expect(exact(0, 1, columns) == 0 && exact(2, 1, columns) < exact(RATE, 1, columns),
+               "zero rate has no captures and damage slows a later capture in the chain");
     }
 
     void testWitnessRecoveryAndExactPacking()
@@ -1777,6 +1833,7 @@ int main()
     testEnumerationOrderAndCapturedExclusion();
     testBudgetBoundary();
     testWitnessRecoveryAndExactPacking();
+    testReplyRatesAndMonotonicity();
     testCapturedNodeAndFloorCompatibility();
     testExhaustiveCeilingEquivalence();
     testCappedRetainedFloor();
