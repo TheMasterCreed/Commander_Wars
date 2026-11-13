@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "ai/coordinator/bundlebuilder.h"
 #include "ai/coordinator/capturedanger.h"
 #include "ai/coordinator/capturedangerdecisions.h"
+#include "ai/coordinator/capturedangerpricing.h"
 #include "ai/coordinator/capturedangerrecord.h"
 #include "ai/coordinator/capturedangerstream.h"
 #include "ai/coordinator/damageoracle.h"
@@ -48,7 +50,7 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 8;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 9;
     // A counter answers an adjacent shot.
     constexpr std::int32_t COUNTER_DISTANCE = 1;
     constexpr auto DANGER_AUDIT_FILE = "coordinated-ai-danger.jsonl";
@@ -177,6 +179,54 @@ namespace
     constexpr auto KEY_FOCUSED_UNKNOWN = "r2Unknown";
     constexpr auto KEY_COUNTER_SOURCE = "counterSource";
     constexpr auto KEY_REPAIR_STEPS = "repairSteps";
+    constexpr auto KEY_REPLY_PRICING = "replyPricing";
+    constexpr auto KEY_SOURCE = "source";
+    constexpr auto KEY_NEXT_SHOT_SCALED = "nextShotScaled";
+    constexpr auto KEY_INSTALLED = "installed";
+    constexpr auto KEY_CAPITAL = "capital";
+    constexpr auto KEY_NEXT_SHOT = "nextShot";
+    constexpr auto KEY_TOTAL = "total";
+    constexpr auto KEY_EXPOSURE_CHARGED = "exposureCharged";
+    constexpr auto KEY_UNITS_SHOT = "unitsShot";
+    constexpr auto KEY_UNITS_DESTROYED = "unitsDestroyed";
+    constexpr auto KEY_UNITS = "units";
+    constexpr auto KEY_SLOT = "slot";
+    constexpr auto KEY_REASON = "reason";
+    constexpr auto KEY_HP_BEFORE = "hpBefore";
+    constexpr auto KEY_LOSS = "loss";
+    constexpr auto KEY_CANDIDATES = "candidates";
+    constexpr auto KEY_PRICED = "priced";
+    constexpr auto KEY_EXACT = "exact";
+    constexpr auto KEY_OPEN = "open";
+    constexpr auto KEY_COUNT = "count";
+    constexpr auto KEY_POSITIVE = "positive";
+    constexpr auto KEY_BEST = "best";
+    constexpr auto KEY_BEST_EXACT = "bestExact";
+    constexpr auto KEY_BEST_OPEN = "bestOpen";
+    constexpr auto KEY_CHANGES_PRICED = "changesPriced";
+    constexpr auto KEY_PAIRS_EXAMINED = "pairsExamined";
+    constexpr auto KEY_UNMATCHED_ENTRIES = "unmatchedEntries";
+    constexpr auto KEY_CANDIDATE = "candidate";
+    constexpr auto KEY_TARGET = "target";
+    constexpr auto KEY_STOCK_KEY_UNCHANGED = "stockKeyUnchanged";
+    constexpr auto KEY_CHAIN_INTERACTION = "chainInteraction";
+    constexpr auto KEY_FIRING_TILES_SHARED = "firingTilesShared";
+    constexpr auto KEY_PLANNER_DELTA = "plannerDelta";
+    constexpr auto KEY_SEATED_DELTA = "seatedDelta";
+    constexpr auto KEY_REPLY_DELTA = "replyDelta";
+    constexpr auto KEY_GAIN = "gain";
+    constexpr auto KEY_SERVICE_INTERACTION = "serviceInteraction";
+    constexpr auto KEY_TARGET_CONTINUATION_DELTA = "targetContinuationDelta";
+    constexpr auto KEY_TARGET_CONTINUATION_CHARGED = "targetContinuationCharged";
+    constexpr auto KEY_BASELINE_CONSISTENT = "baselineConsistent";
+    constexpr auto KEY_INSTALLED_PAIRS_EXAMINED = "installedPairsExamined";
+    constexpr auto KEY_INVALID = "invalid";
+    constexpr auto KEY_HAS_STOCK_ROW = "hasStockRow";
+    constexpr auto REASON_SHOT = "SHOT";
+    constexpr auto REASON_HITS_SHOOTER = "HITS_SHOOTER";
+    constexpr auto OMITTED_DESTINATION_TAKEN = "DESTINATION_TAKEN";
+    constexpr auto OMITTED_TARGET_GONE = "TARGET_GONE";
+    constexpr auto OMITTED_BREAKS_LATER_ACTION = "BREAKS_LATER_ACTION";
 
     enum class DamageSource : std::int8_t
     {
@@ -239,6 +289,60 @@ namespace
     const char* actionFactsName(ActionFacts facts)
     {
         return facts == ActionFacts::Candidate ? ACTION_FACTS_CANDIDATE : ACTION_FACTS_UNMATCHED;
+    }
+
+    const char* reasonName(Coordinator::ChangeReason reason)
+    {
+        return reason == Coordinator::ChangeReason::Shot ? REASON_SHOT : REASON_HITS_SHOOTER;
+    }
+
+    constexpr std::array OMISSIONS{
+        Coordinator::ChangeOmission::DestinationTaken,
+        Coordinator::ChangeOmission::TargetGone,
+        Coordinator::ChangeOmission::BreaksLaterAction,
+    };
+
+    const char* omissionName(Coordinator::ChangeOmission omission)
+    {
+        switch (omission)
+        {
+            case Coordinator::ChangeOmission::DestinationTaken:
+                return OMITTED_DESTINATION_TAKEN;
+            case Coordinator::ChangeOmission::TargetGone:
+                return OMITTED_TARGET_GONE;
+            case Coordinator::ChangeOmission::None:
+            case Coordinator::ChangeOmission::BreaksLaterAction:
+                break;
+        }
+        return OMITTED_BREAKS_LATER_ACTION;
+    }
+
+    QJsonObject lossRecord(const Coordinator::ReplyLoss & loss)
+    {
+        return QJsonObject{
+            {KEY_CAPITAL, static_cast<qint64>(loss.capital)},
+            {KEY_NEXT_SHOT, static_cast<qint64>(loss.nextShot)},
+            {KEY_CAPTURE, static_cast<qint64>(loss.capture)},
+        };
+    }
+
+    QJsonObject lossTotalRecord(const Coordinator::ReplyLoss & loss)
+    {
+        QJsonObject record = lossRecord(loss);
+        record.insert(KEY_TOTAL, static_cast<qint64>(loss.total()));
+        return record;
+    }
+
+    using ChangeBucket = Coordinator::ChangeBucket<QJsonObject>;
+
+    QJsonValue bestRecord(const ChangeBucket & bucket)
+    {
+        return bucket.bestGain ? QJsonValue(bucket.best) : QJsonValue();
+    }
+
+    QJsonObject bucketRecord(const ChangeBucket & bucket)
+    {
+        return QJsonObject{{KEY_COUNT, bucket.count}, {KEY_POSITIVE, bucket.positive}, {KEY_BEST, bestRecord(bucket)}};
     }
 
     Coordinator::CaptureDamageFormula damageFormula(GameEnums::DamageFormula formula)
@@ -317,6 +421,42 @@ namespace
         Coordinator::MilliFunds cost{0};
         std::vector<Shooter> shooters;
         ActorDamage damage;
+        std::int32_t knowledgeIndex{Coordinator::NO_UNIT};
+        Unit* pActor{nullptr};
+        const Coordinator::CandidateBundle* pCandidate{nullptr};
+        std::int32_t actorHpSteps{0};
+        TilePoint destination{Coordinator::INVALID_TILE};
+        std::optional<Coordinator::CaptureStake> capture;
+    };
+
+    struct CaptureSite
+    {
+        std::int32_t carried{0};
+        std::int32_t rate{0};
+        PropertyStockColumn column;
+    };
+
+    // Fire targets and serviced partners are knowledge indices; a destination is held only for a live slot.
+    struct InstalledReply
+    {
+        std::vector<std::set<std::int32_t>> slotTargets;
+        std::vector<std::set<std::int32_t>> slotPartners;
+        std::vector<std::optional<TilePoint>> slotDestinations;
+        std::vector<Coordinator::PlanChainEntry> chainEntries;
+        Coordinator::PlanChainRun chain;
+        std::vector<ReplyEntry> entries;
+        Coordinator::PlanReplyRun run;
+        std::vector<Coordinator::ReplyLoss> losses;
+        Coordinator::ReplyLoss total;
+    };
+
+    struct PricedChange
+    {
+        Coordinator::ChangeOmission omission{Coordinator::ChangeOmission::None};
+        bool exact{false};
+        Coordinator::MilliFunds gain{0};
+        std::int64_t pairsExamined{0};
+        QJsonObject record;
     };
 
     ShotReport shotReport(DamageSource source, const ActorDamage & actor, const ShotDamage & damage,
@@ -442,6 +582,7 @@ namespace
             : m_view(view),
               m_oracle(view.map),
               m_horizonTurns(view.propertyStock.horizonTurns()),
+              m_standing(standingOccupants()),
               m_occupancy(plannedOccupancy())
         {
             for (const Coordinator::AssignmentActor & actor : m_view.actors)
@@ -478,16 +619,21 @@ namespace
             return Coordinator::captureOwnerBefore(facts.ownerId, m_view.knowledge.relation(facts.ownerId));
         }
 
-        Coordinator::PlannedOccupancy plannedOccupancy();
+        std::vector<Coordinator::OccupantAt> standingOccupants();
+        Coordinator::PlannedOccupancy plannedOccupancy(std::int32_t movedUnitId = Coordinator::NO_UNIT,
+                                                       const TilePoint & movedTo = Coordinator::INVALID_TILE) const;
         Unit* liveUnit(std::int32_t knowledgeIndex);
         Coordinator::FiringRange firingRangeOf(const Coordinator::AttackerSpec & spec, const TilePoint & target) const;
-        TilePoint firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target) const;
+        TilePoint firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target,
+                                const Coordinator::PlannedOccupancy & occupancy) const;
         FiringCapacity firingCapacity(const std::vector<Shooter> & shooters, const TilePoint & target) const;
         bool ownBuildingAt(const TilePoint & tile, std::int32_t ownerId) const;
         bool onOwnBuilding(const KnownUnit & shooter) const;
         void priceShooter(Shooter & shooter);
         std::vector<Shooter> shootersAt(const TilePoint & property, std::int32_t victimIndex = Coordinator::NO_UNIT,
                                         std::int32_t victimHpSteps = 0);
+        std::vector<Shooter> shootersAmong(const Coordinator::PlannedOccupancy & occupancy, const TilePoint & property,
+                                           std::int32_t victimIndex, std::int32_t victimHpSteps);
         TerrainDefenseRule terrainRule(Unit & actor, const TilePoint & property) const;
         ActorDamage damageOn(const std::vector<Shooter> & shooters, std::int32_t actorIndex, Unit & actor,
                              const TilePoint & property, ExactQuery exactQuery = ExactQuery::Engine);
@@ -506,16 +652,43 @@ namespace
                                const std::vector<CaptureActor> & actors);
         const Coordinator::CandidateBundle* candidateFor(const Coordinator::PlannedAction & action) const;
         Coordinator::MilliFunds actorCostFor(const Coordinator::PlannedAction & action, Unit & actor) const;
+        CaptureSite captureSite(std::int32_t propertyIndex, std::int32_t actorIndex, Unit & actor,
+                                const TilePoint & destination) const;
         QJsonObject planRecord(const Coordinator::PlannedAction & action, qsizetype planSlot);
+        Coordinator::PlanReplyRun oneActionRun(std::span<const ReplyEntry> entries,
+                                               const Coordinator::TargetHpChain & chain, DamageSource source) const;
         void addOneActionReplies(QJsonArray & plan);
         QJsonArray shooterLoadRecords() const;
         std::int32_t knowledgeIndexOf(std::int32_t engineUnitId) const;
+        const Coordinator::AssignmentActor* actorOf(std::int32_t engineUnitId) const;
+        std::vector<Coordinator::ReplyLoss> replyLosses(std::span<const ReplyEntry> entries,
+                                                        const Coordinator::OneActionReply & reply) const;
+        void addSlotFacts(InstalledReply & installed) const;
+        bool firingTilesMove(std::span<const ReplyEntry> entries, std::size_t changed,
+                             const Coordinator::PlannedOccupancy & occupancy) const;
+        bool chainInteraction(const InstalledReply & installed, qsizetype planSlot,
+                              const Coordinator::CandidateBundle & installedCandidate,
+                              const Coordinator::CandidateBundle & replacement) const;
+        bool entersStockKey(const Coordinator::PlannedAction & action, std::int32_t knowledgeIndex) const;
+        bool stockKeyUnchangedFor(const Coordinator::PlannedAction & action, std::int32_t knowledgeIndex,
+                                  const Coordinator::CandidateBundle & replacement) const;
+        ReplyEntry changedEntry(const ReplyEntry & installed, const Coordinator::CandidateBundle & replacement,
+                                const Coordinator::ActionHpOutcome & planOutcome,
+                                const Coordinator::PlannedOccupancy & occupancy);
+        std::vector<ReplyEntry> entriesOn(const Coordinator::PlanChainRun & chain) const;
+        InstalledReply installedReply() const;
+        bool baselineConsistent(const InstalledReply & installed) const;
+        PricedChange priceChange(const InstalledReply & installed, std::size_t entryIndex,
+                                 Coordinator::ChangeReason reason, std::size_t candidateIndex,
+                                 const Coordinator::CandidateBundle & replacement);
+        QJsonObject replyPricingRecord();
 
         const Coordinator::CaptureDangerAuditView & m_view;
         Coordinator::DamageOracle m_oracle;
         std::int32_t m_horizonTurns{0};
-        // Declared before m_occupancy, whose initializer counts into it.
+        // Declared before m_standing, whose initializer counts into it.
         std::int32_t m_alliedOccupants{0};
+        std::vector<Coordinator::OccupantAt> m_standing;
         Coordinator::PlannedOccupancy m_occupancy;
         std::set<std::int32_t> m_missingLoaded;
         std::set<std::int32_t> m_missingAbsent;
@@ -525,13 +698,16 @@ namespace
         std::vector<ReplyEntry> m_replyEntries;
         // The plan view: one target chain filled in plan order.
         Coordinator::TargetHpChain m_planChain;
+        std::vector<std::int32_t> m_recordedPool;
+        std::vector<std::size_t> m_recordedChosen;
+        std::vector<Coordinator::ReplyOutcome> m_recordedOutcomes;
         std::int32_t m_unmatchedFires{0};
         std::int32_t m_planKills{0};
         std::int32_t m_planDamaged{0};
         std::int64_t m_oneActionNanos{0};
     };
 
-    Coordinator::PlannedOccupancy DangerAuditRecorder::plannedOccupancy()
+    std::vector<Coordinator::OccupantAt> DangerAuditRecorder::standingOccupants()
     {
         std::vector<Coordinator::OccupantAt> ours;
         const std::vector<KnownUnit> & units = m_view.knowledge.units();
@@ -549,6 +725,13 @@ namespace
             }
             ours.push_back(Coordinator::OccupantAt{static_cast<std::int32_t>(index), TilePoint{unit.x, unit.y}});
         }
+        return ours;
+    }
+
+    // movedUnitId ends on movedTo instead of its planned destination.
+    Coordinator::PlannedOccupancy DangerAuditRecorder::plannedOccupancy(std::int32_t movedUnitId,
+                                                                        const TilePoint & movedTo) const
+    {
         std::vector<Coordinator::PlannedMove> moves;
         for (std::int32_t action = 0; action < m_view.plan.actionCount(); ++action)
         {
@@ -557,10 +740,11 @@ namespace
             if (mover != Coordinator::NO_UNIT)
             {
                 const KnownUnit & unit = known(mover);
-                moves.push_back(Coordinator::PlannedMove{mover, TilePoint{unit.x, unit.y}, planned.destination});
+                const TilePoint destination = planned.unitId == movedUnitId ? movedTo : planned.destination;
+                moves.push_back(Coordinator::PlannedMove{mover, TilePoint{unit.x, unit.y}, destination});
             }
         }
-        return Coordinator::PlannedOccupancy(m_view.knowledge.width(), m_view.knowledge.height(), ours, moves);
+        return Coordinator::PlannedOccupancy(m_view.knowledge.width(), m_view.knowledge.height(), m_standing, moves);
     }
 
     Unit* DangerAuditRecorder::liveUnit(std::int32_t knowledgeIndex)
@@ -587,7 +771,8 @@ namespace
         return Coordinator::FiringRange{.target = target, .minRange = spec.minRange, .maxRange = spec.maxRange};
     }
 
-    TilePoint DangerAuditRecorder::firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target) const
+    TilePoint DangerAuditRecorder::firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target,
+                                                 const Coordinator::PlannedOccupancy & occupancy) const
     {
         const Coordinator::AttackerSpec & spec = m_view.enemyReach.attacker(shot.slot);
         if (!spec.canMoveAndFire)
@@ -595,7 +780,7 @@ namespace
             return shot.tile;
         }
         const Coordinator::DistanceField & reach = m_view.enemyReach.reach(shot.slot);
-        return Coordinator::cheapestFiringTile(firingRangeOf(spec, target), m_occupancy,
+        return Coordinator::cheapestFiringTile(firingRangeOf(spec, target), occupancy,
                                                [&](std::int32_t x, std::int32_t y)
                                                {
                                                    return reach.reachable(x, y, spec.movementPoints)
@@ -694,6 +879,13 @@ namespace
     std::vector<Shooter> DangerAuditRecorder::shootersAt(const TilePoint & property, std::int32_t victimIndex,
                                                          std::int32_t victimHpSteps)
     {
+        return shootersAmong(m_occupancy, property, victimIndex, victimHpSteps);
+    }
+
+    std::vector<Shooter> DangerAuditRecorder::shootersAmong(const Coordinator::PlannedOccupancy & occupancy,
+                                                            const TilePoint & property, std::int32_t victimIndex,
+                                                            std::int32_t victimHpSteps)
+    {
         std::vector<Shooter> shooters;
         Coordinator::forEachEnemyShot(
             m_view.knowledge.units(), m_view.enemyReach, property, victimIndex, victimHpSteps,
@@ -707,7 +899,7 @@ namespace
                 Shooter shooter{
                     .shot = shot,
                     .pUnit = liveUnit(shot.unitIndex),
-                    .firingTile = firingTileFor(shot, property),
+                    .firingTile = firingTileFor(shot, property, occupancy),
                     .mustMove = Coordinator::shooterMustMove(shot.tile, property, spec.minRange, spec.maxRange),
                     .direct = spec.canMoveAndFire,
                     .onOwnBuilding = onOwnBuilding(known(shot.unitIndex)),
@@ -1085,8 +1277,7 @@ namespace
     QJsonObject DangerAuditRecorder::planRecord(const Coordinator::PlannedAction & action, qsizetype planSlot)
     {
         const std::int32_t actorIndex = knowledgeIndexOf(action.unitId);
-        const bool captures = action.kind == Coordinator::PlanBundleKind::Capture ||
-                              action.kind == Coordinator::PlanBundleKind::MoveAndCapture;
+        const bool captures = Coordinator::capturesInPlan(action.kind);
         QJsonObject record{
             {KEY_KNOWLEDGE, actorIndex},
             {KEY_UNIT, action.unitId},
@@ -1160,6 +1351,11 @@ namespace
             .cost = actorCost,
             .shooters = shooters,
             .damage = damage,
+            .knowledgeIndex = actorIndex,
+            .pActor = pActor,
+            .pCandidate = pCandidate,
+            .actorHpSteps = pCandidate == nullptr ? unit.hpRounded : pCandidate->actor.hpSteps,
+            .destination = action.destination,
         });
         if (!captures)
         {
@@ -1172,16 +1368,11 @@ namespace
             record.insert(KEY_OMITTED, QLatin1String(OMITTED_NO_PROPERTY));
             return record;
         }
-        const Coordinator::PropertyFacts & facts = m_view.properties[static_cast<std::size_t>(propertyIndex)];
-        const std::int32_t carried = Coordinator::carriedCapturePoints(facts.capturerIndex, facts.capturePoints, actorIndex);
-        // The danger walks use the candidate's destination rate; the stock model assumes the origin rate.
-        const std::int32_t candidateRate = pActor->getCaptureRate(QPoint(action.destination.x, action.destination.y));
+        const CaptureSite site = captureSite(propertyIndex, actorIndex, *pActor, action.destination);
+        const std::int32_t carried = site.carried;
+        const std::int32_t candidateRate = site.rate;
         record.insert(KEY_CANDIDATE_CAPTURE_RATE, candidateRate);
-        const PropertyStockColumn column{
-            .tile = action.destination,
-            .income = Coordinator::captureIncome(facts),
-            .ownerBefore = ownerOf(facts),
-        };
+        const PropertyStockColumn & column = site.column;
         const std::int32_t assumedTurn = Coordinator::unrepliedDeliveredTurn(walkInput(*pActor, carried, unit.captureRate));
         QJsonObject capture{
             {KEY_CARRIED, carried},
@@ -1198,7 +1389,24 @@ namespace
         addDanger(capture, damage, input, &column);
         addPricedWalks(capture, shooters, damage, input, actorCost, column);
         record.insert(KEY_CAPTURE, capture);
+        m_replyEntries.back().capture = Coordinator::CaptureStake{.column = column, .input = input};
         return record;
+    }
+
+    // The danger walks use the candidate's destination rate; the stock model assumes the origin rate.
+    CaptureSite DangerAuditRecorder::captureSite(std::int32_t propertyIndex, std::int32_t actorIndex, Unit & actor,
+                                                 const TilePoint & destination) const
+    {
+        const Coordinator::PropertyFacts & facts = m_view.properties[static_cast<std::size_t>(propertyIndex)];
+        return CaptureSite{
+            .carried = Coordinator::carriedCapturePoints(facts.capturerIndex, facts.capturePoints, actorIndex),
+            .rate = actor.getCaptureRate(QPoint(destination.x, destination.y)),
+            .column = PropertyStockColumn{
+                .tile = destination,
+                .income = Coordinator::captureIncome(facts),
+                .ownerBefore = ownerOf(facts),
+            },
+        };
     }
 
     // PlannedAction keeps no candidate index, so the candidate is found by the intent plannedActionFrom gives it.
@@ -1247,77 +1455,57 @@ namespace
         return records;
     }
 
+    Coordinator::PlanReplyRun DangerAuditRecorder::oneActionRun(std::span<const ReplyEntry> entries,
+                                                                const Coordinator::TargetHpChain & chain,
+                                                                DamageSource source) const
+    {
+        std::vector<Coordinator::ReplyTargetFacts> targets;
+        targets.reserve(entries.size());
+        for (const ReplyEntry & entry : entries)
+        {
+            Coordinator::ReplyTargetFacts facts{
+                .target = Coordinator::OneActionTarget{entry.unitId, entry.hp, entry.cost},
+            };
+            facts.shooters.reserve(entry.shooters.size());
+            for (std::size_t slot = 0; slot < entry.shooters.size(); ++slot)
+            {
+                const Shooter & shooter = entry.shooters[slot];
+                const ShotDamage & shot = entry.damage.shots[slot];
+                facts.shooters.push_back(Coordinator::ReplySlotFacts{
+                    .shooterIndex = shooter.shot.unitIndex,
+                    .onOwnBuilding = shooter.onOwnBuilding,
+                    .resolution = shot.resolution,
+                    .counterRawBase = shot.counterRawBase,
+                    .shooterCost = shooter.cost,
+                    .captureCost = shooter.captureCost,
+                });
+            }
+            targets.push_back(std::move(facts));
+        }
+        return Coordinator::planReply(
+            targets, chain, [&](std::int32_t shooter) { return known(shooter).hpRounded; },
+            [&](std::size_t target, std::size_t slot, std::int32_t shooterHpSteps, std::int32_t hpSteps)
+            {
+                const ReplyEntry & entry = entries[target];
+                return pricedDamageAt(source, entry.damage, entry.damage.shots[slot], shooterHpSteps, hpSteps);
+            });
+    }
+
     void DangerAuditRecorder::addOneActionReplies(QJsonArray & plan)
     {
         const auto started = std::chrono::steady_clock::now();
-        std::set<std::int32_t> pooled;
-        std::vector<std::map<std::int32_t, std::size_t>> shooterSlots(m_replyEntries.size());
-        std::vector<Coordinator::OneActionTarget> targets;
-        targets.reserve(m_replyEntries.size());
-        for (std::size_t entry = 0; entry < m_replyEntries.size(); ++entry)
-        {
-            const ReplyEntry & reply = m_replyEntries[entry];
-            targets.push_back(Coordinator::OneActionTarget{reply.unitId, reply.hp, reply.cost});
-            for (std::size_t slot = 0; slot < reply.shooters.size(); ++slot)
-            {
-                pooled.insert(reply.shooters[slot].shot.unitIndex);
-                shooterSlots[entry].emplace(reply.shooters[slot].shot.unitIndex, slot);
-            }
-        }
-        const std::vector<std::int32_t> pool(pooled.begin(), pooled.end());
-        const Coordinator::TargetHpChain & planHp = m_planChain;
-        for (const auto & [enemyIndex, hp] : planHp)
+        for (const auto & [enemyIndex, hp] : m_planChain)
         {
             m_planKills += hp.after <= 0 ? 1 : 0;
             m_planDamaged += hp.after > 0 && hp.after < hp.before ? 1 : 0;
         }
-        std::vector<std::int32_t> poolHp;
-        poolHp.reserve(pool.size());
-        for (const std::int32_t shooter : pool)
-        {
-            const auto damaged = planHp.find(shooter);
-            poolHp.push_back(damaged == planHp.end() ? known(shooter).hpRounded : damaged->second.after);
-            m_shooterLoads[shooter].oneActionHpSteps = poolHp.back();
-        }
-        const auto slotOf = [&](std::size_t shooter, std::size_t target) -> std::optional<std::size_t>
-        {
-            const auto found = shooterSlots[target].find(pool[shooter]);
-            return found == shooterSlots[target].end() ? std::nullopt : std::optional<std::size_t>(found->second);
-        };
-        // The whole plan's damage, then the shooter's own building repair, sets the hp P1 prices it at.
-        const auto shooterHpAt = [&](std::size_t shooter, std::size_t target)
-        {
-            return Coordinator::oneActionShooterHpSteps(poolHp[shooter],
-                                                        m_replyEntries[target].shooters[*slotOf(shooter, target)].onOwnBuilding);
-        };
         for (const DamageSource source : PRICED_SOURCES)
         {
-            const Coordinator::OneActionReply reply = Coordinator::oneActionReply(
-                targets, pool,
-                [&](std::size_t shooter, std::size_t target)
-                {
-                    const std::optional<std::size_t> slot = slotOf(shooter, target);
-                    return slot && shooterHpAt(shooter, target) > 0 &&
-                           Coordinator::pricedShotPossible(m_replyEntries[target].damage.shots[*slot].resolution);
-                },
-                [&](std::size_t shooter, std::size_t target, std::int32_t hpSteps)
-                {
-                    const ReplyEntry & entry = m_replyEntries[target];
-                    return pricedDamageAt(source, entry.damage, entry.damage.shots[*slotOf(shooter, target)],
-                                          shooterHpAt(shooter, target), hpSteps);
-                },
-                [&](std::size_t shooter, std::size_t target, std::int32_t hpStepsAfter)
-                {
-                    const ReplyEntry & entry = m_replyEntries[target];
-                    const std::size_t slot = *slotOf(shooter, target);
-                    return Coordinator::counterCost(entry.damage.shots[slot].counterRawBase, hpStepsAfter,
-                                                    shooterHpAt(shooter, target), entry.shooters[slot].cost);
-                },
-                [&](std::size_t shooter, std::size_t target)
-                {
-                    return m_replyEntries[target].shooters[*slotOf(shooter, target)].captureCost;
-                });
-            std::vector<QJsonArray> chosenBy(targets.size());
+            const Coordinator::PlanReplyRun run = oneActionRun(m_replyEntries, m_planChain, source);
+            const std::vector<std::int32_t> & pool = run.pool;
+            const Coordinator::OneActionReply & reply = run.reply;
+            const std::size_t targetCount = m_replyEntries.size();
+            std::vector<QJsonArray> chosenBy(targetCount);
             for (const Coordinator::OneActionShot & shot : reply.shots)
             {
                 chosenBy[shot.target].append(QJsonObject{
@@ -1325,7 +1513,7 @@ namespace
                     {KEY_NET, static_cast<qint64>(shot.net)},
                 });
             }
-            for (std::size_t target = 0; target < targets.size(); ++target)
+            for (std::size_t target = 0; target < targetCount; ++target)
             {
                 QJsonObject outcome = Record::outcomeRecord(reply.outcomes[target]);
                 outcome.insert(KEY_SHOOTERS, chosenBy[target]);
@@ -1342,16 +1530,433 @@ namespace
             {
                 continue;
             }
+            m_recordedPool = pool;
+            m_recordedChosen = reply.chosen;
+            m_recordedOutcomes = reply.outcomes;
             for (std::size_t shooter = 0; shooter < pool.size(); ++shooter)
             {
+                m_shooterLoads[pool[shooter]].oneActionHpSteps = run.poolHp[shooter];
                 if (reply.chosen[shooter] != Coordinator::NO_ONE_ACTION_TARGET)
                 {
-                    m_shooterLoads[pool[shooter]].oneActionUnit = targets[reply.chosen[shooter]].unitId;
+                    m_shooterLoads[pool[shooter]].oneActionUnit = m_replyEntries[reply.chosen[shooter]].unitId;
                 }
             }
         }
         m_oneActionNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                                 started).count();
+    }
+
+    const Coordinator::AssignmentActor* DangerAuditRecorder::actorOf(std::int32_t engineUnitId) const
+    {
+        for (const Coordinator::AssignmentActor & actor : m_view.actors)
+        {
+            if (actor.engineUnitId == engineUnitId)
+            {
+                return &actor;
+            }
+        }
+        return nullptr;
+    }
+
+    std::vector<Coordinator::ReplyLoss> DangerAuditRecorder::replyLosses(
+        std::span<const ReplyEntry> entries, const Coordinator::OneActionReply & reply) const
+    {
+        std::vector<Coordinator::ReplyLoss> losses;
+        losses.reserve(entries.size());
+        for (std::size_t index = 0; index < entries.size(); ++index)
+        {
+            const ReplyEntry & entry = entries[index];
+            const Coordinator::ReplyLossFacts facts{
+                .actorCost = entry.cost,
+                .bestNextShot = entry.pCandidate == nullptr
+                                    ? 0
+                                    : Coordinator::bestShot(entry.pCandidate->actorNextShotsAtDestination),
+                .capture = entry.capture,
+            };
+            losses.push_back(Coordinator::replyLoss(facts, Coordinator::ceilHpSteps(entry.hp), reply.outcomes[index]));
+        }
+        return losses;
+    }
+
+    // An unmatched fire keeps only its engine target, so that target's knowledge index stands in for the bundle's.
+    void DangerAuditRecorder::addSlotFacts(InstalledReply & installed) const
+    {
+        const auto slotCount = static_cast<std::size_t>(m_view.plan.actionCount());
+        installed.slotTargets.resize(slotCount);
+        installed.slotPartners.resize(slotCount);
+        installed.slotDestinations.resize(slotCount);
+        for (std::size_t slot = 0; slot < slotCount; ++slot)
+        {
+            const Coordinator::PlannedAction & action = m_view.plan.action(static_cast<std::int32_t>(slot));
+            if (Coordinator::isLiveState(action.state))
+            {
+                installed.slotDestinations[slot] = action.destination;
+            }
+            const Coordinator::CandidateBundle* pCandidate = candidateFor(action);
+            if (pCandidate != nullptr)
+            {
+                const std::vector<std::int32_t> targets = Coordinator::fireTargetsOf(pCandidate->bundle);
+                installed.slotTargets[slot].insert(targets.begin(), targets.end());
+                installed.slotPartners[slot] = Coordinator::servicedPartnersOf(pCandidate->bundle);
+                continue;
+            }
+            const std::int32_t target = action.targetUnitId == Coordinator::NO_UNIT
+                                            ? Coordinator::NO_UNIT
+                                            : knowledgeIndexOf(action.targetUnitId);
+            if (target != Coordinator::NO_UNIT)
+            {
+                installed.slotTargets[slot].insert(target);
+            }
+        }
+    }
+
+    // Another entry's shooters keep their facts unless the moved unit changes the free tile they would fire from.
+    bool DangerAuditRecorder::firingTilesMove(std::span<const ReplyEntry> entries, std::size_t changed,
+                                              const Coordinator::PlannedOccupancy & occupancy) const
+    {
+        for (std::size_t index = 0; index < entries.size(); ++index)
+        {
+            if (index == changed)
+            {
+                continue;
+            }
+            for (const Shooter & shooter : entries[index].shooters)
+            {
+                if (firingTileFor(shooter.shot, entries[index].destination, occupancy) != shooter.firingTile)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool DangerAuditRecorder::chainInteraction(const InstalledReply & installed, qsizetype planSlot,
+                                               const Coordinator::CandidateBundle & installedCandidate,
+                                               const Coordinator::CandidateBundle & replacement) const
+    {
+        for (std::size_t slot = 0; slot < installed.slotTargets.size(); ++slot)
+        {
+            if (static_cast<qsizetype>(slot) != planSlot &&
+                (Coordinator::firesOnAny(installedCandidate.bundle, installed.slotTargets[slot]) ||
+                 Coordinator::firesOnAny(replacement.bundle, installed.slotTargets[slot])))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // JointPlanStockValuer::rowOf finds the knowledge index through the same unit links knowledgeIndexOf reads.
+    bool DangerAuditRecorder::entersStockKey(const Coordinator::PlannedAction & action,
+                                             std::int32_t knowledgeIndex) const
+    {
+        return Coordinator::isLiveState(action.state) &&
+               m_view.propertyStock.ourRowOf(knowledgeIndex) != Coordinator::NO_STOCK_ROW;
+    }
+
+    bool DangerAuditRecorder::stockKeyUnchangedFor(const Coordinator::PlannedAction & action,
+                                                   std::int32_t knowledgeIndex,
+                                                   const Coordinator::CandidateBundle & replacement) const
+    {
+        const bool replacementCaptures = Coordinator::capturesInPlan(Coordinator::planBundleKindOf(replacement.bundle));
+        return Coordinator::stockKeyUnchanged(entersStockKey(action, knowledgeIndex), action.destination,
+                                              Coordinator::capturesInPlan(action.kind), replacement.bundle.destination,
+                                              replacementCaptures);
+    }
+
+    // planRecord's reply facts for the replacement, never asking the engine for an enemy shot.
+    ReplyEntry DangerAuditRecorder::changedEntry(const ReplyEntry & installed,
+                                                 const Coordinator::CandidateBundle & replacement,
+                                                 const Coordinator::ActionHpOutcome & planOutcome,
+                                                 const Coordinator::PlannedOccupancy & occupancy)
+    {
+        const Coordinator::ActionHpOutcome isolated =
+            Coordinator::hpAfterAction(replacement.bundle, replacement.actor.hpSteps);
+        ReplyEntry entry{
+            .planSlot = installed.planSlot,
+            .unitId = installed.unitId,
+            .hp = Coordinator::realHpAfterAction(installed.pActor->getHp(), planOutcome),
+            .cost = replacement.actor.replacementCost,
+            .knowledgeIndex = installed.knowledgeIndex,
+            .pActor = installed.pActor,
+            .pCandidate = &replacement,
+            .actorHpSteps = replacement.actor.hpSteps,
+            .destination = replacement.bundle.destination,
+        };
+        if (isolated.hpSteps > 0 || planOutcome.hpSteps > 0)
+        {
+            entry.shooters = shootersAmong(occupancy, entry.destination, isolated.victimIndex, isolated.victimHpSteps);
+        }
+        entry.damage =
+            damageOn(entry.shooters, entry.knowledgeIndex, *entry.pActor, entry.destination, ExactQuery::Skipped);
+        const std::int32_t propertyIndex = m_view.propertyStock.propertyIndexAt(entry.destination);
+        if (Coordinator::capturesInPlan(Coordinator::planBundleKindOf(replacement.bundle)) &&
+            propertyIndex != Coordinator::NO_PROPERTY_INDEX)
+        {
+            const CaptureSite site = captureSite(propertyIndex, entry.knowledgeIndex, *entry.pActor, entry.destination);
+            entry.capture = Coordinator::CaptureStake{
+                .column = site.column,
+                .input = walkInput(*entry.pActor, site.carried, site.rate),
+            };
+        }
+        return entry;
+    }
+
+    std::vector<ReplyEntry> DangerAuditRecorder::entriesOn(const Coordinator::PlanChainRun & chain) const
+    {
+        std::vector<ReplyEntry> entries = m_replyEntries;
+        for (ReplyEntry & entry : entries)
+        {
+            entry.hp = Coordinator::realHpAfterAction(entry.pActor->getHp(),
+                                                      chain.outcomes[static_cast<std::size_t>(entry.planSlot)]);
+        }
+        return entries;
+    }
+
+    PricedChange DangerAuditRecorder::priceChange(const InstalledReply & installed, std::size_t entryIndex,
+                                                  Coordinator::ChangeReason reason, std::size_t candidateIndex,
+                                                  const Coordinator::CandidateBundle & replacement)
+    {
+        const ReplyEntry & entry = m_replyEntries[entryIndex];
+        const auto slot = static_cast<std::size_t>(entry.planSlot);
+        PricedChange priced;
+        if (Coordinator::destinationTaken(installed.slotDestinations, slot, replacement.bundle.destination))
+        {
+            priced.omission = Coordinator::ChangeOmission::DestinationTaken;
+            return priced;
+        }
+        std::vector<Coordinator::PlanChainEntry> chainEntries = installed.chainEntries;
+        chainEntries[slot] = Coordinator::PlanChainEntry{.pBundle = &replacement.bundle,
+                                                         .actorHpSteps = replacement.actor.hpSteps};
+        const Coordinator::PlanChainRun chain = Coordinator::planChain(chainEntries);
+        priced.omission = Coordinator::chainOmission(installed.chain, chain, slot);
+        if (priced.omission != Coordinator::ChangeOmission::None)
+        {
+            return priced;
+        }
+        const Coordinator::PlannedOccupancy occupancy = plannedOccupancy(entry.unitId, replacement.bundle.destination);
+        std::vector<ReplyEntry> entries = entriesOn(chain);
+        entries[entryIndex] = changedEntry(entry, replacement, chain.outcomes[slot], occupancy);
+        const Coordinator::PlannedAction & action = m_view.plan.action(static_cast<std::int32_t>(entry.planSlot));
+        const Coordinator::ChangeFlags flags{
+            .stockKeyUnchanged = stockKeyUnchangedFor(action, entry.knowledgeIndex, replacement),
+            .chainInteraction = chainInteraction(installed, entry.planSlot, *entry.pCandidate, replacement),
+            .firingTilesShared =
+                replacement.bundle.destination != entry.destination && firingTilesMove(entries, entryIndex, occupancy),
+            .serviceInteraction = Coordinator::serviceInteraction(entry.pCandidate->bundle, replacement.bundle,
+                                                                  installed.slotPartners, slot, entry.knowledgeIndex),
+        };
+        priced.exact = Coordinator::exactChange(flags);
+        const Coordinator::PlanReplyRun run = oneActionRun(entries, chain.chain, LOAD_SOURCE);
+        priced.pairsExamined = run.reply.pairsExamined;
+        const Coordinator::ReplyLoss total = Coordinator::totalLoss(replyLosses(entries, run.reply));
+        const Coordinator::BundleValuation & before = entry.pCandidate->valuation;
+        const Coordinator::BundleValuation & after = replacement.valuation;
+        const Coordinator::MilliFunds seatedDelta = Coordinator::seatedValue(after) - Coordinator::seatedValue(before);
+        priced.gain = Coordinator::changeGain(seatedDelta, installed.total, total);
+        const Coordinator::ReplyOutcome & outcome = run.reply.outcomes[entryIndex];
+        const std::vector<std::int32_t> targets = Coordinator::fireTargetsOf(replacement.bundle);
+        const std::int32_t target = targets.empty()
+                                        ? Coordinator::NO_UNIT
+                                        : Coordinator::linkOf(m_view.unitLinks, targets.front()).engineUnitId;
+        priced.record = QJsonObject{
+            {KEY_UNIT, entry.unitId},
+            {KEY_SLOT, static_cast<qint64>(entry.planSlot)},
+            {KEY_REASON, QLatin1String(reasonName(reason))},
+            {KEY_CANDIDATE, static_cast<qint64>(candidateIndex)},
+            {KEY_KIND, Coordinator::traceBundleKind(Coordinator::planBundleKindOf(replacement.bundle))},
+            {KEY_DESTINATION, tileRecord(replacement.bundle.destination)},
+            {KEY_TARGET, target == Coordinator::NO_UNIT ? QJsonValue() : QJsonValue(target)},
+            {KEY_STOCK_KEY_UNCHANGED, flags.stockKeyUnchanged},
+            {KEY_CHAIN_INTERACTION, flags.chainInteraction},
+            {KEY_FIRING_TILES_SHARED, flags.firingTilesShared},
+            {KEY_SERVICE_INTERACTION, flags.serviceInteraction},
+            {KEY_EXACT, priced.exact},
+            {KEY_PLANNER_DELTA, static_cast<qint64>(after.value().economicValue - before.value().economicValue)},
+            {KEY_TARGET_CONTINUATION_DELTA, static_cast<qint64>(after.continuation.targetContinuationRemoved -
+                                                                before.continuation.targetContinuationRemoved)},
+            {KEY_SEATED_DELTA, static_cast<qint64>(seatedDelta)},
+            {KEY_REPLY_DELTA, lossTotalRecord(total - installed.total)},
+            {KEY_GAIN, static_cast<qint64>(priced.gain)},
+            {Record::KEY_HP_AFTER_REPLY, outcome.hpSteps},
+            {Record::KEY_DESTROYED, outcome.destroyed},
+        };
+        return priced;
+    }
+
+    InstalledReply DangerAuditRecorder::installedReply() const
+    {
+        InstalledReply installed;
+        addSlotFacts(installed);
+        installed.chainEntries.resize(installed.slotTargets.size());
+        for (std::size_t slot = 0; slot < installed.chainEntries.size(); ++slot)
+        {
+            installed.chainEntries[slot].firedTargets.assign(installed.slotTargets[slot].begin(),
+                                                             installed.slotTargets[slot].end());
+        }
+        for (const ReplyEntry & entry : m_replyEntries)
+        {
+            Coordinator::PlanChainEntry & chainEntry = installed.chainEntries[static_cast<std::size_t>(entry.planSlot)];
+            chainEntry.actorHpSteps = entry.actorHpSteps;
+            if (entry.pCandidate != nullptr)
+            {
+                chainEntry.pBundle = &entry.pCandidate->bundle;
+            }
+        }
+        installed.chain = Coordinator::planChain(installed.chainEntries);
+        installed.entries = entriesOn(installed.chain);
+        installed.run = oneActionRun(installed.entries, installed.chain.chain, LOAD_SOURCE);
+        installed.losses = replyLosses(installed.entries, installed.run.reply);
+        installed.total = Coordinator::totalLoss(installed.losses);
+        return installed;
+    }
+
+    // The baseline is rebuilt the way changes are; it must reproduce the P1 outcome the plan records.
+    bool DangerAuditRecorder::baselineConsistent(const InstalledReply & installed) const
+    {
+        if (installed.chain.chain != m_planChain || installed.run.pool != m_recordedPool ||
+            installed.run.reply.chosen != m_recordedChosen || installed.run.reply.outcomes != m_recordedOutcomes)
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < m_replyEntries.size(); ++index)
+        {
+            if (installed.entries[index].hp != m_replyEntries[index].hp)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Runs once the record's other keys are final, so its unit lookups cannot change their counts.
+    QJsonObject DangerAuditRecorder::replyPricingRecord()
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const InstalledReply installed = installedReply();
+        std::set<std::int32_t> firing;
+        for (std::size_t shooter = 0; shooter < installed.run.pool.size(); ++shooter)
+        {
+            if (installed.run.reply.chosen[shooter] != Coordinator::NO_ONE_ACTION_TARGET)
+            {
+                firing.insert(installed.run.pool[shooter]);
+            }
+        }
+        Coordinator::MilliFunds exposureCharged = 0;
+        Coordinator::MilliFunds targetContinuationCharged = 0;
+        std::int32_t unitsShot = 0;
+        std::int32_t unitsDestroyed = 0;
+        std::int32_t unmatchedEntries = 0;
+        std::int64_t changesPriced = 0;
+        std::int64_t pairsExamined = 0;
+        ChangeBucket bestExact;
+        ChangeBucket bestOpen;
+        QJsonArray units;
+        for (std::size_t index = 0; index < installed.entries.size(); ++index)
+        {
+            const ReplyEntry & entry = installed.entries[index];
+            const std::int32_t hpBefore = Coordinator::ceilHpSteps(entry.hp);
+            const Coordinator::ReplyOutcome & outcome = installed.run.reply.outcomes[index];
+            const bool shot = outcome.hpSteps < hpBefore;
+            unitsShot += shot ? 1 : 0;
+            unitsDestroyed += hpBefore > 0 && outcome.destroyed ? 1 : 0;
+            if (entry.pCandidate == nullptr)
+            {
+                ++unmatchedEntries;
+            }
+            else
+            {
+                exposureCharged -= entry.pCandidate->valuation.continuation.exposure;
+                targetContinuationCharged += entry.pCandidate->valuation.continuation.targetContinuationRemoved;
+            }
+            const Coordinator::AssignmentActor* pActor = actorOf(entry.unitId);
+            std::span<const Coordinator::CandidateBundle> candidates;
+            if (entry.pCandidate != nullptr && pActor != nullptr)
+            {
+                candidates = pActor->candidates;
+            }
+            const Coordinator::ChangeReason reason =
+                shot ? Coordinator::ChangeReason::Shot : Coordinator::ChangeReason::HitsShooter;
+            std::int32_t considered = 0;
+            std::int32_t invalid = 0;
+            std::int32_t priced = 0;
+            std::map<Coordinator::ChangeOmission, std::int32_t> omitted;
+            ChangeBucket exact;
+            ChangeBucket open;
+            for (std::size_t candidate = 0; candidate < candidates.size(); ++candidate)
+            {
+                const Coordinator::CandidateBundle & replacement = candidates[candidate];
+                if (&replacement == entry.pCandidate || !Coordinator::consideredFor(reason, replacement.bundle, firing))
+                {
+                    continue;
+                }
+                if (!replacement.valuation.valid)
+                {
+                    ++invalid;
+                    continue;
+                }
+                ++considered;
+                const PricedChange change = priceChange(installed, index, reason, candidate, replacement);
+                if (change.omission != Coordinator::ChangeOmission::None)
+                {
+                    ++omitted[change.omission];
+                    continue;
+                }
+                ++priced;
+                pairsExamined += change.pairsExamined;
+                (change.exact ? exact : open).add(change.gain, change.record);
+            }
+            if (!shot && considered + invalid == 0)
+            {
+                continue;
+            }
+            changesPriced += priced;
+            bestExact.offerBest(exact);
+            bestOpen.offerBest(open);
+            QJsonObject omittedRecord;
+            for (const Coordinator::ChangeOmission omission : OMISSIONS)
+            {
+                omittedRecord.insert(omissionName(omission), omitted[omission]);
+            }
+            units.append(QJsonObject{
+                {KEY_UNIT, entry.unitId},
+                {KEY_SLOT, static_cast<qint64>(entry.planSlot)},
+                {KEY_REASON, QLatin1String(reasonName(reason))},
+                {KEY_HP_BEFORE, hpBefore},
+                {Record::KEY_HP_AFTER_REPLY, outcome.hpSteps},
+                {Record::KEY_DESTROYED, outcome.destroyed},
+                {KEY_LOSS, lossRecord(installed.losses[index])},
+                {KEY_CANDIDATES, considered},
+                {KEY_INVALID, invalid},
+                {KEY_HAS_STOCK_ROW,
+                 entersStockKey(m_view.plan.action(static_cast<std::int32_t>(entry.planSlot)), entry.knowledgeIndex)},
+                {KEY_PRICED, priced},
+                {KEY_OMITTED, omittedRecord},
+                {KEY_EXACT, bucketRecord(exact)},
+                {KEY_OPEN, bucketRecord(open)},
+            });
+        }
+        QJsonObject installedRecord = lossTotalRecord(installed.total);
+        installedRecord.insert(KEY_EXPOSURE_CHARGED, static_cast<qint64>(exposureCharged));
+        installedRecord.insert(KEY_TARGET_CONTINUATION_CHARGED, static_cast<qint64>(targetContinuationCharged));
+        installedRecord.insert(KEY_UNITS_SHOT, unitsShot);
+        installedRecord.insert(KEY_UNITS_DESTROYED, unitsDestroyed);
+        return QJsonObject{
+            {KEY_SOURCE, QLatin1String(sourceName(LOAD_SOURCE))},
+            {KEY_NEXT_SHOT_SCALED, true},
+            {KEY_BASELINE_CONSISTENT, baselineConsistent(installed)},
+            {KEY_INSTALLED, installedRecord},
+            {KEY_UNITS, units},
+            {KEY_BEST_EXACT, bestRecord(bestExact)},
+            {KEY_BEST_OPEN, bestRecord(bestOpen)},
+            {KEY_CHANGES_PRICED, static_cast<qint64>(changesPriced)},
+            {KEY_PAIRS_EXAMINED, static_cast<qint64>(pairsExamined)},
+            {KEY_INSTALLED_PAIRS_EXAMINED, static_cast<qint64>(installed.run.reply.pairsExamined)},
+            {KEY_UNMATCHED_ENTRIES, unmatchedEntries},
+            {KEY_NANOS, static_cast<qint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - started).count())},
+        };
     }
 
     QJsonObject DangerAuditRecorder::record()
@@ -1392,7 +1997,7 @@ namespace
             plan.append(planRecord(m_view.plan.action(action), plan.size()));
         }
         addOneActionReplies(plan);
-        return QJsonObject{
+        QJsonObject result{
             {KEY_SCHEMA, DANGER_AUDIT_SCHEMA},
             {KEY_DAY, m_view.identity.day},
             {KEY_PLAYER, m_view.identity.playerId},
@@ -1422,6 +2027,8 @@ namespace
             {KEY_NANOS, static_cast<qint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - started).count())},
         };
+        result.insert(KEY_REPLY_PRICING, replyPricingRecord());
+        return result;
     }
 }
 

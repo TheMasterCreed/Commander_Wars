@@ -229,6 +229,8 @@ namespace Coordinator
     {
         std::int32_t before{0};
         std::int32_t after{0};
+
+        friend bool operator==(const PlanWideHp &, const PlanWideHp &) = default;
     };
 
     // Keyed by target knowledge index; one chain per bundle is the isolated view, one per plan the plan view.

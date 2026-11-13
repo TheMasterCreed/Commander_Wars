@@ -420,6 +420,20 @@ namespace Coordinator
         return CaptureDangerDetail::walkPoints(input, [](double &, CaptureReply &) {}).deliveredTurn;
     }
 
+    // Today's reply leaves hpAfterReply and no later reply lands.
+    inline std::int32_t deliveredTurnAfterReply(const CaptureWalkInput & input, double hpAfterReply)
+    {
+        bool replied = false;
+        return CaptureDangerDetail::walkPoints(input, [&](double & hp, CaptureReply &)
+        {
+            if (!replied)
+            {
+                hp = std::max(hpAfterReply, 0.0);
+                replied = true;
+            }
+        }).deliveredTurn;
+    }
+
     // reply(hpSteps) is one engine shot per enemy turn against the displayed hp.
     template <typename Reply>
     CaptureWalkResult walkCapture(const CaptureWalkInput & input, Reply && reply)
@@ -480,6 +494,8 @@ namespace Coordinator
         std::int32_t hpSteps{0};
         bool destroyed{false};
         std::vector<bool> fired;
+
+        friend bool operator==(const ReplyOutcome &, const ReplyOutcome &) = default;
     };
 
     namespace CaptureDangerDetail
@@ -769,6 +785,8 @@ namespace Coordinator
         std::vector<ReplyOutcome> outcomes;
         std::vector<OneActionShot> shots;
         std::vector<std::size_t> chosen;
+        // Pairs whose shot was priced, the selection's work.
+        std::int64_t pairsExamined{0};
     };
 
     // Larger net first, then the lower shooter knowledge index, then the lower target unit id.
@@ -818,6 +836,7 @@ namespace Coordinator
                     {
                         continue;
                     }
+                    ++result.pairsExamined;
                     const double damage = static_cast<double>(damageAt(shooter, target, hpSteps));
                     const std::int32_t hpStepsAfter = ceilHpSteps(engineHpAfterReply(hp[target], engineShotDamage(damage)));
                     const MilliFunds net = bookDamage(targets[target].cost, hpSteps - hpStepsAfter) -
