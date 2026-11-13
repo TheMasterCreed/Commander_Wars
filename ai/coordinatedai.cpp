@@ -14,6 +14,7 @@
 #include "ai/coordinator/engineactionbuilder.h"
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
+#include "ai/coordinator/replyfactsbuilder.h"
 #include "ai/coordinator/masterassignmentcontrol.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
@@ -524,6 +525,23 @@ void CoordinatedAi::buildTurnPlan()
 #endif
     Coordinator::DamageOracle oracle(*m_pMap);
     oracle.clear();
+    // A separate oracle keeps reply facts from warming the planner's damage memo.
+    std::optional<Coordinator::DamageOracle> replyOracle;
+    std::optional<Coordinator::ReplyFactsBuilder> replyFacts;
+    const bool replyRecorded =
+        masterShadow.replyPrediction == Coordinator::ReplyPrediction::Recorded && localSessionMenu();
+    if (replyRecorded)
+    {
+        replyOracle.emplace(*m_pMap);
+        replyOracle->clear();
+        replyFacts.emplace(*m_pMap, m_dayStartKnowledge, m_attackOpportunities, m_properties, m_propertyStock,
+                           *replyOracle);
+        input.replyPrediction = {
+            .mode = Coordinator::ReplyPrediction::Recorded,
+            .board = std::make_shared<const Coordinator::ReplyBoard>(Coordinator::replyBoardOf(m_dayStartKnowledge)),
+            .tally = std::make_shared<Coordinator::ReplyPredictionTally>(),
+        };
+    }
     Coordinator::BundleBuildStats buildStats;
     std::vector<ActorTiming> actorTimings;
     std::int64_t candidateBuildNanos = 0;
@@ -594,7 +612,8 @@ void CoordinatedAi::buildTurnPlan()
             m_propertyStock,
             oracle,
             actor.knowledgeUnitIndex,
-            buildStats);
+            buildStats,
+            replyFacts ? &*replyFacts : nullptr);
         if (timed)
         {
             const std::int32_t generatedCandidateCount =
@@ -762,6 +781,15 @@ void CoordinatedAi::buildTurnPlan()
         assignmentTiming = m_assignment.phaseTiming;
     const Coordinator::AssignmentStats & stats =
         m_assignment.stats;
+    Coordinator::ReplyPredictionTelemetry replyTelemetry;
+    if (replyRecorded)
+    {
+        replyTelemetry = {
+            .mode = Coordinator::ReplyPrediction::Recorded,
+            .facts = replyFacts->stats(),
+            .replays = *input.replyPrediction.tally,
+        };
+    }
     QString phaseTimingFields;
     if (timed)
     {
@@ -819,6 +847,13 @@ void CoordinatedAi::buildTurnPlan()
             .arg(stats.mixedPairs.statesUsed).arg(stats.mixedPairs.enemyStatesUsed).arg(stats.mixedPairs.workUsed)
             .arg(stats.mixedPairs.budgetExhaustions).arg(stats.mixedPairs.failures)
             .arg(stats.stockPairs.workUsed + stats.mixedPairs.workUsed);
+        if (replyRecorded)
+        {
+            for (const Coordinator::ReplyTelemetryField & field : Coordinator::replyTelemetryFields(replyTelemetry))
+            {
+                phaseTimingFields += QStringLiteral(" %1=%2").arg(QLatin1String(field.name)).arg(field.value);
+            }
+        }
         if (masterShadow.enabled())
         {
             phaseTimingFields += QStringLiteral(" masterShadowNanos=%1 masterShadowWork=%2 masterShadowAllowance=%3")
@@ -931,6 +966,7 @@ void CoordinatedAi::buildTurnPlan()
             .unitLinks = input.unitLinks,
             .plan = m_assignment.plan,
             .identity = traceIdentity,
+            .reply = replyTelemetry,
         });
         m_captureDangerAuditNanos = planningNanosSince(auditStart, true);
     }
@@ -987,7 +1023,8 @@ CoordinatedAi::candidatesFor(
     const Coordinator::PropertyStockField & propertyStock,
     Coordinator::DamageOracle & oracle,
     qint32 actorUnitIndex,
-    Coordinator::BundleBuildStats & stats)
+    Coordinator::BundleBuildStats & stats,
+    Coordinator::ReplyFactsBuilder* pReplyFacts)
 {
     const Coordinator::BundleBuildContext context{
         .map = *m_pMap,
@@ -1000,6 +1037,7 @@ CoordinatedAi::candidatesFor(
         .oracle = oracle,
         .valuation = Coordinator::makeValuationContext(*m_pMap),
         .pTrace = m_decisionTrace.get(),
+        .pReplyFacts = pReplyFacts,
     };
     return Coordinator::buildCandidateBundles(
         context, actorUnitIndex, stats);
@@ -1809,7 +1847,8 @@ bool CoordinatedAi::replanFailedAction(qint32 actionIndex)
             propertyStock,
             oracle,
             actorUnitIndex,
-            buildStats);
+            buildStats,
+            nullptr);
     if (m_decisionTrace != nullptr)
     {
         m_decisionTrace->record(

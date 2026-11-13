@@ -23,6 +23,7 @@ using spCoordinatedAi = std::shared_ptr<CoordinatedAi>;
 namespace Coordinator
 {
     struct MasterShadowConfig;
+    class ReplyFactsBuilder;
 }
 
 class CoordinatedAi final : public NormalAi
@@ -90,7 +91,8 @@ private:
         const Coordinator::PropertyStockField & propertyStock,
         Coordinator::DamageOracle & oracle,
         qint32 actorUnitIndex,
-        Coordinator::BundleBuildStats & stats);
+        Coordinator::BundleBuildStats & stats,
+        Coordinator::ReplyFactsBuilder* pReplyFacts);
     bool useStartOfDayCoPower();
     bool executeNextPlannedAction();
     bool performPlannedAction(qint32 actionIndex, bool & replanAllowed);

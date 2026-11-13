@@ -8,6 +8,7 @@
 #include "ai/coordinator/masterassignmentcapture.h"
 #include "ai/coordinator/masterassignmentsearch.h"
 #include "ai/coordinator/propertystocksequential.h"
+#include "ai/coordinator/replypredictionmode.h"
 
 class QJsonObject;
 
@@ -81,6 +82,7 @@ namespace Coordinator
         MasterStaleProbe staleProbe{MasterStaleProbe::None};
         MasterPlanNeighborAudit planNeighborAudit{MasterPlanNeighborAudit::Off};
         CaptureDangerAudit captureDangerAudit{CaptureDangerAudit::Off};
+        ReplyPrediction replyPrediction{ReplyPrediction::Off};
 
         bool enabled() const
         {
@@ -151,6 +153,7 @@ namespace Coordinator
     std::optional<MasterStaleProbe> parseMasterStaleProbe(const QByteArray & probe);
     MasterPlanNeighborAudit parseMasterPlanNeighborAudit(const QByteArray & value, MasterStockControlRuntime runtime);
     CaptureDangerAudit parseCaptureDangerAudit(const QByteArray & value, MasterStockControlRuntime runtime);
+    ReplyPrediction parseReplyPrediction(const QByteArray & value, MasterStockControlRuntime runtime);
     MasterShadowConfig readMasterShadowConfig();
     MasterShadowConfig playMasterStockControlConfig();
     void prepareMasterShadow(const MasterShadowConfig & config, AssignmentInput & input, RefinementLedger & ledger);

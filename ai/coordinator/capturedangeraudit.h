@@ -26,6 +26,7 @@ namespace Coordinator
         std::span<const KnownUnitLink> unitLinks;
         const TurnPlan & plan;
         const DecisionTraceIdentity & identity;
+        ReplyPredictionTelemetry reply{};
     };
 
     // Measure only: nothing it computes reaches the planner and it owns its damage memo, but EXACT calls run CO scripts that can append blank variables.

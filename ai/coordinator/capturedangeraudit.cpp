@@ -25,14 +25,14 @@
 #include "ai/coordinator/capturedangerrecord.h"
 #include "ai/coordinator/capturedangerstream.h"
 #include "ai/coordinator/damageoracle.h"
+#include "ai/coordinator/replycheck.h"
+#include "ai/coordinator/replyfacts.h"
+#include "ai/coordinator/replyfactsbuilder.h"
+#include "ai/coordinator/replyprediction.h"
 
 #include "coreengine/settings.h"
 
-#include "game/building.h"
 #include "game/gamemap.h"
-#include "game/gamerules.h"
-#include "game/player.h"
-#include "game/terrain.h"
 #include "game/unit.h"
 
 namespace
@@ -45,16 +45,14 @@ namespace
     using Coordinator::KnownUnit;
     using Coordinator::OwnerSign;
     using Coordinator::PropertyStockColumn;
+    using Coordinator::ReplyCheckLayer;
     using Coordinator::ShotReport;
     using Coordinator::ShotStatus;
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 9;
-    // A counter answers an adjacent shot.
-    constexpr std::int32_t COUNTER_DISTANCE = 1;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 10;
     constexpr auto DANGER_AUDIT_FILE = "coordinated-ai-danger.jsonl";
-    constexpr double TERRAIN_LUCK = Coordinator::averageLuck(Coordinator::ENGINE_DEFAULT_LUCK, Coordinator::NO_MISFORTUNE);
 
     constexpr auto KEY_SCHEMA = "schema";
     constexpr auto KEY_DAY = "day";
@@ -227,6 +225,29 @@ namespace
     constexpr auto OMITTED_DESTINATION_TAKEN = "DESTINATION_TAKEN";
     constexpr auto OMITTED_TARGET_GONE = "TARGET_GONE";
     constexpr auto OMITTED_BREAKS_LATER_ACTION = "BREAKS_LATER_ACTION";
+    constexpr auto KEY_PLAN_REPLAY = "planReplay";
+    constexpr auto KEY_PRESENT = "present";
+    constexpr auto KEY_COMPLETE = "complete";
+    constexpr auto KEY_ENTRIES = "entries";
+    constexpr auto KEY_AGREES = "agrees";
+    constexpr auto KEY_HP_STEPS_BEFORE = "hpStepsBefore";
+    constexpr auto KEY_STEPS_LOST = "stepsLost";
+    constexpr auto KEY_LAYER = "layer";
+    constexpr auto KEY_AUDIT_ENTRIES = "auditEntries";
+    constexpr auto KEY_AUDIT_ONLY = "auditOnly";
+    constexpr auto KEY_AUDIT_INPUTS_AGREE = "auditInputsAgree";
+    constexpr auto KEY_AUDIT_INPUTS_LAYER = "auditInputsLayer";
+    constexpr auto KEY_TELEMETRY = "telemetry";
+    constexpr auto KEY_OCCUPANCY_AGREES = "occupancyAgrees";
+    constexpr auto KEY_AUDIT_HP_BEFORE = "auditHpBefore";
+    constexpr auto KEY_ENEMY_HP = "enemyHp";
+    constexpr auto KEY_PLANNER_HP = "plannerHp";
+    constexpr auto KEY_AUDIT_HP = "auditHp";
+    constexpr auto LAYER_ENTRY = "ENTRY";
+    constexpr auto LAYER_START_HP = "START_HP";
+    constexpr auto LAYER_ENEMY_HP = "ENEMY_HP";
+    constexpr auto LAYER_FACTS = "FACTS";
+    constexpr auto LAYER_OUTCOME = "OUTCOME";
 
     enum class DamageSource : std::int8_t
     {
@@ -246,6 +267,26 @@ namespace
         Engine,
         Skipped,
     };
+
+    QJsonValue layerValue(ReplyCheckLayer layer)
+    {
+        switch (layer)
+        {
+            case ReplyCheckLayer::Agrees:
+                break;
+            case ReplyCheckLayer::Entry:
+                return QLatin1String(LAYER_ENTRY);
+            case ReplyCheckLayer::StartHp:
+                return QLatin1String(LAYER_START_HP);
+            case ReplyCheckLayer::EnemyHp:
+                return QLatin1String(LAYER_ENEMY_HP);
+            case ReplyCheckLayer::Facts:
+                return QLatin1String(LAYER_FACTS);
+            case ReplyCheckLayer::Outcome:
+                return QLatin1String(LAYER_OUTCOME);
+        }
+        return QJsonValue();
+    }
 
     constexpr std::array REPLY_RULES{CaptureReplyRule::LargestShot, CaptureReplyRule::FocusedFire};
     constexpr std::array DAMAGE_SOURCES{DamageSource::Base, DamageSource::Terrain, DamageSource::Exact};
@@ -345,48 +386,23 @@ namespace
         return QJsonObject{{KEY_COUNT, bucket.count}, {KEY_POSITIVE, bucket.positive}, {KEY_BEST, bestRecord(bucket)}};
     }
 
-    Coordinator::CaptureDamageFormula damageFormula(GameEnums::DamageFormula formula)
-    {
-        switch (formula)
-        {
-            case GameEnums::DamageFormula_AdvanceWars1_3:
-                return Coordinator::CaptureDamageFormula::AdvanceWars1To3;
-            case GameEnums::DamageFormula_AdvanceWars4:
-                break;
-        }
-        return Coordinator::CaptureDamageFormula::AdvanceWars4;
-    }
-
     // A null pUnit is a reaching enemy whose live unit was not found; its shot stays unknown.
     struct Shooter
     {
         Coordinator::EnemyShot shot;
         Unit* pUnit{nullptr};
         TilePoint firingTile{Coordinator::INVALID_TILE};
-        bool mustMove{false};
-        bool direct{false};
-        bool onOwnBuilding{false};
-        Coordinator::MilliFunds cost{0};
         std::optional<Coordinator::MilliFunds> plannerTargetCost;
-        Coordinator::CaptureInterruption interruption{Coordinator::CaptureInterruption::None};
-        Coordinator::MilliFunds captureCost{0};
-        // Whether the in-place stream equals the enemy stock's own row weight; empty when nothing is priced.
-        std::optional<bool> stockAgrees;
+        // Indexes the tile facts' shooters and the actor facts' shots alike.
+        std::size_t factsSlot{0};
+        const Coordinator::ReplyShooterFacts* pFacts{nullptr};
     };
 
-    // Engine damage reports; base and luck use the shooter's rounded hp as the engine and the planner do.
-    struct ShotDamage
+    // The shared reply facts plus the engine's own report; base and luck use the shooter's rounded hp.
+    struct ShotDamage : Coordinator::ResolvedReplyShot
     {
-        ShotStatus weapon{ShotStatus::NoLiveShooter};
-        double rawBase{0};
-        double base{0};
-        double withAmmo{0};
-        std::int32_t shooterHpSteps{0};
         ShotStatus exactStatus{ShotStatus::NoLiveShooter};
         double exact{0};
-        Coordinator::PricedResolution resolution{Coordinator::PricedResolution::NoLiveShooter};
-        std::int32_t pricedHpSteps{0};
-        double counterRawBase{Coordinator::NO_COUNTER};
     };
 
     struct FiringCapacity
@@ -427,6 +443,8 @@ namespace
         std::int32_t actorHpSteps{0};
         TilePoint destination{Coordinator::INVALID_TILE};
         std::optional<Coordinator::CaptureStake> capture;
+        // The audit lists shooters while either the isolated or the plan view leaves the actor alive.
+        bool listsShooters{false};
     };
 
     struct CaptureSite
@@ -458,6 +476,58 @@ namespace
         std::int64_t pairsExamined{0};
         QJsonObject record;
     };
+
+    // Units both models list, matched by engine unit id: auditOf per planner entry, plannerOf per audit entry.
+    struct ReplyPairing
+    {
+        std::vector<std::optional<std::size_t>> auditOf;
+        std::vector<std::optional<std::size_t>> plannerOf;
+    };
+
+    // A first-run layer with what explains the hp layers; the hp fields are filled only for their own layer.
+    struct ReplyCheck
+    {
+        ReplyCheckLayer layer{ReplyCheckLayer::Agrees};
+        double auditHpBefore{0};
+        std::vector<Coordinator::ReplyHpGap> enemyHp;
+    };
+
+    QJsonArray enemyHpRecord(std::span<const Coordinator::ReplyHpGap> gaps)
+    {
+        QJsonArray records;
+        for (const Coordinator::ReplyHpGap & gap : gaps)
+        {
+            records.append(QJsonObject{
+                {KEY_KNOWLEDGE, gap.knowledge},
+                {KEY_PLANNER_HP, gap.plannerHp},
+                {KEY_AUDIT_HP, gap.auditHp},
+            });
+        }
+        return records;
+    }
+
+    QJsonObject replyTelemetryRecord(const Coordinator::ReplyPredictionTelemetry & telemetry)
+    {
+        QJsonObject record;
+        for (const Coordinator::ReplyTelemetryField & field : Coordinator::replyTelemetryFields(telemetry))
+        {
+            record.insert(QLatin1String(field.name), static_cast<qint64>(field.value));
+        }
+        return record;
+    }
+
+    Coordinator::ReplyCheckFacts auditCheckFacts(const ReplyEntry & entry)
+    {
+        Coordinator::ReplyCheckFacts facts{.terrain = entry.damage.terrain};
+        facts.shots.reserve(entry.shooters.size());
+        for (std::size_t index = 0; index < entry.shooters.size(); ++index)
+        {
+            const Shooter & shooter = entry.shooters[index];
+            facts.shots.push_back(Coordinator::replyCheckShot(*shooter.pFacts, shooter.firingTile,
+                                                              entry.damage.shots[index]));
+        }
+        return facts;
+    }
 
     ShotReport shotReport(DamageSource source, const ActorDamage & actor, const ShotDamage & damage,
                           std::int32_t defenderHpSteps)
@@ -514,12 +584,12 @@ namespace
     double pricedDamageAt(DamageSource source, const ActorDamage & actor, const ShotDamage & damage,
                           std::int32_t shooterHpSteps, std::int32_t defenderHpSteps)
     {
-        const double rawBase = Coordinator::pricedRawBase(damage.resolution, damage.rawBase, damage.withAmmo);
         if (source == DamageSource::Base)
         {
+            const double rawBase = Coordinator::pricedRawBase(damage.resolution, damage.rawBase, damage.withAmmo);
             return Coordinator::hpScaledBase(rawBase, shooterHpSteps);
         }
-        return Coordinator::terrainReducedDamage(actor.terrain, rawBase, shooterHpSteps, defenderHpSteps);
+        return Coordinator::pricedTerrainDamage(actor.terrain, damage, shooterHpSteps, defenderHpSteps);
     }
 
     double pricedDamage(DamageSource source, const ActorDamage & actor, const ShotDamage & damage,
@@ -536,7 +606,8 @@ namespace
         priced.reserve(order.size());
         for (const std::size_t index : order)
         {
-            priced.push_back(Coordinator::PricedShooter{damage.shots[index].resolution, shooters[index].captureCost});
+            priced.push_back(
+                Coordinator::PricedShooter{damage.shots[index].resolution, shooters[index].pFacts->captureCost});
         }
         return priced;
     }
@@ -555,7 +626,7 @@ namespace
                    {
                        const ShotDamage & shot = damage.shots[order[position]];
                        return Coordinator::counterCost(shot.counterRawBase, hpStepsAfter, shot.pricedHpSteps,
-                                                       shooters[order[position]].cost);
+                                                       shooters[order[position]].pFacts->cost);
                    });
     }
 
@@ -581,6 +652,7 @@ namespace
         explicit DangerAuditRecorder(const Coordinator::CaptureDangerAuditView & view)
             : m_view(view),
               m_oracle(view.map),
+              m_facts(view.map, view.knowledge, view.enemyReach, view.properties, view.propertyStock, m_oracle),
               m_horizonTurns(view.propertyStock.horizonTurns()),
               m_standing(standingOccupants()),
               m_occupancy(plannedOccupancy())
@@ -623,31 +695,24 @@ namespace
         Coordinator::PlannedOccupancy plannedOccupancy(std::int32_t movedUnitId = Coordinator::NO_UNIT,
                                                        const TilePoint & movedTo = Coordinator::INVALID_TILE) const;
         Unit* liveUnit(std::int32_t knowledgeIndex);
-        Coordinator::FiringRange firingRangeOf(const Coordinator::AttackerSpec & spec, const TilePoint & target) const;
-        TilePoint firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target,
-                                const Coordinator::PlannedOccupancy & occupancy) const;
-        FiringCapacity firingCapacity(const std::vector<Shooter> & shooters, const TilePoint & target) const;
-        bool ownBuildingAt(const TilePoint & tile, std::int32_t ownerId) const;
-        bool onOwnBuilding(const KnownUnit & shooter) const;
-        void priceShooter(Shooter & shooter);
+        FiringCapacity firingCapacity(const std::vector<Shooter> & shooters) const;
         std::vector<Shooter> shootersAt(const TilePoint & property, std::int32_t victimIndex = Coordinator::NO_UNIT,
                                         std::int32_t victimHpSteps = 0);
         std::vector<Shooter> shootersAmong(const Coordinator::PlannedOccupancy & occupancy, const TilePoint & property,
                                            std::int32_t victimIndex, std::int32_t victimHpSteps);
-        TerrainDefenseRule terrainRule(Unit & actor, const TilePoint & property) const;
         ActorDamage damageOn(const std::vector<Shooter> & shooters, std::int32_t actorIndex, Unit & actor,
                              const TilePoint & property, ExactQuery exactQuery = ExactQuery::Engine);
         CaptureWalkInput walkInput(Unit & actor, std::int32_t carriedPoints, std::int32_t rate) const;
         QJsonObject standingRecord(const KnownUnit & shooter, std::int32_t shooterIndex) const;
         QJsonArray shooterRecords(const std::vector<Shooter> & shooters) const;
-        void addCapacity(QJsonObject & target, const std::vector<Shooter> & shooters, const TilePoint & property) const;
+        void addCapacity(QJsonObject & target, const std::vector<Shooter> & shooters) const;
         void addDanger(QJsonObject & target, const ActorDamage & damage, const CaptureWalkInput & input,
                        const PropertyStockColumn* pColumn) const;
         void addPricedWalks(QJsonObject & target, const std::vector<Shooter> & shooters, const ActorDamage & damage,
                             const CaptureWalkInput & input, Coordinator::MilliFunds actorCost,
                             const PropertyStockColumn & column) const;
         QJsonObject replyRecord(const std::vector<Shooter> & shooters, const ActorDamage & damage, double hp,
-                                Coordinator::MilliFunds actorCost, const TilePoint & destination);
+                                Coordinator::MilliFunds actorCost);
         QJsonObject nodeRecord(std::int32_t propertyIndex, const std::vector<Shooter> & shooters,
                                const std::vector<CaptureActor> & actors);
         const Coordinator::CandidateBundle* candidateFor(const Coordinator::PlannedAction & action) const;
@@ -682,9 +747,23 @@ namespace
                                  Coordinator::ChangeReason reason, std::size_t candidateIndex,
                                  const Coordinator::CandidateBundle & replacement);
         QJsonObject replyPricingRecord();
+        std::int32_t chainHp(const Coordinator::TargetHpChain & chain, std::int32_t shooterIndex) const;
+        std::map<std::int32_t, std::int32_t> poolHp(const std::set<std::int32_t> & shooters,
+                                                    const Coordinator::TargetHpChain & chain) const;
+        std::vector<Coordinator::PlanReplyAction> planReplyActions(const Coordinator::OrderingResult & ordering) const;
+        Coordinator::ReplyBoard replyBoard() const;
+        ReplyPairing pairEntries(const Coordinator::ResolvedPlanReply & resolved) const;
+        std::vector<ReplyCheck> firstRunChecks(const Coordinator::ResolvedPlanReply & resolved,
+                                               const Coordinator::PlanReplyRun & run,
+                                               const ReplyPairing & pairing) const;
+        std::vector<std::optional<ReplyCheckLayer>> secondRunLayers(
+            std::span<const Coordinator::PlanReplyAction> actions, const ReplyPairing & pairing) const;
+        QJsonObject planReplayRecord() const;
 
         const Coordinator::CaptureDangerAuditView & m_view;
         Coordinator::DamageOracle m_oracle;
+        // Declared after m_oracle, which it borrows.
+        Coordinator::ReplyFactsBuilder m_facts;
         std::int32_t m_horizonTurns{0};
         // Declared before m_standing, whose initializer counts into it.
         std::int32_t m_alliedOccupants{0};
@@ -693,7 +772,6 @@ namespace
         std::set<std::int32_t> m_missingLoaded;
         std::set<std::int32_t> m_missingAbsent;
         std::map<std::int32_t, Coordinator::MilliFunds> m_plannerCosts;
-        std::map<QString, Coordinator::MilliFunds> m_baseCosts;
         std::map<std::int32_t, ShooterLoad> m_shooterLoads;
         std::vector<ReplyEntry> m_replyEntries;
         // The plan view: one target chain filled in plan order.
@@ -709,23 +787,9 @@ namespace
 
     std::vector<Coordinator::OccupantAt> DangerAuditRecorder::standingOccupants()
     {
-        std::vector<Coordinator::OccupantAt> ours;
-        const std::vector<KnownUnit> & units = m_view.knowledge.units();
-        for (std::size_t index = 0; index < units.size(); ++index)
-        {
-            const KnownUnit & unit = units[index];
-            const Coordinator::Relation relation = m_view.knowledge.relation(unit.ownerId);
-            if (!Coordinator::blocksEnemyFiringTile(relation, unit.carrier != KnownUnit::NO_CARRIER))
-            {
-                continue;
-            }
-            if (relation == Coordinator::Relation::Allied)
-            {
-                ++m_alliedOccupants;
-            }
-            ours.push_back(Coordinator::OccupantAt{static_cast<std::int32_t>(index), TilePoint{unit.x, unit.y}});
-        }
-        return ours;
+        Coordinator::ReplyBoard board = Coordinator::replyBoardOf(m_view.knowledge);
+        m_alliedOccupants = board.alliedOccupants;
+        return std::move(board.standing);
     }
 
     // movedUnitId ends on movedTo instead of its planned destination.
@@ -765,114 +829,28 @@ namespace
         return pUnit;
     }
 
-    Coordinator::FiringRange DangerAuditRecorder::firingRangeOf(const Coordinator::AttackerSpec & spec,
-                                                                const TilePoint & target) const
-    {
-        return Coordinator::FiringRange{.target = target, .minRange = spec.minRange, .maxRange = spec.maxRange};
-    }
-
-    TilePoint DangerAuditRecorder::firingTileFor(const Coordinator::EnemyShot & shot, const TilePoint & target,
-                                                 const Coordinator::PlannedOccupancy & occupancy) const
-    {
-        const Coordinator::AttackerSpec & spec = m_view.enemyReach.attacker(shot.slot);
-        if (!spec.canMoveAndFire)
-        {
-            return shot.tile;
-        }
-        const Coordinator::DistanceField & reach = m_view.enemyReach.reach(shot.slot);
-        return Coordinator::cheapestFiringTile(firingRangeOf(spec, target), occupancy,
-                                               [&](std::int32_t x, std::int32_t y)
-                                               {
-                                                   return reach.reachable(x, y, spec.movementPoints)
-                                                       ? reach.distance(x, y)
-                                                       : Coordinator::UNREACHABLE;
-                                               });
-    }
-
     // Direct shooters each pick a tile alone, so more of them than free tiles makes R2 an upper bound.
-    FiringCapacity DangerAuditRecorder::firingCapacity(const std::vector<Shooter> & shooters,
-                                                       const TilePoint & target) const
+    FiringCapacity DangerAuditRecorder::firingCapacity(const std::vector<Shooter> & shooters) const
     {
         FiringCapacity capacity;
         std::vector<TilePoint> tiles;
         for (const Shooter & shooter : shooters)
         {
-            if (!shooter.direct)
+            if (!shooter.pFacts->direct)
             {
                 continue;
             }
             ++capacity.directShooters;
-            const Coordinator::AttackerSpec & spec = m_view.enemyReach.attacker(shooter.shot.slot);
-            const Coordinator::DistanceField & reach = m_view.enemyReach.reach(shooter.shot.slot);
-            Coordinator::forEachFreeFiringTile(
-                firingRangeOf(spec, target), m_occupancy,
-                [&](std::int32_t x, std::int32_t y)
+            for (const TilePoint & tile : shooter.pFacts->firingTiles)
+            {
+                if (m_occupancy.at(tile.x, tile.y) == Coordinator::NO_UNIT)
                 {
-                    return reach.reachable(x, y, spec.movementPoints) ? reach.distance(x, y) : Coordinator::UNREACHABLE;
-                },
-                [&](const TilePoint & tile, std::int32_t) { tiles.push_back(tile); });
+                    tiles.push_back(tile);
+                }
+            }
         }
         capacity.freeTiles = Coordinator::distinctTileCount(std::move(tiles));
         return capacity;
-    }
-
-    bool DangerAuditRecorder::ownBuildingAt(const TilePoint & tile, std::int32_t ownerId) const
-    {
-        Terrain* pTerrain = m_view.map.getTerrain(tile.x, tile.y);
-        Building* pBuilding = pTerrain == nullptr ? nullptr : pTerrain->getBuilding();
-        return pBuilding != nullptr && pBuilding->getOwner() != nullptr &&
-               pBuilding->getOwner()->getPlayerID() == ownerId;
-    }
-
-    // building.js repairs and resupplies a unit on its owner's building at that owner's turn start.
-    bool DangerAuditRecorder::onOwnBuilding(const KnownUnit & shooter) const
-    {
-        return ownBuildingAt(TilePoint{shooter.x, shooter.y}, shooter.ownerId);
-    }
-
-    // Every shooter is priced at its type's base cost, one scale for all, so no enemy unit runs a script.
-    void DangerAuditRecorder::priceShooter(Shooter & shooter)
-    {
-        const std::int32_t index = shooter.shot.unitIndex;
-        const KnownUnit & unit = known(index);
-        const auto planned = m_plannerCosts.find(index);
-        if (planned != m_plannerCosts.end())
-        {
-            shooter.plannerTargetCost = planned->second;
-        }
-        auto base = m_baseCosts.find(unit.unitId);
-        if (base == m_baseCosts.end())
-        {
-            // getBaseCost answers -1 for a type without a cost.
-            const std::int32_t funds = std::max(Unit::getBaseCosts(unit.unitId, &m_view.map), 0);
-            base = m_baseCosts.emplace(unit.unitId, Coordinator::toMilliFunds(funds)).first;
-        }
-        shooter.cost = base->second;
-        const TilePoint tile{unit.x, unit.y};
-        const std::int32_t propertyIndex = m_view.propertyStock.propertyIndexAt(tile);
-        const std::int32_t slot = m_view.propertyStock.columnSlotAt(tile);
-        if (propertyIndex == Coordinator::NO_PROPERTY_INDEX || slot == Coordinator::NO_STOCK_COLUMN)
-        {
-            return;
-        }
-        const Coordinator::PropertyFacts & facts = m_view.properties[static_cast<std::size_t>(propertyIndex)];
-        shooter.interruption = Coordinator::captureInterruption(
-            Coordinator::shooterCapturingHere(facts.capturerIndex, facts.capturePoints, index), shooter.mustMove);
-        if (shooter.interruption == Coordinator::CaptureInterruption::None)
-        {
-            return;
-        }
-        const PropertyStockColumn & column = m_view.propertyStock.enemyColumn(slot);
-        const std::int32_t points = m_view.propertyStock.capturePointsToCapture();
-        shooter.captureCost = Coordinator::forgoneCaptureStream(column, facts.capturePoints, unit.captureRate,
-                                                                shooter.interruption, points, m_horizonTurns);
-        const std::int32_t row = m_view.propertyStock.enemyRowOf(index);
-        if (row != Coordinator::NO_STOCK_ROW)
-        {
-            shooter.stockAgrees = Coordinator::captureStreamInPlace(column, facts.capturePoints, unit.captureRate, points,
-                                                                    m_horizonTurns) ==
-                                  m_view.propertyStock.enemyWeight(row, slot);
-        }
     }
 
     // A victim our shot leaves alive replies at its hp after the shot; a killed one does not reply.
@@ -887,86 +865,49 @@ namespace
                                                             std::int32_t victimHpSteps)
     {
         std::vector<Shooter> shooters;
-        Coordinator::forEachEnemyShot(
-            m_view.knowledge.units(), m_view.enemyReach, property, victimIndex, victimHpSteps,
-            [&](const Coordinator::EnemyShot & shot)
+        const std::shared_ptr<const Coordinator::ReplyTileFacts> tile = m_facts.tileFacts(property);
+        for (std::size_t slot = 0; slot < tile->shooters.size(); ++slot)
+        {
+            const Coordinator::ReplyShooterFacts & facts = tile->shooters[slot];
+            const std::int32_t hpSteps = Coordinator::replyShooterHpSteps(facts, victimIndex, victimHpSteps);
+            if (hpSteps <= 0)
             {
-                if (shot.distance == Coordinator::NO_SHOT_DISTANCE)
-                {
-                    return;
-                }
-                const Coordinator::AttackerSpec & spec = m_view.enemyReach.attacker(shot.slot);
-                Shooter shooter{
-                    .shot = shot,
-                    .pUnit = liveUnit(shot.unitIndex),
-                    .firingTile = firingTileFor(shot, property, occupancy),
-                    .mustMove = Coordinator::shooterMustMove(shot.tile, property, spec.minRange, spec.maxRange),
-                    .direct = spec.canMoveAndFire,
-                    .onOwnBuilding = onOwnBuilding(known(shot.unitIndex)),
-                };
-                priceShooter(shooter);
-                shooters.push_back(shooter);
+                continue;
+            }
+            std::optional<Coordinator::MilliFunds> plannerTargetCost;
+            const auto planned = m_plannerCosts.find(facts.shooterIndex);
+            if (planned != m_plannerCosts.end())
+            {
+                plannerTargetCost = planned->second;
+            }
+            shooters.push_back(Shooter{
+                .shot = Coordinator::EnemyShot{.slot = facts.slot, .unitIndex = facts.shooterIndex, .tile = facts.tile,
+                                               .hpSteps = hpSteps, .distance = facts.distance},
+                .pUnit = liveUnit(facts.shooterIndex),
+                .firingTile = Coordinator::replyFiringTile(facts, occupancy),
+                .plannerTargetCost = plannerTargetCost,
+                .factsSlot = slot,
+                .pFacts = &facts,
             });
+        }
         return shooters;
     }
 
-    // Unit::useTerrainDefense and Terrain::getBaseDefense only read scripts; CO terrain modifiers are left out on purpose.
-    TerrainDefenseRule DangerAuditRecorder::terrainRule(Unit & actor, const TilePoint & property) const
-    {
-        TerrainDefenseRule rule;
-        rule.luck = TERRAIN_LUCK;
-        GameRules* pRules = m_view.map.getGameRules();
-        Terrain* pTerrain = m_view.map.getTerrain(property.x, property.y);
-        if (pRules == nullptr || pTerrain == nullptr)
-        {
-            return rule;
-        }
-        rule.defensePerStar = pRules->getTerrainDefense();
-        rule.hpScaled = pRules->getHpDefenseReduction();
-        rule.formula = damageFormula(pRules->getDamageFormula());
-        if (actor.useTerrainDefense())
-        {
-            rule.stars = pTerrain->getBaseDefense();
-        }
-        return rule;
-    }
-
-    // The counter is a weapon table lookup with our unit as attacker, never an engine damage call.
+    // Every shooter comes from shootersAmong on this same property, so its facts share the actor facts' tile.
     ActorDamage DangerAuditRecorder::damageOn(const std::vector<Shooter> & shooters, std::int32_t actorIndex,
                                               Unit & actor, const TilePoint & property, ExactQuery exactQuery)
     {
         const KnownUnit & unit = known(actorIndex);
+        const std::shared_ptr<const Coordinator::ReplyFacts> facts = m_facts.factsFor(actorIndex, actor, property);
         ActorDamage result;
         result.onProperty = TilePoint{unit.x, unit.y} == property;
-        result.terrain = terrainRule(actor, property);
+        result.terrain = facts->terrain;
         result.shots.reserve(shooters.size());
         for (const Shooter & shooter : shooters)
         {
-            const KnownUnit & enemy = known(shooter.shot.unitIndex);
             ShotDamage damage;
-            damage.shooterHpSteps = shooter.shot.hpSteps;
-            if (shooter.pUnit != nullptr)
-            {
-                damage.rawBase = m_oracle.baseDamageAgainst(*shooter.pUnit, actor, shooter.shot.distance, enemy.minRange,
-                                                            enemy.maxRange);
-                damage.base = Coordinator::scaledBaseDamage(m_oracle, *shooter.pUnit, shooter.shot.hpSteps,
-                                                            enemy.minRange, enemy.maxRange, actor, shooter.shot.distance);
-                damage.withAmmo = damage.rawBase >= 0
-                                      ? damage.rawBase
-                                      : m_oracle.baseDamageWithAmmo(*shooter.pUnit, actor, shooter.shot.distance,
-                                                                    enemy.minRange, enemy.maxRange);
-                if (Coordinator::drawsCounter(shooter.direct, shooter.firingTile, property))
-                {
-                    damage.counterRawBase = m_oracle.baseDamageAgainst(actor, *shooter.pUnit, COUNTER_DISTANCE,
-                                                                       unit.minRange, unit.maxRange);
-                }
-            }
-            damage.weapon = Coordinator::shooterWeaponStatus(
-                shooter.pUnit != nullptr, damage.rawBase, damage.withAmmo,
-                Coordinator::repairPending(shooter.shot.hpSteps, shooter.onOwnBuilding));
-            damage.resolution = Coordinator::pricedResolution(damage.weapon, shooter.onOwnBuilding,
-                                                              shooter.firingTile != Coordinator::INVALID_TILE);
-            damage.pricedHpSteps = Coordinator::pricedShooterHpSteps(shooter.shot.hpSteps, shooter.onOwnBuilding);
+            static_cast<Coordinator::ResolvedReplyShot &>(damage) = Coordinator::resolveReplyShot(
+                *shooter.pFacts, facts->shots[shooter.factsSlot], shooter.shot.hpSteps, shooter.firingTile, property);
             damage.exactStatus = Coordinator::exactQueryStatus(damage.weapon, result.onProperty,
                                                                shooter.firingTile != Coordinator::INVALID_TILE);
             if (exactQuery == ExactQuery::Skipped && damage.exactStatus == ShotStatus::Computed)
@@ -1039,31 +980,30 @@ namespace
             record.insert(KEY_TYPE, unit.unitId);
             record.insert(Record::KEY_HP, shooter.shot.hpSteps);
             record.insert(KEY_HP_REAL, live ? QJsonValue(shooter.pUnit->getHp()) : QJsonValue());
-            record.insert(KEY_DIRECT, shooter.direct);
-            record.insert(KEY_ON_OWN_BUILDING, shooter.onOwnBuilding);
+            const Coordinator::ReplyShooterFacts & facts = *shooter.pFacts;
+            record.insert(KEY_DIRECT, facts.direct);
+            record.insert(KEY_ON_OWN_BUILDING, facts.onOwnBuilding);
             record.insert(KEY_TILE, tileRecord(shooter.shot.tile));
             record.insert(KEY_DISTANCE, shooter.shot.distance);
-            record.insert(KEY_MUST_MOVE, shooter.mustMove);
+            record.insert(KEY_MUST_MOVE, facts.mustMove);
             record.insert(KEY_FIRING_TILE, shooter.firingTile == Coordinator::INVALID_TILE
                                                ? QJsonValue()
                                                : QJsonValue(tileRecord(shooter.firingTile)));
-            record.insert(KEY_TYPE_BASE_COST, static_cast<qint64>(shooter.cost));
+            record.insert(KEY_TYPE_BASE_COST, static_cast<qint64>(facts.cost));
             record.insert(KEY_PLANNER_TARGET_COST, shooter.plannerTargetCost
                                                        ? QJsonValue(static_cast<qint64>(*shooter.plannerTargetCost))
                                                        : QJsonValue());
-            record.insert(KEY_CAPTURE_INTERRUPTION, QLatin1String(Record::interruptionName(shooter.interruption)));
-            record.insert(Record::KEY_CAPTURE_COST, static_cast<qint64>(shooter.captureCost));
-            record.insert(KEY_CAPTURE_STOCK_AGREES,
-                          shooter.stockAgrees ? QJsonValue(*shooter.stockAgrees) : QJsonValue());
+            record.insert(KEY_CAPTURE_INTERRUPTION, QLatin1String(Record::interruptionName(facts.interruption)));
+            record.insert(Record::KEY_CAPTURE_COST, static_cast<qint64>(facts.captureCost));
+            record.insert(KEY_CAPTURE_STOCK_AGREES, facts.stockAgrees ? QJsonValue(*facts.stockAgrees) : QJsonValue());
             records.append(record);
         }
         return records;
     }
 
-    void DangerAuditRecorder::addCapacity(QJsonObject & target, const std::vector<Shooter> & shooters,
-                                          const TilePoint & property) const
+    void DangerAuditRecorder::addCapacity(QJsonObject & target, const std::vector<Shooter> & shooters) const
     {
-        const FiringCapacity capacity = firingCapacity(shooters, property);
+        const FiringCapacity capacity = firingCapacity(shooters);
         target.insert(KEY_DIRECT_SHOOTERS, capacity.directShooters);
         target.insert(KEY_DIRECT_FIRING_TILES, capacity.freeTiles);
         target.insert(KEY_FOCUSED_EXCEEDS_TILES, capacity.directShooters > capacity.freeTiles);
@@ -1136,8 +1076,7 @@ namespace
     }
 
     QJsonObject DangerAuditRecorder::replyRecord(const std::vector<Shooter> & shooters, const ActorDamage & damage,
-                                                 double hp, Coordinator::MilliFunds actorCost,
-                                                 const TilePoint & destination)
+                                                 double hp, Coordinator::MilliFunds actorCost)
     {
         const std::vector<std::size_t> order = focusedOrderOf(damage);
         QJsonArray shooterFacts = shooterRecords(shooters);
@@ -1151,7 +1090,7 @@ namespace
             shooterFacts.replace(static_cast<qsizetype>(index), record);
         }
         QJsonObject reply{{KEY_SHOOTERS, shooterFacts}};
-        addCapacity(reply, shooters, destination);
+        addCapacity(reply, shooters);
         for (const DamageSource source : PRICED_SOURCES)
         {
             const auto ordered = [&](std::int32_t hpSteps)
@@ -1244,7 +1183,7 @@ namespace
             {KEY_SHOOTERS, shooterRecords(shooters)},
             {KEY_ACTORS, actorRecords},
         };
-        addCapacity(node, shooters, tile);
+        addCapacity(node, shooters);
         return node;
     }
 
@@ -1319,7 +1258,8 @@ namespace
         record.insert(KEY_COUNTER_APPLIED, outcome.counterApplied);
         record.insert(KEY_VICTIM, outcome.victimIndex == Coordinator::NO_UNIT ? QJsonValue() : QJsonValue(outcome.victimIndex));
         record.insert(KEY_VICTIM_HP, outcome.victimHpSteps);
-        record.insert(KEY_DESTINATION_OWN_BUILDING, ownBuildingAt(action.destination, unit.ownerId));
+        record.insert(KEY_DESTINATION_OWN_BUILDING,
+                      Coordinator::ownBuildingAt(m_view.map, action.destination, unit.ownerId));
         if (!Coordinator::replyStartKnown(pCandidate != nullptr, action.kind))
         {
             ++m_unmatchedFires;
@@ -1337,13 +1277,14 @@ namespace
         record.insert(KEY_COUNTER_FROM_ISOLATED_VIEW, planOutcome.counterFromIsolatedView);
         // A unit our own action destroys in both views holds no post, so nothing replies to it.
         std::vector<Shooter> shooters;
-        if (outcome.hpSteps > 0 || planOutcome.hpSteps > 0)
+        const bool listsShooters = outcome.hpSteps > 0 || planOutcome.hpSteps > 0;
+        if (listsShooters)
         {
             shooters = shootersAt(action.destination, outcome.victimIndex, outcome.victimHpSteps);
         }
         const ActorDamage damage = damageOn(shooters, actorIndex, *pActor, action.destination,
                                             captures ? ExactQuery::Engine : ExactQuery::Skipped);
-        record.insert(KEY_REPLY, replyRecord(shooters, damage, hpAfter, actorCost, action.destination));
+        record.insert(KEY_REPLY, replyRecord(shooters, damage, hpAfter, actorCost));
         m_replyEntries.push_back(ReplyEntry{
             .planSlot = planSlot,
             .unitId = action.unitId,
@@ -1356,6 +1297,7 @@ namespace
             .pCandidate = pCandidate,
             .actorHpSteps = pCandidate == nullptr ? unit.hpRounded : pCandidate->actor.hpSteps,
             .destination = action.destination,
+            .listsShooters = listsShooters,
         });
         if (!captures)
         {
@@ -1384,7 +1326,7 @@ namespace
             {KEY_SHOOTERS, shooterRecords(shooters)},
             {KEY_STREAM_ASSUMED, Coordinator::captureWalkStream(column, assumedTurn, m_horizonTurns)},
         };
-        addCapacity(capture, shooters, action.destination);
+        addCapacity(capture, shooters);
         const CaptureWalkInput input = walkInput(*pActor, carried, candidateRate);
         addDanger(capture, damage, input, &column);
         addPricedWalks(capture, shooters, damage, input, actorCost, column);
@@ -1469,16 +1411,8 @@ namespace
             facts.shooters.reserve(entry.shooters.size());
             for (std::size_t slot = 0; slot < entry.shooters.size(); ++slot)
             {
-                const Shooter & shooter = entry.shooters[slot];
-                const ShotDamage & shot = entry.damage.shots[slot];
-                facts.shooters.push_back(Coordinator::ReplySlotFacts{
-                    .shooterIndex = shooter.shot.unitIndex,
-                    .onOwnBuilding = shooter.onOwnBuilding,
-                    .resolution = shot.resolution,
-                    .counterRawBase = shot.counterRawBase,
-                    .shooterCost = shooter.cost,
-                    .captureCost = shooter.captureCost,
-                });
+                facts.shooters.push_back(
+                    Coordinator::replySlotFacts(*entry.shooters[slot].pFacts, entry.damage.shots[slot]));
             }
             targets.push_back(std::move(facts));
         }
@@ -1542,8 +1476,7 @@ namespace
                 }
             }
         }
-        m_oneActionNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                                                started).count();
+        m_oneActionNanos = Coordinator::nanosSince(started);
     }
 
     const Coordinator::AssignmentActor* DangerAuditRecorder::actorOf(std::int32_t engineUnitId) const
@@ -1622,7 +1555,7 @@ namespace
             }
             for (const Shooter & shooter : entries[index].shooters)
             {
-                if (firingTileFor(shooter.shot, entries[index].destination, occupancy) != shooter.firingTile)
+                if (Coordinator::replyFiringTile(*shooter.pFacts, occupancy) != shooter.firingTile)
                 {
                     return true;
                 }
@@ -1684,7 +1617,8 @@ namespace
             .actorHpSteps = replacement.actor.hpSteps,
             .destination = replacement.bundle.destination,
         };
-        if (isolated.hpSteps > 0 || planOutcome.hpSteps > 0)
+        entry.listsShooters = isolated.hpSteps > 0 || planOutcome.hpSteps > 0;
+        if (entry.listsShooters)
         {
             entry.shooters = shootersAmong(occupancy, entry.destination, isolated.victimIndex, isolated.victimHpSteps);
         }
@@ -1954,8 +1888,7 @@ namespace
             {KEY_PAIRS_EXAMINED, static_cast<qint64>(pairsExamined)},
             {KEY_INSTALLED_PAIRS_EXAMINED, static_cast<qint64>(installed.run.reply.pairsExamined)},
             {KEY_UNMATCHED_ENTRIES, unmatchedEntries},
-            {KEY_NANOS, static_cast<qint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - started).count())},
+            {KEY_NANOS, static_cast<qint64>(Coordinator::nanosSince(started))},
         };
     }
 
@@ -2004,7 +1937,7 @@ namespace
             {KEY_PLAN_SEQUENCE, static_cast<qint64>(m_view.identity.planSequence)},
             {KEY_HORIZON, m_horizonTurns},
             {KEY_POINTS_TO_CAPTURE, Unit::MAX_CAPTURE_POINTS},
-            {KEY_TERRAIN_LUCK, TERRAIN_LUCK},
+            {KEY_TERRAIN_LUCK, Coordinator::REPLY_TERRAIN_LUCK},
             {KEY_RATE_BONUS_CONSTANT, true},
             {KEY_CAPTURABLE, capturable},
             {KEY_UNSHOT, unshot},
@@ -2024,11 +1957,254 @@ namespace
             {KEY_MISSING_LOADED, static_cast<qint64>(m_missingLoaded.size())},
             {KEY_MISSING_ABSENT, static_cast<qint64>(m_missingAbsent.size())},
             {KEY_ALLIED_OCCUPANTS, m_alliedOccupants},
-            {KEY_NANOS, static_cast<qint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - started).count())},
+            {KEY_NANOS, static_cast<qint64>(Coordinator::nanosSince(started))},
         };
         result.insert(KEY_REPLY_PRICING, replyPricingRecord());
+        result.insert(KEY_PLAN_REPLAY, planReplayRecord());
         return result;
+    }
+
+    std::int32_t DangerAuditRecorder::chainHp(const Coordinator::TargetHpChain & chain, std::int32_t shooterIndex) const
+    {
+        const auto damaged = chain.find(shooterIndex);
+        return damaged == chain.end() ? known(shooterIndex).hpRounded : damaged->second.after;
+    }
+
+    std::map<std::int32_t, std::int32_t> DangerAuditRecorder::poolHp(const std::set<std::int32_t> & shooters,
+                                                                     const Coordinator::TargetHpChain & chain) const
+    {
+        std::map<std::int32_t, std::int32_t> hp;
+        for (const std::int32_t shooter : shooters)
+        {
+            hp.emplace(shooter, chainHp(chain, shooter));
+        }
+        return hp;
+    }
+
+    // Live actions only, in execution order, each matched to its candidate the way planRecord matches it.
+    std::vector<Coordinator::PlanReplyAction> DangerAuditRecorder::planReplyActions(
+        const Coordinator::OrderingResult & ordering) const
+    {
+        std::vector<Coordinator::PlanReplyAction> actions;
+        actions.reserve(ordering.order.size());
+        for (const std::int32_t index : ordering.order)
+        {
+            const Coordinator::PlannedAction & action = m_view.plan.action(index);
+            actions.push_back(Coordinator::PlanReplyAction{
+                .pCandidate = candidateFor(action),
+                .engineUnitId = action.unitId,
+                .actionIndex = index,
+                .plannedDamageSteps = action.plannedDamageSteps,
+            });
+        }
+        return actions;
+    }
+
+    Coordinator::ReplyBoard DangerAuditRecorder::replyBoard() const
+    {
+        return Coordinator::ReplyBoard{
+            .width = m_view.knowledge.width(),
+            .height = m_view.knowledge.height(),
+            .standing = m_standing,
+            .alliedOccupants = m_alliedOccupants,
+        };
+    }
+
+    ReplyPairing DangerAuditRecorder::pairEntries(const Coordinator::ResolvedPlanReply & resolved) const
+    {
+        ReplyPairing pairing{
+            .auditOf = std::vector<std::optional<std::size_t>>(resolved.entries.size()),
+            .plannerOf = std::vector<std::optional<std::size_t>>(m_replyEntries.size()),
+        };
+        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
+        {
+            const auto found = std::find_if(resolved.entries.begin(), resolved.entries.end(),
+                                            [&](const Coordinator::PlanReplyEntry & entry)
+                                            {
+                                                return entry.engineUnitId == m_replyEntries[audit].unitId;
+                                            });
+            if (found != resolved.entries.end())
+            {
+                const auto planner = static_cast<std::size_t>(found - resolved.entries.begin());
+                pairing.auditOf[planner] = audit;
+                pairing.plannerOf[audit] = planner;
+            }
+        }
+        return pairing;
+    }
+
+    // Each model on its own inputs: the planner's isolated hp, granted damage and live-only occupancy.
+    std::vector<ReplyCheck> DangerAuditRecorder::firstRunChecks(const Coordinator::ResolvedPlanReply & resolved,
+                                                                const Coordinator::PlanReplyRun & run,
+                                                                const ReplyPairing & pairing) const
+    {
+        std::vector<ReplyCheck> checks;
+        checks.reserve(resolved.entries.size());
+        for (std::size_t index = 0; index < resolved.entries.size(); ++index)
+        {
+            const Coordinator::PlanReplyEntry & entry = resolved.entries[index];
+            std::set<std::int32_t> shooters;
+            for (const std::size_t slot : entry.shooterSlots)
+            {
+                shooters.insert(entry.pFacts->tile->shooters[slot].shooterIndex);
+            }
+            const std::optional<std::size_t> audit = pairing.auditOf[index];
+            if (audit)
+            {
+                for (const Shooter & shooter : m_replyEntries[*audit].shooters)
+                {
+                    shooters.insert(shooter.shot.unitIndex);
+                }
+            }
+            const Coordinator::ReplyCheckSide planner{
+                .startHp = resolved.targets[index].target.hp,
+                .shooterHp = poolHp(shooters, resolved.chain),
+                .facts = Coordinator::replyCheckFacts(entry),
+                .outcome = run.reply.outcomes[index],
+            };
+            std::optional<Coordinator::ReplyCheckSide> audited;
+            if (audit)
+            {
+                const ReplyEntry & auditEntry = m_replyEntries[*audit];
+                audited = Coordinator::ReplyCheckSide{
+                    .startHp = auditEntry.hp,
+                    .shooterHp = poolHp(shooters, m_planChain),
+                    .facts = auditCheckFacts(auditEntry),
+                    .outcome = m_recordedOutcomes[*audit],
+                };
+            }
+            ReplyCheck check{.layer = Coordinator::replyCheckLayer(planner, audited ? &*audited : nullptr)};
+            if (check.layer == ReplyCheckLayer::StartHp)
+            {
+                check.auditHpBefore = audited->startHp;
+            }
+            if (check.layer == ReplyCheckLayer::EnemyHp)
+            {
+                check.enemyHp = Coordinator::shooterHpGaps(planner, *audited);
+            }
+            checks.push_back(std::move(check));
+        }
+        return checks;
+    }
+
+    // Every model input comes from the audit, so only the planner's plain-data facts are left to differ.
+    std::vector<std::optional<ReplyCheckLayer>> DangerAuditRecorder::secondRunLayers(
+        std::span<const Coordinator::PlanReplyAction> actions, const ReplyPairing & pairing) const
+    {
+        std::vector<std::optional<ReplyCheckLayer>> layers(pairing.auditOf.size());
+        // The audit's outcomes cover all its targets, so a run without some of them proves nothing.
+        if (std::ranges::any_of(pairing.plannerOf, [](const auto & planner) { return !planner; }))
+        {
+            return layers;
+        }
+        Coordinator::ResolvedPlanReply auditInputs{.complete = true, .chain = m_planChain};
+        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
+        {
+            const ReplyEntry & entry = m_replyEntries[audit];
+            Coordinator::ReplyTargetFacts target;
+            auditInputs.entries.push_back(Coordinator::ReplyPredictionDetail::resolveEntry(
+                actions[*pairing.plannerOf[audit]], m_occupancy, entry.listsShooters, target, auditInputs.startHp));
+            target.target.hp = entry.hp;
+            target.target.cost = entry.cost;
+            auditInputs.targets.push_back(std::move(target));
+        }
+        for (auto & [shooter, hp] : auditInputs.startHp)
+        {
+            hp = known(shooter).hpRounded;
+        }
+        const Coordinator::PlanReplyRun run = Coordinator::runResolvedPlanReply(auditInputs);
+        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
+        {
+            layers[*pairing.plannerOf[audit]] = Coordinator::factsThenOutcome(
+                Coordinator::replyCheckFacts(auditInputs.entries[audit]), auditCheckFacts(m_replyEntries[audit]),
+                run.reply.outcomes[audit], m_recordedOutcomes[audit]);
+        }
+        return layers;
+    }
+
+    // The planner's model of the plan beside the audit's own P1; the audit's model is left as it is.
+    QJsonObject DangerAuditRecorder::planReplayRecord() const
+    {
+        const bool present = m_view.reply.mode == Coordinator::ReplyPrediction::Recorded;
+        QJsonObject record{{KEY_PRESENT, present}};
+        if (!present)
+        {
+            return record;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        record.insert(KEY_TELEMETRY, replyTelemetryRecord(m_view.reply));
+        record.insert(KEY_AUDIT_ENTRIES, static_cast<qint64>(m_replyEntries.size()));
+        const Coordinator::OrderingResult ordering = m_view.plan.executionOrder();
+        const std::vector<Coordinator::PlanReplyAction> actions = planReplyActions(ordering);
+        const Coordinator::ReplyBoard board = replyBoard();
+        Coordinator::ResolvedPlanReply resolved;
+        if (Coordinator::orderingAcyclic(ordering))
+        {
+            resolved = Coordinator::resolvePlanReply(actions, board);
+        }
+        record.insert(KEY_COMPLETE, resolved.complete);
+        if (resolved.complete)
+        {
+            record.insert(KEY_OCCUPANCY_AGREES,
+                          Coordinator::sameOccupancy(Coordinator::planReplyOccupancy(actions, board), m_occupancy,
+                                                     board.width, board.height));
+            const Coordinator::PlanReplyRun run = Coordinator::runResolvedPlanReply(resolved);
+            const Coordinator::PlanReplyPrediction prediction = Coordinator::planReplyPrediction(resolved, run);
+            const ReplyPairing pairing = pairEntries(resolved);
+            const std::vector<ReplyCheck> checks = firstRunChecks(resolved, run, pairing);
+            const std::vector<std::optional<ReplyCheckLayer>> auditInputsLayers = secondRunLayers(actions, pairing);
+            QJsonArray entries;
+            std::int32_t agrees = 0;
+            std::int32_t auditInputsAgree = 0;
+            for (std::size_t index = 0; index < prediction.actors.size(); ++index)
+            {
+                const Coordinator::PlanReplyActorOutcome & actor = prediction.actors[index];
+                const ReplyCheck & check = checks[index];
+                agrees += check.layer == ReplyCheckLayer::Agrees ? 1 : 0;
+                QJsonObject entry{
+                    {KEY_UNIT, actor.engineUnitId},
+                    {KEY_SLOT, actor.actionIndex},
+                    {KEY_HP_BEFORE, actor.hpBefore},
+                    {KEY_HP_STEPS_BEFORE, actor.hpStepsBefore},
+                    {KEY_STEPS_LOST, actor.stepsLost},
+                    {Record::KEY_DESTROYED, actor.destroyed},
+                    {KEY_LAYER, layerValue(check.layer)},
+                };
+                if (check.layer == ReplyCheckLayer::StartHp)
+                {
+                    entry.insert(KEY_AUDIT_HP_BEFORE, check.auditHpBefore);
+                }
+                if (check.layer == ReplyCheckLayer::EnemyHp)
+                {
+                    entry.insert(KEY_ENEMY_HP, enemyHpRecord(check.enemyHp));
+                }
+                if (auditInputsLayers[index])
+                {
+                    auditInputsAgree += *auditInputsLayers[index] == ReplyCheckLayer::Agrees ? 1 : 0;
+                    entry.insert(KEY_AUDIT_INPUTS_LAYER, layerValue(*auditInputsLayers[index]));
+                }
+                entries.append(entry);
+            }
+            QJsonArray auditOnly;
+            for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
+            {
+                if (!pairing.plannerOf[audit])
+                {
+                    auditOnly.append(m_replyEntries[audit].unitId);
+                }
+            }
+            record.insert(KEY_ENTRIES, entries);
+            record.insert(KEY_AGREES, agrees);
+            record.insert(KEY_AUDIT_ONLY, auditOnly);
+            // Left out when the strict run was skipped, so a skipped run never reads as zero agreement.
+            if (auditOnly.isEmpty())
+            {
+                record.insert(KEY_AUDIT_INPUTS_AGREE, auditInputsAgree);
+            }
+            record.insert(KEY_PAIRS_EXAMINED, static_cast<qint64>(prediction.pairsExamined));
+        }
+        record.insert(KEY_NANOS, static_cast<qint64>(Coordinator::nanosSince(started)));
+        return record;
     }
 }
 

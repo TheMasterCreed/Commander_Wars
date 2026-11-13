@@ -22,6 +22,7 @@
 #include "ai/coordinator/planidentity.h"
 #include "ai/coordinator/refinementledger.h"
 #include "ai/coordinator/relativestockaudit.h"
+#include "ai/coordinator/replypredictionmode.h"
 #include "ai/coordinator/turnplan.h"
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
@@ -71,6 +72,7 @@ namespace Coordinator
         RelativeStockSchedule relativeStockSchedule{RelativeStockSchedule::Current};
         RelativeStockObserver* pRelativeStockObserver{nullptr};
         bool retainSelections{false};
+        ReplyPredictionSetup replyPrediction;
     };
 
     inline MilliFunds planStockDelta(const AssignmentInput & input, const TurnPlan & plan)

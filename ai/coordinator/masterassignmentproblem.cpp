@@ -2,8 +2,10 @@
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/assignmentvaluation.h"
 #include "ai/coordinator/propertystockbuilder.h"
+#include "ai/coordinator/replyprediction.h"
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -248,6 +250,48 @@ namespace
         return nullptr;
     }
 
+    // Measured and tallied, never priced; a live action no actor owns leaves the prediction incomplete.
+    PlanReplyPrediction recordedReplyPrediction(std::span<const MasterActor> actors,
+                                                const ReplyPredictionSetup & setup,
+                                                std::span<const std::int32_t> choices,
+                                                const MasterAssignmentReplayResult & replay)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<PlanReplyAction> actions;
+        actions.reserve(replay.ordering.order.size());
+        bool owned = setup.board != nullptr;
+        for (const std::int32_t actionIndex : replay.ordering.order)
+        {
+            const auto found =
+                std::find(replay.actionIndices.begin(), replay.actionIndices.end(), actionIndex);
+            const auto slot = static_cast<std::size_t>(found - replay.actionIndices.begin());
+            if (found == replay.actionIndices.end() || choices[slot] == NO_CANDIDATE)
+            {
+                owned = false;
+                break;
+            }
+            const MasterActor & actor = actors[slot];
+            actions.push_back(PlanReplyAction{
+                .pCandidate = &actor.candidates[static_cast<std::size_t>(choices[slot])].source,
+                .engineUnitId = actor.engineUnitId,
+                .actionIndex = actionIndex,
+                .plannedDamageSteps = replay.plan.action(actionIndex).plannedDamageSteps,
+            });
+        }
+        PlanReplyPrediction prediction;
+        if (owned)
+        {
+            prediction = predictPlanReply(actions, *setup.board);
+        }
+        if (setup.tally != nullptr)
+        {
+            ++setup.tally->replays;
+            setup.tally->incomplete += prediction.complete ? 0 : 1;
+            setup.tally->pairs += prediction.pairsExamined;
+            setup.tally->nanos += nanosSince(started);
+        }
+        return prediction;
+    }
 }
 
 namespace Coordinator
@@ -443,6 +487,7 @@ namespace Coordinator
         MasterAssignmentProblem problem(request.sessionIdentity);
         problem.m_actionIds = input.actionIds;
         problem.m_unitLinks = input.unitLinks;
+        problem.m_replyPrediction = input.replyPrediction;
         problem.m_incumbentExecutionOrder.assign(
             request.incumbentExecutionOrder.begin(),
             request.incumbentExecutionOrder.end());
@@ -1290,6 +1335,11 @@ namespace Coordinator
         }
         result.continuationKey = *key;
         result.error = MasterAssignmentReplayError::None;
+        if (problem.m_replyPrediction.mode == ReplyPrediction::Recorded && result.complete())
+        {
+            result.replyPrediction =
+                recordedReplyPrediction(problem.m_actors, problem.m_replyPrediction, choices, result);
+        }
         return result;
     }
 

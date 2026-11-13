@@ -115,6 +115,8 @@ namespace Coordinator
         bool hpScaled{false};
         CaptureDamageFormula formula{CaptureDamageFormula::AdvanceWars4};
         double luck{0};
+
+        friend bool operator==(const TerrainDefenseRule &, const TerrainDefenseRule &) = default;
     };
 
     // ACTION_FIRE.calcDamage in LuckDamageMode_Average, which rolls nothing.

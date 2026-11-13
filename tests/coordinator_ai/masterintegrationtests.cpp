@@ -5496,6 +5496,13 @@ namespace
         expect(playMasterStockControlConfig().captureDangerAudit == CaptureDangerAudit::Off &&
                    MasterShadowConfig{}.captureDangerAudit == CaptureDangerAudit::Off,
                "the danger audit defaults off");
+        expect(parseReplyPrediction("1", MasterStockControlRuntime::Arena) == ReplyPrediction::Recorded &&
+                   parseReplyPrediction("1", MasterStockControlRuntime::PlayableTrial) == ReplyPrediction::Recorded &&
+                   parseReplyPrediction("1", MasterStockControlRuntime::Play) == ReplyPrediction::Off &&
+                   parseReplyPrediction("1", MasterStockControlRuntime::None) == ReplyPrediction::Off &&
+                   parseReplyPrediction("true", MasterStockControlRuntime::Arena) == ReplyPrediction::Off &&
+                   MasterShadowConfig{}.replyPrediction == ReplyPrediction::Off,
+               "reply prediction follows the danger audit's switch rule and defaults off");
     }
 }
 

@@ -24,6 +24,7 @@ namespace Coordinator
     class MobilityFieldCache;
     class PropertyStockField;
     class DecisionTrace;
+    class ReplyFactsBuilder;
 
     inline const QString TURN_LIMIT_VICTORY_RULE = QStringLiteral("VICTORYRULE_TURNLIMIT");
     constexpr std::int32_t TURN_LIMIT_RULE_ITEM = 0;
@@ -244,6 +245,8 @@ namespace Coordinator
         DamageOracle & oracle;
         ValuationContext valuation;
         DecisionTrace* pTrace{nullptr};
+        // Null when reply prediction is off, so no reply facts are built.
+        ReplyFactsBuilder* pReplyFacts{nullptr};
     };
 
     struct BundleBuildStats

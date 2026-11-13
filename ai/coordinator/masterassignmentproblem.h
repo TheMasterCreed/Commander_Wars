@@ -11,6 +11,7 @@
 #include "ai/coordinator/continuationinterval.h"
 #include "ai/coordinator/planidentity.h"
 #include "ai/coordinator/propertystock.h"
+#include "ai/coordinator/replypredictionmode.h"
 #include "ai/coordinator/turnplan.h"
 
 namespace Coordinator
@@ -216,6 +217,7 @@ namespace Coordinator
         std::vector<std::int32_t> m_incumbentExecutionOrder;
         MilliFunds m_incumbentEconomicTotal{0};
         ContinuationKey m_incumbentContinuationKey;
+        ReplyPredictionSetup m_replyPrediction;
     };
 
     struct MasterActorSelection
@@ -304,6 +306,8 @@ namespace Coordinator
         std::vector<MilliFunds> seatedValues;
         MilliFunds seatedEconomicTotal{0};
         ContinuationKey continuationKey;
+        // Recorded only: the plan's predicted enemy reply, read by nothing that values the plan.
+        std::optional<PlanReplyPrediction> replyPrediction;
 
         bool valid() const
         {

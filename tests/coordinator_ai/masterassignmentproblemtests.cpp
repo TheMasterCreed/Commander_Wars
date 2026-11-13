@@ -5,6 +5,7 @@
 
 #include "ai/coordinator/masterassignmentproblem.h"
 #include "ai/coordinator/bundleassignment.h"
+#include "ai/coordinator/replyprediction.h"
 
 namespace
 {
@@ -786,6 +787,99 @@ namespace
         expect(!replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{1, 0}).valid(),
                "a mutable role cannot permit reselection of a committed action");
     }
+
+    constexpr std::int32_t REPLY_SHOOTER = 7;
+    constexpr double REPLY_BASE = 60;
+    constexpr MilliFunds REPLY_COST = 7000;
+    // A 60 base at 10 hp on neutral terrain is 60 damage, taking a 10 hp unit to 4.
+    constexpr std::int32_t REPLY_STEPS_LOST = 6;
+    constexpr std::int32_t NO_STEPS_RECORDED = -1;
+
+    std::shared_ptr<const ReplyFacts> replyFactsAt(const TilePoint & target)
+    {
+        auto tile = std::make_shared<ReplyTileFacts>();
+        tile->target = target;
+        tile->shooters.push_back(ReplyShooterFacts{
+            .shooterIndex = REPLY_SHOOTER, .tile = {target.x, 1}, .dayStartHpSteps = UNIT_HP_STEPS, .distance = 1,
+            .live = true, .cost = REPLY_COST,
+        });
+        auto facts = std::make_shared<ReplyFacts>();
+        facts->tile = tile;
+        facts->actorRealHp = UNIT_HP_STEPS;
+        facts->shots.push_back(ReplyShotBase{.rawBase = REPLY_BASE, .withAmmo = REPLY_BASE});
+        return facts;
+    }
+
+    void testRecordedReplyPrediction()
+    {
+        auto input = inputWith(2);
+        for (auto & actor : input.actors)
+        {
+            CandidateBundle & choice = actor.candidates[0];
+            choice.actor.hpSteps = UNIT_HP_STEPS;
+            choice.actor.replacementCost = REPLY_COST;
+            choice.replyFacts = replyFactsAt(choice.bundle.destination);
+        }
+        const auto fixture = planFrom(input);
+        const auto off = extract(input, fixture);
+        const auto board = std::make_shared<const ReplyBoard>(ReplyBoard{.width = 2, .height = 2});
+        const auto tally = std::make_shared<ReplyPredictionTally>();
+        input.replyPrediction = {.mode = ReplyPrediction::Recorded, .board = board, .tally = tally};
+        const auto recorded = extract(input, fixture);
+        expect(off.valid() && recorded.valid(), "reply prediction fixtures extract");
+        if (!off.valid() || !recorded.valid())
+        {
+            return;
+        }
+        expect(tally->replays == 1, "the incumbent verification replay is counted");
+        const auto offReplay = replayMasterAssignment(*off.problem, off.problem->incumbentChoices());
+        const auto replay = replayMasterAssignment(*recorded.problem, recorded.problem->incumbentChoices());
+        expect(offReplay.complete() && !offReplay.replyPrediction, "off records no reply prediction");
+        expect(replay.complete() && replay.plan.equivalentState(offReplay.plan) &&
+                   replay.ordering.order == offReplay.ordering.order &&
+                   replay.seatedValues == offReplay.seatedValues && replay.error == offReplay.error,
+               "recorded replay leaves every existing field unchanged");
+        std::vector<PlanReplyAction> actions;
+        for (const std::int32_t actionIndex : replay.ordering.order)
+        {
+            const auto & actor = input.actors[static_cast<std::size_t>(actionIndex)];
+            actions.push_back({&actor.candidates[0], actor.engineUnitId, actionIndex, 0});
+        }
+        const PlanReplyPrediction expected = predictPlanReply(actions, *board);
+        expect(replay.replyPrediction && expected.complete && expected.actors.size() == 2 &&
+                   *replay.replyPrediction == expected,
+               "recorded replay stores the shared plan reply prediction");
+        expect(tally->replays == 2 && tally->incomplete == 0 && tally->pairs == 2 * expected.pairsExamined,
+               "the tally counts every recorded replay");
+        const auto lossOf = [&](std::int32_t engineUnitId)
+        {
+            for (const PlanReplyActorOutcome & actor : replay.replyPrediction->actors)
+            {
+                if (actor.engineUnitId == engineUnitId)
+                {
+                    return actor.stepsLost;
+                }
+            }
+            return NO_STEPS_RECORDED;
+        };
+        expect(replay.replyPrediction && lossOf(input.actors[0].engineUnitId) == REPLY_STEPS_LOST &&
+                   lossOf(input.actors[1].engineUnitId) == 0,
+               "the one shooter fires once, on the lower unit id at an equal net, for six steps");
+        auto missing = input;
+        missing.actors[1].candidates[0].replyFacts.reset();
+        const auto missingTally = std::make_shared<ReplyPredictionTally>();
+        missing.replyPrediction.tally = missingTally;
+        const auto unfacted = extract(missing, fixture);
+        expect(unfacted.valid() && missingTally->replays == 1 && missingTally->incomplete == 1,
+               "a chosen candidate without reply facts leaves the prediction incomplete and is tallied");
+        if (unfacted.valid())
+        {
+            const auto incomplete = replayMasterAssignment(*unfacted.problem, unfacted.problem->incumbentChoices());
+            expect(incomplete.complete() && incomplete.replyPrediction && !incomplete.replyPrediction->complete &&
+                       incomplete.replyPrediction->actors.empty() && missingTally->incomplete == 2,
+                   "the replay stays complete and stores an incomplete prediction");
+        }
+    }
 }
 
 int main()
@@ -807,6 +901,7 @@ int main()
     testCandidateOrderingAndCompleteTupleEnumeration();
     testReviewedSnapshotBoundaries();
     testCommittedActionsCannotBeReselected();
+    testRecordedReplyPrediction();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

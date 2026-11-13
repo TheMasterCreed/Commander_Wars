@@ -21,6 +21,7 @@ namespace
     constexpr auto EXPORT_VARIABLE = "COW_MASTER_ASSIGNMENT_EXPORT";
     constexpr auto NEIGHBOR_AUDIT_VARIABLE = "COW_MASTER_PLAN_NEIGHBOR_AUDIT";
     constexpr auto DANGER_AUDIT_VARIABLE = "COW_COORDINATED_DANGER_AUDIT";
+    constexpr auto REPLY_PREDICTION_VARIABLE = "COW_COORDINATED_REPLY_PREDICTION";
     constexpr auto AUDIT_RECORDED = "1";
     constexpr auto STOCK_CONTROL_MODE = "stockControl";
     constexpr auto BATTLE_ANIMATION_SPEED_PROBE = "battleAnimationSpeed";
@@ -57,6 +58,11 @@ namespace Coordinator
     CaptureDangerAudit parseCaptureDangerAudit(const QByteArray & value, MasterStockControlRuntime runtime)
     {
         return auditRecorded(value, runtime) ? CaptureDangerAudit::Recorded : CaptureDangerAudit::Off;
+    }
+
+    ReplyPrediction parseReplyPrediction(const QByteArray & value, MasterStockControlRuntime runtime)
+    {
+        return auditRecorded(value, runtime) ? ReplyPrediction::Recorded : ReplyPrediction::Off;
     }
 
     bool isolatedMasterTrialPath(const QString & applicationDirectory, const QString & explicitUserPath,
@@ -165,6 +171,7 @@ namespace Coordinator
             qgetenv(EXPORT_VARIABLE), runtime);
         result.planNeighborAudit = parseMasterPlanNeighborAudit(qgetenv(NEIGHBOR_AUDIT_VARIABLE), runtime);
         result.captureDangerAudit = parseCaptureDangerAudit(qgetenv(DANGER_AUDIT_VARIABLE), runtime);
+        result.replyPrediction = parseReplyPrediction(qgetenv(REPLY_PREDICTION_VARIABLE), runtime);
 #ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
         if (result.controlsStock() && runtime == MasterStockControlRuntime::PlayableTrial)
         {

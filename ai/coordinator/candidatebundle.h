@@ -1,12 +1,15 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "ai/coordinator/bundlevaluation.h"
 
 namespace Coordinator
 {
+    struct ReplyFacts;
+
     constexpr std::int32_t NO_CANDIDATE = -1;
 
     struct CandidateBundle
@@ -21,6 +24,8 @@ namespace Coordinator
         std::vector<MilliFunds> enemyShotsOnActorAtOrigin;
         std::vector<MilliFunds> enemyShotsOnActorAtDestination;
         BundleValuation valuation;
+        // Null unless reply prediction is recorded; nothing prices it.
+        std::shared_ptr<const ReplyFacts> replyFacts;
     };
 
     inline PositionFacts positionFacts(const CandidateBundle & candidate)

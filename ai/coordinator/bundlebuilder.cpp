@@ -9,6 +9,7 @@
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coordinator/propertystockfield.h"
 #include "ai/coordinator/decisiontrace.h"
+#include "ai/coordinator/replyfactsbuilder.h"
 #include "ai/coreai.h"
 
 #include "coreengine/gameconsole.h"
@@ -176,6 +177,7 @@ namespace
         std::vector<MilliFunds> m_enemyShotsAtOrigin;
         std::int32_t m_generationIndex{0};
         std::int32_t m_actorEngineUnitId{Coordinator::NO_UNIT};
+        Unit* m_pActor{nullptr};
         bool m_actorOnActiveFriendlyProduction{false};
     };
 
@@ -576,6 +578,12 @@ namespace
                              QString::number(candidate.bundle.unitId), GameConsole::eWARNING);
             return;
         }
+        if (m_context.pReplyFacts != nullptr)
+        {
+            candidate.replyFacts =
+                m_context.pReplyFacts->factsFor(candidate.bundle.unitId, *m_pActor, candidate.bundle.destination);
+            m_context.pReplyFacts->countCandidate();
+        }
         result.push_back(std::move(candidate));
     }
 
@@ -749,6 +757,7 @@ namespace
             return result;
         }
         m_actorEngineUnitId = actor.pUnit->getUniqueID();
+        m_pActor = actor.pUnit;
         const Coordinator::PropertyFacts* pOriginProperty =
             propertyAt(actor.tile);
         m_actorOnActiveFriendlyProduction =
