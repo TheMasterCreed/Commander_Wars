@@ -1103,7 +1103,9 @@ namespace Coordinator
                         table.continuationOwnedTurn(previousNode,
                                                     previousTurn,
                                                     step.node);
-                    if (expectedTurn == NO_CAPTURE_TURNS ||
+                    // A first leg without an owned turn earns only its weight, so nothing can follow it.
+                    if (previousTurn == NO_CAPTURE_TURNS ||
+                        expectedTurn == NO_CAPTURE_TURNS ||
                         step.turn != expectedTurn ||
                         step.turn <= previousTurn)
                     {

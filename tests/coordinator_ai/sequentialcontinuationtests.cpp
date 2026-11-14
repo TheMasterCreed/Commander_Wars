@@ -761,6 +761,13 @@ namespace
         expect(warmDirect.warmStartAccepted && warmDirect.certificate && !warmDirect.searchCompleted &&
                    warmDirect.witness == direct.witness && warmDirect.bookedValue == floor,
                "a nonzero sentinel first leg can certify its matching upper without claiming search completion");
+        const std::int32_t continuedTurn = fixture.table.continuationOwnedTurn(0, NO_CAPTURE_TURNS, 1);
+        const std::array sentinelChain{WitnessStep{0, NO_CAPTURE_TURNS}, WitnessStep{1, continuedTurn}};
+        const std::array continued{Coordinator::SequentialDetail::ownedWitness(
+            fixture.instance, fixture.instance.rows.front(), 0, sentinelChain)};
+        expect(continuedTurn != NO_CAPTURE_TURNS &&
+                   !replaySequentialWitness(fixture.instance, continued, continued.front().value),
+               "a chain cannot continue from a first leg that never completes a capture");
     }
 
     void testRowCacheTransparencyAndBudgetFallback()
