@@ -53,7 +53,7 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 12;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 13;
     constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
     constexpr Coordinator::DiagnosticRefinementLimits STOCK_REPLY_REFINEMENT_LIMITS{
         .stateCap = STOCK_REPLY_REFINEMENT_STATE_CAP,
@@ -294,10 +294,7 @@ namespace
     constexpr auto KEY_HP_STEPS_BEFORE = "hpStepsBefore";
     constexpr auto KEY_STEPS_LOST = "stepsLost";
     constexpr auto KEY_LAYER = "layer";
-    constexpr auto KEY_AUDIT_ENTRIES = "auditEntries";
-    constexpr auto KEY_AUDIT_ONLY = "auditOnly";
-    constexpr auto KEY_AUDIT_INPUTS_AGREE = "auditInputsAgree";
-    constexpr auto KEY_AUDIT_INPUTS_LAYER = "auditInputsLayer";
+    constexpr auto KEY_MEASUREMENT_AVAILABLE = "measurementAvailable";
     constexpr auto KEY_TELEMETRY = "telemetry";
     constexpr auto KEY_OCCUPANCY_AGREES = "occupancyAgrees";
     constexpr auto KEY_AUDIT_HP_BEFORE = "auditHpBefore";
@@ -504,8 +501,6 @@ namespace
         std::int32_t actorHpSteps{0};
         TilePoint destination{Coordinator::INVALID_TILE};
         std::optional<Coordinator::CaptureStake> capture;
-        // The audit lists shooters while either the isolated or the plan view leaves the actor alive.
-        bool listsShooters{false};
     };
 
     struct CaptureSite
@@ -538,14 +533,15 @@ namespace
         QJsonObject record;
     };
 
-    // Units both models list, matched by engine unit id: auditOf per planner entry, plannerOf per audit entry.
-    struct ReplyPairing
+    // replies is indexed by plan slot; nanos is the time spent measuring.
+    struct MeasuredPlan
     {
-        std::vector<std::optional<std::size_t>> auditOf;
-        std::vector<std::optional<std::size_t>> plannerOf;
+        Record::StockPlanMeasurement measurement;
+        std::vector<Coordinator::PlanReplyEntry> replies;
+        std::int64_t nanos{0};
     };
 
-    // A first-run layer with what explains the hp layers; the hp fields are filled only for their own layer.
+    // A layer with what explains the hp layers; the hp fields are filled only for their own layer.
     struct ReplyCheck
     {
         ReplyCheckLayer layer{ReplyCheckLayer::Agrees};
@@ -575,19 +571,6 @@ namespace
             record.insert(QLatin1String(field.name), static_cast<qint64>(field.value));
         }
         return record;
-    }
-
-    Coordinator::ReplyCheckFacts auditCheckFacts(const ReplyEntry & entry)
-    {
-        Coordinator::ReplyCheckFacts facts{.terrain = entry.damage.terrain};
-        facts.shots.reserve(entry.shooters.size());
-        for (std::size_t index = 0; index < entry.shooters.size(); ++index)
-        {
-            const Shooter & shooter = entry.shooters[index];
-            facts.shots.push_back(Coordinator::replyCheckShot(*shooter.pFacts, shooter.firingTile,
-                                                              entry.damage.shots[index]));
-        }
-        return facts;
     }
 
     ShotReport shotReport(DamageSource source, const ActorDamage & actor, const ShotDamage & damage,
@@ -820,18 +803,16 @@ namespace
                                                     const Coordinator::TargetHpChain & chain) const;
         std::vector<Coordinator::PlanReplyAction> planReplyActions(const Coordinator::OrderingResult & ordering) const;
         Coordinator::ReplyBoard replyBoard() const;
-        ReplyPairing pairEntries(const Coordinator::ResolvedPlanReply & resolved) const;
-        std::vector<ReplyCheck> firstRunChecks(const Coordinator::ResolvedPlanReply & resolved,
-                                               const Coordinator::PlanReplyRun & run,
-                                               const ReplyPairing & pairing) const;
-        std::vector<std::optional<ReplyCheckLayer>> secondRunLayers(
-            std::span<const Coordinator::PlanReplyAction> actions, const ReplyPairing & pairing) const;
-        QJsonObject planReplayRecord() const;
-        Record::StockPlanMeasurement stockPlanMeasurement();
+        std::vector<ReplyCheck> measurementChecks(const Coordinator::ResolvedPlanReply & resolved,
+                                                  const Coordinator::PlanReplyRun & run,
+                                                  const MeasuredPlan & measured) const;
+        QJsonObject planReplayRecord(const MeasuredPlan & measured) const;
+        MeasuredPlan measuredPlan();
+        Record::StockPlanMeasurement stockPlanMeasurement(std::vector<Coordinator::PlanReplyEntry> & replies);
         void prepareStockReply(const Record::StockPlanMeasurement & measurement,
                                std::vector<Coordinator::PlanReplyEntry> & replies,
                                std::span<Coordinator::ReplyTargetFacts> targets);
-        QJsonObject stockReplyQuoteRecord(const QJsonArray & plan);
+        QJsonObject stockReplyQuoteRecord(const QJsonArray & plan, const MeasuredPlan & measured);
 
         const Coordinator::CaptureDangerAuditView & m_view;
         Coordinator::DamageOracle m_oracle;
@@ -1374,7 +1355,6 @@ namespace
             .pCandidate = pCandidate,
             .actorHpSteps = pCandidate == nullptr ? unit.hpRounded : pCandidate->actor.hpSteps,
             .destination = action.destination,
-            .listsShooters = listsShooters,
         });
         if (!captures)
         {
@@ -1694,8 +1674,8 @@ namespace
             .actorHpSteps = replacement.actor.hpSteps,
             .destination = replacement.bundle.destination,
         };
-        entry.listsShooters = isolated.hpSteps > 0 || planOutcome.hpSteps > 0;
-        if (entry.listsShooters)
+        // The audit lists shooters while either the isolated or the plan view leaves the actor alive.
+        if (isolated.hpSteps > 0 || planOutcome.hpSteps > 0)
         {
             entry.shooters = shootersAmong(occupancy, entry.destination, isolated.victimIndex, isolated.victimHpSteps);
         }
@@ -2037,25 +2017,36 @@ namespace
             {KEY_NANOS, static_cast<qint64>(Coordinator::nanosSince(started))},
         };
         result.insert(KEY_REPLY_PRICING, replyPricingRecord());
-        result.insert(KEY_PLAN_REPLAY, planReplayRecord());
-        result.insert(KEY_STOCK_REPLY_QUOTE, stockReplyQuoteRecord(plan));
+        const MeasuredPlan measured = measuredPlan();
+        result.insert(KEY_PLAN_REPLAY, planReplayRecord(measured));
+        result.insert(KEY_STOCK_REPLY_QUOTE, stockReplyQuoteRecord(plan, measured));
         return result;
     }
 
-    Record::StockPlanMeasurement DangerAuditRecorder::stockPlanMeasurement()
+    MeasuredPlan DangerAuditRecorder::measuredPlan()
+    {
+        const auto started = std::chrono::steady_clock::now();
+        MeasuredPlan measured;
+        measured.measurement = stockPlanMeasurement(measured.replies);
+        measured.nanos = Coordinator::nanosSince(started);
+        return measured;
+    }
+
+    Record::StockPlanMeasurement DangerAuditRecorder::stockPlanMeasurement(
+        std::vector<Coordinator::PlanReplyEntry> & replies)
     {
         using namespace Coordinator;
         if (!orderingAcyclic(m_view.plan.executionOrder()))
         {
-            return {.status = Record::StockQuoteStatus::CyclicOrdering};
+            return {{.status = Record::StockQuoteStatus::CyclicOrdering}};
         }
         const auto count = static_cast<std::size_t>(m_view.plan.actionCount());
         std::vector<PlanChainEntry> entries(count);
         std::vector<ReplyTargetFacts> targets(count);
-        std::vector<PlanReplyEntry> replies(count);
+        replies.assign(count, PlanReplyEntry{});
         for (std::size_t slot = 0; slot < count; ++slot)
         {
-            entries[slot].actorHpSteps = Record::UNKNOWN_ACTION_HP;
+            entries[slot].actorHpSteps = UNKNOWN_ACTION_HP;
             if (!isLiveState(m_view.plan.action(static_cast<std::int32_t>(slot)).state))
             {
                 continue;
@@ -2091,36 +2082,23 @@ namespace
                                                 std::span<Coordinator::ReplyTargetFacts> orderedTargets)
     {
         using namespace Coordinator;
-        const auto occupancy = Record::stockReplyOccupancy(
-            plannedOccupancy(NO_UNIT, INVALID_TILE, PlanOccupancyView::Live), measurement,
-            [&](std::int32_t slot) { return knowledgeIndexOf(m_view.plan.action(slot).unitId); });
-        for (std::size_t index = 0; index < measurement.planSlots.size(); ++index)
-        {
-            if (orderedTargets[index].target.hp <= 0)
+        prepareSurvivorReplies(measurement.chain, plannedOccupancy(NO_UNIT, INVALID_TILE, PlanOccupancyView::Live),
+            [&](std::size_t index)
             {
-                continue;
-            }
-            auto & reply = replies[measurement.planSlots[index]];
-            const auto & facts = *reply.pFacts;
-            for (std::size_t shooter = 0; shooter < facts.tile->shooters.size(); ++shooter)
-            {
-                const auto & source = facts.tile->shooters[shooter];
-                const auto firingTile = replyFiringTile(source, occupancy);
-                reply.shots.push_back(resolveReplyShot(source, facts.shots[shooter], source.dayStartHpSteps,
-                                                       firingTile, reply.destination));
-                orderedTargets[index].shooters.push_back(replySlotFacts(source, reply.shots.back()));
-            }
-        }
+                return knowledgeIndexOf(m_view.plan.action(measurement.planSlots[index]).unitId);
+            },
+            [&](std::size_t index) -> PlanReplyEntry & { return replies[measurement.planSlots[index]]; },
+            orderedTargets);
     }
 
-    void addCounterRecord(QJsonObject & record, const Record::MeasuredCounter & counter)
+    void addCounterRecord(QJsonObject & record, const Coordinator::MeasuredCounter & counter)
     {
         record.insert(KEY_ISOLATED_COUNTER_STEPS, counter.isolatedSteps);
         record.insert(KEY_COUNTER_STEPS_USED, counter.steps);
         record.insert(KEY_COUNTER_SCALED, counter.counterScaled);
     }
 
-    QJsonObject DangerAuditRecorder::stockReplyQuoteRecord(const QJsonArray & plan)
+    QJsonObject DangerAuditRecorder::stockReplyQuoteRecord(const QJsonArray & plan, const MeasuredPlan & measured)
     {
         using namespace Coordinator;
         const auto intervalRecord = [](const StockInterval & interval)
@@ -2146,10 +2124,10 @@ namespace
         std::int32_t damagedAlive = 0;
         const bool fieldAvailable = m_view.propertyStock.horizonTurns() > 0 &&
                                     m_view.propertyStock.capturePointsToCapture() > 0;
-        const auto chainStarted = std::chrono::steady_clock::now();
-        const auto measurement = fieldAvailable ? stockPlanMeasurement() :
-            Record::StockPlanMeasurement{.status = Record::StockQuoteStatus::MissingField};
-        const auto chainNanos = Coordinator::nanosSince(chainStarted);
+        const Record::StockPlanMeasurement missingField{{.status = Record::StockQuoteStatus::MissingField}};
+        const Record::StockPlanMeasurement & measurement = fieldAvailable ? measured.measurement : missingField;
+        // Without the stock field the quote measures nothing, so it spends no time measuring.
+        const std::int64_t chainNanos = fieldAvailable ? measured.nanos : 0;
         bool chainUsable = measurement.status == Record::StockQuoteStatus::Available;
         QJsonArray ownActions;
         std::int32_t ownDifferences = 0;
@@ -2351,7 +2329,6 @@ namespace
                 .pCandidate = candidateFor(action),
                 .engineUnitId = action.unitId,
                 .actionIndex = index,
-                .plannedDamageSteps = action.plannedDamageSteps,
             });
         }
         return actions;
@@ -2367,51 +2344,34 @@ namespace
         };
     }
 
-    ReplyPairing DangerAuditRecorder::pairEntries(const Coordinator::ResolvedPlanReply & resolved) const
+    // The planner's prediction on its candidate facts beside the measurement on the audit's own facts.
+    std::vector<ReplyCheck> DangerAuditRecorder::measurementChecks(const Coordinator::ResolvedPlanReply & resolved,
+                                                                   const Coordinator::PlanReplyRun & run,
+                                                                   const MeasuredPlan & measured) const
     {
-        ReplyPairing pairing{
-            .auditOf = std::vector<std::optional<std::size_t>>(resolved.entries.size()),
-            .plannerOf = std::vector<std::optional<std::size_t>>(m_replyEntries.size()),
-        };
-        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
-        {
-            const auto found = std::find_if(resolved.entries.begin(), resolved.entries.end(),
-                                            [&](const Coordinator::PlanReplyEntry & entry)
-                                            {
-                                                return entry.engineUnitId == m_replyEntries[audit].unitId;
-                                            });
-            if (found != resolved.entries.end())
-            {
-                const auto planner = static_cast<std::size_t>(found - resolved.entries.begin());
-                pairing.auditOf[planner] = audit;
-                pairing.plannerOf[audit] = planner;
-            }
-        }
-        return pairing;
-    }
-
-    // Each model on its own inputs: the planner's isolated hp, granted damage and live-only occupancy.
-    std::vector<ReplyCheck> DangerAuditRecorder::firstRunChecks(const Coordinator::ResolvedPlanReply & resolved,
-                                                                const Coordinator::PlanReplyRun & run,
-                                                                const ReplyPairing & pairing) const
-    {
+        const Record::StockPlanMeasurement & measurement = measured.measurement;
         std::vector<ReplyCheck> checks;
         checks.reserve(resolved.entries.size());
         for (std::size_t index = 0; index < resolved.entries.size(); ++index)
         {
             const Coordinator::PlanReplyEntry & entry = resolved.entries[index];
-            std::set<std::int32_t> shooters;
-            for (const std::size_t slot : entry.shooterSlots)
+            const Coordinator::PlanReplyEntry* pMeasured = nullptr;
+            if (index < measurement.planSlots.size() && measurement.planSlots[index] == entry.actionIndex)
             {
-                shooters.insert(entry.pFacts->tile->shooters[slot].shooterIndex);
+                pMeasured = &measured.replies[static_cast<std::size_t>(entry.actionIndex)];
             }
-            const std::optional<std::size_t> audit = pairing.auditOf[index];
-            if (audit)
+            std::set<std::int32_t> shooters;
+            const auto addShooters = [&](const Coordinator::PlanReplyEntry & listed)
             {
-                for (const Shooter & shooter : m_replyEntries[*audit].shooters)
+                for (const std::size_t slot : listed.shooterSlots)
                 {
-                    shooters.insert(shooter.shot.unitIndex);
+                    shooters.insert(listed.pFacts->tile->shooters[slot].shooterIndex);
                 }
+            };
+            addShooters(entry);
+            if (pMeasured != nullptr)
+            {
+                addShooters(*pMeasured);
             }
             const Coordinator::ReplyCheckSide planner{
                 .startHp = resolved.targets[index].target.hp,
@@ -2420,14 +2380,13 @@ namespace
                 .outcome = run.reply.outcomes[index],
             };
             std::optional<Coordinator::ReplyCheckSide> audited;
-            if (audit)
+            if (pMeasured != nullptr)
             {
-                const ReplyEntry & auditEntry = m_replyEntries[*audit];
                 audited = Coordinator::ReplyCheckSide{
-                    .startHp = auditEntry.hp,
-                    .shooterHp = poolHp(shooters, m_planChain),
-                    .facts = auditCheckFacts(auditEntry),
-                    .outcome = m_recordedOutcomes[*audit],
+                    .startHp = measurement.hpAfterActions[index],
+                    .shooterHp = poolHp(shooters, measurement.chain.chain),
+                    .facts = Coordinator::replyCheckFacts(*pMeasured),
+                    .outcome = measurement.reply.reply.outcomes[index],
                 };
             }
             ReplyCheck check{.layer = Coordinator::replyCheckLayer(planner, audited ? &*audited : nullptr)};
@@ -2444,43 +2403,8 @@ namespace
         return checks;
     }
 
-    // Every model input comes from the audit, so only the planner's plain-data facts are left to differ.
-    std::vector<std::optional<ReplyCheckLayer>> DangerAuditRecorder::secondRunLayers(
-        std::span<const Coordinator::PlanReplyAction> actions, const ReplyPairing & pairing) const
-    {
-        std::vector<std::optional<ReplyCheckLayer>> layers(pairing.auditOf.size());
-        // The audit's outcomes cover all its targets, so a run without some of them proves nothing.
-        if (std::ranges::any_of(pairing.plannerOf, [](const auto & planner) { return !planner; }))
-        {
-            return layers;
-        }
-        Coordinator::ResolvedPlanReply auditInputs{.complete = true, .chain = m_planChain};
-        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
-        {
-            const ReplyEntry & entry = m_replyEntries[audit];
-            Coordinator::ReplyTargetFacts target;
-            auditInputs.entries.push_back(Coordinator::ReplyPredictionDetail::resolveEntry(
-                actions[*pairing.plannerOf[audit]], m_occupancy, entry.listsShooters, target, auditInputs.startHp));
-            target.target.hp = entry.hp;
-            target.target.cost = entry.cost;
-            auditInputs.targets.push_back(std::move(target));
-        }
-        for (auto & [shooter, hp] : auditInputs.startHp)
-        {
-            hp = known(shooter).hpRounded;
-        }
-        const Coordinator::PlanReplyRun run = Coordinator::runResolvedPlanReply(auditInputs);
-        for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
-        {
-            layers[*pairing.plannerOf[audit]] = Coordinator::factsThenOutcome(
-                Coordinator::replyCheckFacts(auditInputs.entries[audit]), auditCheckFacts(m_replyEntries[audit]),
-                run.reply.outcomes[audit], m_recordedOutcomes[audit]);
-        }
-        return layers;
-    }
-
-    // The planner's model of the plan beside the audit's own P1; the audit's model is left as it is.
-    QJsonObject DangerAuditRecorder::planReplayRecord() const
+    // Layers exist only when both sides computed the plan; otherwise the two flags are the finding.
+    QJsonObject DangerAuditRecorder::planReplayRecord(const MeasuredPlan & measured) const
     {
         const bool present = m_view.reply.mode == Coordinator::ReplyPrediction::Recorded;
         QJsonObject record{{KEY_PRESENT, present}};
@@ -2490,7 +2414,6 @@ namespace
         }
         const auto started = std::chrono::steady_clock::now();
         record.insert(KEY_TELEMETRY, replyTelemetryRecord(m_view.reply));
-        record.insert(KEY_AUDIT_ENTRIES, static_cast<qint64>(m_replyEntries.size()));
         const Coordinator::OrderingResult ordering = m_view.plan.executionOrder();
         const std::vector<Coordinator::PlanReplyAction> actions = planReplyActions(ordering);
         const Coordinator::ReplyBoard board = replyBoard();
@@ -2499,25 +2422,25 @@ namespace
         {
             resolved = Coordinator::resolvePlanReply(actions, board);
         }
+        const bool measurementAvailable = measured.measurement.status == Record::StockQuoteStatus::Available;
         record.insert(KEY_COMPLETE, resolved.complete);
+        record.insert(KEY_MEASUREMENT_AVAILABLE, measurementAvailable);
         if (resolved.complete)
         {
             record.insert(KEY_OCCUPANCY_AGREES,
-                          Coordinator::sameOccupancy(Coordinator::planReplyOccupancy(actions, board), m_occupancy,
-                                                     board.width, board.height));
+                          Coordinator::sameOccupancy(
+                              Coordinator::planReplyOccupancy(actions, board),
+                              plannedOccupancy(Coordinator::NO_UNIT, Coordinator::INVALID_TILE, PlanOccupancyView::Live),
+                              board.width, board.height));
             const Coordinator::PlanReplyRun run = Coordinator::runResolvedPlanReply(resolved);
             const Coordinator::PlanReplyPrediction prediction = Coordinator::planReplyPrediction(resolved, run);
-            const ReplyPairing pairing = pairEntries(resolved);
-            const std::vector<ReplyCheck> checks = firstRunChecks(resolved, run, pairing);
-            const std::vector<std::optional<ReplyCheckLayer>> auditInputsLayers = secondRunLayers(actions, pairing);
+            const std::vector<ReplyCheck> checks =
+                measurementAvailable ? measurementChecks(resolved, run, measured) : std::vector<ReplyCheck>{};
             QJsonArray entries;
             std::int32_t agrees = 0;
-            std::int32_t auditInputsAgree = 0;
             for (std::size_t index = 0; index < prediction.actors.size(); ++index)
             {
                 const Coordinator::PlanReplyActorOutcome & actor = prediction.actors[index];
-                const ReplyCheck & check = checks[index];
-                agrees += check.layer == ReplyCheckLayer::Agrees ? 1 : 0;
                 QJsonObject entry{
                     {KEY_UNIT, actor.engineUnitId},
                     {KEY_SLOT, actor.actionIndex},
@@ -2525,38 +2448,27 @@ namespace
                     {KEY_HP_STEPS_BEFORE, actor.hpStepsBefore},
                     {KEY_STEPS_LOST, actor.stepsLost},
                     {Record::KEY_DESTROYED, actor.destroyed},
-                    {KEY_LAYER, layerValue(check.layer)},
                 };
-                if (check.layer == ReplyCheckLayer::StartHp)
+                if (measurementAvailable)
                 {
-                    entry.insert(KEY_AUDIT_HP_BEFORE, check.auditHpBefore);
-                }
-                if (check.layer == ReplyCheckLayer::EnemyHp)
-                {
-                    entry.insert(KEY_ENEMY_HP, enemyHpRecord(check.enemyHp));
-                }
-                if (auditInputsLayers[index])
-                {
-                    auditInputsAgree += *auditInputsLayers[index] == ReplyCheckLayer::Agrees ? 1 : 0;
-                    entry.insert(KEY_AUDIT_INPUTS_LAYER, layerValue(*auditInputsLayers[index]));
+                    const ReplyCheck & check = checks[index];
+                    agrees += check.layer == ReplyCheckLayer::Agrees ? 1 : 0;
+                    entry.insert(KEY_LAYER, layerValue(check.layer));
+                    if (check.layer == ReplyCheckLayer::StartHp)
+                    {
+                        entry.insert(KEY_AUDIT_HP_BEFORE, check.auditHpBefore);
+                    }
+                    if (check.layer == ReplyCheckLayer::EnemyHp)
+                    {
+                        entry.insert(KEY_ENEMY_HP, enemyHpRecord(check.enemyHp));
+                    }
                 }
                 entries.append(entry);
             }
-            QJsonArray auditOnly;
-            for (std::size_t audit = 0; audit < m_replyEntries.size(); ++audit)
-            {
-                if (!pairing.plannerOf[audit])
-                {
-                    auditOnly.append(m_replyEntries[audit].unitId);
-                }
-            }
             record.insert(KEY_ENTRIES, entries);
-            record.insert(KEY_AGREES, agrees);
-            record.insert(KEY_AUDIT_ONLY, auditOnly);
-            // Left out when the strict run was skipped, so a skipped run never reads as zero agreement.
-            if (auditOnly.isEmpty())
+            if (measurementAvailable)
             {
-                record.insert(KEY_AUDIT_INPUTS_AGREE, auditInputsAgree);
+                record.insert(KEY_AGREES, agrees);
             }
             record.insert(KEY_PAIRS_EXAMINED, static_cast<qint64>(prediction.pairsExamined));
         }

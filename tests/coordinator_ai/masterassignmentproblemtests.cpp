@@ -365,11 +365,11 @@ namespace
     constexpr std::int32_t SHARED_TARGET_HP_STEPS = 10;
     constexpr MilliFunds SHARED_TARGET_COST = 1000;
 
-    void addFire(CandidateBundle & choice, std::int32_t damage, std::int32_t target = 2)
+    void addFire(CandidateBundle & choice, std::int32_t damage, std::int32_t target = 2, std::int32_t counter = 0)
     {
         choice.bundle.components.push_back(fireComponent({
             .targetUnitId = target, .targetReplacementCost = SHARED_TARGET_COST,
-            .targetHpSteps = SHARED_TARGET_HP_STEPS, .damageSteps = damage,
+            .targetHpSteps = SHARED_TARGET_HP_STEPS, .damageSteps = damage, .counterSteps = counter,
         }));
     }
 
@@ -912,19 +912,60 @@ namespace
     constexpr std::int32_t REPLY_STEPS_LOST = 6;
     constexpr std::int32_t NO_STEPS_RECORDED = -1;
 
-    std::shared_ptr<const ReplyFacts> replyFactsAt(const TilePoint & target)
+    std::shared_ptr<const ReplyFacts> replyFactsFor(const TilePoint & target, std::vector<ReplyShooterFacts> shooters)
     {
         auto tile = std::make_shared<ReplyTileFacts>();
         tile->target = target;
-        tile->shooters.push_back(ReplyShooterFacts{
-            .shooterIndex = REPLY_SHOOTER, .tile = {target.x, 1}, .dayStartHpSteps = UNIT_HP_STEPS, .distance = 1,
-            .live = true, .cost = REPLY_COST,
-        });
+        tile->shooters = std::move(shooters);
         auto facts = std::make_shared<ReplyFacts>();
         facts->tile = tile;
         facts->actorRealHp = UNIT_HP_STEPS;
-        facts->shots.push_back(ReplyShotBase{.rawBase = REPLY_BASE, .withAmmo = REPLY_BASE});
+        facts->shots.assign(tile->shooters.size(), ReplyShotBase{.rawBase = REPLY_BASE, .withAmmo = REPLY_BASE});
         return facts;
+    }
+
+    ReplyShooterFacts replyShooterAt(const TilePoint & target)
+    {
+        return ReplyShooterFacts{
+            .shooterIndex = REPLY_SHOOTER, .tile = {target.x, 1}, .dayStartHpSteps = UNIT_HP_STEPS, .distance = 1,
+            .live = true, .cost = REPLY_COST,
+        };
+    }
+
+    void readyForReply(CandidateBundle & choice, std::vector<ReplyShooterFacts> shooters = {})
+    {
+        choice.actor.hpSteps = UNIT_HP_STEPS;
+        choice.actor.replacementCost = REPLY_COST;
+        choice.replyFacts = replyFactsFor(choice.bundle.destination, std::move(shooters));
+    }
+
+    constexpr std::int32_t REPLY_BOARD_SIZE = 3;
+
+    MasterAssignmentBuildResult extractRecorded(AssignmentInput input, const Fixture & fixture)
+    {
+        input.replyPrediction = {
+            .mode = ReplyPrediction::Recorded,
+            .board = std::make_shared<const ReplyBoard>(
+                ReplyBoard{.width = REPLY_BOARD_SIZE, .height = REPLY_BOARD_SIZE}),
+            .tally = std::make_shared<ReplyPredictionTally>(),
+        };
+        return extract(input, fixture);
+    }
+
+    const PlanReplyActorOutcome* predictedFor(const MasterAssignmentReplayResult & replay, std::int32_t engineUnitId)
+    {
+        if (!replay.replyPrediction)
+        {
+            return nullptr;
+        }
+        for (const PlanReplyActorOutcome & actor : replay.replyPrediction->actors)
+        {
+            if (actor.engineUnitId == engineUnitId)
+            {
+                return &actor;
+            }
+        }
+        return nullptr;
     }
 
     void testRecordedReplyPrediction()
@@ -932,10 +973,7 @@ namespace
         auto input = inputWith(2);
         for (auto & actor : input.actors)
         {
-            CandidateBundle & choice = actor.candidates[0];
-            choice.actor.hpSteps = UNIT_HP_STEPS;
-            choice.actor.replacementCost = REPLY_COST;
-            choice.replyFacts = replyFactsAt(choice.bundle.destination);
+            readyForReply(actor.candidates[0], {replyShooterAt(actor.candidates[0].bundle.destination)});
         }
         const auto fixture = planFrom(input);
         const auto off = extract(input, fixture);
@@ -960,7 +998,7 @@ namespace
         for (const std::int32_t actionIndex : replay.ordering.order)
         {
             const auto & actor = input.actors[static_cast<std::size_t>(actionIndex)];
-            actions.push_back({&actor.candidates[0], actor.engineUnitId, actionIndex, 0});
+            actions.push_back({&actor.candidates[0], actor.engineUnitId, actionIndex});
         }
         const PlanReplyPrediction expected = predictPlanReply(actions, *board);
         expect(replay.replyPrediction && expected.complete && expected.actors.size() == 2 &&
@@ -970,14 +1008,8 @@ namespace
                "the tally counts every recorded replay");
         const auto lossOf = [&](std::int32_t engineUnitId)
         {
-            for (const PlanReplyActorOutcome & actor : replay.replyPrediction->actors)
-            {
-                if (actor.engineUnitId == engineUnitId)
-                {
-                    return actor.stepsLost;
-                }
-            }
-            return NO_STEPS_RECORDED;
+            const PlanReplyActorOutcome* actor = predictedFor(replay, engineUnitId);
+            return actor == nullptr ? NO_STEPS_RECORDED : actor->stepsLost;
         };
         expect(replay.replyPrediction && lossOf(input.actors[0].engineUnitId) == REPLY_STEPS_LOST &&
                    lossOf(input.actors[1].engineUnitId) == 0,
@@ -996,6 +1028,152 @@ namespace
                        incomplete.replyPrediction->actors.empty() && missingTally->incomplete == 2,
                    "the replay stays complete and stores an incomplete prediction");
         }
+    }
+
+    constexpr std::int32_t SHOT_TARGET_ENGINE_ID = 999;
+    constexpr TilePoint SHOT_TARGET_TILE{5, 5};
+
+    void testReplyPredictionFollowsExecutionOrder()
+    {
+        constexpr std::int32_t firstShot = 4;
+        constexpr std::int32_t secondIsolatedCounter = 8;
+        constexpr std::int32_t secondHpAfterScaledCounter = 6;
+        constexpr auto extracts = "execution-order prediction fixture extracts";
+        constexpr auto ordered = "the higher valued shooter acts first";
+        constexpr auto scaled = "the second shooter's counter comes from the target the first shot weakened";
+        constexpr auto killed = "a target the first shot kills completes the prediction when nothing fires at it later";
+        constexpr auto gone = "a later live shot at a target already destroyed leaves only the prediction incomplete";
+        auto input = inputWith(2);
+        const auto target = static_cast<std::int32_t>(input.unitLinks.size());
+        input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, SHOT_TARGET_TILE});
+        input.actors[0].candidates.push_back(input.actors[0].candidates[0]);
+        addFire(input.actors[0].candidates[0], 2, target, secondIsolatedCounter);
+        input.actors[1].candidates.push_back(input.actors[1].candidates[0]);
+        addFire(input.actors[1].candidates[0], firstShot, target);
+        addFire(input.actors[1].candidates[1], SHARED_TARGET_HP_STEPS, target);
+        for (auto & actor : input.actors)
+        {
+            for (auto & choice : actor.candidates)
+            {
+                readyForReply(choice);
+            }
+        }
+        const auto extracted = extractRecorded(input, planFrom(input));
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto first = input.actors[1].engineUnitId;
+        const auto second = input.actors[0].engineUnitId;
+        const auto weakened = replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{0, 0});
+        expect(weakened.complete() && weakened.ordering.order == std::vector<std::int32_t>{1, 0}, ordered);
+        const PlanReplyActorOutcome* secondShooter = predictedFor(weakened, second);
+        const PlanReplyActorOutcome* firstShooter = predictedFor(weakened, first);
+        expect(weakened.replyPrediction && weakened.replyPrediction->complete && secondShooter != nullptr &&
+                   firstShooter != nullptr && secondShooter->hpStepsBefore == secondHpAfterScaledCounter &&
+                   secondShooter->hpBefore == secondHpAfterScaledCounter &&
+                   firstShooter->hpStepsBefore == UNIT_HP_STEPS,
+               scaled);
+        const auto alone = replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{1, 1});
+        const PlanReplyActorOutcome* waiting = predictedFor(alone, second);
+        expect(alone.complete() && alone.replyPrediction && alone.replyPrediction->complete && waiting != nullptr &&
+                   waiting->hpStepsBefore == UNIT_HP_STEPS,
+               killed);
+        const auto late = replayMasterAssignment(*extracted.problem, std::vector<std::int32_t>{0, 1});
+        expect(late.complete() && late.ordering.order == std::vector<std::int32_t>{1, 0} && late.replyPrediction &&
+                   !late.replyPrediction->complete && late.replyPrediction->actors.empty(),
+               gone);
+    }
+
+    void testReplyPredictionFreesOwnActionDeaths()
+    {
+        constexpr TilePoint doomedTile{0, 1};
+        constexpr auto extracts = "own-action death prediction fixture extracts";
+        constexpr auto notTarget = "a unit its own attack kills is no reply target and loses nothing to the reply";
+        constexpr auto freed = "the tile the dead unit would have held lets the shooter hit the other unit";
+        auto input = inputWith(2);
+        const auto target = static_cast<std::int32_t>(input.unitLinks.size());
+        input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, SHOT_TARGET_TILE});
+        input.actors[0].candidates[0] = candidate(0, {0, 0}, doomedTile, 1);
+        addFire(input.actors[0].candidates[0], 2, target, UNIT_HP_STEPS);
+        ReplyShooterFacts walker = replyShooterAt(doomedTile);
+        walker.direct = true;
+        walker.firingTiles = {doomedTile};
+        for (auto & actor : input.actors)
+        {
+            readyForReply(actor.candidates[0], {walker});
+        }
+        const auto extracted = extractRecorded(input, planFrom(input));
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto replay = replayMasterAssignment(*extracted.problem, extracted.problem->incumbentChoices());
+        const PlanReplyActorOutcome* doomed = predictedFor(replay, input.actors[0].engineUnitId);
+        const PlanReplyActorOutcome* other = predictedFor(replay, input.actors[1].engineUnitId);
+        expect(replay.complete() && replay.replyPrediction && replay.replyPrediction->complete && doomed != nullptr &&
+                   doomed->hpStepsBefore == 0 && doomed->stepsLost == 0 && !doomed->destroyed,
+               notTarget);
+        expect(other != nullptr && other->hpStepsBefore == UNIT_HP_STEPS && other->stepsLost == REPLY_STEPS_LOST,
+               freed);
+    }
+
+    void testReplyPredictionBooksRealDamage()
+    {
+        constexpr std::int32_t realShot = 7;
+        constexpr std::int32_t grantedShare = 4;
+        constexpr std::int32_t secondRealShot = 5;
+        constexpr std::int32_t secondGrantedShare = 3;
+        constexpr std::int32_t lossAtThreeHp = 1;
+        constexpr std::int32_t actorCount = 3;
+        constexpr std::size_t exposedSlot = 2;
+        constexpr auto extracts = "real-damage prediction fixtures extract";
+        constexpr auto real = "the enemy replies with the hp the real shot leaves, not the granted share";
+        constexpr auto clipped = "real shots clipped at remaining hp kill a target the granted split leaves alive";
+        auto input = inputWith(actorCount);
+        const auto target = static_cast<std::int32_t>(input.unitLinks.size());
+        input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, SHOT_TARGET_TILE});
+        addFire(input.actors[0].candidates[0], realShot, target);
+        input.actors[1].candidates.push_back(input.actors[1].candidates[0]);
+        addFire(input.actors[1].candidates[1], secondRealShot, target);
+        const ReplyShooterFacts enemy{
+            .shooterIndex = target, .tile = SHOT_TARGET_TILE, .dayStartHpSteps = UNIT_HP_STEPS, .live = true,
+            .cost = REPLY_COST,
+        };
+        for (std::size_t slot = 0; slot < input.actors.size(); ++slot)
+        {
+            for (auto & choice : input.actors[slot].candidates)
+            {
+                readyForReply(choice, slot == exposedSlot ? std::vector<ReplyShooterFacts>{enemy}
+                                                          : std::vector<ReplyShooterFacts>{});
+            }
+        }
+        const std::vector<std::int32_t> oneShot{0, 0, 0};
+        const std::vector<std::int32_t> oneShotGrants{grantedShare, 0, 0};
+        const std::vector<std::int32_t> twoShots{0, 1, 0};
+        const std::vector<std::int32_t> twoShotGrants{grantedShare, secondGrantedShare, 0};
+        const auto single = extractRecorded(input, planFrom(input, oneShot, oneShotGrants));
+        const auto pair = extractRecorded(input, planFrom(input, twoShots, twoShotGrants));
+        expect(single.valid() && pair.valid(), extracts);
+        if (!single.valid() || !pair.valid())
+        {
+            return;
+        }
+        const auto exposed = input.actors[exposedSlot].engineUnitId;
+        const auto singleReplay = replayMasterAssignment(*single.problem, single.problem->incumbentChoices());
+        const PlanReplyActorOutcome* singleLoss = predictedFor(singleReplay, exposed);
+        expect(singleReplay.complete() && singleReplay.plan.action(0).plannedDamageSteps == grantedShare &&
+                   singleReplay.replyPrediction && singleReplay.replyPrediction->complete && singleLoss != nullptr &&
+                   singleLoss->stepsLost == lossAtThreeHp,
+               real);
+        const auto pairReplay = replayMasterAssignment(*pair.problem, pair.problem->incumbentChoices());
+        const PlanReplyActorOutcome* pairLoss = predictedFor(pairReplay, exposed);
+        expect(pairReplay.complete() && pairReplay.plan.action(1).plannedDamageSteps == secondGrantedShare &&
+                   pairReplay.ordering.order == std::vector<std::int32_t>{2, 1, 0} && pairReplay.replyPrediction &&
+                   pairReplay.replyPrediction->complete && pairLoss != nullptr && pairLoss->stepsLost == 0,
+               clipped);
     }
 }
 
@@ -1023,6 +1201,9 @@ int main()
     testReviewedSnapshotBoundaries();
     testCommittedActionsCannotBeReselected();
     testRecordedReplyPrediction();
+    testReplyPredictionFollowsExecutionOrder();
+    testReplyPredictionFreesOwnActionDeaths();
+    testReplyPredictionBooksRealDamage();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

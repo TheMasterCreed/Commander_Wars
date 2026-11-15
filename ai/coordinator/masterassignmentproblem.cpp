@@ -275,7 +275,6 @@ namespace
                 .pCandidate = &actor.candidates[static_cast<std::size_t>(choices[slot])].source,
                 .engineUnitId = actor.engineUnitId,
                 .actionIndex = actionIndex,
-                .plannedDamageSteps = replay.plan.action(actionIndex).plannedDamageSteps,
             });
         }
         PlanReplyPrediction prediction;

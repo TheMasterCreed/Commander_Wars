@@ -14,6 +14,7 @@
 #include "ai/coordinator/capturedanger.h"
 #include "ai/coordinator/continuationinterval.h"
 #include "ai/coordinator/capturedangerstream.h"
+#include "ai/coordinator/ownactionmeasurement.h"
 #include "ai/coordinator/replycheck.h"
 
 namespace Coordinator::CaptureDangerRecord
@@ -55,17 +56,7 @@ namespace Coordinator::CaptureDangerRecord
     constexpr auto INTERRUPTION_DELAYED = "DELAYED";
     constexpr auto INTERRUPTION_RESTARTED = "RESTARTED";
 
-    enum class StockQuoteStatus : std::int8_t
-    {
-        Available,
-        MissingField,
-        UnusablePlanChain,
-        ReplayFailed,
-        CyclicOrdering,
-        MissingActionFacts,
-        UnsupportedAction,
-        TargetAlreadyGone,
-    };
+    using Coordinator::StockQuoteStatus;
 
     inline constexpr std::array STOCK_QUOTE_STATUS_NAMES{
         "AVAILABLE", "MISSING_STOCK_FIELD", "UNUSABLE_PLAN_CHAIN", "REPLAY_FAILED",
@@ -129,73 +120,11 @@ namespace Coordinator::CaptureDangerRecord
                !replayValid ? StockQuoteStatus::ReplayFailed : StockQuoteStatus::Available;
     }
 
-    struct MeasuredCounter
+    struct StockPlanMeasurement : OwnActionMeasurement
     {
-        StockQuoteStatus status{StockQuoteStatus::Available};
-        std::int32_t isolatedSteps{0};
-        std::int32_t steps{0};
-        bool counterScaled{false};
-        double hpAfter{0};
-    };
-
-    inline MeasuredCounter measuredCounter(const FireFacts & fire, std::int32_t targetHp,
-                                           std::int32_t actorHp, double actorRealHp)
-    {
-        MeasuredCounter result{.isolatedSteps = fire.counterSteps, .hpAfter = actorRealHp};
-        if (targetHp <= 0)
-        {
-            return result;
-        }
-        const auto isolatedHp = fire.targetHpSteps - std::min(fire.damageSteps, fire.targetHpSteps);
-        if (isolatedHp <= 0 || targetHp > isolatedHp)
-        {
-            result.status = StockQuoteStatus::UnusablePlanChain;
-            return result;
-        }
-        result.steps = std::min(fire.counterSteps, actorHp);
-        if (targetHp < isolatedHp)
-        {
-            // FireFacts retains steps only; use the oracle's real-hp loss conversion after scaling.
-            const double damage = static_cast<double>(fire.counterSteps) * targetHp * FastBattleEstimate::HP_SCALE / isolatedHp;
-            result.steps = std::min(damageStepsFrom(actorRealHp, damage), actorHp);
-            result.counterScaled = true;
-        }
-        result.hpAfter = realHpAfterAction(actorRealHp, ActionHpOutcome{
-            .hpSteps = actorHp - result.steps, .realHpFromSteps = result.steps > 0,
-        });
-        return result;
-    }
-
-    constexpr std::int32_t UNKNOWN_ACTION_HP = -1;
-
-    struct StockPlanMeasurement
-    {
-        StockQuoteStatus status{StockQuoteStatus::UnusablePlanChain};
         std::vector<std::int32_t> planSlots;
-        std::vector<StockQuoteStatus> ownStatus;
-        PlanChainRun chain;
-        std::vector<double> hpAfterActions;
         PlanReplyRun reply;
-        std::vector<MeasuredCounter> counters;
-        std::int32_t certainCounterUnits{0};
-        std::int32_t scaledCounterUnits{0};
-        std::int32_t scaledCounterSurvivalDifferences{0};
     };
-
-    template <typename UnitAt>
-    PlannedOccupancy stockReplyOccupancy(const PlannedOccupancy & live, const StockPlanMeasurement & measurement,
-                                         UnitAt && unitAt)
-    {
-        std::vector<std::int32_t> dead;
-        for (std::size_t index = 0; index < measurement.planSlots.size(); ++index)
-        {
-            if (measurement.chain.outcomes[index].hpSteps <= 0)
-            {
-                dead.push_back(unitAt(measurement.planSlots[index]));
-            }
-        }
-        return live.withoutUnits(dead);
-    }
 
     template <typename PrepareReply, typename StartHp, typename DamageAt>
     StockPlanMeasurement measureStockPlan(const TurnPlan & plan, std::span<const PlanChainEntry> entries,
@@ -223,73 +152,17 @@ namespace Coordinator::CaptureDangerRecord
                 continue;
             }
             result.planSlots.push_back(slot);
-            if (entries[slot].actorHpSteps == UNKNOWN_ACTION_HP ||
-                entries[slot].actorHpSteps != ceilHpSteps(replies[slot].target.hp) ||
-                !replyStartKnown(entries[slot].pBundle != nullptr, plan.action(slot).kind))
+            const bool startKnown = replyStartKnown(entries[slot].pBundle != nullptr, plan.action(slot).kind);
+            const auto facts = ownActionFacts(entries[slot], replies[slot].target.hp, startKnown);
+            if (facts != StockQuoteStatus::Available)
             {
-                result.status = StockQuoteStatus::MissingActionFacts;
-                return result;
-            }
-            if (entries[slot].pBundle != nullptr &&
-                (entries[slot].pBundle->components.size() > 1 || servesOtherUnit(*entries[slot].pBundle)))
-            {
-                result.status = StockQuoteStatus::UnsupportedAction;
+                result.status = facts;
                 return result;
             }
             ordered.push_back(entries[slot]);
             targets.push_back(replies[slot]);
         }
-        result.ownStatus.assign(ordered.size(), StockQuoteStatus::Available);
-        std::vector<bool> hasCounterResult(ordered.size(), false);
-        result.counters.resize(ordered.size());
-        result.chain = planChain(ordered, [&](std::size_t index, const FireFacts & fire,
-                                              std::int32_t targetHp, std::int32_t actorHp)
-        {
-            const auto counter = measuredCounter(fire, targetHp, actorHp, targets[index].target.hp);
-            result.counters[index] = counter;
-            result.ownStatus[index] = counter.status;
-            hasCounterResult[index] = true;
-            if (counter.status != StockQuoteStatus::Available)
-            {
-                return ActionCounterDamage{};
-            }
-            targets[index].target.hp = counter.hpAfter;
-            return ActionCounterDamage{counter.steps, ActionCounterSource::Repriced};
-        });
-        result.status = StockQuoteStatus::Available;
-        result.hpAfterActions.resize(ordered.size());
-        for (std::size_t index = 0; index < ordered.size(); ++index)
-        {
-            if (!result.chain.targetsAlive[index])
-            {
-                result.ownStatus[index] = StockQuoteStatus::TargetAlreadyGone;
-            }
-            if (result.ownStatus[index] != StockQuoteStatus::Available)
-            {
-                if (result.status == StockQuoteStatus::Available)
-                {
-                    result.status = result.ownStatus[index];
-                }
-                continue;
-            }
-            if (!hasCounterResult[index])
-            {
-                targets[index].target.hp = realHpAfterAction(targets[index].target.hp, result.chain.outcomes[index]);
-            }
-            else if (result.counters[index].counterScaled)
-            {
-                ++result.scaledCounterUnits;
-                const auto isolatedHp = ordered[index].actorHpSteps -
-                    std::min(result.counters[index].isolatedSteps, ordered[index].actorHpSteps);
-                result.scaledCounterSurvivalDifferences +=
-                    (result.chain.outcomes[index].hpSteps <= 0) != (isolatedHp <= 0) ? 1 : 0;
-            }
-            else
-            {
-                ++result.certainCounterUnits;
-            }
-            result.hpAfterActions[index] = targets[index].target.hp;
-        }
+        static_cast<OwnActionMeasurement &>(result) = measureOwnActions(ordered, targets);
         if (result.status != StockQuoteStatus::Available)
         {
             return result;
