@@ -131,6 +131,15 @@ namespace Coordinator
     };
 
     void removeCapturedNode(SequentialRow & row, std::int32_t node);
+
+    namespace MasterPlanPricingDetail
+    {
+        // Callers pass a captured node that is NO_SEQUENTIAL_NODE or indexes prices.
+        bool addMasterPlanTerms(MilliFunds & total, std::span<const MilliFunds> terms);
+        std::optional<MilliFunds> masterPlanCandidateValue(MilliFunds immediateValue, std::int32_t capturedNode,
+                                                           MilliFunds futureUpper, std::span<const MilliFunds> prices);
+    }
+
     std::map<std::int32_t, std::int64_t> masterPlanOccupiedUsage(const MasterPlanPricingModel & model);
     bool indexMasterPlanActions(MasterPlanPricingModel & model);
     std::optional<MasterPlanPricingModel> restrictMasterPlanModel(

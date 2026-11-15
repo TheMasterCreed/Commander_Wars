@@ -45,9 +45,34 @@ namespace Coordinator
         std::vector<MasterFutureRowPrice> actions;
     };
 
+    struct MasterFuturePricedCell
+    {
+        MilliFunds value{0};
+        std::int32_t next{NO_SEQUENTIAL_NODE};
+    };
+
+    using MasterFuturePricedClass = std::vector<MasterFuturePricedCell>;
+
     MasterFuturePricing priceMasterFuture(
         const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
         RefinementLedger & ledger, RefinementWork category);
+
+    namespace MasterFutureDetail
+    {
+        // Callers pass at least one column per price, a priced table for every class a row names, and a fresh result.
+        bool validMasterFuturePrices(std::span<const PropertyStockColumn> columns,
+                                     std::span<const MilliFunds> nodePrices);
+        MasterFutureStatus priceMasterFutureClass(
+            const SequentialClassTable & table, std::span<const PropertyStockColumn> columns, std::int32_t horizon,
+            std::span<const MilliFunds> nodePrices, RefinementLedger & ledger, RefinementWork category,
+            MasterFuturePricedClass & values);
+        MasterFutureStatus priceMasterFutureRow(
+            const SequentialRow & row, std::span<const SequentialClassTable> classes,
+            std::span<const MasterFuturePricedClass> pricedClasses, std::int32_t horizon,
+            std::span<const MilliFunds> nodePrices, RefinementLedger & ledger, RefinementWork category,
+            MasterFutureRowPrice & result);
+    }
+
     inline const MasterFutureAction* findMasterFutureAction(const MasterFutureCatalog & catalog,
                                                             const CanonicalPlanActionKey & key)
     {

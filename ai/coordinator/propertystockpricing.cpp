@@ -2,15 +2,38 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <set>
 
 #include "ai/coordinator/masterassignmentfuture.h"
 #include "ai/coordinator/masterplanpricing.h"
 #include "ai/coordinator/relativestockcomparison.h"
+#include "ai/coordinator/replystockcontext.h"
 
 namespace
 {
     using namespace Coordinator;
+
+    constexpr RefinementWork REPLY_STOCK_WORK = RefinementWork::MasterDualOptimization;
+    // Stock keys carry no immediate value, exactly as in the diagnostic dual model.
+    constexpr MilliFunds KEY_IMMEDIATE_VALUE = 0;
+
+    ReplyStockStatus replyStatusOf(MasterFutureStatus status)
+    {
+        switch (status)
+        {
+            case MasterFutureStatus::Valid:
+                return ReplyStockStatus::Valid;
+            case MasterFutureStatus::ArithmeticFailure:
+                return ReplyStockStatus::ArithmeticFailure;
+            case MasterFutureStatus::BudgetExhausted:
+                return ReplyStockStatus::LimitReached;
+            case MasterFutureStatus::Unavailable:
+            case MasterFutureStatus::Invalid:
+                break;
+        }
+        return ReplyStockStatus::Invalid;
+    }
 
     bool dualFailure(MasterPlanPricingStatus status)
     {
@@ -18,9 +41,26 @@ namespace
             status == MasterPlanPricingStatus::Inconsistent;
     }
 
+    std::int32_t capturedNodeOf(std::span<const PropertyStockColumn> columns, std::int32_t capturedColumn)
+    {
+        return capturedColumn == NO_STOCK_COLUMN ? NO_SEQUENTIAL_NODE : futureNodeOfColumn(columns, capturedColumn);
+    }
+
+    // The ceiling refunds each captured node price once, so a second capturer of it would be unsound.
+    bool claimCapturedNode(std::vector<bool> & capturedNodes, std::int32_t node)
+    {
+        const auto slot = static_cast<std::size_t>(node);
+        if (capturedNodes[slot])
+        {
+            return false;
+        }
+        capturedNodes[slot] = true;
+        return true;
+    }
+
     std::optional<MasterPlanPricingModel> dualModel(const MasterFutureCatalog & catalog,
                                                     const CheapPricingModel & cheap, const ContinuationKey & key,
-                                                    const SequentialInstance & instance)
+                                                    const std::vector<bool> & expectedCaptured)
     {
         MasterPlanPricingModel model;
         model.catalog.horizon = catalog.horizon;
@@ -41,25 +81,19 @@ namespace
             MasterPlanPricingCandidate candidate;
             candidate.key = action;
             candidate.row = pFuture->row;
-            if (pTerms->capturedColumn != NO_STOCK_COLUMN)
-            {
-                candidate.capturedNode = futureNodeOfColumn(catalog.columns, pTerms->capturedColumn);
-            }
+            candidate.capturedNode = capturedNodeOf(catalog.columns, pTerms->capturedColumn);
             if (candidate.capturedNode != NO_SEQUENTIAL_NODE)
             {
-                const auto node = static_cast<std::size_t>(candidate.capturedNode);
-                // The ceiling refunds each captured node price once, so a second capturer of it would be unsound.
-                if (capturedNodes[node])
+                if (!claimCapturedNode(capturedNodes, candidate.capturedNode))
                 {
                     return std::nullopt;
                 }
-                capturedNodes[node] = true;
                 removeCapturedNode(candidate.row, candidate.capturedNode);
             }
             model.rowActors[static_cast<std::size_t>(action.row())] = static_cast<std::int32_t>(model.actors.size());
             model.actors.push_back(MasterPlanPricingActor{action.row(), {std::move(candidate)}});
         }
-        if (capturedNodes != instance.capturedNodes || !indexMasterPlanActions(model))
+        if (capturedNodes != expectedCaptured || !indexMasterPlanActions(model))
         {
             return std::nullopt;
         }
@@ -71,7 +105,7 @@ namespace
                          const DiagnosticRefinementLimits & limits, DiagnosticStockQuote & quote)
     {
         quote.dualStatus = MasterPlanPricingStatus::Invalid;
-        const auto model = dualModel(catalog, cheap, key, instance);
+        const auto model = dualModel(catalog, cheap, key, instance.capturedNodes);
         std::int64_t ledgerTotal = limits.dualWork;
         RefinementLedger ledger;
         // The final evaluation draws on what tuning leaves, so it gets a reserve as large as the tuning budget.
@@ -355,31 +389,16 @@ namespace Coordinator
         DiagnosticStockQuotes result;
         result.limits = limits;
         result.quotes.resize(keys.size());
-        std::set<CanonicalPlanActionKey> uniqueActions;
-        std::vector<ContinuationKey> validKeys;
-        std::vector<std::size_t> validIndices;
-        for (std::size_t index = 0; index < keys.size(); ++index)
+        const DiagnosticCatalogKeys selected = diagnosticCatalogKeys(field, keys);
+        const std::vector<std::size_t> & validIndices = selected.validIndices;
+        const std::vector<ContinuationKey> & validKeys = selected.validKeys;
+        for (const std::size_t index : validIndices)
         {
-            std::set<std::int32_t> rows;
-            const bool valid = std::all_of(keys[index].begin(), keys[index].end(), [&](const auto & action)
-            {
-                return action.row() >= 0 && action.row() < field.m_ours.rowCount() &&
-                    action.x() >= 0 && action.x() < field.m_width && action.y() >= 0 && action.y() < field.m_height &&
-                    rows.insert(action.row()).second;
-            });
-            if (!valid)
-            {
-                continue;
-            }
             result.quotes[index].status = DiagnosticStockStatus::PreparationFailed;
-            validIndices.push_back(index);
-            validKeys.push_back(keys[index]);
-            uniqueActions.insert(keys[index].begin(), keys[index].end());
         }
-        const ContinuationKey catalog(uniqueActions.begin(), uniqueActions.end());
-        result.actions = catalog.size();
+        result.actions = selected.catalog.size();
         auto scratch = validKeys.empty() ? std::nullopt :
-            buildCheapModelFor(field, planActions(catalog), true, &result.classesBuilt, nullptr);
+            buildCheapModelFor(field, planActions(selected.catalog), true, &result.classesBuilt, nullptr);
         result.preparationNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
         if (scratch)
@@ -429,7 +448,6 @@ namespace Coordinator
         instance.nodeColumns = catalog.columns;
         instance.classes = catalog.classes;
         instance.rows = catalog.dayRows;
-        instance.capturedNodes.assign(catalog.columns.size(), false);
         for (const CanonicalPlanActionKey & action : key)
         {
             const MasterFutureAction* pAction = findMasterFutureAction(catalog, action);
@@ -439,14 +457,7 @@ namespace Coordinator
             }
             instance.rows[static_cast<std::size_t>(action.row())] = pAction->row;
         }
-        for (const std::int32_t column : facts.capturedColumns)
-        {
-            const std::int32_t node = futureNodeOfColumn(catalog.columns, column);
-            if (node != NO_SEQUENTIAL_NODE)
-            {
-                instance.capturedNodes[static_cast<std::size_t>(node)] = true;
-            }
-        }
+        instance.capturedNodes = capturedNodesOf(catalog.columns, facts.capturedColumns);
         const SequentialTierResult tier = solveSequentialPacking(
             instance, field.ourOpenOptimum(facts), stateCap, nullptr, true, SequentialWitnessPolicy::BookedValue,
             SequentialTierAuditMode::CountersOnly, nullptr, nullptr, SequentialPackingPolicy::CompatibleRows);
@@ -468,6 +479,161 @@ namespace Coordinator
         quote.dualNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - dualStarted).count();
         return dualSound;
+    }
+
+    bool JointPlanStockValuer::validDiagnosticKey(const PropertyStockField & field, const ContinuationKey & key)
+    {
+        std::set<std::int32_t> rows;
+        return std::all_of(key.begin(), key.end(), [&](const auto & action)
+        {
+            return action.row() >= 0 && action.row() < field.m_ours.rowCount() &&
+                action.x() >= 0 && action.x() < field.m_width && action.y() >= 0 && action.y() < field.m_height &&
+                rows.insert(action.row()).second;
+        });
+    }
+
+    JointPlanStockValuer::DiagnosticCatalogKeys JointPlanStockValuer::diagnosticCatalogKeys(
+        const PropertyStockField & field, std::span<const ContinuationKey> keys)
+    {
+        DiagnosticCatalogKeys result;
+        std::set<CanonicalPlanActionKey> uniqueActions;
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            if (!validDiagnosticKey(field, keys[index]))
+            {
+                continue;
+            }
+            result.validIndices.push_back(index);
+            result.validKeys.push_back(keys[index]);
+            uniqueActions.insert(keys[index].begin(), keys[index].end());
+        }
+        result.catalog.assign(uniqueActions.begin(), uniqueActions.end());
+        return result;
+    }
+
+    std::vector<bool> JointPlanStockValuer::capturedNodesOf(
+        std::span<const PropertyStockColumn> nodeColumns, std::span<const std::int32_t> capturedColumns)
+    {
+        std::vector<bool> captured(nodeColumns.size(), false);
+        for (const std::int32_t column : capturedColumns)
+        {
+            const std::int32_t node = futureNodeOfColumn(nodeColumns, column);
+            if (node != NO_SEQUENTIAL_NODE)
+            {
+                captured[static_cast<std::size_t>(node)] = true;
+            }
+        }
+        return captured;
+    }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    DiagnosticPricingModels JointPlanStockValuer::diagnosticPricingModels(
+        const PropertyStockField & field, std::span<const ContinuationKey> keys)
+    {
+        DiagnosticPricingModels result;
+        result.models.resize(keys.size());
+        const DiagnosticCatalogKeys selected = diagnosticCatalogKeys(field, keys);
+        auto build = selected.validKeys.empty() ? std::nullopt :
+            buildCheapModelFor(field, planActions(selected.catalog), true, &result.classes, nullptr);
+        if (!build)
+        {
+            return result;
+        }
+        for (std::size_t valid = 0; valid < selected.validKeys.size(); ++valid)
+        {
+            const ContinuationKey & key = selected.validKeys[valid];
+            const PropertyStockField::JointActionFacts facts = build->field->jointActionFacts(planActions(key));
+            result.models[selected.validIndices[valid]] = dualModel(*build->future, build->model, key,
+                capturedNodesOf(build->future->columns, facts.capturedColumns));
+        }
+        return result;
+    }
+#endif
+
+    void JointPlanStockValuer::ourStockNodes(const PropertyStockField & field, std::vector<std::int32_t> & nodeSlots,
+                                             std::vector<PropertyStockColumn> & nodeColumns)
+    {
+        for (std::size_t slot = 0;
+             slot < field.m_ours.columns.size();
+             ++slot)
+        {
+            const PropertyStockColumn & column =
+                field.m_ours.columns[slot];
+            if (column.ownerBefore == STOCK_OWNER_AFTER)
+            {
+                continue;
+            }
+            nodeSlots.push_back(static_cast<std::int32_t>(slot));
+            nodeColumns.push_back(column);
+        }
+    }
+
+    std::vector<std::int32_t> JointPlanStockValuer::dayClassIndices(
+        PropertyStockField & field, const std::vector<std::int32_t> & nodeSlots,
+        const std::vector<PropertyStockColumn> & nodeColumns, std::vector<SequentialClassKey> & classKeys,
+        std::vector<SequentialClassTable> & classTables)
+    {
+        std::vector<std::int32_t> classOfRow(
+            field.m_ours.rows.size(),
+            NO_SEQUENTIAL_CLASS);
+        for (std::size_t rowIndex = 0; rowIndex < field.m_ours.rows.size(); ++rowIndex)
+        {
+            classOfRow[rowIndex] = cheapClassIndexFor(field, field.m_ours.rows[rowIndex],
+                nodeSlots, nodeColumns, classKeys, classTables);
+        }
+        return classOfRow;
+    }
+
+    SequentialRow JointPlanStockValuer::daySequentialRow(PropertyStockField & field, std::int32_t rowIndex,
+                                                         const std::vector<std::int32_t> & nodeSlots,
+                                                         std::int32_t classIndex)
+    {
+        return sequentialRowFor(
+            field,
+            field.m_ours,
+            field.m_ours.rows[static_cast<std::size_t>(rowIndex)],
+            rowIndex,
+            nullptr,
+            nodeSlots,
+            classIndex);
+    }
+
+    std::int32_t JointPlanStockValuer::actionClassIndexFor(
+        PropertyStockField & field, const PlanRowAction & action, std::span<const std::int32_t> classOfRow,
+        const std::vector<std::int32_t> & nodeSlots, const std::vector<PropertyStockColumn> & nodeColumns,
+        std::vector<SequentialClassKey> & classKeys, std::vector<SequentialClassTable> & classTables)
+    {
+        if (action.row < 0 || action.row >= field.m_ours.rowCount() ||
+            action.stepsLost < 0 || action.stepsLost > CanonicalPlanActionKey::MAX_STEPS_LOST)
+        {
+            return NO_SEQUENTIAL_CLASS;
+        }
+        if (action.stepsLost == 0 && !action.destroyed)
+        {
+            return classOfRow[static_cast<std::size_t>(action.row)];
+        }
+        PropertyStockRow row = field.m_ours.rows[static_cast<std::size_t>(action.row)];
+        row.captureRate = replyCaptureRate(row.captureRate, action.stepsLost, action.destroyed);
+        return cheapClassIndexFor(field, row, nodeSlots, nodeColumns, classKeys, classTables);
+    }
+
+    SequentialRow JointPlanStockValuer::actionSequentialRow(PropertyStockField & field, const PlanRowAction & action,
+                                                            const std::vector<std::int32_t> & nodeSlots,
+                                                            std::int32_t classIndex, std::int32_t & capturedColumn)
+    {
+        const PropertyStockRow & source =
+            field.m_ours.rows[
+                static_cast<std::size_t>(action.row)];
+        capturedColumn = NO_STOCK_COLUMN;
+        const PropertyStockActor mover = field.actionMover(action, capturedColumn);
+        return sequentialRowFor(
+            field,
+            field.m_ours,
+            source,
+            action.row,
+            &mover,
+            nodeSlots,
+            classIndex);
     }
 
     SequentialClassTable JointPlanStockValuer::buildOurClassTable(
@@ -521,47 +687,23 @@ namespace Coordinator
             std::make_unique<PropertyStockField>(source);
         std::vector<std::int32_t> nodeSlots;
         std::vector<PropertyStockColumn> nodeColumns;
-        for (std::size_t slot = 0;
-             slot < pricingField->m_ours.columns.size();
-             ++slot)
-        {
-            const PropertyStockColumn & column =
-                pricingField->m_ours.columns[slot];
-            if (column.ownerBefore == STOCK_OWNER_AFTER)
-            {
-                continue;
-            }
-            nodeSlots.push_back(static_cast<std::int32_t>(slot));
-            nodeColumns.push_back(column);
-        }
+        ourStockNodes(*pricingField, nodeSlots, nodeColumns);
 
         std::vector<SequentialClassKey> classKeys;
         std::vector<SequentialClassTable> classTables;
-        std::vector<std::int32_t> classOfRow(
-            pricingField->m_ours.rows.size(),
-            NO_SEQUENTIAL_CLASS);
-        for (std::size_t rowIndex = 0; rowIndex < pricingField->m_ours.rows.size(); ++rowIndex)
-        {
-            classOfRow[rowIndex] = cheapClassIndexFor(*pricingField, pricingField->m_ours.rows[rowIndex],
-                nodeSlots, nodeColumns, classKeys, classTables);
-        }
+        const std::vector<std::int32_t> classOfRow =
+            dayClassIndices(*pricingField, nodeSlots, nodeColumns, classKeys, classTables);
         std::vector<std::int32_t> classOfAction;
         classOfAction.reserve(catalogActions.size());
         for (const PlanRowAction & action : catalogActions)
         {
-            if (action.row < 0 || action.row >= pricingField->m_ours.rowCount() ||
-                action.stepsLost < 0 || action.stepsLost > CanonicalPlanActionKey::MAX_STEPS_LOST)
+            const std::int32_t classIndex =
+                actionClassIndexFor(*pricingField, action, classOfRow, nodeSlots, nodeColumns, classKeys, classTables);
+            if (classIndex == NO_SEQUENTIAL_CLASS)
             {
                 return std::nullopt;
             }
-            if (action.stepsLost == 0 && !action.destroyed)
-            {
-                classOfAction.push_back(classOfRow[static_cast<std::size_t>(action.row)]);
-                continue;
-            }
-            PropertyStockRow row = pricingField->m_ours.rows[static_cast<std::size_t>(action.row)];
-            row.captureRate = replyCaptureRate(row.captureRate, action.stepsLost, action.destroyed);
-            classOfAction.push_back(cheapClassIndexFor(*pricingField, row, nodeSlots, nodeColumns, classKeys, classTables));
+            classOfAction.push_back(classIndex);
         }
         if (classesBuilt != nullptr)
         {
@@ -589,14 +731,8 @@ namespace Coordinator
              rowIndex < pricingField->m_ours.rows.size();
              ++rowIndex)
         {
-            const SequentialRow row = sequentialRowFor(
-                *pricingField,
-                pricingField->m_ours,
-                pricingField->m_ours.rows[rowIndex],
-                static_cast<std::int32_t>(rowIndex),
-                nullptr,
-                nodeSlots,
-                classOfRow[rowIndex]);
+            const SequentialRow row = daySequentialRow(
+                *pricingField, static_cast<std::int32_t>(rowIndex), nodeSlots, classOfRow[rowIndex]);
             if (future)
             {
                 future->dayRows.push_back(row);
@@ -618,19 +754,9 @@ namespace Coordinator
         std::size_t actionIndex = 0;
         for (const PlanRowAction & action : catalogActions)
         {
-            const PropertyStockRow & source =
-                pricingField->m_ours.rows[
-                    static_cast<std::size_t>(action.row)];
             std::int32_t capturedColumn = NO_STOCK_COLUMN;
-            const PropertyStockActor mover = pricingField->actionMover(action, capturedColumn);
-            const SequentialRow row = sequentialRowFor(
-                *pricingField,
-                pricingField->m_ours,
-                source,
-                action.row,
-                &mover,
-                nodeSlots,
-                classOfAction[actionIndex++]);
+            const SequentialRow row =
+                actionSequentialRow(*pricingField, action, nodeSlots, classOfAction[actionIndex++], capturedColumn);
             if (future)
             {
                 future->actions.push_back({canonicalPlanActionKey(action), row});
@@ -776,4 +902,256 @@ namespace Coordinator
         return result;
     }
 
+    ReplyStockContext::ReplyStockContext(const PropertyStockField & field)
+        : m_field(std::make_unique<PropertyStockField>(field))
+    {
+        JointPlanStockValuer::ourStockNodes(*m_field, m_nodeSlots, m_nodeColumns);
+        m_classOfRow =
+            JointPlanStockValuer::dayClassIndices(*m_field, m_nodeSlots, m_nodeColumns, m_classKeys, m_classTables);
+        m_dayRows.reserve(m_classOfRow.size());
+        for (std::size_t row = 0; row < m_classOfRow.size(); ++row)
+        {
+            m_dayRows.push_back(JointPlanStockValuer::daySequentialRow(
+                *m_field, static_cast<std::int32_t>(row), m_nodeSlots, m_classOfRow[row]));
+        }
+        m_dayUppers.resize(m_dayRows.size());
+        m_valid = m_meter.open(std::numeric_limits<std::int64_t>::max());
+    }
+
+    ReplyStockPriceInstall ReplyStockContext::installPrices(std::span<const MilliFunds> prices)
+    {
+        ReplyStockPriceInstall result{ReplyStockStatus::Invalid, m_priceVersion};
+        const std::int32_t horizon = m_field->m_horizonTurns;
+        if (!m_valid || horizon < 0 || prices.size() != m_nodeColumns.size())
+        {
+            return result;
+        }
+        if (!chargeMasterWork(m_meter, prices.size() + 1, 1, REPLY_STOCK_WORK))
+        {
+            result.status = ReplyStockStatus::LimitReached;
+            return result;
+        }
+        if (!MasterFutureDetail::validMasterFuturePrices(m_nodeColumns, prices))
+        {
+            return result;
+        }
+        if (!masterWorkProduct(prices.size(), static_cast<std::size_t>(horizon)))
+        {
+            result.status = ReplyStockStatus::ArithmeticFailure;
+            return result;
+        }
+        m_prices.assign(prices.begin(), prices.end());
+        m_pricedClasses.assign(m_classTables.size(), {});
+        m_classPriced.assign(m_classTables.size(), false);
+        m_dayUppers.assign(m_dayRows.size(), std::nullopt);
+        for (auto & [key, entry] : m_actions)
+        {
+            entry.upper.reset();
+        }
+        result.version = ++m_priceVersion;
+        result.status = ReplyStockStatus::Valid;
+        return result;
+    }
+
+    ReplyStockCeiling ReplyStockContext::ceiling(const ContinuationKey & key)
+    {
+        ReplyStockCeiling result;
+        const std::int64_t workBefore = work();
+        result.priceVersion = m_priceVersion;
+        result.status = m_priceVersion == 0 ? ReplyStockStatus::NoPrices : extend(key, result.counters);
+        if (result.status == ReplyStockStatus::Valid)
+        {
+            result.status = composeCeiling(key, result);
+        }
+        result.work = work() - workBefore;
+        return result;
+    }
+
+    ReplyStockOwned ReplyStockContext::owned(const ContinuationKey & key)
+    {
+        ReplyStockOwned result;
+        ReplyStockCounters counters;
+        result.status = extend(key, counters);
+        if (result.status != ReplyStockStatus::Valid)
+        {
+            return result;
+        }
+        const std::vector<PropertyStockColumn> & columns = m_field->m_ours.columns;
+        std::vector<bool> captured(columns.size(), false);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const std::int32_t column = m_actions.at(action).capturedColumn;
+            if (column != NO_STOCK_COLUMN)
+            {
+                captured[static_cast<std::size_t>(column)] = true;
+            }
+        }
+        MilliFunds owned = m_field->m_ownedBaseline;
+        for (std::size_t column = 0; column < columns.size(); ++column)
+        {
+            if (captured[column] &&
+                !RelativeStockDetail::checkedAdd(owned, ownershipFlipSwing(columns[column], m_field->m_horizonTurns)))
+            {
+                result.status = ReplyStockStatus::ArithmeticFailure;
+                return result;
+            }
+        }
+        result.owned = owned;
+        return result;
+    }
+
+    ReplyStockStatus ReplyStockContext::extend(const ContinuationKey & key, ReplyStockCounters & counters)
+    {
+        if (!m_valid)
+        {
+            return ReplyStockStatus::PreparationFailed;
+        }
+        if (!JointPlanStockValuer::validDiagnosticKey(*m_field, key))
+        {
+            return ReplyStockStatus::InvalidKey;
+        }
+        const std::vector<PlanRowAction> actions = JointPlanStockValuer::planActions(key);
+        for (std::size_t index = 0; index < key.size(); ++index)
+        {
+            if (m_actions.contains(key[index]))
+            {
+                continue;
+            }
+            const std::size_t classesBefore = m_classTables.size();
+            const std::int32_t classIndex = JointPlanStockValuer::actionClassIndexFor(
+                *m_field, actions[index], m_classOfRow, m_nodeSlots, m_nodeColumns, m_classKeys, m_classTables);
+            if (classIndex == NO_SEQUENTIAL_CLASS)
+            {
+                return ReplyStockStatus::PreparationFailed;
+            }
+            counters.classesAdded += static_cast<std::int64_t>(m_classTables.size() - classesBefore);
+            ActionEntry entry;
+            entry.row = JointPlanStockValuer::actionSequentialRow(
+                *m_field, actions[index], m_nodeSlots, classIndex, entry.capturedColumn);
+            entry.capturedNode = capturedNodeOf(m_nodeColumns, entry.capturedColumn);
+            if (entry.capturedNode != NO_SEQUENTIAL_NODE)
+            {
+                removeCapturedNode(entry.row, entry.capturedNode);
+            }
+            m_actions.emplace(key[index], std::move(entry));
+            ++counters.actionsAdded;
+        }
+        m_pricedClasses.resize(m_classTables.size());
+        m_classPriced.resize(m_classTables.size(), false);
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result)
+    {
+        std::vector<bool> capturedNodes(m_nodeColumns.size(), false);
+        std::vector<bool> acting(m_dayRows.size(), false);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const ActionEntry & entry = m_actions.at(action);
+            if (entry.capturedNode != NO_SEQUENTIAL_NODE && !claimCapturedNode(capturedNodes, entry.capturedNode))
+            {
+                return ReplyStockStatus::Invalid;
+            }
+            acting[static_cast<std::size_t>(action.row())] = true;
+        }
+        for (std::size_t row = 0; row < m_dayRows.size(); ++row)
+        {
+            const ReplyStockStatus status =
+                acting[row] ? ReplyStockStatus::Valid : rowUpper(m_dayRows[row], m_dayUppers[row], result.counters);
+            if (status != ReplyStockStatus::Valid)
+            {
+                return status;
+            }
+        }
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            ActionEntry & entry = m_actions.at(action);
+            if (!chargeMasterWork(m_meter, 1, 1, REPLY_STOCK_WORK))
+            {
+                return ReplyStockStatus::LimitReached;
+            }
+            const ReplyStockStatus status = rowUpper(entry.row, entry.upper, result.counters);
+            if (status != ReplyStockStatus::Valid)
+            {
+                return status;
+            }
+        }
+        MilliFunds ceiling = 0;
+        if (!MasterPlanPricingDetail::addMasterPlanTerms(ceiling, m_prices))
+        {
+            return ReplyStockStatus::ArithmeticFailure;
+        }
+        for (std::size_t row = 0; row < m_dayRows.size(); ++row)
+        {
+            if (!acting[row] && !RelativeStockDetail::checkedAdd(ceiling, *m_dayUppers[row]))
+            {
+                return ReplyStockStatus::ArithmeticFailure;
+            }
+        }
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const ActionEntry & entry = m_actions.at(action);
+            const auto value = MasterPlanPricingDetail::masterPlanCandidateValue(
+                KEY_IMMEDIATE_VALUE, entry.capturedNode, *entry.upper, m_prices);
+            if (!value || !RelativeStockDetail::checkedAdd(ceiling, *value))
+            {
+                return ReplyStockStatus::ArithmeticFailure;
+            }
+        }
+        result.ceiling = ceiling;
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::rowUpper(const SequentialRow & row, std::optional<MilliFunds> & cached,
+                                                 ReplyStockCounters & counters)
+    {
+        if (cached)
+        {
+            ++counters.rowHits;
+            return ReplyStockStatus::Valid;
+        }
+        const ReplyStockStatus priced = priceClass(row.classIndex, counters);
+        if (priced != ReplyStockStatus::Valid)
+        {
+            return priced;
+        }
+        MasterFutureRowPrice price;
+        const MasterFutureStatus status = MasterFutureDetail::priceMasterFutureRow(row, m_classTables,
+            m_pricedClasses, m_field->m_horizonTurns, m_prices, m_meter, REPLY_STOCK_WORK, price);
+        if (status != MasterFutureStatus::Valid)
+        {
+            return replyStatusOf(status);
+        }
+        cached = price.upper;
+        ++counters.rowScans;
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::priceClass(std::int32_t classIndex, ReplyStockCounters & counters)
+    {
+        if (classIndex < 0 || static_cast<std::size_t>(classIndex) >= m_classTables.size())
+        {
+            return ReplyStockStatus::Invalid;
+        }
+        const auto slot = static_cast<std::size_t>(classIndex);
+        if (m_classPriced[slot])
+        {
+            ++counters.tableHits;
+            return ReplyStockStatus::Valid;
+        }
+        // The share of priceMasterFuture's per-pricing tariff that each class adds.
+        if (!chargeMasterWork(m_meter, 1, 1, REPLY_STOCK_WORK))
+        {
+            return ReplyStockStatus::LimitReached;
+        }
+        const MasterFutureStatus status = MasterFutureDetail::priceMasterFutureClass(m_classTables[slot],
+            m_nodeColumns, m_field->m_horizonTurns, m_prices, m_meter, REPLY_STOCK_WORK, m_pricedClasses[slot]);
+        if (status != MasterFutureStatus::Valid)
+        {
+            return replyStatusOf(status);
+        }
+        m_classPriced[slot] = true;
+        ++counters.classTablesPriced;
+        return ReplyStockStatus::Valid;
+    }
 }

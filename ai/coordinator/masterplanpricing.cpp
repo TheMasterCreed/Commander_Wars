@@ -131,12 +131,6 @@ namespace
         return left.classIndex == right.classIndex && left.weight == right.weight && left.ownedTurn == right.ownedTurn;
     }
 
-    bool addAll(MilliFunds & total, std::span<const MilliFunds> terms)
-    {
-        return std::all_of(terms.begin(), terms.end(),
-            [&](MilliFunds term) { return RelativeStockDetail::checkedAdd(total, term); });
-    }
-
     void countNodes(std::vector<std::int32_t> & demand, const std::vector<std::int32_t> & nodes)
     {
         for (const auto node : nodes)
@@ -240,16 +234,15 @@ namespace
         std::vector<MilliFunds> values;
         for (const auto & candidate : actor.candidates)
         {
-            auto value = candidate.immediateValue;
             const auto & future = pricing.actions[static_cast<std::size_t>(candidate.actionIndex)];
-            const auto captured = static_cast<std::size_t>(candidate.capturedNode);
-            if ((candidate.capturedNode != NO_SEQUENTIAL_NODE &&
-                 !RelativeStockDetail::checkedSubtract(value, prices[captured])) ||
-                !RelativeStockDetail::checkedAdd(value, future.upper))
+            const auto value =
+                MasterPlanPricingDetail::masterPlanCandidateValue(candidate.immediateValue, candidate.capturedNode,
+                                                                  future.upper, prices);
+            if (!value)
             {
                 return std::nullopt;
             }
-            values.push_back(value);
+            values.push_back(*value);
         }
         return values;
     }
@@ -272,7 +265,7 @@ namespace
         }
         MilliFunds ceiling = 0;
         result.nodeDemand.assign(prices.size(), 0);
-        if (!addAll(ceiling, prices) || !addIdleRows(model, pricing, ceiling, result.nodeDemand))
+        if (!MasterPlanPricingDetail::addMasterPlanTerms(ceiling, prices) || !addIdleRows(model, pricing, ceiling, result.nodeDemand))
         {
             result.status = MasterPlanPricingStatus::ArithmeticFailure;
             return result;
@@ -1130,6 +1123,25 @@ namespace Coordinator
     {
         row.weight[static_cast<std::size_t>(node)] = 0;
         row.ownedTurn[static_cast<std::size_t>(node)] = NO_CAPTURE_TURNS;
+    }
+
+    bool MasterPlanPricingDetail::addMasterPlanTerms(MilliFunds & total, std::span<const MilliFunds> terms)
+    {
+        return std::all_of(terms.begin(), terms.end(),
+            [&](MilliFunds term) { return RelativeStockDetail::checkedAdd(total, term); });
+    }
+
+    std::optional<MilliFunds> MasterPlanPricingDetail::masterPlanCandidateValue(
+        MilliFunds immediateValue, std::int32_t capturedNode, MilliFunds futureUpper, std::span<const MilliFunds> prices)
+    {
+        auto value = immediateValue;
+        if ((capturedNode != NO_SEQUENTIAL_NODE &&
+             !RelativeStockDetail::checkedSubtract(value, prices[static_cast<std::size_t>(capturedNode)])) ||
+            !RelativeStockDetail::checkedAdd(value, futureUpper))
+        {
+            return std::nullopt;
+        }
+        return value;
     }
 
     std::map<std::int32_t, std::int64_t> masterPlanOccupiedUsage(const MasterPlanPricingModel & model)

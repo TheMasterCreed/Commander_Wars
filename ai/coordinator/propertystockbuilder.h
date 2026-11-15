@@ -148,6 +148,8 @@ namespace Coordinator
         bool witnessReplays{false};
         bool valid{false};
     };
+
+    struct DiagnosticPricingModels;
 #endif
 
     class JointPlanStockValuer final : public PlanStockValuer
@@ -182,6 +184,8 @@ namespace Coordinator
         bool prepareMasterContinuationPricing(ContinuationPricingCatalog catalog, RefinementLedger & ledger,
                                               MasterAssignmentProfile* profile = nullptr);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
+        static DiagnosticPricingModels diagnosticPricingModels(
+            const PropertyStockField & field, std::span<const ContinuationKey> keys);
         bool prepareDiagnosticContinuationPricing(
             ContinuationPricingCatalog catalog, RefinementLedger & ledger, std::int64_t diagnosticWorkLimit);
         const SequentialTierResult* diagnosticLastOurRefinement() const
@@ -208,6 +212,7 @@ namespace Coordinator
 
     private:
         friend class MasterAssignmentStockContext;
+        friend class ReplyStockContext;
 
         struct OperationBaseTariffs
         {
@@ -342,6 +347,33 @@ namespace Coordinator
             std::shared_ptr<MasterFutureCatalog> future;
         };
 
+        struct DiagnosticCatalogKeys
+        {
+            std::vector<std::size_t> validIndices;
+            std::vector<ContinuationKey> validKeys;
+            ContinuationKey catalog;
+        };
+
+        static bool validDiagnosticKey(const PropertyStockField & field, const ContinuationKey & key);
+        static DiagnosticCatalogKeys diagnosticCatalogKeys(
+            const PropertyStockField & field, std::span<const ContinuationKey> keys);
+        static std::vector<bool> capturedNodesOf(
+            std::span<const PropertyStockColumn> nodeColumns, std::span<const std::int32_t> capturedColumns);
+        static void ourStockNodes(const PropertyStockField & field, std::vector<std::int32_t> & nodeSlots,
+                                  std::vector<PropertyStockColumn> & nodeColumns);
+        static std::vector<std::int32_t> dayClassIndices(
+            PropertyStockField & field, const std::vector<std::int32_t> & nodeSlots,
+            const std::vector<PropertyStockColumn> & nodeColumns, std::vector<SequentialClassKey> & classKeys,
+            std::vector<SequentialClassTable> & classTables);
+        static SequentialRow daySequentialRow(PropertyStockField & field, std::int32_t rowIndex,
+                                              const std::vector<std::int32_t> & nodeSlots, std::int32_t classIndex);
+        static std::int32_t actionClassIndexFor(
+            PropertyStockField & field, const PlanRowAction & action, std::span<const std::int32_t> classOfRow,
+            const std::vector<std::int32_t> & nodeSlots, const std::vector<PropertyStockColumn> & nodeColumns,
+            std::vector<SequentialClassKey> & classKeys, std::vector<SequentialClassTable> & classTables);
+        static SequentialRow actionSequentialRow(PropertyStockField & field, const PlanRowAction & action,
+                                                 const std::vector<std::int32_t> & nodeSlots,
+                                                 std::int32_t classIndex, std::int32_t & capturedColumn);
         static std::optional<CheapModelBuild> buildCheapModelFor(
             const PropertyStockField & source, std::span<const PlanRowAction> actions, bool retainSequentialRows,
             std::size_t* classesBuilt, EnemyCeiling priceEnemy);

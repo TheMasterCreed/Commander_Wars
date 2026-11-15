@@ -156,6 +156,7 @@ namespace Coordinator
 #endif
         friend class JointPlanStockValuer;
         friend class MasterAssignmentStockContext;
+        friend class ReplyStockContext;
 
     private:
         static std::int32_t tileSlot(std::int32_t width, std::int32_t height, std::int32_t x, std::int32_t y);

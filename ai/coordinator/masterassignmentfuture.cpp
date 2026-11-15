@@ -8,12 +8,6 @@ namespace
 {
     using namespace Coordinator;
 
-    struct PricedCell
-    {
-        MilliFunds value{0};
-        std::int32_t next{NO_SEQUENTIAL_NODE};
-    };
-
     std::optional<MilliFunds> checkedPrize(const PropertyStockColumn & column,
                                           std::int32_t turn, std::int32_t horizon)
     {
@@ -81,27 +75,19 @@ namespace
             {
                 return {MasterFutureStatus::BudgetExhausted};
             }
-            for (std::size_t node = 0; node < m_prices.size(); ++node)
+            if (!MasterFutureDetail::validMasterFuturePrices(m_catalog.columns, m_prices))
             {
-                if (m_prices[node] < 0 || m_catalog.columns[node].slot < 0 ||
-                    (node > 0 && m_catalog.columns[node - 1].slot >= m_catalog.columns[node].slot))
-                {
-                    return {MasterFutureStatus::Invalid};
-                }
+                return {MasterFutureStatus::Invalid};
             }
-            const auto cells = masterWorkProduct(m_prices.size(), static_cast<std::size_t>(m_catalog.horizon));
-            if (!cells)
+            if (!masterWorkProduct(m_prices.size(), static_cast<std::size_t>(m_catalog.horizon)))
             {
                 return {MasterFutureStatus::ArithmeticFailure};
             }
-            for (const auto & original : m_catalog.classes)
+            m_values.resize(m_catalog.classes.size());
+            for (std::size_t index = 0; index < m_catalog.classes.size(); ++index)
             {
-                if (!original.hasValidTransitions() || original.nodeCount() != static_cast<std::int32_t>(m_prices.size()) ||
-                    original.horizonTurns() != m_catalog.horizon)
-                {
-                    return {MasterFutureStatus::Invalid};
-                }
-                const auto status = buildClass(original, static_cast<std::size_t>(*cells));
+                const auto status = MasterFutureDetail::priceMasterFutureClass(m_catalog.classes[index],
+                    m_catalog.columns, m_catalog.horizon, m_prices, m_ledger, m_category, m_values[index]);
                 if (status != MasterFutureStatus::Valid)
                 {
                     return {status};
@@ -139,112 +125,17 @@ namespace
         }
 
     private:
-        MasterFutureStatus buildClass(const SequentialClassTable & original, std::size_t cells)
-        {
-            if (!chargeMasterWork(m_ledger, cells + 1, 1, m_category))
-            {
-                return MasterFutureStatus::BudgetExhausted;
-            }
-            std::vector<PricedCell> values(cells);
-            for (std::int32_t turn = m_catalog.horizon - 1; turn >= 1; --turn)
-            {
-                for (std::int32_t node = 0; node < original.nodeCount(); ++node)
-                {
-                    auto & best = values[cellIndex(node, turn, m_catalog.horizon)];
-                    for (std::int32_t next = 0; next < original.nodeCount(); ++next)
-                    {
-                        if (!chargeMasterWork(m_ledger, 1, 1, m_category))
-                        {
-                            return MasterFutureStatus::BudgetExhausted;
-                        }
-                        const auto nextTurn = original.continuationOwnedTurn(node, turn, next);
-                        if (nextTurn == NO_CAPTURE_TURNS)
-                        {
-                            continue;
-                        }
-                        auto value = checkedPrize(m_catalog.columns[static_cast<std::size_t>(next)],
-                                                  nextTurn, m_catalog.horizon);
-                        if (!value || !RelativeStockDetail::checkedSubtract(*value, m_prices[static_cast<std::size_t>(next)]) ||
-                            !RelativeStockDetail::checkedAdd(*value, values[cellIndex(next, nextTurn, m_catalog.horizon)].value))
-                        {
-                            return MasterFutureStatus::ArithmeticFailure;
-                        }
-                        if (*value > best.value)
-                        {
-                            best = {*value, next};
-                        }
-                    }
-                }
-            }
-            m_values.push_back(std::move(values));
-            return MasterFutureStatus::Valid;
-        }
-
         MasterFutureStatus priceRow(const SequentialRow & row, MasterFutureRowPrice & result)
         {
-            if (!chargeMasterWork(m_ledger, m_prices.size() + 1, 1, m_category))
-            {
-                return MasterFutureStatus::BudgetExhausted;
-            }
-            if (row.classIndex < 0 || static_cast<std::size_t>(row.classIndex) >= m_catalog.classes.size() ||
-                row.weight.size() != m_prices.size() || row.ownedTurn.size() != m_prices.size())
-            {
-                return MasterFutureStatus::Invalid;
-            }
-            const auto & values = m_values[static_cast<std::size_t>(row.classIndex)];
-            const auto & original = m_catalog.classes[static_cast<std::size_t>(row.classIndex)];
-            std::int32_t selected = NO_SEQUENTIAL_NODE;
-            for (std::int32_t node = 0; node < original.nodeCount(); ++node)
-            {
-                const auto slot = static_cast<std::size_t>(node);
-                const auto turn = row.ownedTurn[slot];
-                if (turn != NO_CAPTURE_TURNS && (turn < 1 || turn >= m_catalog.horizon))
-                {
-                    return MasterFutureStatus::Invalid;
-                }
-                auto value = row.weight[slot];
-                if (!RelativeStockDetail::checkedSubtract(value, m_prices[slot]) ||
-                    (turn != NO_CAPTURE_TURNS &&
-                     !RelativeStockDetail::checkedAdd(value, values[cellIndex(node, turn, m_catalog.horizon)].value)))
-                {
-                    return MasterFutureStatus::ArithmeticFailure;
-                }
-                if (value > result.upper)
-                {
-                    result.upper = value;
-                    selected = node;
-                }
-            }
-            if (selected != NO_SEQUENTIAL_NODE)
-            {
-                auto turn = row.ownedTurn[static_cast<std::size_t>(selected)];
-                while (selected != NO_SEQUENTIAL_NODE)
-                {
-                    if (!chargeMasterWork(m_ledger, 1, 1, m_category))
-                    {
-                        return MasterFutureStatus::BudgetExhausted;
-                    }
-                    result.nodes.push_back(selected);
-                    if (turn == NO_CAPTURE_TURNS)
-                    {
-                        break;
-                    }
-                    const auto next = values[cellIndex(selected, turn, m_catalog.horizon)].next;
-                    if (next != NO_SEQUENTIAL_NODE)
-                    {
-                        turn = original.continuationOwnedTurn(selected, turn, next);
-                    }
-                    selected = next;
-                }
-            }
-            return MasterFutureStatus::Valid;
+            return MasterFutureDetail::priceMasterFutureRow(row, m_catalog.classes, m_values, m_catalog.horizon,
+                                                            m_prices, m_ledger, m_category, result);
         }
 
         const MasterFutureCatalog & m_catalog;
         std::span<const MilliFunds> m_prices;
         RefinementLedger & m_ledger;
         RefinementWork m_category;
-        std::vector<std::vector<PricedCell>> m_values;
+        std::vector<MasterFuturePricedClass> m_values;
     };
 }
 
@@ -254,5 +145,136 @@ namespace Coordinator
         std::span<const MilliFunds> nodePrices, RefinementLedger & ledger, RefinementWork category)
     {
         return FuturePricing(catalog, nodePrices, ledger, category).run();
+    }
+
+    bool MasterFutureDetail::validMasterFuturePrices(std::span<const PropertyStockColumn> columns,
+                                                     std::span<const MilliFunds> nodePrices)
+    {
+        for (std::size_t node = 0; node < nodePrices.size(); ++node)
+        {
+            if (nodePrices[node] < 0 || columns[node].slot < 0 ||
+                (node > 0 && columns[node - 1].slot >= columns[node].slot))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    MasterFutureStatus MasterFutureDetail::priceMasterFutureClass(
+        const SequentialClassTable & table, std::span<const PropertyStockColumn> columns, std::int32_t horizon,
+        std::span<const MilliFunds> nodePrices, RefinementLedger & ledger, RefinementWork category,
+        MasterFuturePricedClass & values)
+    {
+        if (!table.hasValidTransitions() || table.nodeCount() != static_cast<std::int32_t>(nodePrices.size()) ||
+            table.horizonTurns() != horizon)
+        {
+            return MasterFutureStatus::Invalid;
+        }
+        const auto cells = masterWorkProduct(nodePrices.size(), static_cast<std::size_t>(horizon));
+        if (!cells)
+        {
+            return MasterFutureStatus::ArithmeticFailure;
+        }
+        if (!chargeMasterWork(ledger, static_cast<std::size_t>(*cells) + 1, 1, category))
+        {
+            return MasterFutureStatus::BudgetExhausted;
+        }
+        MasterFuturePricedClass priced(static_cast<std::size_t>(*cells));
+        for (std::int32_t turn = horizon - 1; turn >= 1; --turn)
+        {
+            for (std::int32_t node = 0; node < table.nodeCount(); ++node)
+            {
+                auto & best = priced[cellIndex(node, turn, horizon)];
+                for (std::int32_t next = 0; next < table.nodeCount(); ++next)
+                {
+                    if (!chargeMasterWork(ledger, 1, 1, category))
+                    {
+                        return MasterFutureStatus::BudgetExhausted;
+                    }
+                    const auto nextTurn = table.continuationOwnedTurn(node, turn, next);
+                    if (nextTurn == NO_CAPTURE_TURNS)
+                    {
+                        continue;
+                    }
+                    auto value = checkedPrize(columns[static_cast<std::size_t>(next)], nextTurn, horizon);
+                    if (!value || !RelativeStockDetail::checkedSubtract(*value, nodePrices[static_cast<std::size_t>(next)]) ||
+                        !RelativeStockDetail::checkedAdd(*value, priced[cellIndex(next, nextTurn, horizon)].value))
+                    {
+                        return MasterFutureStatus::ArithmeticFailure;
+                    }
+                    if (*value > best.value)
+                    {
+                        best = {*value, next};
+                    }
+                }
+            }
+        }
+        values = std::move(priced);
+        return MasterFutureStatus::Valid;
+    }
+
+    MasterFutureStatus MasterFutureDetail::priceMasterFutureRow(
+        const SequentialRow & row, std::span<const SequentialClassTable> classes,
+        std::span<const MasterFuturePricedClass> pricedClasses, std::int32_t horizon,
+        std::span<const MilliFunds> nodePrices, RefinementLedger & ledger, RefinementWork category,
+        MasterFutureRowPrice & result)
+    {
+        if (!chargeMasterWork(ledger, nodePrices.size() + 1, 1, category))
+        {
+            return MasterFutureStatus::BudgetExhausted;
+        }
+        if (row.classIndex < 0 || static_cast<std::size_t>(row.classIndex) >= classes.size() ||
+            row.weight.size() != nodePrices.size() || row.ownedTurn.size() != nodePrices.size())
+        {
+            return MasterFutureStatus::Invalid;
+        }
+        const auto & values = pricedClasses[static_cast<std::size_t>(row.classIndex)];
+        const auto & original = classes[static_cast<std::size_t>(row.classIndex)];
+        std::int32_t selected = NO_SEQUENTIAL_NODE;
+        for (std::int32_t node = 0; node < original.nodeCount(); ++node)
+        {
+            const auto slot = static_cast<std::size_t>(node);
+            const auto turn = row.ownedTurn[slot];
+            if (turn != NO_CAPTURE_TURNS && (turn < 1 || turn >= horizon))
+            {
+                return MasterFutureStatus::Invalid;
+            }
+            auto value = row.weight[slot];
+            if (!RelativeStockDetail::checkedSubtract(value, nodePrices[slot]) ||
+                (turn != NO_CAPTURE_TURNS &&
+                 !RelativeStockDetail::checkedAdd(value, values[cellIndex(node, turn, horizon)].value)))
+            {
+                return MasterFutureStatus::ArithmeticFailure;
+            }
+            if (value > result.upper)
+            {
+                result.upper = value;
+                selected = node;
+            }
+        }
+        if (selected != NO_SEQUENTIAL_NODE)
+        {
+            auto turn = row.ownedTurn[static_cast<std::size_t>(selected)];
+            while (selected != NO_SEQUENTIAL_NODE)
+            {
+                if (!chargeMasterWork(ledger, 1, 1, category))
+                {
+                    return MasterFutureStatus::BudgetExhausted;
+                }
+                result.nodes.push_back(selected);
+                if (turn == NO_CAPTURE_TURNS)
+                {
+                    break;
+                }
+                const auto next = values[cellIndex(selected, turn, horizon)].next;
+                if (next != NO_SEQUENTIAL_NODE)
+                {
+                    turn = original.continuationOwnedTurn(selected, turn, next);
+                }
+                selected = next;
+            }
+        }
+        return MasterFutureStatus::Valid;
     }
 }

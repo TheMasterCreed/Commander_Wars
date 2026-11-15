@@ -11,6 +11,7 @@
 #include "ai/coordinator/masterplanpricing.h"
 #include "ai/coordinator/propertystock.h"
 #include "ai/coordinator/propertystockbuilder.h"
+#include "ai/coordinator/replystockcontext.h"
 
 namespace Coordinator
 {
@@ -595,6 +596,170 @@ namespace
                "a capture completed this turn keeps the dual ceiling above the exact optimum");
     }
 
+    std::vector<MilliFunds> referenceCeilings(const Coordinator::PropertyStockField & field,
+                                              std::span<const Coordinator::ContinuationKey> keys,
+                                              std::span<const MilliFunds> prices)
+    {
+        using namespace Coordinator;
+        const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, keys);
+        std::vector<MilliFunds> ceilings;
+        for (const auto & model : reference.models)
+        {
+            RefinementLedger ledger;
+            ledger.open(MASTER_PLAN_PRICING_WORK);
+            const auto priced = model ? priceMasterPlan(*model, prices, ledger) : MasterPlanCeiling{};
+            expect(priced.status == MasterPlanPricingStatus::Valid,
+                   "the diagnostic dual model prices every fixture key");
+            ceilings.push_back(priced.ceiling);
+        }
+        return ceilings;
+    }
+
+    std::vector<MilliFunds> tunedPrices(const Coordinator::PropertyStockField & field,
+                                        const Coordinator::ContinuationKey & key)
+    {
+        using namespace Coordinator;
+        const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
+        RefinementLedger ledger;
+        if (!reference.models.front() || !ledger.open(2 * MASTER_PLAN_PRICING_WORK))
+        {
+            return {};
+        }
+        const MasterPlanPricingLimits limits{
+            MASTER_PLAN_PRICING_ROUNDS, MASTER_PLAN_PRICING_WORK, MASTER_PLAN_PRICING_WITNESS_WORK};
+        return tuneMasterPlanPrices(*reference.models.front(), limits, ledger).prices;
+    }
+
+    void stockContextMatchesDiagnosticCeilings()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::size_t NODES = 2;
+        constexpr std::array FIXED_PRICES{MilliFunds{3}, MilliFunds{1}};
+        // Above every row weight and column stream, so each relaxed row maximum is the empty itinerary.
+        constexpr MilliFunds PROHIBITIVE = 1000;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto waiting = CanonicalPlanActionKey::fromAction(0, 1, 0, false);
+        const auto moved = CanonicalPlanActionKey::fromAction(0, 0, 0, false);
+        const auto stalled = *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, true, Fixture::RATE, false);
+        const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
+        struct Case
+        {
+            PropertyStockField field;
+            std::vector<ContinuationKey> keys;
+        };
+        const std::array cases{
+            Case{Fixture::make(2), {{today}, {waiting}, {moved}, {damaged, second}, {stalled, second},
+                                    {dead, second}, {second}, {today, second}}},
+            Case{Fixture::make(1, Fixture::RATE), {{today}, {moved}, {dead}, {damaged}}},
+        };
+        for (const auto & testCase : cases)
+        {
+            const auto & keys = testCase.keys;
+            const auto tuned = tunedPrices(testCase.field, keys.front());
+            expect(tuned.size() == NODES && std::any_of(tuned.begin(), tuned.end(), [](MilliFunds p) { return p > 0; }),
+                   "tuning moves the fixture prices off zero");
+            const auto quotes = JointPlanStockValuer::diagnosticQuotes(testCase.field, keys, SEQUENTIAL_ONLY);
+            for (const auto & prices : {std::vector<MilliFunds>(NODES, 0),
+                                        std::vector<MilliFunds>(FIXED_PRICES.begin(), FIXED_PRICES.end()), tuned})
+            {
+                const auto expected = referenceCeilings(testCase.field, keys, prices);
+                ReplyStockContext forward(testCase.field);
+                ReplyStockContext backward(testCase.field);
+                expect(forward.installPrices(prices).status == ReplyStockStatus::Valid &&
+                       backward.installPrices(prices).status == ReplyStockStatus::Valid,
+                       "the context installs a nonnegative price vector over its nodes");
+                std::vector<ReplyStockCeiling> later(keys.size());
+                for (std::size_t index = keys.size(); index-- > 0;)
+                {
+                    later[index] = backward.ceiling(keys[index]);
+                }
+                for (std::size_t index = 0; index < keys.size(); ++index)
+                {
+                    const auto early = forward.ceiling(keys[index]);
+                    const auto owned = forward.owned(keys[index]);
+                    expect(early.status == ReplyStockStatus::Valid && later[index].status == ReplyStockStatus::Valid &&
+                           early.ceiling == expected[index] && later[index].ceiling == expected[index],
+                           "the context ceiling equals the diagnostic dual ceiling in either order of asking");
+                    expect(owned.status == ReplyStockStatus::Valid && owned.owned == quotes.quotes[index].owned,
+                           "the context owned value equals the diagnostic quote");
+                }
+            }
+        }
+
+        ReplyStockContext open(Fixture::make(1));
+        open.installPrices(std::vector<MilliFunds>(NODES, 0));
+        expect(open.ceiling({dead}).ceiling == 0 && open.ceiling({today}).ceiling > 0,
+               "a destroyed actor is an explicit zero row, not its idle day row");
+        ReplyStockContext completed(Fixture::make(1, Fixture::RATE));
+        completed.installPrices(std::vector<MilliFunds>(NODES, PROHIBITIVE));
+        expect(completed.ceiling({today}).ceiling == PROHIBITIVE &&
+                   completed.ceiling({moved}).ceiling == 2 * PROHIBITIVE,
+               "the ceiling is the price sum less the price of the node captured this turn");
+    }
+
+    void stockContextExtensionKeepsAnswers()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::array FIXED_PRICES{MilliFunds{3}, MilliFunds{1}};
+        constexpr std::array NEW_PRICES{MilliFunds{5}, MilliFunds{2}};
+        constexpr std::array REJECTED_PRICES{MilliFunds{-1}, MilliFunds{0}};
+        constexpr std::size_t NEW_RATE_CLASSES = 2;
+        constexpr std::int64_t KEY_ROWS = 2;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
+        const auto field = Fixture::make(2);
+        const auto before = Fixture::snapshot(field);
+        ReplyStockContext context(field);
+        expect(context.valid() && context.nodeCount() == FIXED_PRICES.size() && context.classCount() == 1 &&
+               context.actionCount() == 0 && context.ceiling({today}).status == ReplyStockStatus::NoPrices,
+               "a fresh context holds only the day rows and refuses a ceiling before prices");
+        expect(context.installPrices(FIXED_PRICES).version == 1, "an installed price vector gets a version");
+        const auto first = context.ceiling({today});
+        const auto other = context.ceiling({second});
+        const auto classes = context.classCount();
+        const auto damagedCeiling = context.ceiling({damaged, second});
+        const auto deadCeiling = context.ceiling({dead, second});
+        expect(damagedCeiling.counters.classesAdded == 1 && deadCeiling.counters.classesAdded == 1 &&
+               context.classCount() == classes + NEW_RATE_CLASSES && damagedCeiling.counters.classTablesPriced == 1,
+               "a damaged rate extends the class set in place and prices only its own table");
+        const auto again = context.ceiling({today});
+        const auto otherAgain = context.ceiling({second});
+        expect(again.status == ReplyStockStatus::Valid && again.ceiling == first.ceiling &&
+               otherAgain.ceiling == other.ceiling && again.counters.rowScans == 0 &&
+               again.counters.classTablesPriced == 0 && again.counters.actionsAdded == 0 && again.work > 0 &&
+               again.counters.rowHits == KEY_ROWS && again.counters.tableHits == 0 &&
+               first.counters.rowHits == 0 && first.counters.tableHits == 1,
+               "extending the context leaves earlier answers and their cached rows unchanged");
+        const std::vector<ContinuationKey> earlier{{today}, {second}, {damaged, second}, {dead, second}};
+        const auto expected = referenceCeilings(field, earlier, NEW_PRICES);
+        expect(context.installPrices(NEW_PRICES).version == 2, "a new price vector gets the next version");
+        std::vector<ReplyStockCeiling> repriced;
+        for (const auto & key : earlier)
+        {
+            repriced.push_back(context.ceiling(key));
+        }
+        bool matches = true;
+        for (std::size_t index = 0; index < earlier.size(); ++index)
+        {
+            matches = matches && repriced[index].status == ReplyStockStatus::Valid &&
+                repriced[index].ceiling == expected[index] && repriced[index].priceVersion == 2;
+        }
+        expect(matches && repriced.front().counters.rowScans == KEY_ROWS &&
+               repriced.front().counters.classTablesPriced == 1 && repriced.front().counters.rowHits == 0 &&
+               repriced[2].counters.classTablesPriced == 1,
+               "new prices discard the warm caches and reprice the earlier keys from scratch");
+        const auto rejected = context.installPrices(REJECTED_PRICES);
+        const auto wrongSize = context.installPrices(std::span(NEW_PRICES).first(1));
+        const auto kept = context.ceiling({today});
+        expect(rejected.status == ReplyStockStatus::Invalid && rejected.version == 2 &&
+               wrongSize.status == ReplyStockStatus::Invalid && context.priceVersion() == 2 &&
+               kept.priceVersion == 2 && kept.ceiling == expected.front() && kept.counters.rowScans == 0,
+               "a rejected price vector keeps the previous version and its answers");
+        expect(Fixture::unchanged(field, before), "the context works on its own copy of the field");
+    }
+
     void testReadSetOnlyBoundsWork()
     {
         constexpr TilePoint origin{0, 0};
@@ -626,6 +791,8 @@ int main()
     stockFieldDiagnosticChecks();
     stockFieldRefinementIsExact();
     stockFieldDualCeilingIsSound();
+    stockContextMatchesDiagnosticCeilings();
+    stockContextExtensionKeepsAnswers();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
