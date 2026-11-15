@@ -82,9 +82,22 @@ namespace Coordinator
                 const auto & weights = rowIndex == 0 ? (carried > 0 ? CARRIED_WEIGHTS : CENTER_WEIGHTS) : SECOND_WEIGHTS;
                 field.m_ours.weights.insert(field.m_ours.weights.end(), weights.begin(), weights.end());
             }
+            rebuildMarginals(field);
+            return field;
+        }
+
+        static void rebuildMarginals(PropertyStockField & field)
+        {
+            field.m_marginals.clear();
             field.m_marginals.emplace(PropertyStockField::MarginalKey{0, NO_STOCK_COLUMN},
                                       buildMarginalTable(field.m_ours, 0, NO_STOCK_COLUMN));
-            return field;
+        }
+
+        static void setWeight(PropertyStockField & field, std::int32_t row, std::int32_t node, MilliFunds weight)
+        {
+            const std::size_t nodes = field.m_ours.columns.size();
+            field.m_ours.weights[static_cast<std::size_t>(row) * nodes + static_cast<std::size_t>(node)] = weight;
+            rebuildMarginals(field);
         }
 
         static Snapshot snapshot(const PropertyStockField & field)
@@ -615,8 +628,8 @@ namespace
         return ceilings;
     }
 
-    std::vector<MilliFunds> tunedPrices(const Coordinator::PropertyStockField & field,
-                                        const Coordinator::ContinuationKey & key)
+    Coordinator::MasterPlanPricingResult existingTune(const Coordinator::PropertyStockField & field,
+                                                      const Coordinator::ContinuationKey & key)
     {
         using namespace Coordinator;
         const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
@@ -627,7 +640,13 @@ namespace
         }
         const MasterPlanPricingLimits limits{
             MASTER_PLAN_PRICING_ROUNDS, MASTER_PLAN_PRICING_WORK, MASTER_PLAN_PRICING_WITNESS_WORK};
-        return tuneMasterPlanPrices(*reference.models.front(), limits, ledger).prices;
+        return tuneMasterPlanPrices(*reference.models.front(), limits, ledger);
+    }
+
+    std::vector<MilliFunds> tunedPrices(const Coordinator::PropertyStockField & field,
+                                        const Coordinator::ContinuationKey & key)
+    {
+        return existingTune(field, key).prices;
     }
 
     void stockContextMatchesDiagnosticCeilings()
@@ -760,6 +779,171 @@ namespace
         expect(Fixture::unchanged(field, before), "the context works on its own copy of the field");
     }
 
+    bool ascendingWitness(const Coordinator::ReplyStockFloor & floor)
+    {
+        MilliFunds total = 0;
+        std::int32_t previous = NO_STOCK_ROW;
+        for (const auto & row : floor.witness)
+        {
+            if (row.row <= previous || row.steps.empty())
+            {
+                return false;
+            }
+            previous = row.row;
+            total += row.value;
+        }
+        return total == floor.floor;
+    }
+
+    void stockContextFloorBracketsExact()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::size_t NODES = 2;
+        constexpr std::array FIXED_PRICES{MilliFunds{3}, MilliFunds{1}};
+        constexpr std::array EXACT{MilliFunds{20}, MilliFunds{18}, MilliFunds{12}};
+        constexpr std::size_t DEAD_INDEX = 2;
+        constexpr std::int32_t DEAD_HEAD_TURN = 3;
+        constexpr MilliFunds DEAD_HEAD_WEIGHT = 10;
+        constexpr std::int32_t DEAD_RETURN_TURN = 6;
+        constexpr MilliFunds DEAD_RETURN_STREAM = 2;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead}};
+        const auto field = Fixture::make(2);
+        const std::vector<MilliFunds> zero(NODES, 0);
+        const std::vector<MilliFunds> fixed(FIXED_PRICES.begin(), FIXED_PRICES.end());
+        for (const auto & prices : {zero, fixed, tunedPrices(field, keys.front())})
+        {
+            ReplyStockContext context(field);
+            const auto version = context.installPrices(prices).version;
+            for (std::size_t index = 0; index < keys.size(); ++index)
+            {
+                const auto ceiling = context.ceiling(keys[index]);
+                const auto floor = context.floor(keys[index]);
+                expect(floor.status == ReplyStockStatus::Valid && ceiling.status == ReplyStockStatus::Valid &&
+                           floor.floor <= EXACT[index] && EXACT[index] <= ceiling.ceiling &&
+                           floor.priceVersion == version && floor.key == keys[index] && ascendingWitness(floor) &&
+                           floor.counters.steps > 0 && floor.work > 0,
+                       "a published floor replays and brackets the exact optimum below the ceiling");
+            }
+        }
+        ReplyStockContext derived(field);
+        derived.installPrices(zero);
+        const auto deadFloor = derived.floor(keys[DEAD_INDEX]);
+        const std::vector<SequentialRowWitness> deadWitness{SequentialRowWitness{1,
+            {{0, DEAD_HEAD_TURN, DEAD_HEAD_WEIGHT}, {1, DEAD_RETURN_TURN, DEAD_RETURN_STREAM}},
+            DEAD_HEAD_WEIGHT + DEAD_RETURN_STREAM}};
+        expect(deadFloor.floor == EXACT[DEAD_INDEX] && deadFloor.witness == deadWitness &&
+                   deadFloor.counters.prefixRows == 1 && deadFloor.counters.emptyRows == 1,
+               "the destroyed key's floor is the second row's whole relaxed chain");
+
+        for (std::size_t index = 0; index < keys.size(); ++index)
+        {
+            const auto existing = existingTune(field, keys[index]);
+            const bool usable = existing.status == MasterPlanPricingStatus::Valid && existing.floor.has_value();
+            const bool closes = usable && *existing.floor == existing.ceiling;
+            ReplyStockContext context(field);
+            const auto tuned = context.tune(keys[index], MASTER_PLAN_PRICING_ROUNDS);
+            const auto plain = context.floor(keys[index]);
+            expect(usable && tuned.status == ReplyStockStatus::Valid && tuned.floor.status == ReplyStockStatus::Valid &&
+                       tuned.floor.floor <= EXACT[index] && EXACT[index] <= tuned.ceiling &&
+                       (!closes || (tuned.floor.floor == EXACT[index] && tuned.ceiling == EXACT[index])) &&
+                       tuned.rounds > 0 && plain.status == ReplyStockStatus::Valid && tuned.floor.floor >= plain.floor &&
+                       ascendingWitness(tuned.floor) && tuned.limits.limits.rounds == MASTER_PLAN_PRICING_ROUNDS &&
+                       context.priceVersion() == 1 && context.ceiling(keys[index]).ceiling == tuned.ceiling,
+                   "tune leaves verified prices installed and closes the gap wherever the existing tuner does");
+        }
+    }
+
+    void stockContextFloorConflictsAndReference()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        // The second node costs more than any continuation through it earns, so both relaxed chains stop at node zero.
+        constexpr std::array CONFLICT_PRICES{MilliFunds{0}, MilliFunds{7}};
+        constexpr std::array REFERENCE_PRICES{MilliFunds{10}, MilliFunds{6}};
+        constexpr std::size_t NODES = 2;
+        constexpr std::int32_t ACTING_TURN = 1;
+        constexpr std::int32_t IDLE_TURN = 2;
+        constexpr std::int32_t FAR_TURN = 3;
+        constexpr std::int32_t RETURN_TURN = 5;
+        constexpr MilliFunds ACTING_WEIGHT = 14;
+        constexpr MilliFunds SECOND_HEAD_WEIGHT = 10;
+        constexpr MilliFunds SECOND_HOME_WEIGHT = 6;
+        constexpr MilliFunds FAR_HEAD_WEIGHT = 4;
+        constexpr MilliFunds FIRST_NODE_STREAM = 6;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
+        const auto away = *CanonicalPlanActionKey::checkedFromAction(0, 1, 0, false, 1, true);
+        const auto field = Fixture::make(2);
+        const SequentialRowWitness actingRow{0, {{0, ACTING_TURN, ACTING_WEIGHT}}, ACTING_WEIGHT};
+        const SequentialRowWitness homeRow{1, {{1, IDLE_TURN, SECOND_HOME_WEIGHT}}, SECOND_HOME_WEIGHT};
+
+        ReplyStockContext fresh(field);
+        const auto refused = fresh.floor({today});
+        expect(refused.status == ReplyStockStatus::NoPrices && refused.floor == 0 && refused.witness.empty() &&
+                   refused.priceVersion == 0,
+               "a floor asked before any prices is refused");
+
+        ReplyStockContext conflict(field);
+        conflict.installPrices(CONFLICT_PRICES);
+        const auto alone = conflict.floor({dead});
+        const auto shared = conflict.floor({today});
+
+        const std::vector<SequentialRowWitness> aloneWitness{
+            SequentialRowWitness{1, {{0, FAR_TURN, SECOND_HEAD_WEIGHT}}, SECOND_HEAD_WEIGHT}};
+        const std::vector<SequentialRowWitness> sharedWitness{actingRow, homeRow};
+        expect(alone.witness == aloneWitness && alone.counters.prefixRows == 1,
+               "alone, the second row's relaxed chain starts at the first node");
+        expect(shared.status == ReplyStockStatus::Valid && shared.witness == sharedWitness &&
+                   shared.counters.prefixRows == 1 && shared.counters.fallbackRows == 1,
+               "a later row whose chain starts at a used node falls back to its best free head");
+
+        ReplyStockContext context(field);
+        context.installPrices(REFERENCE_PRICES);
+        const auto base = context.floor({second});
+        const auto rebuilt = context.floor({today, second}, &base);
+        const auto again = context.floor({today, second}, &base);
+        const std::vector<SequentialRowWitness> rebuiltWitness{actingRow, homeRow};
+        expect(base.status == ReplyStockStatus::Valid && rebuilt.status == ReplyStockStatus::Valid &&
+                   rebuilt.witness == rebuiltWitness && rebuilt.counters.reusedRows == 1 &&
+                   rebuilt.counters.prefixRows == 1 && rebuilt.counters.fallbackRows == 0,
+               "the reference serves the unchanged row while the changed row is rebuilt");
+        expect(again.witness == rebuilt.witness && again.floor == rebuilt.floor &&
+                   again.counters.reusedRows == rebuilt.counters.reusedRows,
+               "asking twice gives the identical witness");
+        auto corrupted = base;
+        ++corrupted.witness.front().steps.front().turn;
+        const auto rejected = context.floor({second}, &corrupted);
+        expect(rejected.status == ReplyStockStatus::ReplayRejected && rejected.floor == 0 && rejected.witness.empty(),
+               "a reused step the replay disagrees with withholds the whole floor");
+
+        ReplyStockContext open(field);
+        open.installPrices(std::vector<MilliFunds>(NODES, 0));
+        const auto destroyed = open.floor({dead});
+        auto worthless = destroyed;
+        worthless.witness.insert(worthless.witness.begin(),
+                                 SequentialRowWitness{0, {{0, NO_CAPTURE_TURNS, 0}}, 0});
+        const auto unblocked = open.floor({dead}, &worthless);
+        expect(destroyed.status == ReplyStockStatus::Valid && unblocked.status == ReplyStockStatus::Valid &&
+                   unblocked.witness == destroyed.witness && unblocked.counters.emptyRows == 1,
+               "a reused prefix worth nothing releases its node to the rows after it");
+
+        auto farField = Fixture::make(2, Fixture::RATE);
+        Fixture::setWeight(farField, 1, 0, FAR_HEAD_WEIGHT);
+        ReplyStockContext capture(farField);
+        capture.installPrices(std::vector<MilliFunds>(NODES, 0));
+        const auto through = capture.floor({away});
+        const auto cut = capture.floor({today}, &through);
+        const std::vector<SequentialRowWitness> throughWitness{SequentialRowWitness{1,
+            {{1, IDLE_TURN, SECOND_HOME_WEIGHT}, {0, RETURN_TURN, FIRST_NODE_STREAM}},
+            SECOND_HOME_WEIGHT + FIRST_NODE_STREAM}};
+        const std::vector<SequentialRowWitness> cutWitness{homeRow};
+        expect(through.witness == throughWitness && cut.status == ReplyStockStatus::Valid &&
+                   cut.witness == cutWitness && cut.counters.reusedRows == 1 && cut.counters.emptyRows == 1,
+               "a reference chain is cut before the node the new key captures, keeping its turns and gains");
+    }
+
     void testReadSetOnlyBoundsWork()
     {
         constexpr TilePoint origin{0, 0};
@@ -793,6 +977,8 @@ int main()
     stockFieldDualCeilingIsSound();
     stockContextMatchesDiagnosticCeilings();
     stockContextExtensionKeepsAnswers();
+    stockContextFloorBracketsExact();
+    stockContextFloorConflictsAndReference();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

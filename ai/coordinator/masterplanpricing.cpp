@@ -11,8 +11,8 @@ namespace
     using namespace Coordinator;
 
     constexpr std::int32_t STALL_ROUNDS = 20;
-    constexpr std::int32_t WITNESS_INTERVAL = 10;
-    constexpr std::int32_t MAX_POLISH_PASSES = 8;
+    constexpr std::int32_t WITNESS_INTERVAL = MASTER_PLAN_WITNESS_INTERVAL;
+    constexpr std::int32_t MAX_POLISH_PASSES = MASTER_PLAN_POLISH_PASSES;
     constexpr double INITIAL_SCALE = 1.0;
     constexpr double SCALE_DECAY = 0.5;
     constexpr double PRICE_LIMIT = 1.0e15;

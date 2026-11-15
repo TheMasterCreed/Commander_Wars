@@ -15,8 +15,17 @@ namespace
     using namespace Coordinator;
 
     constexpr RefinementWork REPLY_STOCK_WORK = RefinementWork::MasterDualOptimization;
+    constexpr RefinementWork REPLY_FLOOR_WORK = RefinementWork::MasterWitness;
     // Stock keys carry no immediate value, exactly as in the diagnostic dual model.
     constexpr MilliFunds KEY_IMMEDIATE_VALUE = 0;
+    // The tuner's price step charges one unit per demand entry and one per price.
+    constexpr std::size_t PRICE_STEP_TERMS_PER_NODE = 2;
+    // One pick search and then up to the polish passes, each sized as rows times nodes times turns.
+    constexpr std::size_t WITNESS_SEARCH_PASSES = 1 + MASTER_PLAN_POLISH_PASSES;
+    // The tuner refuses a zero witness budget, which a model without rows or classes would otherwise get.
+    constexpr std::int64_t MIN_TUNE_BUILD_WORK = 1;
+    // Each consideration makes an enforced build and, until a floor exists, a relaxed one.
+    constexpr std::size_t WITNESS_BUILDS_PER_CONSIDERATION = 2;
 
     ReplyStockStatus replyStatusOf(MasterFutureStatus status)
     {
@@ -30,6 +39,24 @@ namespace
                 return ReplyStockStatus::LimitReached;
             case MasterFutureStatus::Unavailable:
             case MasterFutureStatus::Invalid:
+                break;
+        }
+        return ReplyStockStatus::Invalid;
+    }
+
+    ReplyStockStatus replyStatusOf(MasterPlanPricingStatus status)
+    {
+        switch (status)
+        {
+            case MasterPlanPricingStatus::Valid:
+                return ReplyStockStatus::Valid;
+            case MasterPlanPricingStatus::ArithmeticFailure:
+                return ReplyStockStatus::ArithmeticFailure;
+            case MasterPlanPricingStatus::LimitReached:
+                return ReplyStockStatus::LimitReached;
+            case MasterPlanPricingStatus::Unavailable:
+            case MasterPlanPricingStatus::Invalid:
+            case MasterPlanPricingStatus::Inconsistent:
                 break;
         }
         return ReplyStockStatus::Invalid;
@@ -58,30 +85,38 @@ namespace
         return true;
     }
 
-    std::optional<MasterPlanPricingModel> dualModel(const MasterFutureCatalog & catalog,
-                                                    const CheapPricingModel & cheap, const ContinuationKey & key,
-                                                    const std::vector<bool> & expectedCaptured)
+    struct ForcedAction
+    {
+        const SequentialRow* pRow{nullptr};
+        std::int32_t capturedNode{NO_SEQUENTIAL_NODE};
+    };
+
+    // Removing a captured node is idempotent, so a lookup may hand over a row that already lost it.
+    template <typename Lookup>
+    std::optional<MasterPlanPricingModel> forcedPricingModel(
+        std::int32_t horizon, std::span<const PropertyStockColumn> columns,
+        std::span<const SequentialClassTable> classes, std::span<const SequentialRow> dayRows,
+        const ContinuationKey & key, Lookup && lookup, const std::vector<bool>* pExpectedCaptured)
     {
         MasterPlanPricingModel model;
-        model.catalog.horizon = catalog.horizon;
-        model.catalog.columns = catalog.columns;
-        model.catalog.classes = catalog.classes;
-        model.catalog.dayRows = catalog.dayRows;
+        model.catalog.horizon = horizon;
+        model.catalog.columns.assign(columns.begin(), columns.end());
+        model.catalog.classes.assign(classes.begin(), classes.end());
+        model.catalog.dayRows.assign(dayRows.begin(), dayRows.end());
         model.catalog.complete = true;
-        model.rowActors.assign(catalog.dayRows.size(), MASTER_PLAN_NO_ACTOR);
-        std::vector<bool> capturedNodes(catalog.columns.size(), false);
+        model.rowActors.assign(dayRows.size(), MASTER_PLAN_NO_ACTOR);
+        std::vector<bool> capturedNodes(columns.size(), false);
         for (const CanonicalPlanActionKey & action : key)
         {
-            const MasterFutureAction* pFuture = findMasterFutureAction(catalog, action);
-            const CheapActionTerms* pTerms = cheap.actionTerms(action);
-            if (pFuture == nullptr || pTerms == nullptr)
+            const ForcedAction forced = lookup(action);
+            if (forced.pRow == nullptr)
             {
                 return std::nullopt;
             }
             MasterPlanPricingCandidate candidate;
             candidate.key = action;
-            candidate.row = pFuture->row;
-            candidate.capturedNode = capturedNodeOf(catalog.columns, pTerms->capturedColumn);
+            candidate.row = *forced.pRow;
+            candidate.capturedNode = forced.capturedNode;
             if (candidate.capturedNode != NO_SEQUENTIAL_NODE)
             {
                 if (!claimCapturedNode(capturedNodes, candidate.capturedNode))
@@ -93,11 +128,75 @@ namespace
             model.rowActors[static_cast<std::size_t>(action.row())] = static_cast<std::int32_t>(model.actors.size());
             model.actors.push_back(MasterPlanPricingActor{action.row(), {std::move(candidate)}});
         }
-        if (capturedNodes != expectedCaptured || !indexMasterPlanActions(model))
+        if ((pExpectedCaptured != nullptr && capturedNodes != *pExpectedCaptured) || !indexMasterPlanActions(model))
         {
             return std::nullopt;
         }
         return model;
+    }
+
+    std::optional<MasterPlanPricingModel> dualModel(const MasterFutureCatalog & catalog,
+                                                    const CheapPricingModel & cheap, const ContinuationKey & key,
+                                                    const std::vector<bool> & expectedCaptured)
+    {
+        return forcedPricingModel(catalog.horizon, catalog.columns, catalog.classes, catalog.dayRows, key,
+            [&](const CanonicalPlanActionKey & action)
+        {
+            const MasterFutureAction* pFuture = findMasterFutureAction(catalog, action);
+            const CheapActionTerms* pTerms = cheap.actionTerms(action);
+            return pFuture == nullptr || pTerms == nullptr ? ForcedAction{} :
+                ForcedAction{&pFuture->row, capturedNodeOf(catalog.columns, pTerms->capturedColumn)};
+        }, &expectedCaptured);
+    }
+
+    bool compactWitness(std::span<const SequentialRowWitness> source, std::vector<SequentialRowWitness> & rows,
+                        MilliFunds & value)
+    {
+        bool summed = true;
+        for (const SequentialRowWitness & row : source)
+        {
+            if (row.steps.empty())
+            {
+                continue;
+            }
+            summed = summed && RelativeStockDetail::checkedAdd(value, row.value);
+            rows.push_back(row);
+        }
+        return summed;
+    }
+
+    std::size_t witnessSteps(std::span<const SequentialRowWitness> rows)
+    {
+        std::size_t steps = 0;
+        for (const SequentialRowWitness & row : rows)
+        {
+            steps += row.steps.size();
+        }
+        return steps;
+    }
+
+    std::vector<const CanonicalPlanActionKey*> rowVariants(const ContinuationKey & key, std::size_t rowCount)
+    {
+        std::vector<const CanonicalPlanActionKey*> variants(rowCount, nullptr);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            variants[static_cast<std::size_t>(action.row())] = &action;
+        }
+        return variants;
+    }
+
+    bool sameVariant(const CanonicalPlanActionKey* pLeft, const CanonicalPlanActionKey* pRight)
+    {
+        return pLeft == nullptr ? pRight == nullptr : pRight != nullptr && *pLeft == *pRight;
+    }
+
+    std::optional<std::int64_t> addWork(std::int64_t left, std::optional<std::int64_t> right)
+    {
+        if (!right || !RelativeStockDetail::checkedAdd(left, *right))
+        {
+            return std::nullopt;
+        }
+        return left;
     }
 
     bool tightenWithDual(const MasterFutureCatalog & catalog, const CheapPricingModel & cheap,
@@ -140,16 +239,7 @@ namespace
         {
             std::vector<SequentialRowWitness> rows;
             MilliFunds value = 0;
-            bool summed = true;
-            for (const SequentialRowWitness & row : tuned.witness.rows)
-            {
-                if (row.steps.empty())
-                {
-                    continue;
-                }
-                summed = summed && RelativeStockDetail::checkedAdd(value, row.value);
-                rows.push_back(row);
-            }
+            const bool summed = compactWitness(tuned.witness.rows, rows, value);
             quote.dualWitnessValue = value;
             quote.dualWitnessReplays = summed && replaySequentialWitness(instance, rows, value);
             if (quote.dualWitnessReplays && value > interval.lower)
@@ -914,7 +1004,7 @@ namespace Coordinator
             m_dayRows.push_back(JointPlanStockValuer::daySequentialRow(
                 *m_field, static_cast<std::int32_t>(row), m_nodeSlots, m_classOfRow[row]));
         }
-        m_dayUppers.resize(m_dayRows.size());
+        m_pricedDayRows.resize(m_dayRows.size());
         m_valid = m_meter.open(std::numeric_limits<std::int64_t>::max());
     }
 
@@ -943,10 +1033,10 @@ namespace Coordinator
         m_prices.assign(prices.begin(), prices.end());
         m_pricedClasses.assign(m_classTables.size(), {});
         m_classPriced.assign(m_classTables.size(), false);
-        m_dayUppers.assign(m_dayRows.size(), std::nullopt);
+        m_pricedDayRows.assign(m_dayRows.size(), std::nullopt);
         for (auto & [key, entry] : m_actions)
         {
-            entry.upper.reset();
+            entry.priced.reset();
         }
         result.version = ++m_priceVersion;
         result.status = ReplyStockStatus::Valid;
@@ -1041,10 +1131,40 @@ namespace Coordinator
         return ReplyStockStatus::Valid;
     }
 
-    ReplyStockStatus ReplyStockContext::composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result)
+    ReplyStockFloor ReplyStockContext::floor(const ContinuationKey & key, const ReplyStockFloor * reference)
     {
-        std::vector<bool> capturedNodes(m_nodeColumns.size(), false);
-        std::vector<bool> acting(m_dayRows.size(), false);
+        ReplyStockFloor result;
+        const std::int64_t workBefore = work();
+        result.key = key;
+        result.priceVersion = m_priceVersion;
+        result.status = m_priceVersion == 0 ? ReplyStockStatus::NoPrices : extend(key, result.pricing);
+        if (result.status == ReplyStockStatus::Valid)
+        {
+            result.status = composeFloor(key, reference, result);
+        }
+        if (result.status != ReplyStockStatus::Valid)
+        {
+            result.floor = 0;
+            result.witness.clear();
+        }
+        result.work = work() - workBefore;
+        return result;
+    }
+
+    ReplyStockTune ReplyStockContext::tune(const ContinuationKey & key, std::int32_t rounds)
+    {
+        ReplyStockTune result;
+        const std::int64_t workBefore = work();
+        result.status = tuneKey(key, rounds, result);
+        result.work = work() - workBefore;
+        return result;
+    }
+
+    ReplyStockStatus ReplyStockContext::claimKey(const ContinuationKey & key, std::vector<bool> & capturedNodes,
+                                                 std::vector<bool> & acting) const
+    {
+        capturedNodes.assign(m_nodeColumns.size(), false);
+        acting.assign(m_dayRows.size(), false);
         for (const CanonicalPlanActionKey & action : key)
         {
             const ActionEntry & entry = m_actions.at(action);
@@ -1054,10 +1174,41 @@ namespace Coordinator
             }
             acting[static_cast<std::size_t>(action.row())] = true;
         }
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::keyInstance(const ContinuationKey & key, SequentialInstance & instance) const
+    {
+        std::vector<bool> acting;
+        const ReplyStockStatus status = claimKey(key, instance.capturedNodes, acting);
+        if (status != ReplyStockStatus::Valid)
+        {
+            return status;
+        }
+        instance.horizonTurns = m_field->m_horizonTurns;
+        instance.nodeColumns = m_nodeColumns;
+        instance.classes = m_classTables;
+        instance.rows = m_dayRows;
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            instance.rows[static_cast<std::size_t>(action.row())] = m_actions.at(action).row;
+        }
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result)
+    {
+        std::vector<bool> capturedNodes;
+        std::vector<bool> acting;
+        const ReplyStockStatus claimed = claimKey(key, capturedNodes, acting);
+        if (claimed != ReplyStockStatus::Valid)
+        {
+            return claimed;
+        }
         for (std::size_t row = 0; row < m_dayRows.size(); ++row)
         {
-            const ReplyStockStatus status =
-                acting[row] ? ReplyStockStatus::Valid : rowUpper(m_dayRows[row], m_dayUppers[row], result.counters);
+            const ReplyStockStatus status = acting[row] ? ReplyStockStatus::Valid :
+                rowUpper(m_dayRows[row], m_pricedDayRows[row], result.counters);
             if (status != ReplyStockStatus::Valid)
             {
                 return status;
@@ -1070,7 +1221,7 @@ namespace Coordinator
             {
                 return ReplyStockStatus::LimitReached;
             }
-            const ReplyStockStatus status = rowUpper(entry.row, entry.upper, result.counters);
+            const ReplyStockStatus status = rowUpper(entry.row, entry.priced, result.counters);
             if (status != ReplyStockStatus::Valid)
             {
                 return status;
@@ -1083,7 +1234,7 @@ namespace Coordinator
         }
         for (std::size_t row = 0; row < m_dayRows.size(); ++row)
         {
-            if (!acting[row] && !RelativeStockDetail::checkedAdd(ceiling, *m_dayUppers[row]))
+            if (!acting[row] && !RelativeStockDetail::checkedAdd(ceiling, m_pricedDayRows[row]->upper))
             {
                 return ReplyStockStatus::ArithmeticFailure;
             }
@@ -1092,7 +1243,7 @@ namespace Coordinator
         {
             const ActionEntry & entry = m_actions.at(action);
             const auto value = MasterPlanPricingDetail::masterPlanCandidateValue(
-                KEY_IMMEDIATE_VALUE, entry.capturedNode, *entry.upper, m_prices);
+                KEY_IMMEDIATE_VALUE, entry.capturedNode, entry.priced->upper, m_prices);
             if (!value || !RelativeStockDetail::checkedAdd(ceiling, *value))
             {
                 return ReplyStockStatus::ArithmeticFailure;
@@ -1102,7 +1253,345 @@ namespace Coordinator
         return ReplyStockStatus::Valid;
     }
 
-    ReplyStockStatus ReplyStockContext::rowUpper(const SequentialRow & row, std::optional<MilliFunds> & cached,
+    ReplyStockStatus ReplyStockContext::composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
+                                                     ReplyStockFloor & result)
+    {
+        ReplyStockCeiling priced;
+        priced.counters = result.pricing;
+        ReplyStockStatus status = composeCeiling(key, priced);
+        result.pricing = priced.counters;
+        SequentialInstance instance;
+        if (status == ReplyStockStatus::Valid)
+        {
+            status = keyInstance(key, instance);
+        }
+        if (status != ReplyStockStatus::Valid)
+        {
+            return status;
+        }
+        const std::size_t rowCount = instance.rows.size();
+        const std::size_t nodeCount = m_nodeColumns.size();
+        std::vector<bool> used(nodeCount, false);
+        const auto freeNode = [&](std::int32_t node)
+        {
+            return node >= 0 && static_cast<std::size_t>(node) < nodeCount &&
+                !instance.capturedNodes[static_cast<std::size_t>(node)] && !used[static_cast<std::size_t>(node)];
+        };
+        // A prefix worth nothing only blocks nodes, so its row goes on to the relaxed chain and fallback instead.
+        const auto releaseWorthless = [&](auto & steps, MilliFunds value)
+        {
+            if (value > 0)
+            {
+                return false;
+            }
+            for (const auto & step : steps)
+            {
+                used[static_cast<std::size_t>(step.node)] = false;
+            }
+            steps.clear();
+            return true;
+        };
+        std::vector<std::optional<SequentialRowWitness>> chosen(rowCount);
+        const std::vector<const CanonicalPlanActionKey*> variants = rowVariants(key, rowCount);
+        ReplyStockFloorCounters & counters = result.counters;
+        if (reference != nullptr && reference->status == ReplyStockStatus::Valid &&
+            JointPlanStockValuer::validDiagnosticKey(*m_field, reference->key))
+        {
+            const std::vector<const CanonicalPlanActionKey*> referenceVariants =
+                rowVariants(reference->key, rowCount);
+            std::int32_t previousRow = NO_STOCK_ROW;
+            for (const SequentialRowWitness & source : reference->witness)
+            {
+                const auto slot = static_cast<std::size_t>(source.row);
+                if (source.row <= previousRow || slot >= rowCount ||
+                    !sameVariant(variants[slot], referenceVariants[slot]))
+                {
+                    continue;
+                }
+                previousRow = source.row;
+                SequentialRowWitness kept;
+                kept.row = source.row;
+                for (const SequentialWitnessStep & step : source.steps)
+                {
+                    if (!chargeFloor(1))
+                    {
+                        return ReplyStockStatus::LimitReached;
+                    }
+                    if (!freeNode(step.node))
+                    {
+                        break;
+                    }
+                    if (!RelativeStockDetail::checkedAdd(kept.value, step.gain))
+                    {
+                        return ReplyStockStatus::ArithmeticFailure;
+                    }
+                    used[static_cast<std::size_t>(step.node)] = true;
+                    kept.steps.push_back(step);
+                }
+                if (!releaseWorthless(kept.steps, kept.value) && !kept.steps.empty())
+                {
+                    chosen[slot] = std::move(kept);
+                    ++counters.reusedRows;
+                }
+            }
+        }
+        for (std::size_t slot = 0; slot < rowCount; ++slot)
+        {
+            if (chosen[slot])
+            {
+                continue;
+            }
+            const SequentialRow & row = instance.rows[slot];
+            const SequentialClassTable & table = m_classTables[static_cast<std::size_t>(row.classIndex)];
+            const std::optional<PricedRow> & pricedRow =
+                variants[slot] == nullptr ? m_pricedDayRows[slot] : m_actions.at(*variants[slot]).priced;
+            std::vector<SequentialDetail::WitnessStep> steps;
+            for (const std::int32_t node : pricedRow->chain)
+            {
+                if (!chargeFloor(1))
+                {
+                    return ReplyStockStatus::LimitReached;
+                }
+                if (!freeNode(node))
+                {
+                    break;
+                }
+                const std::int32_t turn = steps.empty() ? row.ownedTurn[static_cast<std::size_t>(node)] :
+                    table.continuationOwnedTurn(steps.back().node, steps.back().turn, node);
+                if (!steps.empty() && turn == NO_CAPTURE_TURNS)
+                {
+                    break;
+                }
+                used[static_cast<std::size_t>(node)] = true;
+                steps.push_back({node, turn});
+            }
+            SequentialRowWitness witness =
+                SequentialDetail::ownedWitness(instance, row, static_cast<std::int32_t>(slot), steps);
+            releaseWorthless(steps, witness.value);
+            if (!steps.empty())
+            {
+                ++counters.prefixRows;
+                chosen[slot] = std::move(witness);
+                continue;
+            }
+            if (!chargeFloor(nodeCount))
+            {
+                return ReplyStockStatus::LimitReached;
+            }
+            std::int32_t best = NO_SEQUENTIAL_NODE;
+            for (std::int32_t node = 0; node < static_cast<std::int32_t>(nodeCount); ++node)
+            {
+                const MilliFunds weight = row.weight[static_cast<std::size_t>(node)];
+                if (freeNode(node) && weight > 0 &&
+                    (best == NO_SEQUENTIAL_NODE || weight > row.weight[static_cast<std::size_t>(best)]))
+                {
+                    best = node;
+                }
+            }
+            if (best == NO_SEQUENTIAL_NODE)
+            {
+                ++counters.emptyRows;
+                continue;
+            }
+            used[static_cast<std::size_t>(best)] = true;
+            steps.push_back({best, row.ownedTurn[static_cast<std::size_t>(best)]});
+            chosen[slot] = SequentialDetail::ownedWitness(instance, row, static_cast<std::int32_t>(slot), steps);
+            ++counters.fallbackRows;
+        }
+        std::vector<SequentialRowWitness> rows;
+        for (std::optional<SequentialRowWitness> & row : chosen)
+        {
+            if (row)
+            {
+                rows.push_back(std::move(*row));
+            }
+        }
+        return publishFloor(instance, rows, result);
+    }
+
+    ReplyStockStatus ReplyStockContext::publishFloor(const SequentialInstance & instance,
+                                                     std::span<const SequentialRowWitness> source,
+                                                     ReplyStockFloor & result)
+    {
+        std::vector<SequentialRowWitness> rows;
+        MilliFunds value = 0;
+        if (!compactWitness(source, rows, value))
+        {
+            return ReplyStockStatus::ArithmeticFailure;
+        }
+        const std::size_t steps = witnessSteps(rows);
+        if (!chargeFloor(rows.size() + m_nodeColumns.size() + steps))
+        {
+            return ReplyStockStatus::LimitReached;
+        }
+        if (!replaySequentialWitness(instance, rows, value))
+        {
+            return ReplyStockStatus::ReplayRejected;
+        }
+        result.floor = value;
+        result.witness = std::move(rows);
+        result.counters.steps = static_cast<std::int64_t>(steps);
+        return ReplyStockStatus::Valid;
+    }
+
+    bool ReplyStockContext::chargeFloor(std::size_t work)
+    {
+        return chargeMasterWork(m_meter, work, 1, REPLY_FLOOR_WORK);
+    }
+
+    std::optional<MasterPlanPricingModel> ReplyStockContext::forcedModel(const ContinuationKey & key) const
+    {
+        return forcedPricingModel(m_field->m_horizonTurns, m_nodeColumns, m_classTables, m_dayRows, key,
+            [&](const CanonicalPlanActionKey & action)
+        {
+            const auto found = m_actions.find(action);
+            return found == m_actions.end() ? ForcedAction{} :
+                ForcedAction{&found->second.row, found->second.capturedNode};
+        }, nullptr);
+    }
+
+    ReplyStockStatus ReplyStockContext::tuneLimits(const MasterPlanPricingModel & model, std::int32_t rounds,
+                                                   ReplyStockTuneLimits & result)
+    {
+        const MasterFutureCatalog & catalog = model.catalog;
+        const std::size_t nodes = catalog.columns.size();
+        const auto turns = static_cast<std::size_t>(std::max(catalog.horizon, 1));
+        const std::size_t transitionTurns = turns - 1;
+        RefinementLedger probe;
+        const std::vector<MilliFunds> zeroPrices(nodes, 0);
+        if (rounds <= 0 || !probe.open(std::numeric_limits<std::int64_t>::max()))
+        {
+            return ReplyStockStatus::Invalid;
+        }
+        const MasterPlanPricingStatus probed = priceMasterPlan(model, zeroPrices, probe).status;
+        if (!m_meter.consume(probe.stats().granted, REPLY_STOCK_WORK))
+        {
+            return ReplyStockStatus::LimitReached;
+        }
+        if (probed != MasterPlanPricingStatus::Valid)
+        {
+            return replyStatusOf(probed);
+        }
+        // The probe ran at one price vector; every row chain may reach the horizon at another.
+        const auto chains = masterWorkProduct(catalog.dayRows.size() + catalog.actions.size(), turns);
+        const auto evaluation = chains ?
+            addWork(probe.stats().granted, addWork(*chains, masterWorkProduct(nodes, PRICE_STEP_TERMS_PER_NODE))) :
+            std::nullopt;
+        const auto squared = masterWorkProduct(nodes, nodes);
+        const auto transitions = squared ? masterWorkProduct(static_cast<std::size_t>(*squared), transitionTurns)
+                                         : std::nullopt;
+        const auto cells = masterWorkProduct(nodes, turns);
+        const auto table = cells ? addWork(*cells + 1, transitions) : std::nullopt;
+        const auto tables = table ? masterWorkProduct(catalog.classes.size(), static_cast<std::size_t>(*table))
+                                  : std::nullopt;
+        const auto searchPass = cells ? masterWorkProduct(catalog.dayRows.size(), static_cast<std::size_t>(*cells))
+                                      : std::nullopt;
+        const auto search = searchPass ? masterWorkProduct(WITNESS_SEARCH_PASSES, static_cast<std::size_t>(*searchPass))
+                                       : std::nullopt;
+        const auto summed = tables ? addWork(*tables, search) : std::nullopt;
+        const auto build = summed ? std::optional(std::max(*summed, MIN_TUNE_BUILD_WORK)) : std::nullopt;
+        const auto interval = static_cast<std::size_t>(MASTER_PLAN_WITNESS_INTERVAL);
+        const std::size_t considerations = (static_cast<std::size_t>(rounds) + interval - 1) / interval + 1;
+        const auto builds = masterWorkProduct(WITNESS_BUILDS_PER_CONSIDERATION, considerations);
+        if (!evaluation || !build || !builds)
+        {
+            return ReplyStockStatus::ArithmeticFailure;
+        }
+        const auto pricing =
+            masterWorkProduct(static_cast<std::size_t>(*evaluation), static_cast<std::size_t>(rounds) + 1);
+        const auto witness = masterWorkProduct(static_cast<std::size_t>(*build), static_cast<std::size_t>(*builds));
+        const auto maximum = pricing ? addWork(*pricing, witness) : std::nullopt;
+        if (!maximum)
+        {
+            return ReplyStockStatus::ArithmeticFailure;
+        }
+        result.evaluationWork = *evaluation;
+        result.pricingWork = *pricing;
+        result.buildWork = *build;
+        result.builds = *builds;
+        result.limits = MasterPlanPricingLimits{rounds, *maximum, *build};
+        return ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::tuneKey(const ContinuationKey & key, std::int32_t rounds,
+                                                ReplyStockTune & result)
+    {
+        ReplyStockCounters counters;
+        const ReplyStockStatus extended = rounds <= 0 ? ReplyStockStatus::Invalid : extend(key, counters);
+        if (extended != ReplyStockStatus::Valid)
+        {
+            return extended;
+        }
+        const std::optional<MasterPlanPricingModel> model = forcedModel(key);
+        if (!model)
+        {
+            return ReplyStockStatus::Invalid;
+        }
+        const ReplyStockStatus limited = tuneLimits(*model, rounds, result.limits);
+        if (limited != ReplyStockStatus::Valid)
+        {
+            return limited;
+        }
+        RefinementLedger ledger;
+        if (!ledger.open(result.limits.limits.maximumWork))
+        {
+            return ReplyStockStatus::ArithmeticFailure;
+        }
+        const MasterPlanPricingResult tuned = tuneMasterPlanPrices(*model, result.limits.limits, ledger);
+        result.tunerStatus = tuned.status;
+        result.rounds = tuned.rounds;
+        result.tunerWork = ledger.stats().granted;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.tunerPricingWork = tuned.pricingWork;
+        result.tunerWitnessWork = tuned.witnessWork;
+        result.witnessStats = tuned.witnessStats;
+#endif
+        if (!m_meter.consume(result.tunerWork, REPLY_STOCK_WORK))
+        {
+            return ReplyStockStatus::LimitReached;
+        }
+        if (dualFailure(tuned.status))
+        {
+            return replyStatusOf(tuned.status);
+        }
+        // Only an evaluated round leaves prices, and an empty vector is correct for a field without stock nodes.
+        if (tuned.rounds <= 0 || tuned.prices.size() != m_nodeColumns.size())
+        {
+            return ReplyStockStatus::LimitReached;
+        }
+        const ReplyStockPriceInstall installed = installPrices(tuned.prices);
+        if (installed.status != ReplyStockStatus::Valid)
+        {
+            return installed.status;
+        }
+        const ReplyStockCeiling checked = ceiling(key);
+        if (checked.status != ReplyStockStatus::Valid)
+        {
+            return checked.status;
+        }
+        result.ceiling = checked.ceiling;
+        result.floor = floor(key, nullptr);
+        if (result.floor.status != ReplyStockStatus::Valid)
+        {
+            return result.floor.status;
+        }
+        result.floorSource = ReplyStockFloorSource::Prefix;
+        SequentialInstance instance;
+        ReplyStockFloor tunerFloor;
+        tunerFloor.key = key;
+        tunerFloor.priceVersion = m_priceVersion;
+        if (tuned.witness.valid && keyInstance(key, instance) == ReplyStockStatus::Valid &&
+            publishFloor(instance, tuned.witness.rows, tunerFloor) == ReplyStockStatus::Valid &&
+            tunerFloor.floor >= result.floor.floor)
+        {
+            tunerFloor.status = ReplyStockStatus::Valid;
+            result.floor = std::move(tunerFloor);
+            result.floorSource = ReplyStockFloorSource::Tuner;
+        }
+        return result.floor.floor > result.ceiling ? ReplyStockStatus::Inverted : ReplyStockStatus::Valid;
+    }
+
+    ReplyStockStatus ReplyStockContext::rowUpper(const SequentialRow & row, std::optional<PricedRow> & cached,
                                                  ReplyStockCounters & counters)
     {
         if (cached)
@@ -1122,7 +1611,7 @@ namespace Coordinator
         {
             return replyStatusOf(status);
         }
-        cached = price.upper;
+        cached = PricedRow{price.upper, std::move(price.nodes)};
         ++counters.rowScans;
         return ReplyStockStatus::Valid;
     }

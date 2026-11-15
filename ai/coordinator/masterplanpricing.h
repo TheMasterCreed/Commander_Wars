@@ -16,6 +16,8 @@ namespace Coordinator
     constexpr std::int32_t MASTER_PLAN_PRICING_ROUNDS = 200;
     constexpr std::int64_t MASTER_PLAN_PRICING_WORK = 8000000;
     constexpr std::int64_t MASTER_PLAN_PRICING_WITNESS_WORK = 250000;
+    constexpr std::int32_t MASTER_PLAN_WITNESS_INTERVAL = 10;
+    constexpr std::int32_t MASTER_PLAN_POLISH_PASSES = 8;
 
     struct MasterPlanPricingCandidate
     {
