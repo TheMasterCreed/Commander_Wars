@@ -2448,20 +2448,18 @@ namespace
             {
                 continue;
             }
-            const auto & outcome = measurement.reply.reply.outcomes[index];
-            const auto dayStartSteps = known(knowledge).hpRounded;
-            const auto ownHp = measurement.chain.outcomes[index].hpSteps;
-            const auto counterSteps = dayStartSteps - ownHp;
-            const auto replySteps = ownHp - outcome.hpSteps;
-            const auto key = CanonicalPlanActionKey::fromAction(row, action.destination.x, action.destination.y,
-                                                               capturesInPlan(action.kind));
-            const auto variants = Record::stockReplyKeys(key, dayStartSteps, counterSteps, replySteps);
-            if (!variants)
+            const auto stock = stockReplyRow(row, action.destination, capturesInPlan(action.kind),
+                                             known(knowledge).hpRounded, measurement.chain.outcomes[index].hpSteps,
+                                             measurement.reply.reply.outcomes[index].hpSteps);
+            if (!stock)
             {
                 chainUsable = false;
                 break;
             }
-            today.push_back(key);
+            const auto counterSteps = stock->counterSteps;
+            const auto replySteps = stock->replySteps;
+            const auto* variants = &stock->keys;
+            today.push_back(stock->today);
             afterOwnActions.push_back(variants->afterOwnActions);
             afterReply.push_back(variants->afterReply);
             if (counterSteps == 0 && replySteps == 0 && variants->death == Record::StockDeathCause::None)
@@ -2641,7 +2639,7 @@ namespace
             }
             const Coordinator::ReplyCheckSide planner{
                 .startHp = resolved.targets[index].target.hp,
-                .shooterHp = poolHp(shooters, resolved.chain),
+                .shooterHp = poolHp(shooters, resolved.own.chain.chain),
                 .facts = Coordinator::replyCheckFacts(entry),
                 .outcome = run.reply.outcomes[index],
             };

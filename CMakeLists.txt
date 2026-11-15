@@ -851,7 +851,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/capturedangerrecord.h ai/coordinator/capturedangeraudit.h ai/coordinator/capturedangeraudit.cpp
     ai/coordinator/capturedangerauditmode.h ai/coordinator/capturedangerpricing.h
     ai/coordinator/replypredictionmode.h ai/coordinator/replyfacts.h ai/coordinator/replyprediction.h
-    ai/coordinator/ownactionmeasurement.h
+    ai/coordinator/ownactionmeasurement.h ai/coordinator/stockreplykeys.h ai/coordinator/replypassevaluation.h
+    ai/coordinator/masterreplyactions.h
     ai/coordinator/replyfactsbuilder.h ai/coordinator/replyfactsbuilder.cpp ai/coordinator/replycheck.h
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp

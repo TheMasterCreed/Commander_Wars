@@ -201,6 +201,10 @@ namespace Coordinator
         friend struct MasterAssignmentReplayResult replayMasterAssignment(
             const MasterAssignmentProblem &,
             std::span<const std::int32_t>);
+        friend struct MasterAssignmentReplayResult replayMasterAssignment(
+            const MasterAssignmentProblem &,
+            std::span<const std::int32_t>,
+            const ReplyPredictionSetup &);
 
         explicit MasterAssignmentProblem(std::uint64_t sessionIdentity);
 
@@ -333,6 +337,12 @@ namespace Coordinator
     MasterAssignmentReplayResult replayMasterAssignment(
         const MasterAssignmentProblem & problem,
         std::span<const std::int32_t> choices);
+
+    // The problem's own prediction setup is replaced, so a caller can replay without touching the shared tally.
+    MasterAssignmentReplayResult replayMasterAssignment(
+        const MasterAssignmentProblem & problem,
+        std::span<const std::int32_t> choices,
+        const ReplyPredictionSetup & prediction);
 
     std::optional<MilliFunds> checkedAssignmentEconomicTotal(const AssignmentResult & assignment);
 

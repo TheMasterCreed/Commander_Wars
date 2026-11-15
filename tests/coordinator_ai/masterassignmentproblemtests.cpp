@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <limits>
 #include <type_traits>
 
 #include "ai/coordinator/masterassignmentproblem.h"
 #include "ai/coordinator/bundleassignment.h"
+#include "ai/coordinator/replypassevaluation.h"
 #include "ai/coordinator/replyprediction.h"
 
 namespace
@@ -941,15 +944,25 @@ namespace
 
     constexpr std::int32_t REPLY_BOARD_SIZE = 3;
 
-    MasterAssignmentBuildResult extractRecorded(AssignmentInput input, const Fixture & fixture)
+    MasterAssignmentBuildResult extractRecorded(
+        AssignmentInput input, const Fixture & fixture,
+        std::shared_ptr<ReplyPredictionTally> tally = std::make_shared<ReplyPredictionTally>())
     {
         input.replyPrediction = {
             .mode = ReplyPrediction::Recorded,
             .board = std::make_shared<const ReplyBoard>(
                 ReplyBoard{.width = REPLY_BOARD_SIZE, .height = REPLY_BOARD_SIZE}),
-            .tally = std::make_shared<ReplyPredictionTally>(),
+            .tally = std::move(tally),
         };
         return extract(input, fixture);
+    }
+
+    void exposeEachToOneShooter(AssignmentInput & input)
+    {
+        for (auto & actor : input.actors)
+        {
+            readyForReply(actor.candidates[0], {replyShooterAt(actor.candidates[0].bundle.destination)});
+        }
     }
 
     const PlanReplyActorOutcome* predictedFor(const MasterAssignmentReplayResult & replay, std::int32_t engineUnitId)
@@ -971,10 +984,7 @@ namespace
     void testRecordedReplyPrediction()
     {
         auto input = inputWith(2);
-        for (auto & actor : input.actors)
-        {
-            readyForReply(actor.candidates[0], {replyShooterAt(actor.candidates[0].bundle.destination)});
-        }
+        exposeEachToOneShooter(input);
         const auto fixture = planFrom(input);
         const auto off = extract(input, fixture);
         const auto board = std::make_shared<const ReplyBoard>(ReplyBoard{.width = 2, .height = 2});
@@ -1032,24 +1042,25 @@ namespace
 
     constexpr std::int32_t SHOT_TARGET_ENGINE_ID = 999;
     constexpr TilePoint SHOT_TARGET_TILE{5, 5};
+    constexpr std::int32_t WEAKENING_SHOT = 4;
+    constexpr std::int32_t WEAKENED_SHOT = 2;
+    constexpr std::int32_t WEAKENED_ISOLATED_COUNTER = 8;
 
-    void testReplyPredictionFollowsExecutionOrder()
+    std::int32_t addShotTarget(AssignmentInput & input)
     {
-        constexpr std::int32_t firstShot = 4;
-        constexpr std::int32_t secondIsolatedCounter = 8;
-        constexpr std::int32_t secondHpAfterScaledCounter = 6;
-        constexpr auto extracts = "execution-order prediction fixture extracts";
-        constexpr auto ordered = "the higher valued shooter acts first";
-        constexpr auto scaled = "the second shooter's counter comes from the target the first shot weakened";
-        constexpr auto killed = "a target the first shot kills completes the prediction when nothing fires at it later";
-        constexpr auto gone = "a later live shot at a target already destroyed leaves only the prediction incomplete";
-        auto input = inputWith(2);
-        const auto target = static_cast<std::int32_t>(input.unitLinks.size());
         input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, SHOT_TARGET_TILE});
+        return static_cast<std::int32_t>(input.unitLinks.size()) - 1;
+    }
+
+    // Actor 1 fires first; actor 0 then fires on the target actor 1 weakened, or on a target actor 1 killed.
+    AssignmentInput weakenedTargetInput(std::int32_t isolatedCounter)
+    {
+        auto input = inputWith(2);
+        const auto target = addShotTarget(input);
         input.actors[0].candidates.push_back(input.actors[0].candidates[0]);
-        addFire(input.actors[0].candidates[0], 2, target, secondIsolatedCounter);
+        addFire(input.actors[0].candidates[0], WEAKENED_SHOT, target, isolatedCounter);
         input.actors[1].candidates.push_back(input.actors[1].candidates[0]);
-        addFire(input.actors[1].candidates[0], firstShot, target);
+        addFire(input.actors[1].candidates[0], WEAKENING_SHOT, target);
         addFire(input.actors[1].candidates[1], SHARED_TARGET_HP_STEPS, target);
         for (auto & actor : input.actors)
         {
@@ -1058,6 +1069,37 @@ namespace
                 readyForReply(choice);
             }
         }
+        return input;
+    }
+
+    constexpr TilePoint DOOMED_TILE{0, 1};
+
+    // Actor 0 dies to its own attack's counter; a direct shooter can only fire from the tile it would hold.
+    AssignmentInput ownDeathInput()
+    {
+        auto input = inputWith(2);
+        const auto target = addShotTarget(input);
+        input.actors[0].candidates[0] = candidate(0, {0, 0}, DOOMED_TILE, 1);
+        addFire(input.actors[0].candidates[0], 2, target, UNIT_HP_STEPS);
+        ReplyShooterFacts walker = replyShooterAt(DOOMED_TILE);
+        walker.direct = true;
+        walker.firingTiles = {DOOMED_TILE};
+        for (auto & actor : input.actors)
+        {
+            readyForReply(actor.candidates[0], {walker});
+        }
+        return input;
+    }
+
+    void testReplyPredictionFollowsExecutionOrder()
+    {
+        constexpr std::int32_t secondHpAfterScaledCounter = 6;
+        constexpr auto extracts = "execution-order prediction fixture extracts";
+        constexpr auto ordered = "the higher valued shooter acts first";
+        constexpr auto scaled = "the second shooter's counter comes from the target the first shot weakened";
+        constexpr auto killed = "a target the first shot kills completes the prediction when nothing fires at it later";
+        constexpr auto gone = "a later live shot at a target already destroyed leaves only the prediction incomplete";
+        const auto input = weakenedTargetInput(WEAKENED_ISOLATED_COUNTER);
         const auto extracted = extractRecorded(input, planFrom(input));
         expect(extracted.valid(), extracts);
         if (!extracted.valid())
@@ -1088,22 +1130,10 @@ namespace
 
     void testReplyPredictionFreesOwnActionDeaths()
     {
-        constexpr TilePoint doomedTile{0, 1};
         constexpr auto extracts = "own-action death prediction fixture extracts";
         constexpr auto notTarget = "a unit its own attack kills is no reply target and loses nothing to the reply";
         constexpr auto freed = "the tile the dead unit would have held lets the shooter hit the other unit";
-        auto input = inputWith(2);
-        const auto target = static_cast<std::int32_t>(input.unitLinks.size());
-        input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, SHOT_TARGET_TILE});
-        input.actors[0].candidates[0] = candidate(0, {0, 0}, doomedTile, 1);
-        addFire(input.actors[0].candidates[0], 2, target, UNIT_HP_STEPS);
-        ReplyShooterFacts walker = replyShooterAt(doomedTile);
-        walker.direct = true;
-        walker.firingTiles = {doomedTile};
-        for (auto & actor : input.actors)
-        {
-            readyForReply(actor.candidates[0], {walker});
-        }
+        const auto input = ownDeathInput();
         const auto extracted = extractRecorded(input, planFrom(input));
         expect(extracted.valid(), extracts);
         if (!extracted.valid())
@@ -1175,6 +1205,753 @@ namespace
                    pairReplay.replyPrediction->complete && pairLoss != nullptr && pairLoss->stepsLost == 0,
                clipped);
     }
+
+    const ReplyBoard EVALUATION_BOARD{.width = REPLY_BOARD_SIZE, .height = REPLY_BOARD_SIZE};
+    constexpr MilliFunds DESTINATION_SHOT = 1000;
+    constexpr MilliFunds ODD_ACTOR_COST = 7001;
+    constexpr MilliFunds ROUNDING_ACTOR_COST = 7005;
+    constexpr double SPLIT_SHOT_BASE = 30;
+    constexpr double SPLIT_COUNTER_BASE = 30;
+    constexpr std::int32_t SPLIT_SHOT_STEPS = 3;
+    constexpr std::int32_t SECOND_SHOOTER = 8;
+    constexpr std::int32_t CAPTURER_ROW = 3;
+    constexpr std::int32_t DOOMED_ROW = 4;
+
+    const ReplyPassActor* evaluatedFor(const ReplyPassEvaluation & evaluation, std::int32_t actorSlot)
+    {
+        const auto found = std::find_if(evaluation.actors.begin(), evaluation.actors.end(),
+                                        [&](const ReplyPassActor & actor) { return actor.actorSlot == actorSlot; });
+        return found == evaluation.actors.end() ? nullptr : &*found;
+    }
+
+    MilliFunds evaluatedTotal(const ReplyPassEvaluation & evaluation)
+    {
+        MilliFunds total = 0;
+        for (const ReplyPassActor & actor : evaluation.actors)
+        {
+            const ReplyPassTerms & terms = actor.terms;
+            total += terms.actingSeated + terms.ownCounterCorrection - terms.replyCapitalLoss +
+                     terms.replyCounterCapital + terms.nextShotAfterReply;
+        }
+        return total;
+    }
+
+    bool sameEvaluation(const ReplyPassEvaluation & left, const ReplyPassEvaluation & right)
+    {
+        return left.reason == right.reason && left.actorSlot == right.actorSlot && left.actors == right.actors &&
+               left.shots == right.shots && left.afterOwnActions == right.afterOwnActions &&
+               left.afterReply == right.afterReply && left.exactNonStock == right.exactNonStock &&
+               left.pairsExamined == right.pairsExamined && left.replay.ordering.order == right.replay.ordering.order &&
+               left.replay.actionIndices == right.replay.actionIndices &&
+               left.replay.seatedValues == right.replay.seatedValues &&
+               left.replay.replyPrediction.has_value() == right.replay.replyPrediction.has_value();
+    }
+
+    bool agreesWithPrediction(const ReplyPassEvaluation & evaluation, const MasterAssignmentReplayResult & replay)
+    {
+        if (!evaluation.valued() || !replay.replyPrediction || !replay.replyPrediction->complete ||
+            replay.replyPrediction->actors.size() != evaluation.actors.size())
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < evaluation.actors.size(); ++index)
+        {
+            const ReplyPassActor & actor = evaluation.actors[index];
+            const PlanReplyActorOutcome & predicted = replay.replyPrediction->actors[index];
+            if (predicted.engineUnitId != actor.engineUnitId || predicted.hpStepsBefore != actor.stepsAfterOwnActions ||
+                predicted.hpStepsBefore - predicted.stepsLost != actor.stepsAfterReply)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool sameTally(const ReplyPredictionTally & left, const ReplyPredictionTally & right)
+    {
+        return left.replays == right.replays && left.incomplete == right.incomplete && left.pairs == right.pairs &&
+               left.nanos == right.nanos;
+    }
+
+    void testReplyPassAgreesWithPrediction()
+    {
+        constexpr auto extracts = "reply pass agreement fixtures extract";
+        constexpr auto agrees = "the pass measures the steps the recorded prediction reports, actor by actor";
+        constexpr auto untouched = "evaluating a plan leaves the problem's shared reply tally untouched";
+        auto exposed = inputWith(2);
+        exposeEachToOneShooter(exposed);
+        for (const AssignmentInput & input : {exposed, weakenedTargetInput(WEAKENED_ISOLATED_COUNTER), ownDeathInput()})
+        {
+            const auto tally = std::make_shared<ReplyPredictionTally>();
+            const auto extracted = extractRecorded(input, planFrom(input), tally);
+            expect(extracted.valid(), extracts);
+            if (!extracted.valid())
+            {
+                continue;
+            }
+            const auto & problem = *extracted.problem;
+            const auto replay = replayMasterAssignment(problem, problem.incumbentChoices());
+            const ReplyPredictionTally counted = *tally;
+            const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+            expect(sameTally(counted, *tally), untouched);
+            expect(agreesWithPrediction(evaluation, replay), agrees);
+        }
+    }
+
+    AssignmentInput weakenedOddCostInput()
+    {
+        auto input = weakenedTargetInput(WEAKENED_ISOLATED_COUNTER);
+        auto & weakened = input.actors[0].candidates[0];
+        weakened.actorNextShotsAtDestination = {DESTINATION_SHOT};
+        weakened.actor.replacementCost = ODD_ACTOR_COST;
+        weakened.valuation = valueBundle(weakened.bundle, weakened.actor, PositionFacts{}, ValuationContext{});
+        return input;
+    }
+
+    void testReplyPassWeakenedTargetTerms()
+    {
+        // The isolated target keeps 8 hp; after both shots it keeps 4, so the counter scales to 8 * 4 / 8.
+        constexpr std::int32_t measuredCounter = 4;
+        constexpr std::int32_t stepsAfterCounter = UNIT_HP_STEPS - measuredCounter;
+        constexpr std::int32_t isolatedHp = UNIT_HP_STEPS - WEAKENED_ISOLATED_COUNTER;
+        constexpr auto extracts = "weakened-target pass fixture extracts";
+        constexpr auto measured = "the weakened shot takes the measured counter and nothing replies";
+        constexpr auto acting = "the acting term is the acting seated value at the granted damage";
+        constexpr auto corrected = "a smaller measured counter books a positive correction, one booking per side";
+        constexpr auto scaled = "the next shot scales up from the isolated hp to the hp the unit really keeps";
+        constexpr auto summed = "the exact non-stock value is the sum of every actor's five terms";
+        const auto input = weakenedOddCostInput();
+        const auto extracted = extract(input, planFrom(input));
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const ReplyPassActor* actor = evaluatedFor(evaluation, 0);
+        expect(evaluation.valued() && actor != nullptr && actor->stepsAfterOwnActions == stepsAfterCounter &&
+                   actor->stepsAfterReply == stepsAfterCounter && actor->terms.replyCapitalLoss == 0 &&
+                   actor->terms.replyCounterCapital == 0,
+               measured);
+        if (actor == nullptr)
+        {
+            return;
+        }
+        const auto & source = problem.actors()[0].candidates[0].source;
+        expect(actor->terms.actingSeated == checkedActingSeatedCandidateValue(source, actor->grantedDamage), acting);
+        const MilliFunds correction =
+            bookDamage(ODD_ACTOR_COST, WEAKENED_ISOLATED_COUNTER) - bookDamage(ODD_ACTOR_COST, measuredCounter);
+        expect(correction > 0 && actor->terms.ownCounterCorrection == correction, corrected);
+        expect(actor->terms.nextShotAfterReply == DESTINATION_SHOT * stepsAfterCounter / isolatedHp &&
+                   actor->terms.nextShotAfterReply > DESTINATION_SHOT,
+               scaled);
+        expect(evaluation.exactNonStock == evaluatedTotal(evaluation), summed);
+    }
+
+    void testReplyPassActorShotTwice()
+    {
+        constexpr std::int32_t finalSteps = UNIT_HP_STEPS - 2 * SPLIT_SHOT_STEPS;
+        constexpr MilliFunds oddShot = DESTINATION_SHOT + 1;
+        constexpr auto extracts = "twice-shot pass fixture extracts";
+        constexpr auto shotTwice = "two enemies each take three steps off the one actor, the lower index first";
+        constexpr auto counters = "each shot keeps the counter capital its selection priced, summed per unit";
+        constexpr auto booking = "the reply loss is one booking over both shots, not the sum of two roundings";
+        constexpr auto identity = "the next shot after the reply is the best shot less the reply next-shot loss";
+        constexpr auto summed = "the twice-shot exact non-stock value is the sum of the five terms";
+        constexpr auto literal = "the twice-shot terms and total match the values computed by hand";
+        auto input = inputWith(1);
+        auto & choice = input.actors[0].candidates[0];
+        ReplyShooterFacts first = replyShooterAt(choice.bundle.destination);
+        first.direct = true;
+        first.firingTiles = {{1, 0}};
+        ReplyShooterFacts second = first;
+        second.shooterIndex = SECOND_SHOOTER;
+        second.firingTiles = {{0, 1}};
+        readyForReply(choice, {first, second});
+        choice.actor.replacementCost = ROUNDING_ACTOR_COST;
+        choice.actorNextShotsAtDestination = {DESTINATION_SHOT};
+        auto facts = std::make_shared<ReplyFacts>(*choice.replyFacts);
+        facts->shots.assign(facts->shots.size(), ReplyShotBase{SPLIT_SHOT_BASE, SPLIT_SHOT_BASE, SPLIT_COUNTER_BASE});
+        choice.replyFacts = facts;
+        const auto extracted = extract(input, planFrom(input));
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const ReplyPassActor* actor = evaluatedFor(evaluation, 0);
+        expect(evaluation.valued() && actor != nullptr && actor->stepsAfterReply == finalSteps &&
+                   evaluation.shots.size() == 2 && evaluation.shots[0].shooterIndex == REPLY_SHOOTER &&
+                   evaluation.shots[1].shooterIndex == SECOND_SHOOTER,
+               shotTwice);
+        if (actor == nullptr)
+        {
+            return;
+        }
+        MilliFunds counterTotal = 0;
+        bool priced = true;
+        for (const ReplyPassShot & shot : evaluation.shots)
+        {
+            priced = priced && shot.target == 0 && shot.hpStepsBefore - shot.hpStepsAfter == SPLIT_SHOT_STEPS &&
+                     shot.counterCapital > 0 &&
+                     shot.counterCapital ==
+                         counterCost(SPLIT_COUNTER_BASE, shot.hpStepsAfter, UNIT_HP_STEPS, REPLY_COST);
+            counterTotal += shot.counterCapital;
+        }
+        expect(priced && actor->terms.replyCounterCapital == counterTotal, counters);
+        expect(actor->terms.replyCapitalLoss == bookDamage(ROUNDING_ACTOR_COST, 2 * SPLIT_SHOT_STEPS) &&
+                   actor->terms.replyCapitalLoss != 2 * bookDamage(ROUNDING_ACTOR_COST, SPLIT_SHOT_STEPS),
+               booking);
+        bool identical =
+            actor->terms.nextShotAfterReply ==
+            DESTINATION_SHOT - replyNextShotLoss(DESTINATION_SHOT, UNIT_HP_STEPS, finalSteps);
+        for (std::int32_t basis = 1; basis <= UNIT_HP_STEPS; ++basis)
+        {
+            for (std::int32_t kept = 1; kept <= basis; ++kept)
+            {
+                identical = identical && ReplyPassEvaluationDetail::scaledNextShot(oddShot, kept, basis) ==
+                                             oddShot - replyNextShotLoss(oddShot, basis, kept);
+            }
+        }
+        expect(identical, identity);
+        expect(evaluation.exactNonStock == evaluatedTotal(evaluation), summed);
+        constexpr ReplyPassTerms byHand{
+            .actingSeated = 1, .replyCapitalLoss = 4203, .replyCounterCapital = 2100, .nextShotAfterReply = 400};
+        constexpr MilliFunds totalByHand = -1702;
+        expect(actor->terms == byHand && evaluation.exactNonStock == totalByHand, literal);
+    }
+
+    void testReplyPassReplyKillsCapturer()
+    {
+        constexpr auto extracts = "reply-kill pass fixture extracts";
+        constexpr auto killed = "two shots kill the capturer in the reply";
+        constexpr auto lost = "a unit the reply kills has no next shot and books its whole capital once";
+        constexpr auto keyed = "the reply-killed capturer is a destroyed row that keeps its capture flag";
+        auto input = inputWith(1);
+        auto & choice = input.actors[0].candidates[0];
+        choice.bundle.components.push_back(captureComponent({.turnsUntilOwned = 1}));
+        ReplyShooterFacts second = replyShooterAt(choice.bundle.destination);
+        second.shooterIndex = SECOND_SHOOTER;
+        readyForReply(choice, {replyShooterAt(choice.bundle.destination), second});
+        choice.actorNextShotsAtDestination = {DESTINATION_SHOT};
+        auto fixture = planFrom(input);
+        fixture.selections[0].stockRow = CAPTURER_ROW;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const ReplyPassActor* actor = evaluatedFor(evaluation, 0);
+        expect(evaluation.valued() && actor != nullptr && actor->stepsAfterReply == 0 &&
+                   actor->destroyedBy == StockDeathCause::Reply && evaluation.shots.size() == 2,
+               killed);
+        if (actor == nullptr)
+        {
+            return;
+        }
+        expect(actor->terms.nextShotAfterReply == 0 &&
+                   actor->terms.replyCapitalLoss == bookDamage(REPLY_COST, UNIT_HP_STEPS),
+               lost);
+        const TilePoint tile = choice.bundle.destination;
+        const ContinuationKey afterOwn{
+            *CanonicalPlanActionKey::checkedFromAction(CAPTURER_ROW, tile.x, tile.y, true, 0, false)};
+        const ContinuationKey afterReply{
+            *CanonicalPlanActionKey::checkedFromAction(CAPTURER_ROW, tile.x, tile.y, true, UNIT_HP_STEPS, true)};
+        expect(evaluation.afterOwnActions == afterOwn && evaluation.afterReply == afterReply, keyed);
+    }
+
+    void testReplyPassOwnActionDeath()
+    {
+        constexpr auto extracts = "own-death pass fixture extracts";
+        constexpr auto dead = "the unit its own attack kills is destroyed by its own action";
+        constexpr auto unreplied = "a unit dead before the reply has no reply terms and no correction";
+        constexpr auto keyed = "the self-destroyed unit is a destroyed row in both keys";
+        const auto input = ownDeathInput();
+        auto fixture = planFrom(input);
+        fixture.selections[0].stockRow = DOOMED_ROW;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const ReplyPassActor* actor = evaluatedFor(evaluation, 0);
+        expect(evaluation.valued() && actor != nullptr && actor->stepsAfterOwnActions == 0 &&
+                   actor->destroyedBy == StockDeathCause::OwnAction,
+               dead);
+        if (actor == nullptr)
+        {
+            return;
+        }
+        const auto & source = problem.actors()[0].candidates[0].source;
+        expect(actor->terms == ReplyPassTerms{.actingSeated = *checkedActingSeatedCandidateValue(
+                                                  source, actor->grantedDamage)},
+               unreplied);
+        const ContinuationKey doomed{*CanonicalPlanActionKey::checkedFromAction(
+            DOOMED_ROW, DOOMED_TILE.x, DOOMED_TILE.y, false, UNIT_HP_STEPS, true)};
+        expect(evaluation.afterOwnActions == doomed && evaluation.afterReply == doomed, keyed);
+    }
+
+    void testReplyPassCorrectionRebuildsCandidate()
+    {
+        constexpr auto extracts = "rebuild-equivalence fixture extracts";
+        constexpr auto booked = "the isolated valuation booked the isolated counter with the ledger's own booking";
+        constexpr auto rebuilt = "acting value plus correction equals the candidate rebuilt with the measured counter";
+        const auto input = weakenedOddCostInput();
+        const auto extracted = extract(input, planFrom(input));
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const ReplyPassActor* actor = evaluatedFor(evaluation, 0);
+        const auto & source = problem.actors()[0].candidates[0].source;
+        expect(source.valuation.ledger.friendlyCapital == -bookDamage(ODD_ACTOR_COST, WEAKENED_ISOLATED_COUNTER),
+               booked);
+        if (!evaluation.valued() || actor == nullptr)
+        {
+            expect(false, rebuilt);
+            return;
+        }
+        CandidateBundle measured = source;
+        measured.bundle.components.front().fire.counterSteps = actor->dayStartSteps - actor->stepsAfterOwnActions;
+        measured.valuation = valueBundle(measured.bundle, measured.actor, PositionFacts{}, ValuationContext{});
+        const auto isolatedValue = checkedActingSeatedCandidateValue(source, actor->grantedDamage);
+        const auto measuredValue = checkedActingSeatedCandidateValue(measured, actor->grantedDamage);
+        expect(isolatedValue && measuredValue && *isolatedValue + actor->terms.ownCounterCorrection == *measuredValue,
+               rebuilt);
+    }
+
+    ReplyPassEvaluation evaluatedChoices(const AssignmentInput & input, std::span<const std::int32_t> choices)
+    {
+        const auto extracted = extract(input, planFrom(input));
+        expect(extracted.valid(), "no-value fixture extracts");
+        if (!extracted.valid())
+        {
+            return ReplyPassEvaluation{};
+        }
+        return evaluateReplyPassPlan(*extracted.problem, choices, EVALUATION_BOARD);
+    }
+
+    bool refusedFor(const ReplyPassEvaluation & evaluation, ReplyPassNoValue reason, std::int32_t actorSlot)
+    {
+        return evaluation.reason == reason && evaluation.actorSlot == actorSlot;
+    }
+
+    void testReplyPassNoValueReasons()
+    {
+        constexpr auto missing = "a chosen candidate without reply facts has no value, named by its slot";
+        constexpr auto saved = "a unit its isolated counter kills but the plan saves has no next-shot basis";
+        constexpr auto gone = "a live shot at a target an earlier action destroyed has no value";
+        constexpr auto invalid = "an invalid replay has no value";
+        constexpr auto incomplete = "a replay left incomplete by a cycle has no value";
+        constexpr auto arithmetic = "an overflowing next shot has no value, named by its slot";
+        constexpr auto selfService = "a service on the actor itself is recognised for refusal";
+        constexpr auto mapped = "every own-action status maps to its named no-value reason";
+        constexpr auto unevaluated = "a default-constructed evaluation claims no value";
+        expect(!ReplyPassEvaluation{}.valued(), unevaluated);
+        const std::vector<std::int32_t> both{0, 0};
+        auto unfacted = weakenedTargetInput(WEAKENED_ISOLATED_COUNTER);
+        unfacted.actors[0].candidates[0].replyFacts.reset();
+        expect(refusedFor(evaluatedChoices(unfacted, both), ReplyPassNoValue::MissingFacts, 0),
+               missing);
+        const auto savedInput = weakenedTargetInput(UNIT_HP_STEPS);
+        expect(refusedFor(evaluatedChoices(savedInput, both),
+                          ReplyPassNoValue::MissingNextShotBasis, 0),
+               saved);
+        const auto weakened = weakenedTargetInput(WEAKENED_ISOLATED_COUNTER);
+        expect(refusedFor(evaluatedChoices(weakened, std::vector<std::int32_t>{0, 1}),
+                          ReplyPassNoValue::TargetAlreadyGone, 0),
+               gone);
+        expect(evaluatedChoices(weakened, std::vector<std::int32_t>{0}).reason ==
+                   ReplyPassNoValue::ReplayInvalid,
+               invalid);
+        auto vacate = inputWith(2);
+        vacate.actors[0].candidates = {candidate(0, {0, 0}, {-1, 0}, 1), candidate(0, {0, 0}, {1, 0}, 1)};
+        vacate.actors[1].candidates = {candidate(1, {1, 0}, {0, 0}, 1), candidate(1, {1, 0}, {2, 0}, 1)};
+        expect(evaluatedChoices(vacate, std::vector<std::int32_t>{1, 0}).reason ==
+                   ReplyPassNoValue::ReplayIncomplete,
+               incomplete);
+        auto overflowing = weakenedTargetInput(WEAKENED_ISOLATED_COUNTER);
+        overflowing.actors[0].candidates[0].actorNextShotsAtDestination = {std::numeric_limits<MilliFunds>::max() / 2};
+        expect(refusedFor(evaluatedChoices(overflowing, both), ReplyPassNoValue::Arithmetic, 0),
+               arithmetic);
+        ActionBundle serving;
+        serving.unitId = 0;
+        serving.components = {serviceComponent({.partnerUnitId = 0})};
+        ActionBundle servingOther = serving;
+        servingOther.components.front().service.partnerUnitId = 1;
+        expect(ReplyPassEvaluationDetail::servesSelf(serving) && !ReplyPassEvaluationDetail::servesSelf(servingOther),
+               selfService);
+        using ReplyPassEvaluationDetail::noValueOf;
+        expect(noValueOf(StockQuoteStatus::Available) == ReplyPassNoValue::None &&
+                   noValueOf(StockQuoteStatus::MissingField) == ReplyPassNoValue::MissingFacts &&
+                   noValueOf(StockQuoteStatus::MissingActionFacts) == ReplyPassNoValue::MissingFacts &&
+                   noValueOf(StockQuoteStatus::UnusablePlanChain) == ReplyPassNoValue::UnusablePlanChain &&
+                   noValueOf(StockQuoteStatus::ReplayFailed) == ReplyPassNoValue::ReplayInvalid &&
+                   noValueOf(StockQuoteStatus::CyclicOrdering) == ReplyPassNoValue::ReplayIncomplete &&
+                   noValueOf(StockQuoteStatus::UnsupportedAction) == ReplyPassNoValue::UnsupportedAction &&
+                   noValueOf(StockQuoteStatus::TargetAlreadyGone) == ReplyPassNoValue::TargetAlreadyGone,
+               mapped);
+    }
+
+    void testReplyPassRefusesOverflowingAmounts()
+    {
+        constexpr MilliFunds largest = std::numeric_limits<MilliFunds>::max();
+        constexpr auto target = "a shot target whose capital P1 cannot book refuses before P1 runs";
+        constexpr auto shooter = "a shooter cost P1 cannot book refuses before P1 runs";
+        constexpr auto capture = "a capture cost P1 cannot subtract refuses before P1 runs";
+        const std::vector<std::int32_t> only{0};
+        auto costly = inputWith(1);
+        auto & costlyChoice = costly.actors[0].candidates[0];
+        readyForReply(costlyChoice, {replyShooterAt(costlyChoice.bundle.destination)});
+        costlyChoice.actor.replacementCost = largest;
+        expect(refusedFor(evaluatedChoices(costly, only), ReplyPassNoValue::Arithmetic, 0), target);
+        ReplyShooterFacts expensive = replyShooterAt(TilePoint{0, 0});
+        expensive.cost = largest;
+        auto shot = inputWith(1);
+        readyForReply(shot.actors[0].candidates[0], {expensive});
+        expect(refusedFor(evaluatedChoices(shot, only), ReplyPassNoValue::Arithmetic, 0), shooter);
+        ReplyShooterFacts capturing = replyShooterAt(TilePoint{0, 0});
+        capturing.captureCost = largest;
+        auto captured = inputWith(1);
+        readyForReply(captured.actors[0].candidates[0], {capturing});
+        expect(refusedFor(evaluatedChoices(captured, only), ReplyPassNoValue::Arithmetic, 0), capture);
+    }
+
+    // One wait unit at (0,0) shot by one direct shooter from (0,1); adjust edits that shooter and the reply facts.
+    template <typename Adjust>
+    ReplyPassEvaluation evaluatedOneShooter(Adjust && adjust)
+    {
+        auto input = inputWith(1);
+        auto & choice = input.actors[0].candidates[0];
+        ReplyShooterFacts shooter = replyShooterAt(choice.bundle.destination);
+        shooter.direct = true;
+        shooter.firingTiles = {shooter.tile};
+        readyForReply(choice, {shooter});
+        auto facts = std::make_shared<ReplyFacts>(*choice.replyFacts);
+        auto tile = std::make_shared<ReplyTileFacts>(*facts->tile);
+        adjust(tile->shooters.front(), *facts);
+        facts->tile = tile;
+        choice.replyFacts = facts;
+        return evaluatedChoices(input, std::vector<std::int32_t>{0});
+    }
+
+    void testReplyPassBoundsReplyArithmeticInputs()
+    {
+        using ReplyPassEvaluationDetail::REPLY_FACTOR_LIMIT;
+        constexpr std::int32_t intMax = std::numeric_limits<std::int32_t>::max();
+        constexpr std::int32_t intMin = std::numeric_limits<std::int32_t>::min();
+        constexpr double largest = std::numeric_limits<double>::max();
+        constexpr auto shooterHp = "a pooled shooter above a full unit's hp steps refuses before P1 runs";
+        constexpr auto terrainOver = "a terrain product beyond int range refuses before P1 runs";
+        constexpr auto terrainEdges = "terrain products at either end of int range still get a value";
+        constexpr auto baseOver = "an oversized or non-finite shot base refuses before P1 runs";
+        constexpr auto baseEdge = "a negative shot base at the factor limit still gets a value";
+        constexpr auto ammoOver = "an oversized resupplied shot base refuses before P1 runs";
+        constexpr auto luckOver = "an oversized terrain luck refuses before P1 runs";
+        constexpr auto counterOver = "an oversized counter base refuses before P1 runs";
+        const auto refused = [](const ReplyPassEvaluation & evaluation)
+        {
+            return refusedFor(evaluation, ReplyPassNoValue::Arithmetic, 0);
+        };
+        expect(refused(evaluatedOneShooter([](ReplyShooterFacts & shooter, ReplyFacts &)
+                                           { shooter.dayStartHpSteps = UNIT_HP_STEPS + 1; })),
+               shooterHp);
+        const auto withTerrain = [](std::int32_t stars, std::int32_t defensePerStar)
+        {
+            return evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts)
+            {
+                facts.terrain.stars = stars;
+                facts.terrain.defensePerStar = defensePerStar;
+            });
+        };
+        expect(refused(withTerrain(intMax, 2)) && refused(withTerrain(intMin, 2)), terrainOver);
+        expect(withTerrain(1, intMax).valued() && withTerrain(intMin, 1).valued(), terrainEdges);
+        const auto withBase = [](double base)
+        {
+            return evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts) { facts.shots[0].rawBase = base; });
+        };
+        expect(refused(withBase(largest)) && refused(withBase(std::numeric_limits<double>::quiet_NaN())) &&
+                   refused(withBase(-largest)),
+               baseOver);
+        expect(withBase(-REPLY_FACTOR_LIMIT).valued(), baseEdge);
+        expect(refused(evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts)
+                                           { facts.shots[0].withAmmo = largest; })),
+               ammoOver);
+        expect(refused(evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts)
+                                           { facts.terrain.luck = largest; })),
+               luckOver);
+        expect(refused(evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts)
+                                           { facts.shots[0].counterRawBase = largest; })),
+               counterOver);
+    }
+
+    void testReplyPassBoundsActorRealHp()
+    {
+        constexpr double partialHp = 9.3;
+        constexpr auto outOfRange = "a non-finite, non-positive or oversized real hp refuses with missing facts";
+        constexpr auto partial = "a fractional real hp within its unit's steps still gets a value";
+        const auto withRealHp = [](double realHp)
+        {
+            return evaluatedOneShooter([&](ReplyShooterFacts &, ReplyFacts & facts) { facts.actorRealHp = realHp; });
+        };
+        constexpr auto predicate = "the real hp predicate accepts exactly the finite hp in (0, UNIT_HP_STEPS]";
+        const double justAbove =
+            std::nextafter(static_cast<double>(UNIT_HP_STEPS), std::numeric_limits<double>::infinity());
+        const std::vector<double> outside{std::numeric_limits<double>::quiet_NaN(),
+                                          std::numeric_limits<double>::infinity(), 0.0, -1.0, justAbove};
+        bool refused = true;
+        bool rejected = true;
+        for (const double realHp : outside)
+        {
+            refused = refused && refusedFor(withRealHp(realHp), ReplyPassNoValue::MissingFacts, 0);
+            rejected = rejected && !ReplyPassEvaluationDetail::actorRealHpFits(realHp);
+        }
+        expect(refused, outOfRange);
+        expect(withRealHp(partialHp).valued(), partial);
+        expect(rejected && ReplyPassEvaluationDetail::actorRealHpFits(partialHp) &&
+                   ReplyPassEvaluationDetail::actorRealHpFits(UNIT_HP_STEPS),
+               predicate);
+    }
+
+    void testReplyPassKeepsTilesOnBoard()
+    {
+        constexpr std::int32_t intMax = std::numeric_limits<std::int32_t>::max();
+        constexpr auto farFiring = "a firing tile far off the board refuses with missing facts";
+        constexpr auto farShooter = "a shooter tile off the board refuses with missing facts";
+        constexpr auto negative = "a negative firing tile coordinate refuses with missing facts";
+        constexpr auto onBoard = "a shooter with on-board and absent tiles still gets a value";
+        const auto missing = [](const ReplyPassEvaluation & evaluation)
+        {
+            return refusedFor(evaluation, ReplyPassNoValue::MissingFacts, 0);
+        };
+        expect(missing(evaluatedOneShooter([](ReplyShooterFacts & shooter, ReplyFacts &)
+                                           { shooter.firingTiles = {{intMax, 1}}; })),
+               farFiring);
+        expect(missing(evaluatedOneShooter([](ReplyShooterFacts & shooter, ReplyFacts &)
+                                           { shooter.tile = {REPLY_BOARD_SIZE, 1}; })),
+               farShooter);
+        expect(missing(evaluatedOneShooter([](ReplyShooterFacts & shooter, ReplyFacts &)
+                                           { shooter.firingTiles = {{0, -2}}; })),
+               negative);
+        expect(evaluatedOneShooter([](ReplyShooterFacts & shooter, ReplyFacts &)
+                                   { shooter.firingTiles = {INVALID_TILE, {1, 1}, shooter.tile}; })
+                   .valued(),
+               onBoard);
+    }
+
+    void testReplyPassKeepsSignedAmounts()
+    {
+        using ReplyPassEvaluationDetail::ONE_ACTION_AMOUNT_LIMIT;
+        constexpr MilliFunds rebate = -1000;
+        constexpr auto negative = "a plan whose reply carries a negative capture cost still gets a value";
+        constexpr auto edges = "capture costs at either signed end of the amount limit still get a value";
+        constexpr auto beyond = "capture costs one past either signed end of the amount limit refuse";
+        const auto withCapture = [](MilliFunds cost)
+        {
+            return evaluatedOneShooter([&](ReplyShooterFacts & shooter, ReplyFacts &) { shooter.captureCost = cost; });
+        };
+        const auto rebated = withCapture(rebate);
+        expect(rebated.valued() && rebated.shots.size() == 1, negative);
+        expect(withCapture(-ONE_ACTION_AMOUNT_LIMIT).valued() && withCapture(ONE_ACTION_AMOUNT_LIMIT).valued(), edges);
+        expect(refusedFor(withCapture(-ONE_ACTION_AMOUNT_LIMIT - 1), ReplyPassNoValue::Arithmetic, 0) &&
+                   refusedFor(withCapture(ONE_ACTION_AMOUNT_LIMIT + 1), ReplyPassNoValue::Arithmetic, 0),
+               beyond);
+    }
+
+    void testReplyPassRefusesMalformedFacts()
+    {
+        constexpr auto tileless = "reply facts without a tile refuse with missing facts";
+        constexpr auto shotless = "reply facts with fewer shots than tile shooters refuse with missing facts";
+        constexpr auto incomplete = "malformed reply facts leave the recorded prediction incomplete";
+        const std::vector<std::int32_t> only{0};
+        const auto malformed = [](bool keepTile)
+        {
+            auto input = inputWith(1);
+            auto & choice = input.actors[0].candidates[0];
+            readyForReply(choice, {replyShooterAt(choice.bundle.destination)});
+            auto facts = std::make_shared<ReplyFacts>(*choice.replyFacts);
+            if (keepTile)
+            {
+                facts->shots.clear();
+            }
+            else
+            {
+                facts->tile.reset();
+            }
+            choice.replyFacts = facts;
+            return input;
+        };
+        expect(refusedFor(evaluatedChoices(malformed(false), only), ReplyPassNoValue::MissingFacts, 0), tileless);
+        expect(refusedFor(evaluatedChoices(malformed(true), only), ReplyPassNoValue::MissingFacts, 0), shotless);
+        bool recordedIncomplete = true;
+        for (const bool keepTile : {false, true})
+        {
+            const auto input = malformed(keepTile);
+            const auto tally = std::make_shared<ReplyPredictionTally>();
+            const auto extracted = extractRecorded(input, planFrom(input), tally);
+            recordedIncomplete = recordedIncomplete && extracted.valid() && tally->incomplete == 1;
+            if (extracted.valid())
+            {
+                const auto replay = replayMasterAssignment(*extracted.problem, extracted.problem->incumbentChoices());
+                recordedIncomplete = recordedIncomplete && replay.complete() && replay.replyPrediction &&
+                                     !replay.replyPrediction->complete && tally->incomplete == 2;
+            }
+        }
+        expect(recordedIncomplete, incomplete);
+    }
+
+    void testReplyPassThreeRowsByHand()
+    {
+        constexpr std::size_t shotSlots = 2;
+        constexpr std::array<double, shotSlots> shotBases{30, 40};
+        constexpr std::array<double, shotSlots> counterBases{30, 50};
+        constexpr std::array<std::int32_t, 3> rows{5, 6, 7};
+        constexpr std::size_t unharmedSlot = 2;
+        constexpr MilliFunds unharmedShot = 300;
+        constexpr ReplyPassTerms slotZero{
+            .actingSeated = 1, .replyCapitalLoss = 2100, .replyCounterCapital = 1400, .nextShotAfterReply = 630};
+        constexpr ReplyPassTerms slotOne{
+            .actingSeated = 2, .replyCapitalLoss = 2800, .replyCounterCapital = 2100, .nextShotAfterReply = 600};
+        constexpr ReplyPassTerms slotTwo{.actingSeated = 3, .nextShotAfterReply = unharmedShot};
+        constexpr MilliFunds totalByHand = 136;
+        constexpr std::int32_t slotZeroLoss = 3;
+        constexpr std::int32_t slotOneLoss = 4;
+        constexpr auto extracts = "three-row pass fixture extracts";
+        constexpr auto order = "the three actors run in reverse slot order";
+        constexpr auto shots = "each shooter fires once on its own unit, the lower shooter index first";
+        constexpr auto terms = "every actor's five terms match the values computed by hand";
+        constexpr auto total = "the exact non-stock value matches the total computed by hand";
+        constexpr auto keys = "both keys list the three rows sorted, with the reply losses after the reply";
+        auto input = inputWith(static_cast<std::int32_t>(rows.size()));
+        for (std::size_t slot = 0; slot < shotSlots; ++slot)
+        {
+            auto & choice = input.actors[slot].candidates[0];
+            ReplyShooterFacts shooter = replyShooterAt(choice.bundle.destination);
+            shooter.shooterIndex = REPLY_SHOOTER + static_cast<std::int32_t>(slot);
+            shooter.direct = true;
+            shooter.firingTiles = {{choice.bundle.destination.x, 1}};
+            readyForReply(choice, {shooter});
+            auto facts = std::make_shared<ReplyFacts>(*choice.replyFacts);
+            facts->shots = {ReplyShotBase{shotBases[slot], shotBases[slot], counterBases[slot]}};
+            choice.replyFacts = facts;
+        }
+        readyForReply(input.actors[unharmedSlot].candidates[0]);
+        input.actors[0].candidates[0].actorNextShotsAtDestination = {900};
+        input.actors[1].candidates[0].actorNextShotsAtDestination = {DESTINATION_SHOT, 500};
+        input.actors[unharmedSlot].candidates[0].actorNextShotsAtDestination = {unharmedShot};
+        auto fixture = planFrom(input);
+        for (std::size_t slot = 0; slot < rows.size(); ++slot)
+        {
+            fixture.selections[slot].stockRow = rows[slot];
+        }
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto evaluation = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        expect(evaluation.valued() && evaluation.replay.ordering.order == std::vector<std::int32_t>{2, 1, 0},
+               order);
+        const std::vector<ReplyPassShot> shotsByHand{
+            {REPLY_SHOOTER, 2, UNIT_HP_STEPS, UNIT_HP_STEPS - slotZeroLoss, slotZero.replyCounterCapital},
+            {SECOND_SHOOTER, 1, UNIT_HP_STEPS, UNIT_HP_STEPS - slotOneLoss, slotOne.replyCounterCapital},
+        };
+        expect(evaluation.shots == shotsByHand, shots);
+        const ReplyPassActor* zero = evaluatedFor(evaluation, 0);
+        const ReplyPassActor* one = evaluatedFor(evaluation, 1);
+        const ReplyPassActor* two = evaluatedFor(evaluation, static_cast<std::int32_t>(unharmedSlot));
+        expect(zero != nullptr && one != nullptr && two != nullptr && zero->terms == slotZero &&
+                   one->terms == slotOne && two->terms == slotTwo,
+               terms);
+        expect(evaluation.exactNonStock == totalByHand, total);
+        const auto keyOf = [&](std::size_t slot, std::int32_t stepsLost)
+        {
+            return *CanonicalPlanActionKey::checkedFromAction(rows[slot], static_cast<std::int32_t>(slot), 0, false,
+                                                              stepsLost, false);
+        };
+        const ContinuationKey afterOwn{keyOf(0, 0), keyOf(1, 0), keyOf(unharmedSlot, 0)};
+        const ContinuationKey afterReply{keyOf(0, slotZeroLoss), keyOf(1, slotOneLoss), keyOf(unharmedSlot, 0)};
+        expect(evaluation.afterOwnActions == afterOwn && evaluation.afterReply == afterReply, keys);
+    }
+
+    void testReplyPassRepricesFixedActor()
+    {
+        constexpr std::int32_t mutableDamage = 4;
+        constexpr std::int32_t fixedDamage = 9;
+        constexpr std::int32_t incumbentGrant = 6;
+        constexpr std::size_t fixedSlot = 1;
+        constexpr auto extracts = "fixed repricing pass fixture extracts";
+        constexpr auto repriced = "a fixed shooter that absorbs a freed share is valued at its new grant";
+        auto input = inputWith(2);
+        input.unitLinks.push_back({SHOT_TARGET_ENGINE_ID, {2, 1}});
+        input.actors[0].candidates.push_back(input.actors[0].candidates[0]);
+        addFire(input.actors[0].candidates[0], mutableDamage);
+        addFire(input.actors[fixedSlot].candidates[0], fixedDamage);
+        for (auto & actor : input.actors)
+        {
+            for (auto & choice : actor.candidates)
+            {
+                readyForReply(choice);
+            }
+        }
+        auto fixture = planFrom(input);
+        fixture.selections[fixedSlot].role = MasterActorRole::Fixed;
+        const auto extracted = extract(input, fixture);
+        expect(extracted.valid(), extracts);
+        if (!extracted.valid())
+        {
+            return;
+        }
+        const auto & problem = *extracted.problem;
+        const auto & fixedSource = problem.actors()[fixedSlot].candidates[0].source;
+        const auto shared = evaluateReplyPassPlan(problem, problem.incumbentChoices(), EVALUATION_BOARD);
+        const auto freed = evaluateReplyPassPlan(problem, std::vector<std::int32_t>{1, 0}, EVALUATION_BOARD);
+        const ReplyPassActor* before = evaluatedFor(shared, static_cast<std::int32_t>(fixedSlot));
+        const ReplyPassActor* after = evaluatedFor(freed, static_cast<std::int32_t>(fixedSlot));
+        expect(shared.valued() && freed.valued() && before != nullptr && after != nullptr &&
+                   before->grantedDamage == incumbentGrant && after->grantedDamage == fixedDamage &&
+                   before->terms.actingSeated == checkedActingSeatedCandidateValue(fixedSource, incumbentGrant) &&
+                   after->terms.actingSeated == checkedActingSeatedCandidateValue(fixedSource, fixedDamage) &&
+                   before->terms.actingSeated != after->terms.actingSeated,
+               repriced);
+    }
+
+    void testReplyPassIsDeterministicAndModeFree()
+    {
+        constexpr auto extracts = "determinism pass fixtures extract";
+        constexpr auto deterministic = "evaluating the same choices twice gives the same result";
+        constexpr auto modeFree = "the result does not depend on the problem's own prediction mode";
+        auto input = inputWith(2);
+        exposeEachToOneShooter(input);
+        const auto fixture = planFrom(input);
+        const auto off = extract(input, fixture);
+        const auto recorded = extractRecorded(input, fixture);
+        expect(off.valid() && recorded.valid(), extracts);
+        if (!off.valid() || !recorded.valid())
+        {
+            return;
+        }
+        const auto first = evaluateReplyPassPlan(*off.problem, off.problem->incumbentChoices(), EVALUATION_BOARD);
+        const auto second = evaluateReplyPassPlan(*off.problem, off.problem->incumbentChoices(), EVALUATION_BOARD);
+        const auto fromRecorded =
+            evaluateReplyPassPlan(*recorded.problem, recorded.problem->incumbentChoices(), EVALUATION_BOARD);
+        expect(first.valued() && !first.shots.empty() && sameEvaluation(first, second), deterministic);
+        expect(sameEvaluation(first, fromRecorded) && !fromRecorded.replay.replyPrediction, modeFree);
+    }
 }
 
 int main()
@@ -1204,6 +1981,22 @@ int main()
     testReplyPredictionFollowsExecutionOrder();
     testReplyPredictionFreesOwnActionDeaths();
     testReplyPredictionBooksRealDamage();
+    testReplyPassAgreesWithPrediction();
+    testReplyPassWeakenedTargetTerms();
+    testReplyPassActorShotTwice();
+    testReplyPassReplyKillsCapturer();
+    testReplyPassOwnActionDeath();
+    testReplyPassCorrectionRebuildsCandidate();
+    testReplyPassNoValueReasons();
+    testReplyPassRefusesOverflowingAmounts();
+    testReplyPassBoundsReplyArithmeticInputs();
+    testReplyPassBoundsActorRealHp();
+    testReplyPassKeepsTilesOnBoard();
+    testReplyPassKeepsSignedAmounts();
+    testReplyPassRefusesMalformedFacts();
+    testReplyPassThreeRowsByHand();
+    testReplyPassRepricesFixedActor();
+    testReplyPassIsDeterministicAndModeFree();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

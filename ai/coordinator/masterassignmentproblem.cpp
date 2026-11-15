@@ -1,6 +1,7 @@
 #include "ai/coordinator/masterassignmentproblem.h"
 #include "ai/coordinator/bundleassignment.h"
 #include "ai/coordinator/assignmentvaluation.h"
+#include "ai/coordinator/masterreplyactions.h"
 #include "ai/coordinator/propertystockbuilder.h"
 #include "ai/coordinator/replyprediction.h"
 
@@ -257,30 +258,11 @@ namespace
                                                 const MasterAssignmentReplayResult & replay)
     {
         const auto started = std::chrono::steady_clock::now();
-        std::vector<PlanReplyAction> actions;
-        actions.reserve(replay.ordering.order.size());
-        bool owned = setup.board != nullptr;
-        for (const std::int32_t actionIndex : replay.ordering.order)
-        {
-            const auto found =
-                std::find(replay.actionIndices.begin(), replay.actionIndices.end(), actionIndex);
-            const auto slot = static_cast<std::size_t>(found - replay.actionIndices.begin());
-            if (found == replay.actionIndices.end() || choices[slot] == NO_CANDIDATE)
-            {
-                owned = false;
-                break;
-            }
-            const MasterActor & actor = actors[slot];
-            actions.push_back(PlanReplyAction{
-                .pCandidate = &actor.candidates[static_cast<std::size_t>(choices[slot])].source,
-                .engineUnitId = actor.engineUnitId,
-                .actionIndex = actionIndex,
-            });
-        }
+        const std::optional<MasterReplyActions> owned = masterReplyActions(actors, choices, replay);
         PlanReplyPrediction prediction;
-        if (owned)
+        if (setup.board != nullptr && owned)
         {
-            prediction = predictPlanReply(actions, *setup.board);
+            prediction = predictPlanReply(owned->actions, *setup.board);
         }
         if (setup.tally != nullptr)
         {
@@ -1026,6 +1008,14 @@ namespace Coordinator
         const MasterAssignmentProblem & problem,
         std::span<const std::int32_t> choices)
     {
+        return replayMasterAssignment(problem, choices, problem.m_replyPrediction);
+    }
+
+    MasterAssignmentReplayResult replayMasterAssignment(
+        const MasterAssignmentProblem & problem,
+        std::span<const std::int32_t> choices,
+        const ReplyPredictionSetup & prediction)
+    {
         MasterAssignmentReplayResult result;
         if (choices.size() != problem.m_actors.size())
         {
@@ -1393,10 +1383,9 @@ namespace Coordinator
         }
         result.continuationKey = *key;
         result.error = MasterAssignmentReplayError::None;
-        if (problem.m_replyPrediction.mode == ReplyPrediction::Recorded && result.complete())
+        if (prediction.mode == ReplyPrediction::Recorded && result.complete())
         {
-            result.replyPrediction =
-                recordedReplyPrediction(problem.m_actors, problem.m_replyPrediction, choices, result);
+            result.replyPrediction = recordedReplyPrediction(problem.m_actors, prediction, choices, result);
         }
         return result;
     }

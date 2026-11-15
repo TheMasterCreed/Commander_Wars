@@ -16,6 +16,7 @@
 #include "ai/coordinator/capturedangerstream.h"
 #include "ai/coordinator/ownactionmeasurement.h"
 #include "ai/coordinator/replycheck.h"
+#include "ai/coordinator/stockreplykeys.h"
 
 namespace Coordinator::CaptureDangerRecord
 {
@@ -69,44 +70,13 @@ namespace Coordinator::CaptureDangerRecord
         return STOCK_QUOTE_STATUS_NAMES[static_cast<std::size_t>(status)];
     }
 
-    enum class StockDeathCause : std::int8_t
-    {
-        None,
-        OwnAction,
-        Reply,
-    };
+    using Coordinator::StockDeathCause;
+    using Coordinator::StockReplyKeys;
+    using Coordinator::stockReplyKeys;
 
     inline constexpr std::array STOCK_DEATH_CAUSE_NAMES{
         INTERRUPTION_NONE, "OWN_ACTION", "REPLY",
     };
-
-    struct StockReplyKeys
-    {
-        CanonicalPlanActionKey afterOwnActions;
-        CanonicalPlanActionKey afterReply;
-        StockDeathCause death{StockDeathCause::None};
-    };
-
-    inline std::optional<StockReplyKeys> stockReplyKeys(
-        const CanonicalPlanActionKey & today, std::int32_t dayStartSteps,
-        std::int32_t counterSteps, std::int32_t replySteps)
-    {
-        if (today.stepsLost() != 0 || today.destroyed() || dayStartSteps <= 0 ||
-            dayStartSteps > CanonicalPlanActionKey::MAX_STEPS_LOST || counterSteps < 0 || replySteps < 0 ||
-            counterSteps > dayStartSteps || replySteps > dayStartSteps - counterSteps)
-        {
-            return std::nullopt;
-        }
-        const bool diedAttacking = counterSteps == dayStartSteps;
-        const bool dead = counterSteps + replySteps == dayStartSteps;
-        return StockReplyKeys{
-            *CanonicalPlanActionKey::checkedFromAction(today.row(), today.x(), today.y(), today.captures(),
-                                                       counterSteps, diedAttacking),
-            *CanonicalPlanActionKey::checkedFromAction(today.row(), today.x(), today.y(), today.captures(),
-                                                       counterSteps + replySteps, dead),
-            diedAttacking ? StockDeathCause::OwnAction : dead ? StockDeathCause::Reply : StockDeathCause::None,
-        };
-    }
 
     constexpr StockInterval stockQuoteLoss(const StockInterval & before, const StockInterval & after)
     {

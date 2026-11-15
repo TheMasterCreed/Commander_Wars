@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -20,21 +21,38 @@ namespace Coordinator
         std::int32_t actionIndex{NO_ACTION};
     };
 
-    // targets runs parallel to entries; startHp is each pooled shooter's day start hp.
+    constexpr std::size_t NO_FAILED_ACTION = static_cast<std::size_t>(-1);
+
+    // targets runs parallel to entries; when incomplete, own.status says why failedAction could not be measured.
     struct ResolvedPlanReply
     {
         bool complete{false};
         std::vector<PlanReplyEntry> entries;
         std::vector<ReplyTargetFacts> targets;
-        TargetHpChain chain;
+        OwnActionMeasurement own;
         std::map<std::int32_t, std::int32_t> startHp;
+        std::size_t failedAction{NO_FAILED_ACTION};
     };
 
     namespace ReplyPredictionDetail
     {
+        // shots runs parallel to tile->shooters, so every listed shooter needs its shot.
         inline bool resolvable(const PlanReplyAction & action)
         {
-            return action.pCandidate != nullptr && action.pCandidate->replyFacts != nullptr;
+            if (action.pCandidate == nullptr || action.pCandidate->replyFacts == nullptr)
+            {
+                return false;
+            }
+            const ReplyFacts & facts = *action.pCandidate->replyFacts;
+            return facts.tile != nullptr && facts.shots.size() >= facts.tile->shooters.size();
+        }
+
+        inline ResolvedPlanReply refused(StockQuoteStatus status, std::size_t failedAction)
+        {
+            ResolvedPlanReply refusal;
+            refusal.own.status = status;
+            refusal.failedAction = failedAction;
+            return refusal;
         }
     }
 
@@ -58,29 +76,33 @@ namespace Coordinator
         std::vector<ReplyTargetFacts> targets;
         ordered.reserve(actions.size());
         targets.reserve(actions.size());
-        for (const PlanReplyAction & action : actions)
+        for (std::size_t index = 0; index < actions.size(); ++index)
         {
+            const PlanReplyAction & action = actions[index];
             if (!ReplyPredictionDetail::resolvable(action))
             {
-                return ResolvedPlanReply{};
+                return ReplyPredictionDetail::refused(StockQuoteStatus::MissingActionFacts, index);
             }
             const CandidateBundle & candidate = *action.pCandidate;
             const PlanChainEntry entry{&candidate.bundle, candidate.actor.hpSteps};
             // A candidate always carries its bundle, so its reply start is known.
-            if (ownActionFacts(entry, candidate.replyFacts->actorRealHp, true) != StockQuoteStatus::Available)
+            const StockQuoteStatus facts = ownActionFacts(entry, candidate.replyFacts->actorRealHp, true);
+            if (facts != StockQuoteStatus::Available)
             {
-                return ResolvedPlanReply{};
+                return ReplyPredictionDetail::refused(facts, index);
             }
             ordered.push_back(entry);
             targets.push_back(ReplyTargetFacts{.target = OneActionTarget{
                 action.engineUnitId, candidate.replyFacts->actorRealHp, candidate.actor.replacementCost}});
         }
-        const OwnActionMeasurement own = measureOwnActions(ordered, targets);
+        ResolvedPlanReply resolved{.own = measureOwnActions(ordered, targets)};
+        const OwnActionMeasurement & own = resolved.own;
         if (own.status != StockQuoteStatus::Available)
         {
-            return ResolvedPlanReply{};
+            const auto failed = std::find_if(own.ownStatus.begin(), own.ownStatus.end(),
+                [](StockQuoteStatus status) { return status != StockQuoteStatus::Available; });
+            return ReplyPredictionDetail::refused(own.status, static_cast<std::size_t>(failed - own.ownStatus.begin()));
         }
-        ResolvedPlanReply resolved{.chain = own.chain.chain};
         resolved.entries.reserve(actions.size());
         for (std::size_t index = 0; index < actions.size(); ++index)
         {
@@ -112,7 +134,8 @@ namespace Coordinator
     inline PlanReplyRun runResolvedPlanReply(const ResolvedPlanReply & resolved)
     {
         return planReply(
-            resolved.targets, resolved.chain, [&](std::int32_t shooter) { return resolved.startHp.at(shooter); },
+            resolved.targets, resolved.own.chain.chain,
+            [&](std::int32_t shooter) { return resolved.startHp.at(shooter); },
             [&](std::size_t target, std::size_t slot, std::int32_t shooterHpSteps, std::int32_t hpSteps)
             {
                 const PlanReplyEntry & entry = resolved.entries[target];

@@ -774,11 +774,15 @@ namespace Coordinator
         MilliFunds cost{0};
     };
 
+    // The hp and counter cost the selection priced the shot at, kept so callers need not price it again.
     struct OneActionShot
     {
         std::size_t shooter{0};
         std::size_t target{0};
         MilliFunds net{0};
+        std::int32_t hpStepsBefore{0};
+        std::int32_t hpStepsAfter{0};
+        MilliFunds counterCost{0};
     };
 
     // outcomes[target].fired lists that target's shots in firing order; chosen[shooter] is its target or none.
@@ -841,15 +845,16 @@ namespace Coordinator
                     ++result.pairsExamined;
                     const double damage = static_cast<double>(damageAt(shooter, target, hpSteps));
                     const std::int32_t hpStepsAfter = ceilHpSteps(engineHpAfterReply(hp[target], engineShotDamage(damage)));
-                    const MilliFunds net = bookDamage(targets[target].cost, hpSteps - hpStepsAfter) -
-                                           counterCostAt(shooter, target, hpStepsAfter) - captureCostAt(shooter, target);
+                    const MilliFunds counter = counterCostAt(shooter, target, hpStepsAfter);
+                    const MilliFunds net = bookDamage(targets[target].cost, hpSteps - hpStepsAfter) - counter -
+                                           captureCostAt(shooter, target);
                     if (net <= 0 ||
                         (best && !oneActionShotBeats(net, shooterIndices[shooter], targets[target].unitId, best->net,
                                                      shooterIndices[best->shooter], targets[best->target].unitId)))
                     {
                         continue;
                     }
-                    best = OneActionShot{shooter, target, net};
+                    best = OneActionShot{shooter, target, net, hpSteps, hpStepsAfter, counter};
                     bestDamage = damage;
                 }
             }
