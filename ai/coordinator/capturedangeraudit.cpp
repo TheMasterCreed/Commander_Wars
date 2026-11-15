@@ -54,9 +54,11 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 15;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 16;
     constexpr std::int32_t STOCK_CONTEXT_BASE_ROUNDS = Coordinator::MASTER_PLAN_PRICING_ROUNDS;
     constexpr std::int32_t STOCK_CONTEXT_RETUNE_ROUNDS = 25;
+    constexpr Coordinator::MilliFunds STOCK_CONTEXT_TARGET_GAP_PPM = 5'000;
+    constexpr Coordinator::MilliFunds PARTS_PER_MILLION = 1'000'000;
     constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
     constexpr Coordinator::DiagnosticRefinementLimits STOCK_REPLY_REFINEMENT_LIMITS{
         .stateCap = STOCK_REPLY_REFINEMENT_STATE_CAP,
@@ -332,6 +334,9 @@ namespace
     constexpr auto KEY_POLISH = "polish";
     constexpr auto KEY_POLISHED_ROWS = "polishedRows";
     constexpr auto KEY_RETUNE = "retune";
+    constexpr auto KEY_TARGET_TUNE = "targetTune";
+    constexpr auto KEY_TARGET_GAP = "targetGap";
+    constexpr auto KEY_STOPPED_ON_TARGET = "stoppedOnTarget";
     constexpr auto KEY_SKIPPED = "skipped";
     constexpr auto KEY_REINSTALL_STATUS = "reinstallStatus";
     constexpr auto KEY_AGREEMENT = "agreement";
@@ -2155,6 +2160,28 @@ namespace
         record.insert(KEY_POLISHED_ROWS, static_cast<qint64>(floor.counters.polishedRows));
     }
 
+    QJsonObject tuneRecord(const Coordinator::ReplyStockTune & tuned, std::int64_t nanos)
+    {
+        QJsonObject record{
+            {KEY_SKIPPED, false}, {KEY_STATUS, replyStockStatusName(tuned.status)},
+            {KEY_TUNER_STATUS,
+             QLatin1String(Coordinator::MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(tuned.tunerStatus)])},
+            {KEY_ROUNDS, tuned.rounds},
+            {KEY_FLOOR, static_cast<qint64>(tuned.floor.floor)}, {KEY_CEILING, static_cast<qint64>(tuned.ceiling)},
+            {KEY_NANOS, static_cast<qint64>(nanos)},
+        };
+        insertFloorPolish(record, tuned.floor);
+        return record;
+    }
+
+    // Splitting the division keeps the product from overflowing for any non-negative ceiling.
+    Coordinator::MilliFunds targetGapOf(Coordinator::MilliFunds ceiling)
+    {
+        const auto base = std::max<Coordinator::MilliFunds>(ceiling, 0);
+        return base / PARTS_PER_MILLION * STOCK_CONTEXT_TARGET_GAP_PPM +
+            base % PARTS_PER_MILLION * STOCK_CONTEXT_TARGET_GAP_PPM / PARTS_PER_MILLION;
+    }
+
     // Reinstalls the base prices when a re-tune replaced them, so every key is quoted and re-tuned from them.
     bool restoreBasePrices(Coordinator::ReplyStockContext & context, std::span<const Coordinator::MilliFunds> prices,
                            std::uint64_t & version, QJsonObject & record)
@@ -2187,6 +2214,7 @@ namespace
             record.insert(KEY_SKIPPED, true);
             record.insert(KEY_REASON, QLatin1String(REASON_BASE_PRICES_UNAVAILABLE));
             record.insert(KEY_RETUNE, skipped);
+            record.insert(KEY_TARGET_TUNE, skipped);
             interval = ContextInterval{};
             return record;
         }
@@ -2209,27 +2237,41 @@ namespace
         interval = ContextInterval{quoted, floor.floor, ceiling.ceiling};
         if (!quoted)
         {
-            record.insert(KEY_RETUNE, QJsonObject{{KEY_SKIPPED, true},
-                                                  {KEY_REASON, QLatin1String(REASON_BASE_PRICE_QUOTE_INVALID)}});
+            const QJsonObject skipped{{KEY_SKIPPED, true},
+                                      {KEY_REASON, QLatin1String(REASON_BASE_PRICE_QUOTE_INVALID)}};
+            record.insert(KEY_RETUNE, skipped);
+            record.insert(KEY_TARGET_TUNE, skipped);
             return record;
         }
         const auto retuneStarted = std::chrono::steady_clock::now();
         const ReplyStockTune tuned =
             context.tune(key, STOCK_CONTEXT_RETUNE_ROUNDS, ReplyStockTuneStart::InstalledPrices, &floor);
-        QJsonObject retune{
-            {KEY_SKIPPED, false}, {KEY_STATUS, replyStockStatusName(tuned.status)},
-            {KEY_TUNER_STATUS,
-             QLatin1String(MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(tuned.tunerStatus)])},
-            {KEY_ROUNDS, tuned.rounds},
-            {KEY_FLOOR, static_cast<qint64>(tuned.floor.floor)}, {KEY_CEILING, static_cast<qint64>(tuned.ceiling)},
-            {KEY_NANOS, static_cast<qint64>(nanosSince(retuneStarted))},
-        };
-        insertFloorPolish(retune, tuned.floor);
-        record.insert(KEY_RETUNE, retune);
+        record.insert(KEY_RETUNE, tuneRecord(tuned, nanosSince(retuneStarted)));
         if (tuned.status == ReplyStockStatus::Valid)
         {
             interval = ContextInterval{true, tuned.floor.floor, tuned.ceiling};
         }
+        // The re-tune replaced the installed prices, so the target tune starts again from the base prices.
+        QJsonObject restored;
+        if (!restoreBasePrices(context, basePrices, baseVersion, restored))
+        {
+            restored.insert(KEY_SKIPPED, true);
+            restored.insert(KEY_REASON, QLatin1String(REASON_BASE_PRICES_UNAVAILABLE));
+            record.insert(KEY_TARGET_TUNE, restored);
+            return record;
+        }
+        const MilliFunds targetGap = targetGapOf(ceiling.ceiling);
+        const auto targetStarted = std::chrono::steady_clock::now();
+        const ReplyStockTune targeted = context.tune(key, STOCK_CONTEXT_BASE_ROUNDS,
+                                                     ReplyStockTuneStart::InstalledPrices, &floor, targetGap);
+        QJsonObject target = tuneRecord(targeted, nanosSince(targetStarted));
+        target.insert(KEY_TARGET_GAP, static_cast<qint64>(targetGap));
+        target.insert(KEY_STOPPED_ON_TARGET, targeted.stoppedOnTarget);
+        for (auto entry = restored.begin(); entry != restored.end(); ++entry)
+        {
+            target.insert(entry.key(), entry.value());
+        }
+        record.insert(KEY_TARGET_TUNE, target);
         return record;
     }
 

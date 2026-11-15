@@ -127,8 +127,10 @@ namespace Coordinator
     {
         ReplyStockStatus status{ReplyStockStatus::Invalid};
         ReplyStockTuneStart start{ReplyStockTuneStart::Zero};
+        MilliFunds targetGap{0};
         MasterPlanPricingStatus tunerStatus{MasterPlanPricingStatus::Unavailable};
         std::int32_t rounds{0};
+        bool stoppedOnTarget{false};
         MilliFunds ceiling{0};
         ReplyStockFloor floor;
         ReplyStockFloorSource floorSource{ReplyStockFloorSource::None};
@@ -167,7 +169,7 @@ namespace Coordinator
         ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr);
         ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds,
                             ReplyStockTuneStart start = ReplyStockTuneStart::Zero,
-                            const ReplyStockFloor * reference = nullptr);
+                            const ReplyStockFloor * reference = nullptr, MilliFunds targetGap = 0);
 
         std::size_t nodeCount() const
         {

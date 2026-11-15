@@ -1165,10 +1165,11 @@ namespace Coordinator
     }
 
     ReplyStockTune ReplyStockContext::tune(const ContinuationKey & key, std::int32_t rounds, ReplyStockTuneStart start,
-                                           const ReplyStockFloor * reference)
+                                           const ReplyStockFloor * reference, MilliFunds targetGap)
     {
         ReplyStockTune result;
         result.start = start;
+        result.targetGap = targetGap;
         const std::int64_t workBefore = work();
         result.status = start == ReplyStockTuneStart::InstalledPrices && m_priceVersion == 0 ?
             ReplyStockStatus::NoPrices : tuneKey(key, rounds, reference, result);
@@ -1662,11 +1663,23 @@ namespace Coordinator
                                                 const ReplyStockFloor * reference, ReplyStockTune & result)
     {
         ReplyStockCounters counters;
-        const ReplyStockStatus extended = rounds <= 0 ? ReplyStockStatus::Invalid : extend(key, counters);
+        const ReplyStockStatus extended =
+            rounds <= 0 || result.targetGap < 0 ? ReplyStockStatus::Invalid : extend(key, counters);
         if (extended != ReplyStockStatus::Valid)
         {
             return extended;
         }
+        // The key's own floor at the seed prices lets the tuner stop early and, as the reference, bounds the result.
+        std::optional<ReplyStockFloor> seeded;
+        if (result.targetGap > 0 && result.start == ReplyStockTuneStart::InstalledPrices)
+        {
+            seeded = floor(key, reference);
+            if (seeded->status != ReplyStockStatus::Valid)
+            {
+                seeded.reset();
+            }
+        }
+        const ReplyStockFloor * verification = seeded ? &*seeded : reference;
         const std::optional<MasterPlanPricingModel> model = forcedModel(key);
         if (!model)
         {
@@ -1676,6 +1689,11 @@ namespace Coordinator
         if (limited != ReplyStockStatus::Valid)
         {
             return limited;
+        }
+        result.limits.limits.targetGap = result.targetGap;
+        if (seeded)
+        {
+            result.limits.limits.knownFloor = seeded->floor;
         }
         RefinementLedger ledger;
         if (!ledger.open(result.limits.limits.maximumWork))
@@ -1688,6 +1706,7 @@ namespace Coordinator
         const MasterPlanPricingResult tuned = tuneMasterPlanPrices(*model, result.limits.limits, ledger, {}, seed);
         result.tunerStatus = tuned.status;
         result.rounds = tuned.rounds;
+        result.stoppedOnTarget = tuned.stoppedOnTarget;
         result.tunerWork = ledger.stats().granted;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         result.tunerPricingWork = tuned.pricingWork;
@@ -1718,7 +1737,17 @@ namespace Coordinator
             return checked.status;
         }
         result.ceiling = checked.ceiling;
-        result.floor = floor(key, reference);
+        result.floor = floor(key, verification);
+        if (seeded)
+        {
+            // The seed floor pins the result from below, but the caller's reference alone can replay higher.
+            ReplyStockFloor callers = floor(key, reference);
+            if (callers.status == ReplyStockStatus::Valid &&
+                (result.floor.status != ReplyStockStatus::Valid || callers.floor > result.floor.floor))
+            {
+                result.floor = std::move(callers);
+            }
+        }
         if (result.floor.status != ReplyStockStatus::Valid)
         {
             return result.floor.status;

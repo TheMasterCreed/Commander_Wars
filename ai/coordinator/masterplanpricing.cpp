@@ -1061,8 +1061,9 @@ namespace
                 {
                     return finish(MasterPlanPricingStatus::LimitReached);
                 }
-                if (m_floor && *m_bestCeiling == *m_floor)
+                if (onTarget())
                 {
+                    m_result.stoppedOnTarget = true;
                     break;
                 }
                 auto ceiling = priced.ceiling;
@@ -1099,6 +1100,18 @@ namespace
         }
 
     private:
+        // A gap below zero would mean a floor above the ceiling, which never counts as reaching the target.
+        bool onTarget() const
+        {
+            auto floor = m_floor;
+            if (m_limits.knownFloor && (!floor || *m_limits.knownFloor > *floor))
+            {
+                floor = m_limits.knownFloor;
+            }
+            auto gap = *m_bestCeiling;
+            return floor && RelativeStockDetail::checkedSubtract(gap, *floor) && gap >= 0 && gap <= m_limits.targetGap;
+        }
+
         void consider(std::span<const MilliFunds> at, const MasterPlanCeiling & priced)
         {
             const auto witness = buildWitness(m_model, at, priced, ResourcePolicy::Enforced, m_options,
@@ -1363,8 +1376,8 @@ namespace Coordinator
                                                  std::span<const MilliFunds> seed)
     {
         const auto outOfRange = [](MilliFunds price) { return price < 0 || price > MASTER_PLAN_PRICE_LIMIT; };
-        if (!seed.empty() &&
-            (seed.size() != model.catalog.columns.size() || std::any_of(seed.begin(), seed.end(), outOfRange)))
+        if (limits.targetGap < 0 || (!seed.empty() && (seed.size() != model.catalog.columns.size() ||
+                                                       std::any_of(seed.begin(), seed.end(), outOfRange))))
         {
             MasterPlanPricingResult refused;
             refused.status = MasterPlanPricingStatus::Invalid;

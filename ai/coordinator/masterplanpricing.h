@@ -100,6 +100,9 @@ namespace Coordinator
         std::int32_t rounds{0};
         std::int64_t maximumWork{0};
         std::int64_t witnessBuildWork{0};
+        // Zero keeps the exact-match stop; a known floor only enters the stop test.
+        MilliFunds targetGap{0};
+        std::optional<MilliFunds> knownFloor;
     };
 
     struct MasterPlanPricingResult
@@ -108,6 +111,7 @@ namespace Coordinator
         std::vector<MilliFunds> prices;
         MasterPlanWitness witness;
         std::int32_t rounds{0};
+        bool stoppedOnTarget{false};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         MilliFunds ceiling{0};
         std::optional<MilliFunds> floor;

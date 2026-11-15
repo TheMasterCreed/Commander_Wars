@@ -628,10 +628,18 @@ namespace
         return ceilings;
     }
 
+    Coordinator::MasterPlanPricingLimits pricingLimits(std::int32_t rounds = Coordinator::MASTER_PLAN_PRICING_ROUNDS)
+    {
+        using namespace Coordinator;
+        return MasterPlanPricingLimits{rounds, MASTER_PLAN_PRICING_WORK, MASTER_PLAN_PRICING_WITNESS_WORK};
+    }
+
     Coordinator::MasterPlanPricingResult existingTune(const Coordinator::PropertyStockField & field,
                                                       const Coordinator::ContinuationKey & key,
                                                       std::span<const MilliFunds> seed = {},
-                                                      std::int64_t* pGranted = nullptr)
+                                                      std::int64_t* pGranted = nullptr,
+                                                      const Coordinator::MasterPlanPricingLimits & limits =
+                                                          pricingLimits())
     {
         using namespace Coordinator;
         const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
@@ -640,14 +648,27 @@ namespace
         {
             return {};
         }
-        const MasterPlanPricingLimits limits{
-            MASTER_PLAN_PRICING_ROUNDS, MASTER_PLAN_PRICING_WORK, MASTER_PLAN_PRICING_WITNESS_WORK};
         auto result = tuneMasterPlanPrices(*reference.models.front(), limits, ledger, {}, seed);
         if (pGranted != nullptr)
         {
             *pGranted = ledger.stats().granted;
         }
         return result;
+    }
+
+    bool sameOutcome(const Coordinator::MasterPlanPricingResult & left,
+                     const Coordinator::MasterPlanPricingResult & right)
+    {
+        return left.status == right.status && left.prices == right.prices && left.ceiling == right.ceiling &&
+            left.floor == right.floor && left.rounds == right.rounds && left.witness.valid == right.witness.valid &&
+            left.witness.candidateIndices == right.witness.candidateIndices &&
+            left.witness.rows == right.witness.rows && left.witness.value == right.witness.value;
+    }
+
+    bool sameTune(const Coordinator::MasterPlanPricingResult & left, const Coordinator::MasterPlanPricingResult & right)
+    {
+        return sameOutcome(left, right) && left.stoppedOnTarget == right.stoppedOnTarget &&
+            left.pricingWork == right.pricingWork && left.witnessWork == right.witnessWork;
     }
 
     std::vector<MilliFunds> tunedPrices(const Coordinator::PropertyStockField & field,
@@ -1150,13 +1171,8 @@ namespace
         std::int64_t zeroSeededWork = -1;
         const auto unseeded = existingTune(field, {damaged}, {}, &unseededWork);
         const auto zeroSeeded = existingTune(field, {damaged}, zero, &zeroSeededWork);
-        expect(unseeded.status == MasterPlanPricingStatus::Valid && zeroSeeded.status == unseeded.status &&
-                   zeroSeeded.prices == unseeded.prices && zeroSeeded.ceiling == unseeded.ceiling &&
-                   zeroSeeded.floor == unseeded.floor && zeroSeeded.rounds == unseeded.rounds &&
-                   zeroSeeded.witness.valid == unseeded.witness.valid &&
-                   zeroSeeded.witness.candidateIndices == unseeded.witness.candidateIndices &&
-                   zeroSeeded.witness.rows == unseeded.witness.rows &&
-                   zeroSeeded.witness.value == unseeded.witness.value && zeroSeededWork == unseededWork,
+        expect(unseeded.status == MasterPlanPricingStatus::Valid && sameTune(zeroSeeded, unseeded) &&
+                   zeroSeededWork == unseededWork,
                "an explicit all-zero seed runs exactly the unseeded tune");
         const std::array wrongSize{MilliFunds{0}};
         const std::array negative{MilliFunds{-1}, MilliFunds{0}};
@@ -1184,6 +1200,172 @@ namespace
             other.tune({damaged}, SHORT_ROUNDS, ReplyStockTuneStart::InstalledPrices, &corrupted);
         expect(misled.status == ReplyStockStatus::ReplayRejected,
                "the verification floor is taken with the caller's reference");
+    }
+
+    void tunerStopsAtTargetGap()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t CAPPED_ROUNDS = 10;
+        constexpr std::int32_t DEEP_ROWS = 3;
+        constexpr MilliFunds WIDE_GAP = 3;
+        constexpr MilliFunds NARROW_GAP = 1;
+        constexpr MilliFunds TODAY_EXACT = 20;
+        constexpr MilliFunds ABOVE_EVERY_CEILING = 1000;
+        const auto today = Fixture::replyKeys().today;
+        const auto shallow = Fixture::make(2);
+        const auto deep = Fixture::make(DEEP_ROWS);
+        const auto limitsWith = [](std::int32_t rounds, MilliFunds gap, std::optional<MilliFunds> known) {
+            auto limits = pricingLimits(rounds);
+            limits.targetGap = gap;
+            limits.knownFloor = known;
+            return limits;
+        };
+
+        std::int64_t plainWork = -1;
+        std::int64_t zeroWork = -1;
+        const auto plain = existingTune(shallow, {today}, {}, &plainWork);
+        const auto zeroGap = existingTune(shallow, {today}, {}, &zeroWork,
+                                          limitsWith(MASTER_PLAN_PRICING_ROUNDS, 0, std::nullopt));
+        expect(plain.status == MasterPlanPricingStatus::Valid && plain.floor && *plain.floor < plain.ceiling &&
+                   !plain.stoppedOnTarget && sameTune(zeroGap, plain) && zeroWork == plainWork,
+               "a zero gap without a known floor is the exact-match tune on a key it does not close");
+        const auto above = existingTune(shallow, {today}, {}, nullptr,
+                                        limitsWith(MASTER_PLAN_PRICING_ROUNDS, 0, ABOVE_EVERY_CEILING));
+        expect(!above.stoppedOnTarget && sameTune(above, plain),
+               "a known floor above the best ceiling never stops the tune");
+
+        const auto exact = existingTune(deep, {today}, {}, nullptr, limitsWith(CAPPED_ROUNDS, 0, std::nullopt));
+        const auto wide = existingTune(deep, {today}, {}, nullptr, limitsWith(CAPPED_ROUNDS, WIDE_GAP, std::nullopt));
+        expect(exact.status == MasterPlanPricingStatus::Valid && exact.rounds == CAPPED_ROUNDS &&
+                   !exact.stoppedOnTarget && wide.status == MasterPlanPricingStatus::Valid &&
+                   wide.rounds < CAPPED_ROUNDS && wide.stoppedOnTarget && wide.floor &&
+                   wide.witness.value == *wide.floor && wide.ceiling - *wide.floor <= WIDE_GAP &&
+                   referenceCeilings(deep, std::array{ContinuationKey{today}}, wide.prices).front() == wide.ceiling,
+               "a positive gap stops before the round cap the exact rule runs into, on a repriced ceiling");
+
+        const auto ownOnly = existingTune(deep, {today}, {}, nullptr,
+                                          limitsWith(MASTER_PLAN_PRICING_ROUNDS, NARROW_GAP, std::nullopt));
+        const auto known = existingTune(deep, {today}, {}, nullptr,
+                                        limitsWith(MASTER_PLAN_PRICING_ROUNDS, NARROW_GAP, TODAY_EXACT));
+        const auto ownAtStop = existingTune(deep, {today}, {}, nullptr,
+                                            limitsWith(known.rounds, NARROW_GAP, std::nullopt));
+        expect(known.status == MasterPlanPricingStatus::Valid && known.stoppedOnTarget &&
+                   known.ceiling - TODAY_EXACT <= NARROW_GAP && ownOnly.stoppedOnTarget &&
+                   known.rounds < ownOnly.rounds && !ownAtStop.stoppedOnTarget,
+               "a known floor stops the tune where the tuner's own floor has not reached the target");
+        expect(sameOutcome(known, ownAtStop),
+               "a stop on the known floor returns the tuner's own floor and witness, never the known floor");
+
+        for (const auto * field : {&shallow, &deep})
+        {
+            const auto alone = existingTune(*field, {today}, {}, nullptr, pricingLimits());
+            const auto belowExact = existingTune(*field, {today}, {}, nullptr,
+                                                 limitsWith(MASTER_PLAN_PRICING_ROUNDS, 0, TODAY_EXACT - 1));
+            expect(alone.status == MasterPlanPricingStatus::Valid && sameTune(belowExact, alone),
+                   "a known floor that never meets the target leaves the price path unchanged");
+        }
+
+        std::int64_t negativeWork = -1;
+        const auto negative = existingTune(shallow, {today}, {}, &negativeWork,
+                                           limitsWith(MASTER_PLAN_PRICING_ROUNDS, -1, std::nullopt));
+        ReplyStockContext refusing(shallow);
+        const auto refused = refusing.tune({today}, MASTER_PLAN_PRICING_ROUNDS, ReplyStockTuneStart::Zero, nullptr, -1);
+        expect(negative.status == MasterPlanPricingStatus::Invalid && negativeWork == 0 &&
+                   refused.status == ReplyStockStatus::Invalid && refusing.priceVersion() == 0,
+               "a negative gap is refused before any work");
+    }
+
+    bool provenTune(Coordinator::ReplyStockContext & context, const Coordinator::ContinuationKey & key,
+                    const Coordinator::ReplyStockTune & tuned, MilliFunds exact)
+    {
+        using namespace Coordinator;
+        // Taking the returned floor as a reference replays its witness on the key's own instance.
+        const auto replayed = context.floor(key, &tuned.floor);
+        return tuned.status == ReplyStockStatus::Valid && tuned.floor.status == ReplyStockStatus::Valid &&
+            replayed.status == ReplyStockStatus::Valid && replayed.floor >= tuned.floor.floor &&
+            tuned.floor.floor <= exact && exact <= tuned.ceiling && ascendingWitness(tuned.floor) &&
+            context.ceiling(key).ceiling == tuned.ceiling &&
+            (!tuned.stoppedOnTarget || tuned.ceiling - tuned.floor.floor <= tuned.targetGap);
+    }
+
+    void stockContextTargetTune()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t CAPPED_ROUNDS = 10;
+        constexpr std::int32_t SEED_ROUNDS = 2;
+        constexpr std::int32_t DEEP_ROWS = 3;
+        constexpr MilliFunds WIDE_GAP = 3;
+        constexpr MilliFunds NARROW_GAP = 1;
+        constexpr MilliFunds FOREIGN_GAP = 5;
+        constexpr std::array EXACT{MilliFunds{20}, MilliFunds{18}, MilliFunds{12}};
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const std::array keys{ContinuationKey{today}, ContinuationKey{damaged}, ContinuationKey{dead}};
+        const auto field = Fixture::make(2);
+
+        ReplyStockContext unseeded(Fixture::make(DEEP_ROWS));
+        const auto fromZero = unseeded.tune({today}, CAPPED_ROUNDS, ReplyStockTuneStart::Zero, nullptr, WIDE_GAP);
+        expect(fromZero.stoppedOnTarget && fromZero.rounds < CAPPED_ROUNDS && fromZero.targetGap == WIDE_GAP &&
+                   provenTune(unseeded, {today}, fromZero, EXACT.front()),
+               "an unseeded tune with a target stops early on proven bounds");
+
+        struct SeededRun
+        {
+            ReplyStockTune tuned;
+            ReplyStockFloor before;
+            MilliFunds seedCeiling{0};
+            bool proven{false};
+        };
+        // Two rounds on the damaged key leave prices at which the today key's own floor is already exact.
+        const auto seededTune = [&](MilliFunds gap, bool ownReference) {
+            ReplyStockContext context(field);
+            context.tune({damaged}, SEED_ROUNDS);
+            SeededRun run;
+            run.before = context.floor({today});
+            run.seedCeiling = context.ceiling({today}).ceiling;
+            run.tuned = context.tune({today}, MASTER_PLAN_PRICING_ROUNDS, ReplyStockTuneStart::InstalledPrices,
+                                     ownReference ? &run.before : nullptr, gap);
+            run.proven = provenTune(context, {today}, run.tuned, EXACT.front());
+            return run;
+        };
+        const auto targeted = seededTune(NARROW_GAP, false);
+        const auto plain = seededTune(0, false);
+        expect(targeted.tuned.stoppedOnTarget && targeted.proven && targeted.tuned.rounds < plain.tuned.rounds &&
+                   plain.proven && targeted.before.status == ReplyStockStatus::Valid &&
+                   targeted.tuned.floor.floor >= targeted.before.floor,
+               "a seeded tune stops on its own floor at the seed and verifies against it");
+        const auto owned = seededTune(NARROW_GAP, true);
+        expect(owned.proven && targeted.tuned.ceiling <= targeted.seedCeiling &&
+                   owned.tuned.ceiling <= owned.seedCeiling && owned.tuned.floor.floor >= owned.before.floor,
+               "a seeded target tune never raises the seed ceiling nor drops below the key's own reference");
+
+        // One round on the today key: its seed floor stays 18, while its floor without that reference reaches 20.
+        ReplyStockContext oneRound(field);
+        oneRound.tune({today}, 1);
+        const auto seedFloor = oneRound.floor({today});
+        const auto unstopped = oneRound.tune({today}, MASTER_PLAN_PRICING_ROUNDS,
+                                             ReplyStockTuneStart::InstalledPrices, nullptr, NARROW_GAP);
+        const auto callerAlone = oneRound.floor({today});
+        expect(!unstopped.stoppedOnTarget && provenTune(oneRound, {today}, unstopped, EXACT.front()) &&
+                   callerAlone.status == ReplyStockStatus::Valid && callerAlone.floor > seedFloor.floor &&
+                   unstopped.floor.floor >= callerAlone.floor && unstopped.floor.floor >= seedFloor.floor,
+               "a target tune keeps the caller's floor when it beats the one referenced to the seed");
+
+        // After one round on the today key its floor sits above anything the damaged key's floor reaches there.
+        for (const std::int32_t baseRounds : {1, MASTER_PLAN_PRICING_ROUNDS})
+        {
+            for (std::size_t index = 0; index < keys.size(); ++index)
+            {
+                ReplyStockContext context(field);
+                context.tune(keys.front(), baseRounds);
+                const auto foreign = context.floor(keys.front());
+                const auto tuned = context.tune(keys[index], MASTER_PLAN_PRICING_ROUNDS,
+                                                ReplyStockTuneStart::InstalledPrices, &foreign, FOREIGN_GAP);
+                expect(provenTune(context, keys[index], tuned, EXACT[index]),
+                       "a reference from another key never ends the tune on a gap its own floor does not close");
+            }
+        }
     }
 
     void testReadSetOnlyBoundsWork()
@@ -1222,6 +1404,8 @@ int main()
     stockContextFloorBracketsExact();
     stockContextFloorConflictsAndReference();
     stockContextSeededTune();
+    tunerStopsAtTargetGap();
+    stockContextTargetTune();
     polishWitnessRejectsMalformedStarts();
     stockContextAdaptsChangedRows();
     std::printf("%d checks, %d failures\n", checks, failures);
