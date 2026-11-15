@@ -629,7 +629,9 @@ namespace
     }
 
     Coordinator::MasterPlanPricingResult existingTune(const Coordinator::PropertyStockField & field,
-                                                      const Coordinator::ContinuationKey & key)
+                                                      const Coordinator::ContinuationKey & key,
+                                                      std::span<const MilliFunds> seed = {},
+                                                      std::int64_t* pGranted = nullptr)
     {
         using namespace Coordinator;
         const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
@@ -640,7 +642,12 @@ namespace
         }
         const MasterPlanPricingLimits limits{
             MASTER_PLAN_PRICING_ROUNDS, MASTER_PLAN_PRICING_WORK, MASTER_PLAN_PRICING_WITNESS_WORK};
-        return tuneMasterPlanPrices(*reference.models.front(), limits, ledger);
+        auto result = tuneMasterPlanPrices(*reference.models.front(), limits, ledger, {}, seed);
+        if (pGranted != nullptr)
+        {
+            *pGranted = ledger.stats().granted;
+        }
+        return result;
     }
 
     std::vector<MilliFunds> tunedPrices(const Coordinator::PropertyStockField & field,
@@ -944,6 +951,87 @@ namespace
                "a reference chain is cut before the node the new key captures, keeping its turns and gains");
     }
 
+    void stockContextSeededTune()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::size_t NODES = 2;
+        constexpr MilliFunds TODAY_EXACT = 20;
+        constexpr MilliFunds DAMAGED_EXACT = 18;
+        constexpr std::int32_t SHORT_ROUNDS = 5;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto field = Fixture::make(2);
+        const std::vector<MilliFunds> zero(NODES, 0);
+
+        ReplyStockContext fresh(field);
+        const auto refused = fresh.tune({today}, SHORT_ROUNDS, ReplyStockTuneStart::InstalledPrices);
+        expect(refused.status == ReplyStockStatus::NoPrices && fresh.priceVersion() == 0 &&
+                   refused.start == ReplyStockTuneStart::InstalledPrices,
+               "a tune from installed prices before any install is refused and installs nothing");
+
+        ReplyStockContext seeded(field);
+        const auto base = seeded.tune({today}, MASTER_PLAN_PRICING_ROUNDS);
+        const auto atSeed = seeded.ceiling({today});
+        const auto oneSeeded = seeded.tune({today}, 1, ReplyStockTuneStart::InstalledPrices);
+        const auto oneZero = ReplyStockContext(field).tune({today}, 1);
+        expect(base.status == ReplyStockStatus::Valid && base.ceiling == TODAY_EXACT &&
+                   oneSeeded.status == ReplyStockStatus::Valid && oneSeeded.rounds == 1 &&
+                   oneSeeded.ceiling == TODAY_EXACT && oneSeeded.ceiling <= atSeed.ceiling &&
+                   oneZero.status == ReplyStockStatus::Valid && oneZero.ceiling > TODAY_EXACT,
+               "one round from the tuned prices returns the exact ceiling, one round from zero does not");
+
+        ReplyStockContext other(field);
+        other.tune({today}, MASTER_PLAN_PRICING_ROUNDS);
+        const auto earlierCeiling = other.ceiling({damaged});
+        const auto earlierFloor = other.floor({damaged});
+        const auto retuned =
+            other.tune({damaged}, SHORT_ROUNDS, ReplyStockTuneStart::InstalledPrices, &earlierFloor);
+        expect(earlierFloor.status == ReplyStockStatus::Valid && retuned.status == ReplyStockStatus::Valid &&
+                   retuned.start == ReplyStockTuneStart::InstalledPrices &&
+                   retuned.ceiling <= earlierCeiling.ceiling && retuned.floor.floor >= earlierFloor.floor &&
+                   retuned.floor.floor <= DAMAGED_EXACT && DAMAGED_EXACT <= retuned.ceiling,
+               "a seeded re-tune with the key's own floor never loosens either side and brackets the exact value");
+
+        std::int64_t unseededWork = -1;
+        std::int64_t zeroSeededWork = -1;
+        const auto unseeded = existingTune(field, {damaged}, {}, &unseededWork);
+        const auto zeroSeeded = existingTune(field, {damaged}, zero, &zeroSeededWork);
+        expect(unseeded.status == MasterPlanPricingStatus::Valid && zeroSeeded.status == unseeded.status &&
+                   zeroSeeded.prices == unseeded.prices && zeroSeeded.ceiling == unseeded.ceiling &&
+                   zeroSeeded.floor == unseeded.floor && zeroSeeded.rounds == unseeded.rounds &&
+                   zeroSeeded.witness.valid == unseeded.witness.valid &&
+                   zeroSeeded.witness.candidateIndices == unseeded.witness.candidateIndices &&
+                   zeroSeeded.witness.rows == unseeded.witness.rows &&
+                   zeroSeeded.witness.value == unseeded.witness.value && zeroSeededWork == unseededWork,
+               "an explicit all-zero seed runs exactly the unseeded tune");
+        const std::array wrongSize{MilliFunds{0}};
+        const std::array negative{MilliFunds{-1}, MilliFunds{0}};
+        const std::array tooHigh{MASTER_PLAN_PRICE_LIMIT + 1, MilliFunds{0}};
+        std::int64_t wrongSizeWork = -1;
+        std::int64_t negativeWork = -1;
+        std::int64_t tooHighWork = -1;
+        const auto shortSeed = existingTune(field, {damaged}, wrongSize, &wrongSizeWork);
+        const auto negativeSeed = existingTune(field, {damaged}, negative, &negativeWork);
+        const auto tooHighSeed = existingTune(field, {damaged}, tooHigh, &tooHighWork);
+        expect(shortSeed.status == MasterPlanPricingStatus::Invalid && wrongSizeWork == 0 &&
+                   negativeSeed.status == MasterPlanPricingStatus::Invalid && negativeWork == 0 &&
+                   tooHighSeed.status == MasterPlanPricingStatus::Invalid && tooHighWork == 0,
+               "a seed of the wrong size or with a price outside the limits is refused before any work");
+
+        if (earlierFloor.status != ReplyStockStatus::Valid || earlierFloor.witness.empty() ||
+            earlierFloor.witness.front().steps.empty())
+        {
+            expect(false, "the earlier floor has a witness step to corrupt");
+            return;
+        }
+        auto corrupted = earlierFloor;
+        ++corrupted.witness.front().steps.front().turn;
+        const auto misled =
+            other.tune({damaged}, SHORT_ROUNDS, ReplyStockTuneStart::InstalledPrices, &corrupted);
+        expect(misled.status == ReplyStockStatus::ReplayRejected,
+               "the verification floor is taken with the caller's reference");
+    }
+
     void testReadSetOnlyBoundsWork()
     {
         constexpr TilePoint origin{0, 0};
@@ -979,6 +1067,7 @@ int main()
     stockContextExtensionKeepsAnswers();
     stockContextFloorBracketsExact();
     stockContextFloorConflictsAndReference();
+    stockContextSeededTune();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

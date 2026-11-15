@@ -33,6 +33,12 @@ namespace Coordinator
         Tuner,
     };
 
+    enum class ReplyStockTuneStart : std::int8_t
+    {
+        Zero,
+        InstalledPrices,
+    };
+
     struct ReplyStockPriceInstall
     {
         ReplyStockStatus status{ReplyStockStatus::NoPrices};
@@ -97,6 +103,7 @@ namespace Coordinator
     struct ReplyStockTune
     {
         ReplyStockStatus status{ReplyStockStatus::Invalid};
+        ReplyStockTuneStart start{ReplyStockTuneStart::Zero};
         MasterPlanPricingStatus tunerStatus{MasterPlanPricingStatus::Unavailable};
         std::int32_t rounds{0};
         MilliFunds ceiling{0};
@@ -135,7 +142,9 @@ namespace Coordinator
         ReplyStockCeiling ceiling(const ContinuationKey & key);
         ReplyStockOwned owned(const ContinuationKey & key);
         ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr);
-        ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds);
+        ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds,
+                            ReplyStockTuneStart start = ReplyStockTuneStart::Zero,
+                            const ReplyStockFloor * reference = nullptr);
 
         std::size_t nodeCount() const
         {
@@ -155,6 +164,12 @@ namespace Coordinator
         std::uint64_t priceVersion() const
         {
             return m_priceVersion;
+        }
+
+        // Any price installation, including the one tune makes, invalidates this view.
+        std::span<const MilliFunds> installedPrices() const
+        {
+            return m_prices;
         }
 
         std::int64_t work() const
@@ -184,7 +199,8 @@ namespace Coordinator
         ReplyStockStatus composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result);
         ReplyStockStatus composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
                                       ReplyStockFloor & result);
-        ReplyStockStatus tuneKey(const ContinuationKey & key, std::int32_t rounds, ReplyStockTune & result);
+        ReplyStockStatus tuneKey(const ContinuationKey & key, std::int32_t rounds, const ReplyStockFloor * reference,
+                                 ReplyStockTune & result);
         std::optional<MasterPlanPricingModel> forcedModel(const ContinuationKey & key) const;
         ReplyStockStatus tuneLimits(const MasterPlanPricingModel & model, std::int32_t rounds,
                                     ReplyStockTuneLimits & result);

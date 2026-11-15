@@ -1151,11 +1151,14 @@ namespace Coordinator
         return result;
     }
 
-    ReplyStockTune ReplyStockContext::tune(const ContinuationKey & key, std::int32_t rounds)
+    ReplyStockTune ReplyStockContext::tune(const ContinuationKey & key, std::int32_t rounds, ReplyStockTuneStart start,
+                                           const ReplyStockFloor * reference)
     {
         ReplyStockTune result;
+        result.start = start;
         const std::int64_t workBefore = work();
-        result.status = tuneKey(key, rounds, result);
+        result.status = start == ReplyStockTuneStart::InstalledPrices && m_priceVersion == 0 ?
+            ReplyStockStatus::NoPrices : tuneKey(key, rounds, reference, result);
         result.work = work() - workBefore;
         return result;
     }
@@ -1514,7 +1517,7 @@ namespace Coordinator
     }
 
     ReplyStockStatus ReplyStockContext::tuneKey(const ContinuationKey & key, std::int32_t rounds,
-                                                ReplyStockTune & result)
+                                                const ReplyStockFloor * reference, ReplyStockTune & result)
     {
         ReplyStockCounters counters;
         const ReplyStockStatus extended = rounds <= 0 ? ReplyStockStatus::Invalid : extend(key, counters);
@@ -1537,7 +1540,10 @@ namespace Coordinator
         {
             return ReplyStockStatus::ArithmeticFailure;
         }
-        const MasterPlanPricingResult tuned = tuneMasterPlanPrices(*model, result.limits.limits, ledger);
+        const std::span<const MilliFunds> seed =
+            result.start == ReplyStockTuneStart::InstalledPrices ? std::span<const MilliFunds>(m_prices) :
+                                                                   std::span<const MilliFunds>();
+        const MasterPlanPricingResult tuned = tuneMasterPlanPrices(*model, result.limits.limits, ledger, {}, seed);
         result.tunerStatus = tuned.status;
         result.rounds = tuned.rounds;
         result.tunerWork = ledger.stats().granted;
@@ -1570,7 +1576,7 @@ namespace Coordinator
             return checked.status;
         }
         result.ceiling = checked.ceiling;
-        result.floor = floor(key, nullptr);
+        result.floor = floor(key, reference);
         if (result.floor.status != ReplyStockStatus::Valid)
         {
             return result.floor.status;

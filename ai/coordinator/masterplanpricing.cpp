@@ -15,7 +15,7 @@ namespace
     constexpr std::int32_t MAX_POLISH_PASSES = MASTER_PLAN_POLISH_PASSES;
     constexpr double INITIAL_SCALE = 1.0;
     constexpr double SCALE_DECAY = 0.5;
-    constexpr double PRICE_LIMIT = 1.0e15;
+    constexpr double PRICE_LIMIT = static_cast<double>(MASTER_PLAN_PRICE_LIMIT);
 
     enum class MeterStop : std::int8_t
     {
@@ -945,7 +945,7 @@ namespace
     {
     public:
         PriceTuner(const MasterPlanPricingModel & model, const MasterPlanPricingLimits & limits,
-                   RefinementLedger & ledger, MasterPlanWitnessOptions options)
+                   RefinementLedger & ledger, MasterPlanWitnessOptions options, std::span<const MilliFunds> seed)
             : m_model(model),
               m_limits(limits),
               m_options(options),
@@ -957,6 +957,7 @@ namespace
 #endif
               m_prices(model.catalog.columns.size(), 0)
         {
+            std::copy(seed.begin(), seed.end(), m_prices.begin());
         }
 
         MasterPlanPricingResult run()
@@ -1241,13 +1242,22 @@ namespace Coordinator
 
     MasterPlanPricingResult tuneMasterPlanPrices(const MasterPlanPricingModel & model,
                                                  const MasterPlanPricingLimits & limits,
-                                                 RefinementLedger & ledger, MasterPlanWitnessOptions options)
+                                                 RefinementLedger & ledger, MasterPlanWitnessOptions options,
+                                                 std::span<const MilliFunds> seed)
     {
+        const auto outOfRange = [](MilliFunds price) { return price < 0 || price > MASTER_PLAN_PRICE_LIMIT; };
+        if (!seed.empty() &&
+            (seed.size() != model.catalog.columns.size() || std::any_of(seed.begin(), seed.end(), outOfRange)))
+        {
+            MasterPlanPricingResult refused;
+            refused.status = MasterPlanPricingStatus::Invalid;
+            return refused;
+        }
         if (limits.rounds <= 0 || limits.maximumWork <= 0 || limits.witnessBuildWork <= 0 ||
             ledger.balance() < limits.maximumWork)
         {
             return {};
         }
-        return PriceTuner(model, limits, ledger, options).run();
+        return PriceTuner(model, limits, ledger, options, seed).run();
     }
 }
