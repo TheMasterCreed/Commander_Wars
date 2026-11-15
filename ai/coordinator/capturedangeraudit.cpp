@@ -31,6 +31,7 @@
 #include "ai/coordinator/replyfacts.h"
 #include "ai/coordinator/replyfactsbuilder.h"
 #include "ai/coordinator/replyprediction.h"
+#include "ai/coordinator/replystockcontext.h"
 
 #include "coreengine/settings.h"
 
@@ -53,7 +54,9 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 13;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 14;
+    constexpr std::int32_t STOCK_CONTEXT_BASE_ROUNDS = Coordinator::MASTER_PLAN_PRICING_ROUNDS;
+    constexpr std::int32_t STOCK_CONTEXT_RETUNE_ROUNDS = 25;
     constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
     constexpr Coordinator::DiagnosticRefinementLimits STOCK_REPLY_REFINEMENT_LIMITS{
         .stateCap = STOCK_REPLY_REFINEMENT_STATE_CAP,
@@ -306,6 +309,38 @@ namespace
     constexpr auto LAYER_ENEMY_HP = "ENEMY_HP";
     constexpr auto LAYER_FACTS = "FACTS";
     constexpr auto LAYER_OUTCOME = "OUTCOME";
+    constexpr auto KEY_STOCK_CONTEXT = "stockContext";
+    constexpr auto KEY_CLASSES = "classes";
+    constexpr auto KEY_STOCK_ROWS = "stockRows";
+    constexpr auto KEY_BASE_TUNE = "baseTune";
+    constexpr auto KEY_STATUS = "status";
+    constexpr auto KEY_TUNER_STATUS = "tunerStatus";
+    constexpr auto KEY_ROUNDS = "rounds";
+    constexpr auto KEY_FLOOR = "floor";
+    constexpr auto KEY_CEILING = "ceiling";
+    constexpr auto KEY_FLOOR_SOURCE = "floorSource";
+    constexpr auto KEY_MAXIMUM_WORK = "maximumWork";
+    constexpr auto KEY_WITNESS_BUILD_WORK = "witnessBuildWork";
+    constexpr auto KEY_TUNER_WORK = "tunerWork";
+    constexpr auto KEY_CEILING_STATUS = "ceilingStatus";
+    constexpr auto KEY_FLOOR_STATUS = "floorStatus";
+    constexpr auto KEY_REUSED_ROWS = "reusedRows";
+    constexpr auto KEY_PREFIX_ROWS = "prefixRows";
+    constexpr auto KEY_FALLBACK_ROWS = "fallbackRows";
+    constexpr auto KEY_EMPTY_ROWS = "emptyRows";
+    constexpr auto KEY_RETUNE = "retune";
+    constexpr auto KEY_SKIPPED = "skipped";
+    constexpr auto KEY_REINSTALL_STATUS = "reinstallStatus";
+    constexpr auto KEY_AGREEMENT = "agreement";
+    constexpr auto KEY_COMPARABLE = "comparable";
+    constexpr auto KEY_INTERVAL = "interval";
+    constexpr auto KEY_COMPARISONS = "comparisons";
+    constexpr auto KEY_DISAGREEMENTS = "disagreements";
+    constexpr auto KEY_WORK = "work";
+    constexpr auto REASON_BASE_PRICE_QUOTE_INVALID = "BASE_PRICE_QUOTE_INVALID";
+    constexpr auto REASON_BASE_PRICES_UNAVAILABLE = "BASE_PRICES_UNAVAILABLE";
+    constexpr std::array STOCK_REPLY_KEY_NAMES{KEY_TODAY, KEY_AFTER_OWN_ACTIONS, KEY_AFTER_REPLY};
+    constexpr std::size_t STOCK_REPLY_BASE_KEY = 0;
 
     enum class DamageSource : std::int8_t
     {
@@ -2098,6 +2133,178 @@ namespace
         record.insert(KEY_COUNTER_SCALED, counter.counterScaled);
     }
 
+    struct ContextInterval
+    {
+        bool valid{false};
+        Coordinator::MilliFunds floor{0};
+        Coordinator::MilliFunds ceiling{0};
+    };
+
+    QLatin1String replyStockStatusName(Coordinator::ReplyStockStatus status)
+    {
+        return QLatin1String(Coordinator::REPLY_STOCK_STATUS_NAMES[static_cast<std::size_t>(status)]);
+    }
+
+    // Reinstalls the base prices when a re-tune replaced them, so every key is quoted and re-tuned from them.
+    bool restoreBasePrices(Coordinator::ReplyStockContext & context, std::span<const Coordinator::MilliFunds> prices,
+                           std::uint64_t & version, QJsonObject & record)
+    {
+        if (version == 0 || context.priceVersion() == version)
+        {
+            return version != 0;
+        }
+        const auto installed = context.installPrices(prices);
+        record.insert(KEY_REINSTALL_STATUS, replyStockStatusName(installed.status));
+        if (installed.status != Coordinator::ReplyStockStatus::Valid)
+        {
+            return false;
+        }
+        version = installed.version;
+        return true;
+    }
+
+    QJsonObject stockContextKeyRecord(Coordinator::ReplyStockContext & context,
+                                      const Coordinator::ContinuationKey & key,
+                                      const Coordinator::ReplyStockFloor & baseFloor,
+                                      std::span<const Coordinator::MilliFunds> basePrices, std::uint64_t & baseVersion,
+                                      ContextInterval & interval)
+    {
+        using namespace Coordinator;
+        QJsonObject record;
+        if (!restoreBasePrices(context, basePrices, baseVersion, record))
+        {
+            const QJsonObject skipped{{KEY_SKIPPED, true}, {KEY_REASON, QLatin1String(REASON_BASE_PRICES_UNAVAILABLE)}};
+            record.insert(KEY_SKIPPED, true);
+            record.insert(KEY_REASON, QLatin1String(REASON_BASE_PRICES_UNAVAILABLE));
+            record.insert(KEY_RETUNE, skipped);
+            interval = ContextInterval{};
+            return record;
+        }
+        record.insert(KEY_SKIPPED, false);
+        const auto started = std::chrono::steady_clock::now();
+        const ReplyStockCeiling ceiling = context.ceiling(key);
+        const ReplyStockFloor floor = context.floor(key, &baseFloor);
+        record.insert(KEY_NANOS, static_cast<qint64>(nanosSince(started)));
+        record.insert(KEY_CEILING_STATUS, replyStockStatusName(ceiling.status));
+        record.insert(KEY_FLOOR_STATUS, replyStockStatusName(floor.status));
+        record.insert(KEY_CEILING, static_cast<qint64>(ceiling.ceiling));
+        record.insert(KEY_FLOOR, static_cast<qint64>(floor.floor));
+        record.insert(KEY_REUSED_ROWS, static_cast<qint64>(floor.counters.reusedRows));
+        record.insert(KEY_PREFIX_ROWS, static_cast<qint64>(floor.counters.prefixRows));
+        record.insert(KEY_FALLBACK_ROWS, static_cast<qint64>(floor.counters.fallbackRows));
+        record.insert(KEY_EMPTY_ROWS, static_cast<qint64>(floor.counters.emptyRows));
+        const bool quoted = ceiling.status == ReplyStockStatus::Valid && floor.status == ReplyStockStatus::Valid;
+        interval = ContextInterval{quoted, floor.floor, ceiling.ceiling};
+        if (!quoted)
+        {
+            record.insert(KEY_RETUNE, QJsonObject{{KEY_SKIPPED, true},
+                                                  {KEY_REASON, QLatin1String(REASON_BASE_PRICE_QUOTE_INVALID)}});
+            return record;
+        }
+        const auto retuneStarted = std::chrono::steady_clock::now();
+        const ReplyStockTune tuned =
+            context.tune(key, STOCK_CONTEXT_RETUNE_ROUNDS, ReplyStockTuneStart::InstalledPrices, &floor);
+        record.insert(KEY_RETUNE, QJsonObject{
+            {KEY_SKIPPED, false}, {KEY_STATUS, replyStockStatusName(tuned.status)},
+            {KEY_TUNER_STATUS,
+             QLatin1String(MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(tuned.tunerStatus)])},
+            {KEY_ROUNDS, tuned.rounds},
+            {KEY_FLOOR, static_cast<qint64>(tuned.floor.floor)}, {KEY_CEILING, static_cast<qint64>(tuned.ceiling)},
+            {KEY_NANOS, static_cast<qint64>(nanosSince(retuneStarted))},
+        });
+        if (tuned.status == ReplyStockStatus::Valid)
+        {
+            interval = ContextInterval{true, tuned.floor.floor, tuned.ceiling};
+        }
+        return record;
+    }
+
+    QJsonObject stockContextAgreement(std::span<const ContextInterval> intervals,
+                                      const Coordinator::DiagnosticStockQuotes & quotes)
+    {
+        QJsonObject record;
+        std::int32_t comparisons = 0;
+        std::int32_t disagreements = 0;
+        for (std::size_t index = 0; index < intervals.size(); ++index)
+        {
+            const ContextInterval & interval = intervals[index];
+            const bool comparable = interval.valid && index < quotes.quotes.size() && quotes.quotes[index].valid;
+            const bool agrees = comparable && interval.floor <= quotes.quotes[index].ours.upper &&
+                interval.ceiling >= quotes.quotes[index].ours.lower;
+            comparisons += comparable ? 1 : 0;
+            disagreements += comparable && !agrees ? 1 : 0;
+            record.insert(STOCK_REPLY_KEY_NAMES[index], QJsonObject{
+                {KEY_COMPARABLE, comparable}, {KEY_AGREES, comparable ? QJsonValue(agrees) : QJsonValue()},
+                {KEY_INTERVAL, interval.valid ? QJsonValue(QJsonArray{static_cast<qint64>(interval.floor),
+                                                                      static_cast<qint64>(interval.ceiling)})
+                                              : QJsonValue()},
+            });
+        }
+        record.insert(KEY_COMPARISONS, comparisons);
+        record.insert(KEY_DISAGREEMENTS, disagreements);
+        return record;
+    }
+
+    QJsonObject stockContextRecord(const Coordinator::PropertyStockField & field,
+                                   std::span<const Coordinator::ContinuationKey> keys,
+                                   const Coordinator::DiagnosticStockQuotes & quotes)
+    {
+        using namespace Coordinator;
+        const auto started = std::chrono::steady_clock::now();
+        ReplyStockContext context(field);
+        if (!context.valid())
+        {
+            return QJsonObject{{KEY_VALID, false}};
+        }
+        QJsonObject record{{KEY_VALID, true}};
+        const auto baseStarted = std::chrono::steady_clock::now();
+        const ReplyStockTune base = context.tune(keys[STOCK_REPLY_BASE_KEY], STOCK_CONTEXT_BASE_ROUNDS);
+        const std::int64_t baseNanos = nanosSince(baseStarted);
+        record.insert(KEY_BASE_TUNE, QJsonObject{
+            {KEY_STATUS, replyStockStatusName(base.status)},
+            {KEY_TUNER_STATUS,
+             QLatin1String(MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(base.tunerStatus)])},
+            {KEY_ROUNDS, base.rounds}, {KEY_FLOOR, static_cast<qint64>(base.floor.floor)},
+            {KEY_CEILING, static_cast<qint64>(base.ceiling)},
+            {KEY_FLOOR_SOURCE,
+             QLatin1String(REPLY_STOCK_FLOOR_SOURCE_NAMES[static_cast<std::size_t>(base.floorSource)])},
+            {KEY_MAXIMUM_WORK, static_cast<qint64>(base.limits.limits.maximumWork)},
+            {KEY_WITNESS_BUILD_WORK, static_cast<qint64>(base.limits.limits.witnessBuildWork)},
+            {KEY_TUNER_WORK, static_cast<qint64>(base.tunerWork)},
+            {KEY_NANOS, static_cast<qint64>(baseNanos)},
+        });
+        const std::vector<MilliFunds> basePrices(context.installedPrices().begin(), context.installedPrices().end());
+        std::uint64_t baseVersion = context.priceVersion();
+        std::vector<ContextInterval> intervals(keys.size());
+        intervals[STOCK_REPLY_BASE_KEY] = ContextInterval{base.status == ReplyStockStatus::Valid, base.floor.floor,
+                                                          base.ceiling};
+        for (std::size_t index = STOCK_REPLY_BASE_KEY + 1; index < keys.size(); ++index)
+        {
+            record.insert(STOCK_REPLY_KEY_NAMES[index],
+                          stockContextKeyRecord(context, keys[index], base.floor, basePrices, baseVersion,
+                                                intervals[index]));
+        }
+        record.insert(KEY_AGREEMENT, stockContextAgreement(intervals, quotes));
+        record.insert(KEY_NODES, static_cast<qint64>(context.nodeCount()));
+        record.insert(KEY_CLASSES, static_cast<qint64>(context.classCount()));
+        record.insert(KEY_ACTIONS, static_cast<qint64>(context.actionCount()));
+        record.insert(KEY_STOCK_ROWS, static_cast<qint64>(context.rowCount()));
+        record.insert(KEY_WORK, static_cast<qint64>(context.work()));
+        record.insert(KEY_NANOS, static_cast<qint64>(nanosSince(started)));
+        return record;
+    }
+
+    // Recorded only: proves what the stock context bounds on the same field and keys as the diagnostic quotes.
+    void insertStockContextRecord(QJsonObject & result, bool eligible, const Coordinator::PropertyStockField & field,
+                                  std::span<const Coordinator::ContinuationKey> keys,
+                                  const Coordinator::DiagnosticStockQuotes & quotes)
+    {
+        if (eligible)
+        {
+            result.insert(KEY_STOCK_CONTEXT, stockContextRecord(field, keys, quotes));
+        }
+    }
+
     QJsonObject DangerAuditRecorder::stockReplyQuoteRecord(const QJsonArray & plan, const MeasuredPlan & measured)
     {
         using namespace Coordinator;
@@ -2252,7 +2459,7 @@ namespace
             {KEY_DUAL_WORK_LIMIT, static_cast<qint64>(quotes.limits.dualWork)},
             {KEY_DUAL_WITNESS_WORK_LIMIT, static_cast<qint64>(quotes.limits.dualWitnessWork)},
         };
-        const std::array names{KEY_TODAY, KEY_AFTER_OWN_ACTIONS, KEY_AFTER_REPLY};
+        const auto & names = STOCK_REPLY_KEY_NAMES;
         for (std::size_t index = 0; index < keys.size(); ++index)
         {
             QJsonObject quoteRecord{{KEY_KEY, keyRecord(keys[index])}, {KEY_VALID, false},
@@ -2296,6 +2503,7 @@ namespace
             result.insert(KEY_REPLY_LOSS, intervalRecord(Record::stockQuoteLoss(
                 quotes.quotes[1].ours, quotes.quotes[2].ours)));
         }
+        insertStockContextRecord(result, fieldAvailable && chainUsable, m_view.propertyStock, keys, quotes);
         return result;
     }
 

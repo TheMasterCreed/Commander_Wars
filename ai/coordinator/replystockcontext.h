@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -26,12 +27,19 @@ namespace Coordinator
         Inverted,
     };
 
+    inline constexpr std::array REPLY_STOCK_STATUS_NAMES{
+        "VALID", "INVALID_KEY", "PREPARATION_FAILED", "NO_PRICES", "INVALID", "ARITHMETIC_FAILURE", "LIMIT_REACHED",
+        "REPLAY_REJECTED", "INVERTED",
+    };
+
     enum class ReplyStockFloorSource : std::int8_t
     {
         None,
         Prefix,
         Tuner,
     };
+
+    inline constexpr std::array REPLY_STOCK_FLOOR_SOURCE_NAMES{"NONE", "PREFIX", "TUNER"};
 
     enum class ReplyStockTuneStart : std::int8_t
     {
@@ -159,6 +167,11 @@ namespace Coordinator
         std::size_t actionCount() const
         {
             return m_actions.size();
+        }
+
+        std::size_t rowCount() const
+        {
+            return m_dayRows.size();
         }
 
         std::uint64_t priceVersion() const
