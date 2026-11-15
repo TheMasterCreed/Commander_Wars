@@ -51,23 +51,33 @@ namespace Coordinator
             return multiplier == 0 || value <= (maximum - denominator / 2) / multiplier;
         }
 
-        inline bool staticValueFits(const BundleValuation & valuation)
+        inline std::optional<MilliFunds> checkedLedgerTotal(const EconomicDelta & economic)
         {
-            if (!valuation.valid)
-            {
-                return false;
-            }
             MilliFunds ledger = 0;
-            const EconomicDelta & economic = valuation.ledger;
             for (const MilliFunds term : {economic.income, economic.friendlyCapital,
                  economic.enemyCapital, economic.actionCost, economic.resourceCost,
                  economic.scriptedCapital, economic.revaluation})
             {
                 if (!RelativeStockDetail::checkedAdd(ledger, term))
                 {
-                    return false;
+                    return std::nullopt;
                 }
             }
+            return ledger;
+        }
+
+        inline bool staticValueFits(const BundleValuation & valuation)
+        {
+            if (!valuation.valid)
+            {
+                return false;
+            }
+            const std::optional<MilliFunds> checkedLedger = checkedLedgerTotal(valuation.ledger);
+            if (!checkedLedger)
+            {
+                return false;
+            }
+            MilliFunds ledger = *checkedLedger;
             MilliFunds continuation = 0;
             const ContinuationDelta & future = valuation.continuation;
             for (const MilliFunds term : {future.repositioning, future.exposure,
@@ -82,6 +92,23 @@ namespace Coordinator
             return RelativeStockDetail::checkedAdd(ledger, continuation);
         }
 
+        inline std::optional<MilliFunds> checkedCapitalAdjustment(
+            const FireFacts & fire, MilliFunds staticValue, std::int32_t granted)
+        {
+            const std::int32_t dealt = std::min(fire.damageSteps, fire.targetHpSteps);
+            MilliFunds adjustment = staticValue;
+            if (!nonnegativeRoundedProductFits(fire.targetReplacementCost, dealt, UNIT_HP_STEPS) ||
+                !nonnegativeRoundedProductFits(fire.targetReplacementCost, granted, UNIT_HP_STEPS) ||
+                !RelativeStockDetail::checkedSubtract(
+                    adjustment, bookDamage(fire.targetReplacementCost, dealt)) ||
+                !RelativeStockDetail::checkedAdd(
+                    adjustment, bookDamage(fire.targetReplacementCost, granted)))
+            {
+                return std::nullopt;
+            }
+            return adjustment;
+        }
+
         inline bool fireAdjustmentFits(
             const FireFacts & fire, MilliFunds staticValue, std::int32_t granted)
         {
@@ -89,20 +116,12 @@ namespace Coordinator
             MilliFunds staticCredit = fire.targetBestShotBefore;
             const MilliFunds survivingShot =
                 dealt >= fire.targetHpSteps ? 0 : fire.targetBestShotAfter;
-            if (!RelativeStockDetail::checkedSubtract(staticCredit, survivingShot) ||
-                !nonnegativeRoundedProductFits(fire.targetReplacementCost, dealt, UNIT_HP_STEPS) ||
-                !nonnegativeRoundedProductFits(fire.targetReplacementCost, granted, UNIT_HP_STEPS))
+            const std::optional<MilliFunds> capital = checkedCapitalAdjustment(fire, staticValue, granted);
+            if (!RelativeStockDetail::checkedSubtract(staticCredit, survivingShot) || !capital)
             {
                 return false;
             }
-            MilliFunds adjustment = staticValue;
-            if (!RelativeStockDetail::checkedSubtract(
-                    adjustment, bookDamage(fire.targetReplacementCost, dealt)) ||
-                !RelativeStockDetail::checkedAdd(
-                    adjustment, bookDamage(fire.targetReplacementCost, granted)))
-            {
-                return false;
-            }
+            MilliFunds adjustment = *capital;
             if (staticCredit < 0)
             {
                 return true;
@@ -112,32 +131,84 @@ namespace Coordinator
                    RelativeStockDetail::checkedAdd(
                        adjustment, proRatedCredit(staticCredit, granted, dealt));
         }
+
+        enum class SeatedValueMode : std::int8_t
+        {
+            Legacy,
+            // Leaves out the enemy-turn prices: exposure, target continuation and the destination best shot.
+            Acting,
+        };
+
+        inline std::optional<MilliFunds> actingStaticValue(const CandidateBundle & candidate)
+        {
+            const ContinuationDelta & future = candidate.valuation.continuation;
+            std::optional<MilliFunds> value =
+                candidate.valuation.valid ? checkedLedgerTotal(candidate.valuation.ledger) : std::nullopt;
+            if (!value || !RelativeStockDetail::checkedAdd(*value, future.propertyContinuation) ||
+                !RelativeStockDetail::checkedAdd(*value, future.partnerContinuation) ||
+                !RelativeStockDetail::checkedSubtract(*value, bestShot(candidate.actorNextShotsAtOrigin)))
+            {
+                return std::nullopt;
+            }
+            return value;
+        }
+
+        inline std::optional<MilliFunds> seatedValue(
+            const CandidateBundle & candidate, std::int32_t grantedDamage, SeatedValueMode mode)
+        {
+            const bool acting = mode == SeatedValueMode::Acting;
+            std::optional<MilliFunds> staticValue;
+            if (acting)
+            {
+                staticValue = actingStaticValue(candidate);
+            }
+            else if (staticValueFits(candidate.valuation))
+            {
+                staticValue = candidate.valuation.value().economicValue;
+            }
+            if (!staticValue)
+            {
+                return std::nullopt;
+            }
+            const auto & components = candidate.bundle.components;
+            if (components.size() != 1 || components.front().kind != ComponentKind::Fire)
+            {
+                return grantedDamage == 0 ? staticValue : std::nullopt;
+            }
+            const FireFacts & fire = components.front().fire;
+            const std::int32_t dealt = std::min(fire.damageSteps, fire.targetHpSteps);
+            if (!isWellFormedFire(fire) || grantedDamage < 0 || grantedDamage > dealt)
+            {
+                return std::nullopt;
+            }
+            if (grantedDamage == dealt)
+            {
+                return staticValue;
+            }
+            if (acting)
+            {
+                return checkedCapitalAdjustment(fire, *staticValue, grantedDamage);
+            }
+            if (!fireAdjustmentFits(fire, *staticValue, grantedDamage))
+            {
+                return std::nullopt;
+            }
+            return grantedFireValue(fire, *staticValue, grantedDamage);
+        }
     }
 
     inline std::optional<MilliFunds> checkedSeatedCandidateValue(
         const CandidateBundle & candidate, std::int32_t grantedDamage)
     {
-        if (!AssignmentValuationDetail::staticValueFits(candidate.valuation))
-        {
-            return std::nullopt;
-        }
-        const MilliFunds staticValue = candidate.valuation.value().economicValue;
-        const auto & components = candidate.bundle.components;
-        if (components.size() != 1 || components.front().kind != ComponentKind::Fire)
-        {
-            return grantedDamage == 0 ? std::optional<MilliFunds>{staticValue} : std::nullopt;
-        }
-        const FireFacts & fire = components.front().fire;
-        if (!isWellFormedFire(fire) || grantedDamage < 0 ||
-            grantedDamage > std::min(fire.damageSteps, fire.targetHpSteps))
-        {
-            return std::nullopt;
-        }
-        if (grantedDamage != std::min(fire.damageSteps, fire.targetHpSteps) &&
-            !AssignmentValuationDetail::fireAdjustmentFits(fire, staticValue, grantedDamage))
-        {
-            return std::nullopt;
-        }
-        return grantedFireValue(fire, staticValue, grantedDamage);
+        return AssignmentValuationDetail::seatedValue(
+            candidate, grantedDamage, AssignmentValuationDetail::SeatedValueMode::Legacy);
+    }
+
+    // The seated value without the enemy-turn prices a plan-level value supplies once.
+    inline std::optional<MilliFunds> checkedActingSeatedCandidateValue(
+        const CandidateBundle & candidate, std::int32_t grantedDamage)
+    {
+        return AssignmentValuationDetail::seatedValue(
+            candidate, grantedDamage, AssignmentValuationDetail::SeatedValueMode::Acting);
     }
 }
