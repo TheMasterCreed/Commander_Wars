@@ -41,6 +41,18 @@ namespace Coordinator
 
     inline constexpr std::array REPLY_STOCK_FLOOR_SOURCE_NAMES{"NONE", "PREFIX", "TUNER"};
 
+    enum class ReplyStockFloorPolish : std::int8_t
+    {
+        None,
+        Unchanged,
+        Improved,
+        LimitReached,
+        Rejected,
+    };
+
+    inline constexpr std::array REPLY_STOCK_FLOOR_POLISH_NAMES{"NONE", "UNCHANGED", "IMPROVED", "LIMIT_REACHED",
+                                                               "REJECTED"};
+
     enum class ReplyStockTuneStart : std::int8_t
     {
         Zero,
@@ -85,6 +97,8 @@ namespace Coordinator
         std::int64_t fallbackRows{0};
         std::int64_t emptyRows{0};
         std::int64_t steps{0};
+        std::int64_t polishedRows{0};
+        std::int64_t adaptedRows{0};
     };
 
     struct ReplyStockFloor
@@ -95,6 +109,7 @@ namespace Coordinator
         std::vector<SequentialRowWitness> witness;
         std::uint64_t priceVersion{0};
         ReplyStockFloorCounters counters;
+        ReplyStockFloorPolish polish{ReplyStockFloorPolish::None};
         ReplyStockCounters pricing;
         std::int64_t work{0};
     };
@@ -220,6 +235,8 @@ namespace Coordinator
         bool chargeFloor(std::size_t work);
         ReplyStockStatus publishFloor(const SequentialInstance & instance,
                                       std::span<const SequentialRowWitness> source, ReplyStockFloor & result);
+        void polishFloor(const ContinuationKey & key, const SequentialInstance & instance,
+                         const std::vector<bool> & reused, ReplyStockFloor & result);
         ReplyStockStatus rowUpper(const SequentialRow & row, std::optional<PricedRow> & cached,
                                   ReplyStockCounters & counters);
         ReplyStockStatus priceClass(std::int32_t classIndex, ReplyStockCounters & counters);

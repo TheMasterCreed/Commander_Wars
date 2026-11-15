@@ -85,6 +85,13 @@ namespace
         return true;
     }
 
+    // A relaxed chain stops at its first blocked node; a reference sequence skips it and keeps its tail.
+    enum class BlockedNode : std::int8_t
+    {
+        Stop,
+        Skip,
+    };
+
     struct ForcedAction
     {
         const SequentialRow* pRow{nullptr};
@@ -188,6 +195,12 @@ namespace
     bool sameVariant(const CanonicalPlanActionKey* pLeft, const CanonicalPlanActionKey* pRight)
     {
         return pLeft == nullptr ? pRight == nullptr : pRight != nullptr && *pLeft == *pRight;
+    }
+
+    std::optional<std::int64_t> rowSearchWork(std::size_t rows, std::size_t nodes, std::int32_t horizon)
+    {
+        const auto cells = masterWorkProduct(nodes, static_cast<std::size_t>(std::max(horizon, 1)));
+        return cells ? masterWorkProduct(rows, static_cast<std::size_t>(*cells)) : std::nullopt;
     }
 
     std::optional<std::int64_t> addWork(std::int64_t left, std::optional<std::int64_t> right)
@@ -1294,9 +1307,53 @@ namespace Coordinator
             steps.clear();
             return true;
         };
+        const auto walk = [&](std::span<const std::int32_t> nodes, const SequentialRow & row, BlockedNode blocked,
+                              std::vector<SequentialDetail::WitnessStep> & steps)
+        {
+            const SequentialClassTable & table = m_classTables[static_cast<std::size_t>(row.classIndex)];
+            for (const std::int32_t node : nodes)
+            {
+                if (!chargeFloor(1))
+                {
+                    return false;
+                }
+                const bool free = freeNode(node);
+                const std::int32_t turn = !free ? NO_CAPTURE_TURNS :
+                    steps.empty() ? row.ownedTurn[static_cast<std::size_t>(node)] :
+                                    table.continuationOwnedTurn(steps.back().node, steps.back().turn, node);
+                // A relaxed chain keeps a free untimed head, a legal one-step witness when its weight is positive.
+                if (!free || (turn == NO_CAPTURE_TURNS && (!steps.empty() || blocked == BlockedNode::Skip)))
+                {
+                    if (blocked == BlockedNode::Stop)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                used[static_cast<std::size_t>(node)] = true;
+                steps.push_back({node, turn});
+            }
+            return true;
+        };
         std::vector<std::optional<SequentialRowWitness>> chosen(rowCount);
+        std::vector<bool> reused(rowCount, false);
+        std::vector<const SequentialRowWitness*> adapting;
         const std::vector<const CanonicalPlanActionKey*> variants = rowVariants(key, rowCount);
         ReplyStockFloorCounters & counters = result.counters;
+        const auto keepChain = [&](std::size_t slot, std::vector<SequentialDetail::WitnessStep> & steps,
+                                   std::int64_t & counter)
+        {
+            SequentialRowWitness witness =
+                SequentialDetail::ownedWitness(instance, instance.rows[slot], static_cast<std::int32_t>(slot), steps);
+            releaseWorthless(steps, witness.value);
+            if (steps.empty())
+            {
+                return false;
+            }
+            ++counter;
+            chosen[slot] = std::move(witness);
+            return true;
+        };
         if (reference != nullptr && reference->status == ReplyStockStatus::Valid &&
             JointPlanStockValuer::validDiagnosticKey(*m_field, reference->key))
         {
@@ -1306,12 +1363,16 @@ namespace Coordinator
             for (const SequentialRowWitness & source : reference->witness)
             {
                 const auto slot = static_cast<std::size_t>(source.row);
-                if (source.row <= previousRow || slot >= rowCount ||
-                    !sameVariant(variants[slot], referenceVariants[slot]))
+                if (source.row <= previousRow || slot >= rowCount)
                 {
                     continue;
                 }
                 previousRow = source.row;
+                if (!sameVariant(variants[slot], referenceVariants[slot]))
+                {
+                    adapting.push_back(&source);
+                    continue;
+                }
                 SequentialRowWitness kept;
                 kept.row = source.row;
                 for (const SequentialWitnessStep & step : source.steps)
@@ -1334,9 +1395,26 @@ namespace Coordinator
                 if (!releaseWorthless(kept.steps, kept.value) && !kept.steps.empty())
                 {
                     chosen[slot] = std::move(kept);
+                    reused[slot] = true;
                     ++counters.reusedRows;
                 }
             }
+        }
+        // A changed row re-times its own reference nodes, which no other reference row holds.
+        for (const SequentialRowWitness* source : adapting)
+        {
+            const auto slot = static_cast<std::size_t>(source->row);
+            std::vector<std::int32_t> nodes;
+            for (const SequentialWitnessStep & step : source->steps)
+            {
+                nodes.push_back(step.node);
+            }
+            std::vector<SequentialDetail::WitnessStep> steps;
+            if (!walk(nodes, instance.rows[slot], BlockedNode::Skip, steps))
+            {
+                return ReplyStockStatus::LimitReached;
+            }
+            keepChain(slot, steps, counters.adaptedRows);
         }
         for (std::size_t slot = 0; slot < rowCount; ++slot)
         {
@@ -1345,36 +1423,15 @@ namespace Coordinator
                 continue;
             }
             const SequentialRow & row = instance.rows[slot];
-            const SequentialClassTable & table = m_classTables[static_cast<std::size_t>(row.classIndex)];
             const std::optional<PricedRow> & pricedRow =
                 variants[slot] == nullptr ? m_pricedDayRows[slot] : m_actions.at(*variants[slot]).priced;
             std::vector<SequentialDetail::WitnessStep> steps;
-            for (const std::int32_t node : pricedRow->chain)
+            if (!walk(pricedRow->chain, row, BlockedNode::Stop, steps))
             {
-                if (!chargeFloor(1))
-                {
-                    return ReplyStockStatus::LimitReached;
-                }
-                if (!freeNode(node))
-                {
-                    break;
-                }
-                const std::int32_t turn = steps.empty() ? row.ownedTurn[static_cast<std::size_t>(node)] :
-                    table.continuationOwnedTurn(steps.back().node, steps.back().turn, node);
-                if (!steps.empty() && turn == NO_CAPTURE_TURNS)
-                {
-                    break;
-                }
-                used[static_cast<std::size_t>(node)] = true;
-                steps.push_back({node, turn});
+                return ReplyStockStatus::LimitReached;
             }
-            SequentialRowWitness witness =
-                SequentialDetail::ownedWitness(instance, row, static_cast<std::int32_t>(slot), steps);
-            releaseWorthless(steps, witness.value);
-            if (!steps.empty())
+            if (keepChain(slot, steps, counters.prefixRows))
             {
-                ++counters.prefixRows;
-                chosen[slot] = std::move(witness);
                 continue;
             }
             if (!chargeFloor(nodeCount))
@@ -1409,7 +1466,93 @@ namespace Coordinator
                 rows.push_back(std::move(*row));
             }
         }
-        return publishFloor(instance, rows, result);
+        const ReplyStockStatus published = publishFloor(instance, rows, result);
+        if (published == ReplyStockStatus::Valid)
+        {
+            polishFloor(key, instance, reused, result);
+        }
+        return published;
+    }
+
+    // Changed rows go first so they reclaim their natural nodes before unchanged rows extend onto them.
+    void ReplyStockContext::polishFloor(const ContinuationKey & key, const SequentialInstance & instance,
+                                        const std::vector<bool> & reused, ReplyStockFloor & result)
+    {
+        const std::size_t rowCount = instance.rows.size();
+        const std::optional<MasterPlanPricingModel> model = forcedModel(key);
+        if (!model || model->rowActors.size() != rowCount)
+        {
+            result.polish = ReplyStockFloorPolish::Rejected;
+            return;
+        }
+        MasterPlanWitness start;
+        start.rows.resize(rowCount);
+        for (std::size_t slot = 0; slot < rowCount; ++slot)
+        {
+            start.rows[slot].row = static_cast<std::int32_t>(slot);
+        }
+        for (const SequentialRowWitness & row : result.witness)
+        {
+            start.rows[static_cast<std::size_t>(row.row)] = row;
+        }
+        for (const MasterPlanPricingActor & actor : model->actors)
+        {
+            start.candidateIndices.push_back(actor.candidates.front().candidateIndex);
+        }
+        std::vector<std::int32_t> order;
+        for (const bool wasReused : {false, true})
+        {
+            for (std::size_t slot = 0; slot < rowCount; ++slot)
+            {
+                if (reused[slot] == wasReused)
+                {
+                    order.push_back(static_cast<std::int32_t>(slot));
+                }
+            }
+        }
+        const auto searchPass = rowSearchWork(rowCount, m_nodeColumns.size(), m_field->m_horizonTurns);
+        const auto cap = searchPass ? masterWorkProduct(static_cast<std::size_t>(MASTER_PLAN_POLISH_PASSES),
+                                                        static_cast<std::size_t>(*searchPass))
+                                    : std::nullopt;
+        const std::int64_t allowed = cap ? std::min(std::max(*cap, MIN_TUNE_BUILD_WORK), m_meter.balance()) : 0;
+        RefinementLedger scratch;
+        if (allowed <= 0 || !scratch.open(allowed))
+        {
+            result.polish = ReplyStockFloorPolish::LimitReached;
+            return;
+        }
+        const MasterPlanPolishResult polished = polishMasterPlanWitness(*model, start, order, allowed, scratch);
+        if (!m_meter.consume(scratch.stats().granted, REPLY_FLOOR_WORK) ||
+            polished.status == MasterPlanPricingStatus::LimitReached)
+        {
+            result.polish = ReplyStockFloorPolish::LimitReached;
+            return;
+        }
+        ReplyStockFloor candidate;
+        const ReplyStockStatus published = polished.status == MasterPlanPricingStatus::Valid ?
+            publishFloor(instance, polished.witness.rows, candidate) : ReplyStockStatus::Invalid;
+        if (published != ReplyStockStatus::Valid)
+        {
+            result.polish = published == ReplyStockStatus::LimitReached ? ReplyStockFloorPolish::LimitReached
+                                                                         : ReplyStockFloorPolish::Rejected;
+            return;
+        }
+        if (candidate.floor <= result.floor)
+        {
+            result.polish = ReplyStockFloorPolish::Unchanged;
+            return;
+        }
+        for (std::size_t slot = 0; slot < rowCount; ++slot)
+        {
+            if (polished.witness.rows[slot].steps != start.rows[slot].steps)
+            {
+                ++result.counters.polishedRows;
+            }
+        }
+        result.floor = candidate.floor;
+        result.witness = std::move(candidate.witness);
+        result.counters.steps = candidate.counters.steps;
+        result.polish = ReplyStockFloorPolish::Improved;
     }
 
     ReplyStockStatus ReplyStockContext::publishFloor(const SequentialInstance & instance,
@@ -1487,8 +1630,7 @@ namespace Coordinator
         const auto table = cells ? addWork(*cells + 1, transitions) : std::nullopt;
         const auto tables = table ? masterWorkProduct(catalog.classes.size(), static_cast<std::size_t>(*table))
                                   : std::nullopt;
-        const auto searchPass = cells ? masterWorkProduct(catalog.dayRows.size(), static_cast<std::size_t>(*cells))
-                                      : std::nullopt;
+        const auto searchPass = rowSearchWork(catalog.dayRows.size(), nodes, catalog.horizon);
         const auto search = searchPass ? masterWorkProduct(WITNESS_SEARCH_PASSES, static_cast<std::size_t>(*searchPass))
                                        : std::nullopt;
         const auto summed = tables ? addWork(*tables, search) : std::nullopt;

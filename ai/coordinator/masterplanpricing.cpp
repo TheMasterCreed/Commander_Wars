@@ -772,6 +772,16 @@ namespace
         return result;
     }
 
+    std::vector<const MasterPlanPricingCandidate*> candidateOptions(const MasterPlanPricingActor & actor)
+    {
+        std::vector<const MasterPlanPricingCandidate*> options;
+        for (const auto & candidate : actor.candidates)
+        {
+            options.push_back(&candidate);
+        }
+        return options;
+    }
+
     std::vector<Seat> buildSeats(const MasterPlanPricingModel & model, const MasterPlanCeiling & priced,
                                  const std::vector<MasterPlanPricingCandidate> & idle)
     {
@@ -779,12 +789,7 @@ namespace
         for (const auto slot : descending(priced.actorMaxima))
         {
             const auto & actor = model.actors[static_cast<std::size_t>(slot)];
-            Seat seat{actor.row, slot, {}, nullptr, {}};
-            for (const auto & candidate : actor.candidates)
-            {
-                seat.options.push_back(&candidate);
-            }
-            seats.push_back(std::move(seat));
+            seats.push_back(Seat{actor.row, slot, candidateOptions(actor), nullptr, {}});
         }
         auto spare = idle.begin();
         for (std::size_t row = 0; row < model.rowActors.size(); ++row)
@@ -932,6 +937,71 @@ namespace
         }
         meter.endBuild();
         return result;
+    }
+
+    bool sumSteps(std::span<const SequentialWitnessStep> steps, MilliFunds & value)
+    {
+        return std::all_of(steps.begin(), steps.end(),
+            [&](const SequentialWitnessStep & step) { return RelativeStockDetail::checkedAdd(value, step.gain); });
+    }
+
+    bool claimSlot(std::vector<bool> & used, std::int32_t node)
+    {
+        if (node < 0 || static_cast<std::size_t>(node) >= used.size() || used[static_cast<std::size_t>(node)])
+        {
+            return false;
+        }
+        used[static_cast<std::size_t>(node)] = true;
+        return true;
+    }
+
+    std::optional<std::vector<Seat>> seatsFromWitness(const MasterPlanPricingModel & model,
+                                                      const MasterPlanWitness & start,
+                                                      const std::vector<MasterPlanPricingCandidate> & idle)
+    {
+        const auto rows = model.rowActors.size();
+        std::vector<Seat> seats(rows);
+        auto spare = idle.begin();
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            auto & seat = seats[row];
+            seat.row = static_cast<std::int32_t>(row);
+            seat.slot = model.rowActors[row];
+            if (seat.slot == MASTER_PLAN_NO_ACTOR)
+            {
+                seat.options = {&*spare++};
+                seat.chosen = seat.options.front();
+            }
+            else
+            {
+                const auto & actor = model.actors[static_cast<std::size_t>(seat.slot)];
+                seat.options = candidateOptions(actor);
+                const auto index = start.candidateIndices[static_cast<std::size_t>(seat.slot)];
+                seat.chosen = findMasterPlanCandidate(actor, index);
+            }
+            const auto & source = start.rows[row];
+            if (seat.chosen == nullptr || source.row != seat.row ||
+                !sumSteps(source.steps, seat.itinerary.value))
+            {
+                return std::nullopt;
+            }
+            seat.itinerary.steps = source.steps;
+            seat.itinerary.objective = seat.itinerary.value;
+        }
+        return seats;
+    }
+
+    // Captured nodes are claimed before any chain, so a chain through a captured node is rejected too.
+    bool disjointSeats(const std::vector<Seat> & seats, std::size_t nodes)
+    {
+        std::vector<bool> used(nodes, false);
+        const auto capturesFit = std::all_of(seats.begin(), seats.end(), [&](const Seat & seat) {
+            return seat.chosen->capturedNode == NO_SEQUENTIAL_NODE || claimSlot(used, seat.chosen->capturedNode);
+        });
+        return capturesFit && std::all_of(seats.begin(), seats.end(), [&](const Seat & seat) {
+            return std::all_of(seat.itinerary.steps.begin(), seat.itinerary.steps.end(),
+                               [&](const SequentialWitnessStep & step) { return claimSlot(used, step.node); });
+        });
     }
 
     enum class PriceStep : std::int8_t
@@ -1238,6 +1308,53 @@ namespace Coordinator
     {
         WorkMeter meter(ledger, ledger.balance());
         return evaluateCeiling(model, prices, meter);
+    }
+
+    MasterPlanPolishResult polishMasterPlanWitness(const MasterPlanPricingModel & model,
+                                                   const MasterPlanWitness & start,
+                                                   std::span<const std::int32_t> rowOrder, std::int64_t maximumWork,
+                                                   RefinementLedger & ledger, MasterPlanWitnessOptions options)
+    {
+        MasterPlanPolishResult result;
+        result.status = MasterPlanPricingStatus::Invalid;
+        const auto & catalog = model.catalog;
+        const auto rows = model.rowActors.size();
+        if (start.rows.size() != rows || start.candidateIndices.size() != model.actors.size() ||
+            rowOrder.size() != rows || maximumWork <= 0 || ledger.balance() < maximumWork)
+        {
+            return result;
+        }
+        std::vector<bool> ordered(rows, false);
+        if (!std::all_of(rowOrder.begin(), rowOrder.end(), [&](std::int32_t row) { return claimSlot(ordered, row); }))
+        {
+            return result;
+        }
+        const auto idle = idleCandidates(model);
+        const auto byRow = seatsFromWitness(model, start, idle);
+        if (!byRow || !disjointSeats(*byRow, catalog.columns.size()))
+        {
+            return result;
+        }
+        std::vector<Seat> seats;
+        Occupancy occupancy{masterPlanOccupiedUsage(model), std::vector<bool>(catalog.columns.size(), false)};
+        for (const auto row : rowOrder)
+        {
+            seats.push_back((*byRow)[static_cast<std::size_t>(row)]);
+            occupancy.occupy(seats.back());
+        }
+        MasterPlanWitnessStats stats;
+        WorkMeter meter(ledger, maximumWork);
+        const ChoiceContext context{meter, stats, ResourcePolicy::Enforced, options.mode};
+        ItinerarySearch exact(catalog, {}, meter, options.mode, TailSource::Unpriced, stats, stats.polishSearchWork);
+        if (!polishSeats(seats, occupancy, exact, context, options) || meter.stopped())
+        {
+            result.status = meter.stopped() ? MasterPlanPricingStatus::LimitReached : MasterPlanPricingStatus::Invalid;
+            return result;
+        }
+        result.witness = collectWitness(model, seats);
+        result.status =
+            result.witness.valid ? MasterPlanPricingStatus::Valid : MasterPlanPricingStatus::ArithmeticFailure;
+        return result;
     }
 
     MasterPlanPricingResult tuneMasterPlanPrices(const MasterPlanPricingModel & model,

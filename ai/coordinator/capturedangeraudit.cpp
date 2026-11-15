@@ -54,7 +54,7 @@ namespace
     using Coordinator::TerrainDefenseRule;
     using Coordinator::TilePoint;
 
-    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 14;
+    constexpr std::int32_t DANGER_AUDIT_SCHEMA = 15;
     constexpr std::int32_t STOCK_CONTEXT_BASE_ROUNDS = Coordinator::MASTER_PLAN_PRICING_ROUNDS;
     constexpr std::int32_t STOCK_CONTEXT_RETUNE_ROUNDS = 25;
     constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
@@ -325,9 +325,12 @@ namespace
     constexpr auto KEY_CEILING_STATUS = "ceilingStatus";
     constexpr auto KEY_FLOOR_STATUS = "floorStatus";
     constexpr auto KEY_REUSED_ROWS = "reusedRows";
+    constexpr auto KEY_ADAPTED_ROWS = "adaptedRows";
     constexpr auto KEY_PREFIX_ROWS = "prefixRows";
     constexpr auto KEY_FALLBACK_ROWS = "fallbackRows";
     constexpr auto KEY_EMPTY_ROWS = "emptyRows";
+    constexpr auto KEY_POLISH = "polish";
+    constexpr auto KEY_POLISHED_ROWS = "polishedRows";
     constexpr auto KEY_RETUNE = "retune";
     constexpr auto KEY_SKIPPED = "skipped";
     constexpr auto KEY_REINSTALL_STATUS = "reinstallStatus";
@@ -2145,6 +2148,13 @@ namespace
         return QLatin1String(Coordinator::REPLY_STOCK_STATUS_NAMES[static_cast<std::size_t>(status)]);
     }
 
+    void insertFloorPolish(QJsonObject & record, const Coordinator::ReplyStockFloor & floor)
+    {
+        const auto polish = static_cast<std::size_t>(floor.polish);
+        record.insert(KEY_POLISH, QLatin1String(Coordinator::REPLY_STOCK_FLOOR_POLISH_NAMES[polish]));
+        record.insert(KEY_POLISHED_ROWS, static_cast<qint64>(floor.counters.polishedRows));
+    }
+
     // Reinstalls the base prices when a re-tune replaced them, so every key is quoted and re-tuned from them.
     bool restoreBasePrices(Coordinator::ReplyStockContext & context, std::span<const Coordinator::MilliFunds> prices,
                            std::uint64_t & version, QJsonObject & record)
@@ -2190,9 +2200,11 @@ namespace
         record.insert(KEY_CEILING, static_cast<qint64>(ceiling.ceiling));
         record.insert(KEY_FLOOR, static_cast<qint64>(floor.floor));
         record.insert(KEY_REUSED_ROWS, static_cast<qint64>(floor.counters.reusedRows));
+        record.insert(KEY_ADAPTED_ROWS, static_cast<qint64>(floor.counters.adaptedRows));
         record.insert(KEY_PREFIX_ROWS, static_cast<qint64>(floor.counters.prefixRows));
         record.insert(KEY_FALLBACK_ROWS, static_cast<qint64>(floor.counters.fallbackRows));
         record.insert(KEY_EMPTY_ROWS, static_cast<qint64>(floor.counters.emptyRows));
+        insertFloorPolish(record, floor);
         const bool quoted = ceiling.status == ReplyStockStatus::Valid && floor.status == ReplyStockStatus::Valid;
         interval = ContextInterval{quoted, floor.floor, ceiling.ceiling};
         if (!quoted)
@@ -2204,14 +2216,16 @@ namespace
         const auto retuneStarted = std::chrono::steady_clock::now();
         const ReplyStockTune tuned =
             context.tune(key, STOCK_CONTEXT_RETUNE_ROUNDS, ReplyStockTuneStart::InstalledPrices, &floor);
-        record.insert(KEY_RETUNE, QJsonObject{
+        QJsonObject retune{
             {KEY_SKIPPED, false}, {KEY_STATUS, replyStockStatusName(tuned.status)},
             {KEY_TUNER_STATUS,
              QLatin1String(MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(tuned.tunerStatus)])},
             {KEY_ROUNDS, tuned.rounds},
             {KEY_FLOOR, static_cast<qint64>(tuned.floor.floor)}, {KEY_CEILING, static_cast<qint64>(tuned.ceiling)},
             {KEY_NANOS, static_cast<qint64>(nanosSince(retuneStarted))},
-        });
+        };
+        insertFloorPolish(retune, tuned.floor);
+        record.insert(KEY_RETUNE, retune);
         if (tuned.status == ReplyStockStatus::Valid)
         {
             interval = ContextInterval{true, tuned.floor.floor, tuned.ceiling};
@@ -2260,7 +2274,7 @@ namespace
         const auto baseStarted = std::chrono::steady_clock::now();
         const ReplyStockTune base = context.tune(keys[STOCK_REPLY_BASE_KEY], STOCK_CONTEXT_BASE_ROUNDS);
         const std::int64_t baseNanos = nanosSince(baseStarted);
-        record.insert(KEY_BASE_TUNE, QJsonObject{
+        QJsonObject baseTune{
             {KEY_STATUS, replyStockStatusName(base.status)},
             {KEY_TUNER_STATUS,
              QLatin1String(MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(base.tunerStatus)])},
@@ -2272,7 +2286,9 @@ namespace
             {KEY_WITNESS_BUILD_WORK, static_cast<qint64>(base.limits.limits.witnessBuildWork)},
             {KEY_TUNER_WORK, static_cast<qint64>(base.tunerWork)},
             {KEY_NANOS, static_cast<qint64>(baseNanos)},
-        });
+        };
+        insertFloorPolish(baseTune, base.floor);
+        record.insert(KEY_BASE_TUNE, baseTune);
         const std::vector<MilliFunds> basePrices(context.installedPrices().begin(), context.installedPrices().end());
         std::uint64_t baseVersion = context.priceVersion();
         std::vector<ContextInterval> intervals(keys.size());

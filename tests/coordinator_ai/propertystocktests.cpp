@@ -827,10 +827,13 @@ namespace
             {
                 const auto ceiling = context.ceiling(keys[index]);
                 const auto floor = context.floor(keys[index]);
+                const bool polished = floor.polish == ReplyStockFloorPolish::Improved ?
+                    floor.counters.polishedRows > 0 :
+                    floor.polish == ReplyStockFloorPolish::Unchanged && floor.counters.polishedRows == 0;
                 expect(floor.status == ReplyStockStatus::Valid && ceiling.status == ReplyStockStatus::Valid &&
                            floor.floor <= EXACT[index] && EXACT[index] <= ceiling.ceiling &&
                            floor.priceVersion == version && floor.key == keys[index] && ascendingWitness(floor) &&
-                           floor.counters.steps > 0 && floor.work > 0,
+                           floor.counters.steps > 0 && floor.work > 0 && polished,
                        "a published floor replays and brackets the exact optimum below the ceiling");
             }
         }
@@ -879,6 +882,9 @@ namespace
         constexpr MilliFunds SECOND_HOME_WEIGHT = 6;
         constexpr MilliFunds FAR_HEAD_WEIGHT = 4;
         constexpr MilliFunds FIRST_NODE_STREAM = 6;
+        constexpr std::int32_t ALONE_RETURN_TURN = 6;
+        constexpr MilliFunds ALONE_RETURN_STREAM = 2;
+        constexpr MilliFunds DEAD_EXACT = 12;
         const auto [today, damaged, dead] = Fixture::replyKeys();
         const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
         const auto away = *CanonicalPlanActionKey::checkedFromAction(0, 1, 0, false, 1, true);
@@ -897,14 +903,24 @@ namespace
         const auto alone = conflict.floor({dead});
         const auto shared = conflict.floor({today});
 
-        const std::vector<SequentialRowWitness> aloneWitness{
-            SequentialRowWitness{1, {{0, FAR_TURN, SECOND_HEAD_WEIGHT}}, SECOND_HEAD_WEIGHT}};
+        const std::vector<SequentialRowWitness> aloneWitness{SequentialRowWitness{1,
+            {{0, FAR_TURN, SECOND_HEAD_WEIGHT}, {1, ALONE_RETURN_TURN, ALONE_RETURN_STREAM}},
+            SECOND_HEAD_WEIGHT + ALONE_RETURN_STREAM}};
         const std::vector<SequentialRowWitness> sharedWitness{actingRow, homeRow};
-        expect(alone.witness == aloneWitness && alone.counters.prefixRows == 1,
-               "alone, the second row's relaxed chain starts at the first node");
+        expect(alone.witness == aloneWitness && alone.counters.prefixRows == 1 &&
+                   alone.polish == ReplyStockFloorPolish::Improved && alone.counters.polishedRows == 1,
+               "alone, the relaxed chain stops at the first node and the polish extends it");
         expect(shared.status == ReplyStockStatus::Valid && shared.witness == sharedWitness &&
-                   shared.counters.prefixRows == 1 && shared.counters.fallbackRows == 1,
+                   shared.counters.prefixRows == 1 && shared.counters.fallbackRows == 1 &&
+                   shared.polish == ReplyStockFloorPolish::Unchanged && shared.counters.polishedRows == 0,
                "a later row whose chain starts at a used node falls back to its best free head");
+
+        const auto freed = conflict.floor({dead}, &shared);
+        expect(freed.status == ReplyStockStatus::Valid && freed.counters.reusedRows == 1 &&
+                   freed.counters.prefixRows == 0 && freed.counters.fallbackRows == 0 &&
+                   freed.polish == ReplyStockFloorPolish::Improved && freed.counters.polishedRows == 1 &&
+                   freed.floor == DEAD_EXACT && freed.witness == aloneWitness && ascendingWitness(freed),
+               "the node a dead unit frees is picked up by the polish, from the reused home row to the exact value");
 
         ReplyStockContext context(field);
         context.installPrices(REFERENCE_PRICES);
@@ -914,7 +930,9 @@ namespace
         const std::vector<SequentialRowWitness> rebuiltWitness{actingRow, homeRow};
         expect(base.status == ReplyStockStatus::Valid && rebuilt.status == ReplyStockStatus::Valid &&
                    rebuilt.witness == rebuiltWitness && rebuilt.counters.reusedRows == 1 &&
-                   rebuilt.counters.prefixRows == 1 && rebuilt.counters.fallbackRows == 0,
+                   rebuilt.counters.adaptedRows == 1 && rebuilt.counters.prefixRows == 0 &&
+                   rebuilt.counters.fallbackRows == 0 &&
+                   rebuilt.polish == ReplyStockFloorPolish::Unchanged,
                "the reference serves the unchanged row while the changed row is rebuilt");
         expect(again.witness == rebuilt.witness && again.floor == rebuilt.floor &&
                    again.counters.reusedRows == rebuilt.counters.reusedRows,
@@ -949,6 +967,142 @@ namespace
         expect(through.witness == throughWitness && cut.status == ReplyStockStatus::Valid &&
                    cut.witness == cutWitness && cut.counters.reusedRows == 1 && cut.counters.emptyRows == 1,
                "a reference chain is cut before the node the new key captures, keeping its turns and gains");
+    }
+
+    void stockContextAdaptsChangedRows()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::array CONFLICT_PRICES{MilliFunds{0}, MilliFunds{7}};
+        constexpr std::size_t NODES = 2;
+        constexpr MilliFunds TRAP_EXACT = 18;
+        constexpr MilliFunds TRAP_RELAXED = 13;
+        constexpr std::int32_t DAMAGED_TURN = 2;
+        constexpr MilliFunds DAMAGED_WEIGHT = 12;
+        constexpr std::int32_t HOME_TURN = 2;
+        constexpr MilliFunds HOME_WEIGHT = 6;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto second = CanonicalPlanActionKey::fromAction(1, Fixture::WIDTH - 1, 0, false);
+        const std::vector<MilliFunds> zero(NODES, 0);
+        const SequentialRowWitness homeRow{1, {{1, HOME_TURN, HOME_WEIGHT}}, HOME_WEIGHT};
+
+        const auto field = Fixture::make(2);
+        ReplyStockContext context(field);
+        context.installPrices(CONFLICT_PRICES);
+        const auto reference = context.floor({today});
+        context.installPrices(zero);
+        const ContinuationKey both{damaged, second};
+        const auto adapted = context.floor(both, &reference);
+        const auto relaxed = context.floor(both);
+        const auto exact = ReplyStockContext(field).tune(both, MASTER_PLAN_PRICING_ROUNDS);
+        const std::vector<SequentialRowWitness> adaptedWitness{
+            SequentialRowWitness{0, {{0, DAMAGED_TURN, DAMAGED_WEIGHT}}, DAMAGED_WEIGHT}, homeRow};
+        expect(exact.status == ReplyStockStatus::Valid && exact.floor.floor == TRAP_EXACT &&
+                   exact.ceiling == TRAP_EXACT && relaxed.floor == TRAP_RELAXED &&
+                   relaxed.polish == ReplyStockFloorPolish::Unchanged && adapted.floor == TRAP_EXACT &&
+                   adapted.witness == adaptedWitness && adapted.counters.adaptedRows == 2 &&
+                   adapted.counters.reusedRows == 0 && ascendingWitness(adapted),
+               "two changed rows follow their reference nodes out of the trap the relaxed chain and polish leave");
+
+        // Only the nodes of a changed reference row are read, so its turns and gains are placeholders.
+        const auto carried = Fixture::make(2, Fixture::RATE);
+        ReplyStockContext capture(carried);
+        capture.installPrices(zero);
+        ReplyStockFloor through;
+        through.status = ReplyStockStatus::Valid;
+        through.key = {dead};
+        through.witness = {SequentialRowWitness{1, {{0, 1, 1}, {1, 1, 1}}, 2}};
+        const auto skipped = capture.floor(ContinuationKey{today, second}, &through);
+        expect(skipped.status == ReplyStockStatus::Valid && skipped.witness == std::vector{homeRow} &&
+                   skipped.counters.adaptedRows == 1 && skipped.counters.fallbackRows == 0,
+               "a changed row skips the head the key captures and keeps the rest of its reference nodes");
+    }
+
+    void polishWitnessRejectsMalformedStarts()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t HEAD_TURN = 3;
+        constexpr MilliFunds HEAD_WEIGHT = 10;
+        constexpr MilliFunds DEAD_EXACT = 12;
+        constexpr std::int32_t UNKNOWN_CANDIDATE = 99;
+        constexpr std::int32_t UNKNOWN_NODE = 99;
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const ContinuationKey key{dead};
+        const auto field = Fixture::make(2);
+        const auto reference = JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
+        const auto tuned = existingTune(field, key);
+        if (!reference.models.front() || !tuned.witness.valid || tuned.witness.candidateIndices.empty())
+        {
+            expect(false, "the destroyed key has a model and a tuned witness with an actor");
+            return;
+        }
+        const MasterPlanPricingModel & model = *reference.models.front();
+        const std::vector<std::int32_t> order{0, 1};
+        const auto run = [&](const MasterPlanWitness & start, std::span<const std::int32_t> rows,
+                             std::int64_t work = MASTER_PLAN_PRICING_WITNESS_WORK)
+        {
+            RefinementLedger ledger;
+            ledger.open(MASTER_PLAN_PRICING_WITNESS_WORK);
+            return polishMasterPlanWitness(model, start, rows, work, ledger);
+        };
+        auto head = tuned.witness;
+        head.rows[1].steps = {{0, HEAD_TURN, HEAD_WEIGHT}};
+        head.rows[1].value = HEAD_WEIGHT;
+        const auto extended = run(head, order);
+        expect(extended.status == MasterPlanPricingStatus::Valid && extended.witness.value == DEAD_EXACT &&
+                   extended.witness.rows == tuned.witness.rows,
+               "the polish extends a head-only start to the exact chain");
+
+        const auto rejected = [&](const MasterPlanWitness & start, std::span<const std::int32_t> rows)
+        {
+            const auto result = run(start, rows);
+            return result.status == MasterPlanPricingStatus::Invalid && !result.witness.valid;
+        };
+        const auto changed = [&](auto && edit)
+        {
+            auto start = tuned.witness;
+            edit(start);
+            return rejected(start, order);
+        };
+        const auto chain = tuned.witness.rows[1].steps;
+        const std::vector<std::int32_t> repeated{1, 1};
+        const std::vector<std::int32_t> outside{0, 2};
+        expect(changed([&](MasterPlanWitness & start) { start.rows[0].steps = {chain.front()}; }) &&
+                   changed([](MasterPlanWitness & start) { start.candidateIndices.front() = UNKNOWN_CANDIDATE; }) &&
+                   changed([](MasterPlanWitness & start) { start.rows.pop_back(); }) &&
+                   changed([](MasterPlanWitness & start) { start.rows[0].row = 1; }) &&
+                   changed([](MasterPlanWitness & start) { start.rows[1].row = 0; }) &&
+                   changed([](MasterPlanWitness & start) { start.rows[1].steps.front().node = UNKNOWN_NODE; }) &&
+                   changed([&](MasterPlanWitness & start) { start.rows[1].steps = {chain.front(), chain.front()}; }) &&
+                   rejected(tuned.witness, repeated) && rejected(tuned.witness, outside),
+               "overlapping or out-of-range nodes, wrong row slots, an unknown candidate, short rows or a bad order "
+               "are rejected");
+
+        // A carried capture completes this turn, so the acting candidate captures its node.
+        const auto carriedField = Fixture::make(2, Fixture::RATE);
+        const ContinuationKey capturing{today};
+        const auto captureModels =
+            JointPlanStockValuer::diagnosticPricingModels(carriedField, std::span(&capturing, 1));
+        const auto captureTune = existingTune(carriedField, capturing);
+        const auto & captureModel = captureModels.models.front();
+        const std::int32_t captured = captureModel && !captureModel->actors.empty() ?
+            captureModel->actors.front().candidates.front().capturedNode : NO_SEQUENTIAL_NODE;
+        if (!captureTune.witness.valid || captured == NO_SEQUENTIAL_NODE)
+        {
+            expect(false, "the capturing key has a capturing candidate and a tuned witness");
+            return;
+        }
+        auto through = captureTune.witness;
+        through.rows[1].steps = {{captured, HEAD_TURN, HEAD_WEIGHT}};
+        RefinementLedger captureLedger;
+        captureLedger.open(MASTER_PLAN_PRICING_WITNESS_WORK);
+        const auto throughCaptured = polishMasterPlanWitness(*captureModel, through, order,
+                                                             MASTER_PLAN_PRICING_WITNESS_WORK, captureLedger);
+        expect(throughCaptured.status == MasterPlanPricingStatus::Invalid && !throughCaptured.witness.valid,
+               "a chain through the node a candidate captures is rejected");
+        expect(run(head, order, 1).status == MasterPlanPricingStatus::LimitReached,
+               "a cap too small for one best response stops the polish");
     }
 
     void stockContextSeededTune()
@@ -1068,6 +1222,8 @@ int main()
     stockContextFloorBracketsExact();
     stockContextFloorConflictsAndReference();
     stockContextSeededTune();
+    polishWitnessRejectsMalformedStarts();
+    stockContextAdaptsChangedRows();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

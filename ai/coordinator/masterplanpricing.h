@@ -117,6 +117,12 @@ namespace Coordinator
 #endif
     };
 
+    struct MasterPlanPolishResult
+    {
+        MasterPlanPricingStatus status{MasterPlanPricingStatus::Unavailable};
+        MasterPlanWitness witness;
+    };
+
     enum class MasterPlanSearchMode : std::int8_t
     {
         Pruned,
@@ -156,4 +162,8 @@ namespace Coordinator
                                                  RefinementLedger & ledger,
                                                  MasterPlanWitnessOptions options = {},
                                                  std::span<const MilliFunds> seed = {});
+    MasterPlanPolishResult polishMasterPlanWitness(const MasterPlanPricingModel & model,
+                                                   const MasterPlanWitness & start,
+                                                   std::span<const std::int32_t> rowOrder, std::int64_t maximumWork,
+                                                   RefinementLedger & ledger, MasterPlanWitnessOptions options = {});
 }
