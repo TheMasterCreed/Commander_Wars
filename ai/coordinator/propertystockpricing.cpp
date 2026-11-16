@@ -314,9 +314,11 @@ namespace Coordinator
         m_reach.build(grid, tile, movementPoints, m_horizonTurns, m_columnTiles);
         ArrivalVectors arrivals;
         arrivals.activations.reserve(m_columnTiles.size());
+        arrivals.spent.reserve(m_columnTiles.size());
         for (const TilePoint & column : m_columnTiles)
         {
             arrivals.activations.push_back(m_reach.activations(column.x, column.y));
+            arrivals.spent.push_back(m_reach.spent(column.x, column.y));
         }
         return m_arrivals.emplace(key, std::move(arrivals)).first->second;
     }
@@ -952,6 +954,15 @@ namespace Coordinator
         const std::size_t nodeCount = nodeSlots.size();
         result.weight.assign(nodeCount, 0);
         result.ownedTurn.assign(nodeCount, NO_CAPTURE_TURNS);
+        const auto approachOf = [&result, &nodeSlots, nodeCount](const PropertyStockField::ArrivalVectors & arrivals)
+        {
+            result.approach.resize(nodeCount);
+            for (std::size_t node = 0; node < nodeCount; ++node)
+            {
+                const std::size_t slot = static_cast<std::size_t>(nodeSlots[node]);
+                result.approach[node] = {arrivals.activations[slot], arrivals.spent[slot]};
+            }
+        };
         const std::int32_t horizon = field.m_horizonTurns;
         const std::int32_t points = field.m_capturePointsToCapture;
         if (pMover == nullptr)
@@ -976,6 +987,7 @@ namespace Coordinator
                 result.ownedTurn[node] =
                     sequentialFirstOwnedTurn(owned, horizon);
             }
+            approachOf(arrivals);
             return result;
         }
 
@@ -1002,6 +1014,7 @@ namespace Coordinator
             result.ownedTurn[node] =
                 sequentialFirstOwnedTurn(owned, horizon);
         }
+        approachOf(arrivals);
         return result;
     }
 

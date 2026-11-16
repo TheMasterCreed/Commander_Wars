@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -189,6 +190,34 @@ namespace
         expect(identityHolds, "to targets field mirrors the from sources field on a random directional grid");
         expect(sawReachablePair, "random grid contains reachable pairs");
     }
+
+    void testArrivalSpentInsideActivation()
+    {
+        constexpr std::int32_t LENGTH = 8;
+        constexpr std::int32_t MOVEMENT = 3;
+        struct Expected
+        {
+            std::int32_t distance;
+            std::int32_t activations;
+            std::int32_t spent;
+        };
+        constexpr std::array<Expected, 3> EXPECTED{{{6, 2, 3}, {7, 3, 1}, {8, 3, 2}}};
+        const MobilityCostGrid grid = uniformGrid(LENGTH + 1, ROW_HEIGHT, PLAIN_COST);
+        std::vector<TilePoint> targets;
+        for (const auto & expected : EXPECTED)
+        {
+            targets.push_back({expected.distance, 0});
+        }
+        Coordinator::ActivationField field;
+        field.build(grid, {0, 0}, MOVEMENT, Coordinator::UNBOUNDED_ACTIVATIONS, targets);
+        for (const auto & expected : EXPECTED)
+        {
+            expect(field.activations(expected.distance, 0) == expected.activations &&
+                       field.spent(expected.distance, 0) == expected.spent,
+                   "spent counts the points used inside the arrival activation");
+        }
+        expect(field.spent(LENGTH + 1, 0) == UNREACHABLE, "a tile without a label has no spent value");
+    }
 }
 
 int main()
@@ -201,5 +230,6 @@ int main()
     testMultiSourceAndSourceHygiene();
     testGridEquality();
     testReversalIdentity();
+    testArrivalSpentInsideActivation();
     return failures == 0 ? 0 : 1;
 }

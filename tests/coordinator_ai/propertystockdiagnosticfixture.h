@@ -88,6 +88,12 @@ namespace Coordinator
                                       buildMarginalTable(field.m_ours, 0, NO_STOCK_COLUMN));
         }
 
+        static void ownColumn(PropertyStockField & field, std::int32_t slot)
+        {
+            field.m_ours.columns[static_cast<std::size_t>(slot)].ownerBefore = STOCK_OWNER_AFTER;
+            rebuildMarginals(field);
+        }
+
         static void setWeight(PropertyStockField & field, std::int32_t row, std::int32_t node, MilliFunds weight)
         {
             const std::size_t nodes = field.m_ours.columns.size();

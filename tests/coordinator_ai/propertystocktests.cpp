@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -1245,6 +1247,389 @@ namespace
                "an unrequested tile is not exposed as settled");
         expect(wide.activations(far.x, far.y) == 4, "requested distant arrival remains exact");
     }
+
+    void stockRowsCarryRawApproach()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        constexpr std::int32_t MOVEMENT = 1;
+        constexpr TilePoint FIRST{0, 0};
+        constexpr TilePoint MIDDLE{1, 0};
+        constexpr TilePoint LAST{Fixture::WIDTH - 1, 0};
+        MobilityCostGrid grid(Fixture::WIDTH, 1);
+        for (std::int32_t x = 0; x < Fixture::WIDTH; ++x)
+        {
+            grid.setCost(x, 0, EntryDirection::East, 1);
+            grid.setCost(x, 0, EntryDirection::West, 1);
+        }
+        const std::vector<TilePoint> columns{FIRST, LAST};
+        const auto raw = [&](TilePoint from)
+        {
+            ActivationField reach;
+            reach.build(grid, from, MOVEMENT, Fixture::HORIZON, columns);
+            std::vector<SequentialApproach> result;
+            for (const auto & column : columns)
+            {
+                result.push_back({reach.activations(column.x, column.y), reach.spent(column.x, column.y)});
+            }
+            return result;
+        };
+        const auto [today, damaged, dead] = Fixture::replyKeys();
+        const auto stay = CanonicalPlanActionKey::fromAction(0, MIDDLE.x, MIDDLE.y, false);
+        // A damaged unit that steps onto the property without capturing owns it after the healthy one.
+        const auto slowed = *CanonicalPlanActionKey::checkedFromAction(0, FIRST.x, FIRST.y, false, 1, false);
+        const std::array keys{ContinuationKey{stay}, ContinuationKey{slowed}};
+        const auto field = Fixture::make(2);
+        const auto models = JointPlanStockValuer::diagnosticPricingModels(field, keys);
+        const auto carriedField = Fixture::make(2, Fixture::RATE);
+        const ContinuationKey capturing{today};
+        const auto captureModels =
+            JointPlanStockValuer::diagnosticPricingModels(carriedField, std::span(&capturing, 1));
+        if (!models.models[0] || !models.models[1] || !captureModels.models[0])
+        {
+            expect(false, "the approach keys have pricing models");
+            return;
+        }
+        const auto & stayRow = models.models[0]->actors.front().candidates.front().row;
+        const auto & slowedRow = models.models[1]->actors.front().candidates.front().row;
+        const auto & dayRow = models.models[0]->catalog.dayRows[1];
+        const std::vector<SequentialApproach> stayExpected{{1, 1}, {1, 1}};
+        const std::vector<SequentialApproach> slowedExpected{{1, 0}, {2, 1}};
+        const std::vector<SequentialApproach> dayExpected{{2, 1}, {1, 0}};
+        expect(stayRow.approach == stayExpected && stayRow.approach == raw(MIDDLE) &&
+                   slowedRow.approach == slowedExpected && slowedRow.approach == raw(FIRST) &&
+                   dayRow.approach == dayExpected && dayRow.approach == raw(LAST),
+               "mover and day rows carry the field's own movement label for every node");
+        expect(slowedRow.approach[0] < stayRow.approach[0] && slowedRow.ownedTurn[0] > stayRow.ownedTurn[0],
+               "the approach is raw movement even where a slower capture rate reverses the ownership order");
+        const auto & captured = captureModels.models[0]->actors.front().candidates.front();
+        expect(captured.capturedNode == 0 && captured.row.approach.size() == captured.row.ownedTurn.size() &&
+                   !captured.row.approach[0].reachable() && captured.row.ownedTurn[0] == NO_CAPTURE_TURNS &&
+                   captured.row.approach[1] == raw(FIRST)[1],
+               "removing a captured node clears its approach and keeps the rest aligned");
+        // Owning slot 0 leaves slot 1 as the only node, so node and column indices differ.
+        auto ownedField = Fixture::make(2);
+        Fixture::ownColumn(ownedField, 0);
+        const auto onto = CanonicalPlanActionKey::fromAction(0, FIRST.x, FIRST.y, false);
+        const ContinuationKey ontoKey{onto};
+        const auto ownedModels = JointPlanStockValuer::diagnosticPricingModels(ownedField, std::span(&ontoKey, 1));
+        if (!ownedModels.models[0])
+        {
+            expect(false, "the owned-column key has a pricing model");
+            return;
+        }
+        const auto & ownedMover = ownedModels.models[0]->actors.front().candidates.front().row;
+        const auto & ownedDay = ownedModels.models[0]->catalog.dayRows[1];
+        const std::vector<SequentialApproach> moverToLast{{2, 1}};
+        const std::vector<SequentialApproach> dayToLast{{1, 0}};
+        expect(ownedMover.approach == moverToLast && ownedMover.approach.front() == raw(FIRST)[1] &&
+                   ownedMover.approach.size() == ownedMover.ownedTurn.size() && ownedDay.approach == dayToLast &&
+                   ownedDay.approach.front() == raw(LAST)[1] && ownedDay.approach.size() == ownedDay.ownedTurn.size(),
+               "with a filtered column the approach follows each node's own column for mover and day rows");
+    }
+
+    constexpr std::int32_t TIE_NODES = 2;
+    constexpr std::int32_t TIE_HORIZON = 8;
+    constexpr std::int32_t TIE_TURN = 3;
+    constexpr MilliFunds TIE_WEIGHT = 50;
+    constexpr MilliFunds TIE_SIDE_WEIGHT = 5;
+    constexpr Coordinator::SequentialApproach FAR_APPROACH{3, 1};
+    constexpr Coordinator::SequentialApproach NEAR_APPROACH{1, 1};
+    constexpr Coordinator::SequentialApproach NO_APPROACH{};
+    constexpr Coordinator::SequentialApproach MORE_SPENT{2, 3};
+    constexpr Coordinator::SequentialApproach LESS_SPENT{2, 1};
+
+    struct TieCandidate
+    {
+        MilliFunds immediate{0};
+        std::vector<MilliFunds> weight;
+        std::vector<std::int32_t> ownedTurn;
+        std::vector<Coordinator::SequentialApproach> approach;
+        std::vector<Coordinator::MasterResourceUsage> resources;
+    };
+
+    TieCandidate headZero(Coordinator::SequentialApproach approach, MilliFunds immediate = 0)
+    {
+        return TieCandidate{immediate, {TIE_WEIGHT, 0}, {TIE_TURN, NO_CAPTURE_TURNS}, {approach, NO_APPROACH}, {}};
+    }
+
+    TieCandidate idleCandidate(MilliFunds immediate)
+    {
+        return TieCandidate{immediate, {0, 0}, {NO_CAPTURE_TURNS, NO_CAPTURE_TURNS}, {}, {}};
+    }
+
+    std::optional<Coordinator::MasterPlanPricingModel> tieModel(const std::vector<std::vector<TieCandidate>> & actors)
+    {
+        using namespace Coordinator;
+        MasterPlanPricingModel model;
+        auto & catalog = model.catalog;
+        catalog.horizon = TIE_HORIZON;
+        catalog.complete = true;
+        for (std::int32_t node = 0; node < TIE_NODES; ++node)
+        {
+            catalog.columns.push_back(PropertyStockColumn{.slot = node, .tile = {node, 0}, .income = {1, 1}});
+        }
+        // Without continuations every itinerary is a single head.
+        SequentialClassTable table;
+        const std::vector<MilliFunds> prizes(static_cast<std::size_t>(TIE_NODES * TIE_HORIZON), 0);
+        const std::vector<std::int32_t> interArrivals(static_cast<std::size_t>(TIE_NODES * TIE_NODES), 0);
+        table.buildFromPrizes(TIE_NODES, prizes, interArrivals, NO_CAPTURE_TURNS, TIE_HORIZON);
+        catalog.classes.push_back(std::move(table));
+        const auto idle = idleCandidate(0);
+        for (std::size_t row = 0; row < actors.size(); ++row)
+        {
+            const auto rowIndex = static_cast<std::int32_t>(row);
+            catalog.dayRows.push_back(
+                SequentialRow{.classIndex = 0, .weight = idle.weight, .ownedTurn = idle.ownedTurn});
+            model.rowActors.push_back(rowIndex);
+            MasterPlanPricingActor actor{rowIndex, {}};
+            for (std::size_t index = 0; index < actors[row].size(); ++index)
+            {
+                const auto & source = actors[row][index];
+                MasterPlanPricingCandidate candidate;
+                candidate.candidateIndex = static_cast<std::int32_t>(index);
+                candidate.key =
+                    CanonicalPlanActionKey::fromAction(rowIndex, static_cast<std::int32_t>(index), 0, false);
+                candidate.resources = source.resources;
+                candidate.immediateValue = source.immediate;
+                candidate.row = SequentialRow{.classIndex = 0, .weight = source.weight,
+                                              .ownedTurn = source.ownedTurn, .approach = source.approach};
+                actor.candidates.push_back(std::move(candidate));
+            }
+            model.actors.push_back(std::move(actor));
+        }
+        if (!indexMasterPlanActions(model))
+        {
+            return std::nullopt;
+        }
+        return model;
+    }
+
+    bool sameWitness(const Coordinator::MasterPlanWitness & left, const Coordinator::MasterPlanWitness & right)
+    {
+        return left.valid && right.valid && left.candidateIndices == right.candidateIndices &&
+            left.rows == right.rows && left.value == right.value;
+    }
+
+    Coordinator::MasterPlanPricingResult tuneInMode(const Coordinator::MasterPlanPricingModel & model,
+                                                    Coordinator::MasterPlanSearchMode mode)
+    {
+        using namespace Coordinator;
+        RefinementLedger ledger;
+        ledger.open(2 * MASTER_PLAN_PRICING_WORK);
+        return tuneMasterPlanPrices(model, pricingLimits(), ledger, {.mode = mode});
+    }
+
+    void expectTieChoice(const std::vector<TieCandidate> & candidates, std::int32_t expected, std::string_view message)
+    {
+        using namespace Coordinator;
+        const auto model = tieModel({candidates});
+        if (!model)
+        {
+            expect(false, message);
+            return;
+        }
+        const auto pruned = tuneInMode(*model, MasterPlanSearchMode::Pruned);
+        const auto exhaustive = tuneInMode(*model, MasterPlanSearchMode::Exhaustive);
+        expect(sameWitness(pruned.witness, exhaustive.witness) && pruned.witness.candidateIndices.size() == 1 &&
+                   pruned.witness.candidateIndices.front() == expected,
+               message);
+    }
+
+    void tieKeepsOrMovesCloser()
+    {
+        const auto hold = headZero(FAR_APPROACH);
+        expectTieChoice({hold, headZero(NEAR_APPROACH)}, 1, "an equal choice closer to the same head is preferred");
+        expectTieChoice({hold, headZero(FAR_APPROACH)}, 0, "an equal approach keeps the first choice");
+        const TieCandidate otherHead{0, {TIE_SIDE_WEIGHT, TIE_WEIGHT}, {TIE_TURN, TIE_TURN},
+                                     {NEAR_APPROACH, FAR_APPROACH}, {}};
+        expectTieChoice({hold, otherHead}, 0, "an equal choice with a different head keeps the first choice");
+        expectTieChoice({hold, headZero(NEAR_APPROACH, -1)}, 0, "a closer choice one milli-fund lower never wins");
+        expectTieChoice({idleCandidate(TIE_WEIGHT), headZero(NEAR_APPROACH)}, 0,
+                        "a first choice without a head keeps its place on an equal score");
+        auto bareFar = headZero(FAR_APPROACH);
+        auto bareNear = headZero(NEAR_APPROACH);
+        bareFar.approach.clear();
+        bareNear.approach.clear();
+        expectTieChoice({bareFar, bareNear}, 0, "rows without movement detail keep the first choice");
+        expectTieChoice({headZero(MORE_SPENT), headZero(LESS_SPENT)}, 1,
+                        "with equal activations the choice spending fewer points in the arrival activation wins");
+        // The reduced threshold reaches below zero, yet an objective of zero is the empty itinerary, which has no head.
+        const TieCandidate zeroObjective{TIE_WEIGHT, {0, 0}, {TIE_TURN, NO_CAPTURE_TURNS}, {NEAR_APPROACH, NO_APPROACH},
+                                         {}};
+        expectTieChoice({hold, zeroObjective}, 0, "a tie at a zero threshold is the headless empty itinerary");
+        auto unowned = headZero(NEAR_APPROACH);
+        unowned.ownedTurn.front() = NO_CAPTURE_TURNS;
+        expectTieChoice({hold, unowned}, 0, "a closer choice that never owns the head does not take the tie");
+        expectTieChoice({hold, headZero(NO_APPROACH)}, 0, "an unreachable candidate label does not take the tie");
+        expectTieChoice({headZero(NO_APPROACH), headZero(NEAR_APPROACH)}, 0,
+                        "a reachable label does not replace a held unreachable one");
+        constexpr Coordinator::SequentialApproach PARTLY_UNREACHABLE{FAR_APPROACH.activations,
+                                                                     Coordinator::UNREACHABLE};
+        expectTieChoice({headZero(PARTLY_UNREACHABLE), headZero(NEAR_APPROACH)}, 0,
+                        "a partly unreachable held label is never compared, though it orders after the candidate");
+    }
+
+    void expectBothModesFail(const Coordinator::MasterPlanPricingModel & model,
+                             const Coordinator::MasterPlanWitness & start, std::string_view message);
+
+    void exhaustiveArithmeticMatchesHead()
+    {
+        using namespace Coordinator;
+        constexpr MilliFunds LIMIT = std::numeric_limits<MilliFunds>::min();
+        const auto model = tieModel({{idleCandidate(0), idleCandidate(LIMIT)}});
+        if (!model)
+        {
+            expect(false, "the overflow model indexes");
+            return;
+        }
+        const auto pruned = tuneInMode(*model, MasterPlanSearchMode::Pruned);
+        const auto exhaustive = tuneInMode(*model, MasterPlanSearchMode::Exhaustive);
+        expect(!pruned.witness.valid && !exhaustive.witness.valid && pruned.status == exhaustive.status,
+               "an unseeded pick whose threshold overflows fails in both modes");
+        const MasterPlanWitness start{true, {0}, {{0, {}, 0}}, 0};
+        expectBothModesFail(*model, start, "a polish whose scan threshold overflows fails in both modes");
+    }
+
+    Coordinator::MasterPlanPolishResult polishTie(const Coordinator::MasterPlanPricingModel & model,
+                                                  const Coordinator::MasterPlanWitness & start,
+                                                  Coordinator::MasterPlanSearchMode mode, bool audit = false)
+    {
+        using namespace Coordinator;
+        std::vector<std::int32_t> order(model.rowActors.size());
+        std::iota(order.begin(), order.end(), 0);
+        RefinementLedger ledger;
+        ledger.open(MASTER_PLAN_PRICING_WITNESS_WORK);
+        return polishMasterPlanWitness(model, start, order, MASTER_PLAN_PRICING_WITNESS_WORK, ledger,
+                                       {.mode = mode, .auditSkips = audit});
+    }
+
+    void expectBothModesFail(const Coordinator::MasterPlanPricingModel & model,
+                             const Coordinator::MasterPlanWitness & start, std::string_view message)
+    {
+        using namespace Coordinator;
+        const auto pruned = polishTie(model, start, MasterPlanSearchMode::Pruned);
+        const auto exhaustive = polishTie(model, start, MasterPlanSearchMode::Exhaustive);
+        expect(pruned.status == MasterPlanPricingStatus::Invalid &&
+                   exhaustive.status == MasterPlanPricingStatus::Invalid,
+               message);
+    }
+
+    Coordinator::SequentialRowWitness heldHead(std::int32_t row)
+    {
+        return {row, {{0, TIE_TURN, TIE_WEIGHT}}, TIE_WEIGHT};
+    }
+
+    void polishSwitchesToCloserTie()
+    {
+        using namespace Coordinator;
+        constexpr MilliFunds LIMIT = std::numeric_limits<MilliFunds>::min();
+        const auto limitModel = tieModel({{headZero(FAR_APPROACH, LIMIT), headZero(NEAR_APPROACH, TIE_WEIGHT)}});
+        constexpr std::int32_t RESOURCE = 0;
+        constexpr MilliFunds HELD_IMMEDIATE = 10;
+        constexpr MilliFunds FREED_IMMEDIATE = 20;
+        constexpr std::int64_t SWITCHED_RESPONSES = 4;
+        constexpr std::int64_t SETTLED_SKIPS = 2;
+        const MasterResourceUsage resource{RESOURCE, 1, 1};
+        auto near = headZero(NEAR_APPROACH);
+        near.resources = {resource};
+        auto held = idleCandidate(HELD_IMMEDIATE);
+        held.resources = {resource};
+        const auto freedModel =
+            tieModel({{headZero(FAR_APPROACH), near}, {held, idleCandidate(FREED_IMMEDIATE)}});
+        if (!limitModel || !freedModel)
+        {
+            expect(false, "the polish tie models index");
+            return;
+        }
+        const MasterPlanWitness limitStart{true, {0}, {heldHead(0)}, LIMIT + TIE_WEIGHT};
+        const MasterPlanWitness freedStart{true, {0, 0}, {heldHead(0), {1, {}, 0}}, TIE_WEIGHT + HELD_IMMEDIATE};
+        const auto exhaustiveLimit = polishTie(*limitModel, limitStart, MasterPlanSearchMode::Exhaustive);
+        const auto exhaustiveFreed = polishTie(*freedModel, freedStart, MasterPlanSearchMode::Exhaustive);
+        const auto auditedFreed = polishTie(*freedModel, freedStart, MasterPlanSearchMode::Pruned, true);
+        expect(sameWitness(auditedFreed.witness, exhaustiveFreed.witness) &&
+                   auditedFreed.witnessStats.skipViolations == 0 && auditedFreed.witnessStats.tieSwitches == 1,
+               "the audited pruned polish matches exhaustive and no skipped seat would have switched");
+        for (const auto mode : {MasterPlanSearchMode::Pruned, MasterPlanSearchMode::Exhaustive})
+        {
+            const auto limit = polishTie(*limitModel, limitStart, mode);
+            expect(limit.status == MasterPlanPricingStatus::Valid && limit.witness.candidateIndices.front() == 1 &&
+                       limit.witness.value == 2 * TIE_WEIGHT && limit.witnessStats.tieSwitches == 0 &&
+                       sameWitness(limit.witness, exhaustiveLimit.witness),
+                   "a negative threshold at the arithmetic limit is not reduced and a strictly better choice wins");
+            const auto freed = polishTie(*freedModel, freedStart, mode);
+            const std::vector<std::int32_t> switched{1, 1};
+            expect(freed.status == MasterPlanPricingStatus::Valid && freed.witness.candidateIndices == switched &&
+                       freed.witnessStats.tieSwitches == 1 && sameWitness(freed.witness, exhaustiveFreed.witness),
+                   "a seat moves to the closer tied choice once the resource it needs is freed");
+            if (mode == MasterPlanSearchMode::Pruned)
+            {
+                expect(freed.witnessStats.responses == SWITCHED_RESPONSES &&
+                           freed.witnessStats.skippedResponses == SETTLED_SKIPS,
+                       "a tie switch moves the version stamp, so the other seat answers again before both settle");
+            }
+        }
+    }
+
+    void productionRowsPreferTheCloserApproach()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        // Both arrive on the first activation; stepping onto the property spends no points there.
+        const auto stay = CanonicalPlanActionKey::fromAction(0, 1, 0, false);
+        const auto onto = CanonicalPlanActionKey::fromAction(0, 0, 0, false);
+        const std::array keys{ContinuationKey{stay}, ContinuationKey{onto}};
+        const auto field = Fixture::make(1);
+        const auto models = JointPlanStockValuer::diagnosticPricingModels(field, keys);
+        if (!models.models[0] || !models.models[1])
+        {
+            expect(false, "the stay and approach keys have pricing models");
+            return;
+        }
+        const auto & stayCandidate = models.models[0]->actors.front().candidates.front();
+        const auto & ontoCandidate = models.models[1]->actors.front().candidates.front();
+        const auto build = [&](const SequentialRow & ontoRow, bool withOnto)
+        {
+            MasterPlanPricingModel model;
+            model.catalog = models.models[0]->catalog;
+            model.catalog.actions.clear();
+            model.rowActors = {0};
+            MasterPlanPricingActor actor{0, {stayCandidate}};
+            actor.candidates.front().candidateIndex = 0;
+            if (withOnto)
+            {
+                actor.candidates.push_back(ontoCandidate);
+                actor.candidates.back().candidateIndex = 1;
+                actor.candidates.back().row = ontoRow;
+            }
+            model.actors.push_back(std::move(actor));
+            return indexMasterPlanActions(model) ? std::optional<MasterPlanPricingModel>(std::move(model))
+                                                 : std::nullopt;
+        };
+        auto sameLabels = ontoCandidate.row;
+        sameLabels.approach = stayCandidate.row.approach;
+        const auto alone = build(ontoCandidate.row, false);
+        const auto closer = build(ontoCandidate.row, true);
+        const auto equal = build(sameLabels, true);
+        if (!alone || !closer || !equal)
+        {
+            expect(false, "the production-row models index");
+            return;
+        }
+        expect(stayCandidate.row.approach[0] == SequentialApproach{1, 1} &&
+                   ontoCandidate.row.approach[0] == SequentialApproach{1, 0},
+               "the stay and the approach arrive on the same activation, the approach with fewer points spent");
+        for (const auto mode : {MasterPlanSearchMode::Pruned, MasterPlanSearchMode::Exhaustive})
+        {
+            const auto stayOnly = tuneInMode(*alone, mode);
+            const auto moved = tuneInMode(*closer, mode);
+            const auto kept = tuneInMode(*equal, mode);
+            expect(stayOnly.witness.valid && moved.witness.valid && kept.witness.valid &&
+                       moved.witness.value == stayOnly.witness.value && kept.witness.value == stayOnly.witness.value &&
+                       moved.witness.candidateIndices.front() == 1 && kept.witness.candidateIndices.front() == 0,
+                   "production rows of equal value take the approach, and the stay when the labels are equal");
+        }
+    }
 }
 
 int main()
@@ -1269,6 +1654,11 @@ int main()
     stockContextTargetTune();
     polishWitnessRejectsMalformedStarts();
     stockContextAdaptsChangedRows();
+    stockRowsCarryRawApproach();
+    tieKeepsOrMovesCloser();
+    polishSwitchesToCloserTie();
+    exhaustiveArithmeticMatchesHead();
+    productionRowsPreferTheCloserApproach();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

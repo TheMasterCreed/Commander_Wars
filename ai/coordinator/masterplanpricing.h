@@ -85,6 +85,7 @@ namespace Coordinator
         std::int64_t abandonedBuilds{0};
         std::int64_t responses{0};
         std::int64_t skippedResponses{0};
+        std::int64_t tieSwitches{0};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         std::int64_t skipViolations{0};
 #endif
@@ -125,6 +126,9 @@ namespace Coordinator
     {
         MasterPlanPricingStatus status{MasterPlanPricingStatus::Unavailable};
         MasterPlanWitness witness;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MasterPlanWitnessStats witnessStats;
+#endif
     };
 
     enum class MasterPlanSearchMode : std::int8_t

@@ -664,11 +664,44 @@ namespace
         MasterPlanSearchMode mode;
     };
 
+    const SequentialWitnessStep* headOf(const Itinerary & itinerary)
+    {
+        return itinerary.steps.empty() ? nullptr : &itinerary.steps.front();
+    }
+
+    // Raw movement only: ownership time also folds in capture rate and carried points.
+    bool closerToHead(const SequentialRow & row, const Choice & running)
+    {
+        const auto* pHead = headOf(running.itinerary);
+        if (pHead == nullptr)
+        {
+            return false;
+        }
+        const auto head = static_cast<std::size_t>(pHead->node);
+        const auto & held = running.candidate->row;
+        if (head >= row.approach.size() || head >= held.approach.size() || head >= row.ownedTurn.size() ||
+            row.ownedTurn[head] == NO_CAPTURE_TURNS)
+        {
+            return false;
+        }
+        const auto & approach = row.approach[head];
+        return approach.reachable() && held.approach[head].reachable() && approach < held.approach[head];
+    }
+
+    bool sameHead(const Itinerary & left, const Itinerary & right)
+    {
+        const auto* pLeft = headOf(left);
+        const auto* pRight = headOf(right);
+        return pLeft != nullptr && pRight != nullptr && pLeft->node == pRight->node;
+    }
+
+    // Found means the held choice, if any, was replaced: by a higher score, or by an equal one closer to its head.
     SearchStatus bestChoice(const Seat & seat, Occupancy & occupancy, ItinerarySearch & search,
-                            const ChoiceContext & context, std::optional<MilliFunds> floor, Choice & result)
+                            const ChoiceContext & context, const Choice* pHeld, Choice & result)
     {
         ++context.stats.responses;
         auto status = SearchStatus::Dominated;
+        std::optional<MilliFunds> unseededBest;
         for (const auto * candidate : seat.options)
         {
             const auto resources = candidate->resources.size();
@@ -687,11 +720,22 @@ namespace
             {
                 return SearchStatus::Failed;
             }
-            const auto running = status == SearchStatus::Found ? std::optional<MilliFunds>(result.score) : floor;
-            auto threshold = running;
-            if (threshold && !RelativeStockDetail::checkedSubtract(*threshold, offset))
+            const Choice* pRunning = status == SearchStatus::Found ? &result : pHeld;
+            const auto closer = pRunning != nullptr && closerToHead(candidate->row, *pRunning);
+            // Exhaustive mode ignores the threshold but keeps the overflow failures of its unseeded scan.
+            auto threshold = context.mode == MasterPlanSearchMode::Pruned && pRunning != nullptr ?
+                std::optional<MilliFunds>(pRunning->score) : unseededBest;
+            if (threshold)
             {
-                return SearchStatus::Failed;
+                if (!RelativeStockDetail::checkedSubtract(*threshold, offset))
+                {
+                    return SearchStatus::Failed;
+                }
+                // The search only reports a strict excess, so an equal closer itinerary needs one less.
+                if (closer && *threshold >= 0)
+                {
+                    --*threshold;
+                }
             }
             if (capturing)
             {
@@ -715,7 +759,12 @@ namespace
             {
                 return SearchStatus::Failed;
             }
-            if (!running || score > *running)
+            if (!unseededBest || score > *unseededBest)
+            {
+                unseededBest = score;
+            }
+            if (pRunning == nullptr || score > pRunning->score ||
+                (score == pRunning->score && closer && sameHead(search.result(), pRunning->itinerary)))
             {
                 result = Choice{candidate, search.result(), score};
                 status = SearchStatus::Found;
@@ -739,17 +788,20 @@ namespace
         {
             return PolishOutcome::Failed;
         }
-        const auto floor = context.mode == MasterPlanSearchMode::Pruned ? std::optional<MilliFunds>(current)
-                                                                        : std::nullopt;
+        const Choice held{seat.chosen, seat.itinerary, current};
         Choice best;
-        const auto status = bestChoice(seat, occupancy, search, context, floor, best);
+        const auto status = bestChoice(seat, occupancy, search, context, &held, best);
         if (status == SearchStatus::Failed)
         {
             return PolishOutcome::Failed;
         }
-        const auto improved = status == SearchStatus::Found && best.score > current;
+        const auto improved = status == SearchStatus::Found;
         if (improved)
         {
+            if (best.score == current)
+            {
+                ++context.stats.tieSwitches;
+            }
             seat.chosen = best.candidate;
             seat.itinerary = std::move(best.itinerary);
         }
@@ -808,7 +860,7 @@ namespace
         for (auto & seat : seats)
         {
             Choice choice;
-            if (bestChoice(seat, occupancy, search, context, std::nullopt, choice) != SearchStatus::Found)
+            if (bestChoice(seat, occupancy, search, context, nullptr, choice) != SearchStatus::Found)
             {
                 return false;
             }
@@ -1207,6 +1259,10 @@ namespace Coordinator
     {
         row.weight[static_cast<std::size_t>(node)] = 0;
         row.ownedTurn[static_cast<std::size_t>(node)] = NO_CAPTURE_TURNS;
+        if (!row.approach.empty())
+        {
+            row.approach[static_cast<std::size_t>(node)] = {};
+        }
     }
 
     bool MasterPlanPricingDetail::addMasterPlanTerms(MilliFunds & total, std::span<const MilliFunds> terms)
@@ -1367,6 +1423,9 @@ namespace Coordinator
         result.witness = collectWitness(model, seats);
         result.status =
             result.witness.valid ? MasterPlanPricingStatus::Valid : MasterPlanPricingStatus::ArithmeticFailure;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.witnessStats = stats;
+#endif
         return result;
     }
 

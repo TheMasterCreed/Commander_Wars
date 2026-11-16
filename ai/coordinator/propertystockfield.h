@@ -171,6 +171,7 @@ namespace Coordinator
         struct ArrivalVectors
         {
             std::vector<std::int32_t> activations;
+            std::vector<std::int32_t> spent;
         };
 
         struct ArrivalKey

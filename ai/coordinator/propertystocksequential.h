@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -213,11 +214,27 @@ namespace Coordinator
         std::vector<std::int32_t> m_witnesses;
     };
 
+    // Raw movement label to a node: arrival activations, then points spent inside that activation.
+    struct SequentialApproach
+    {
+        std::int32_t activations{UNREACHABLE};
+        std::int32_t spent{UNREACHABLE};
+
+        constexpr bool reachable() const
+        {
+            return activations != UNREACHABLE && spent != UNREACHABLE;
+        }
+
+        friend constexpr auto operator<=>(const SequentialApproach &, const SequentialApproach &) = default;
+    };
+
     struct SequentialRow
     {
         std::int32_t classIndex{NO_SEQUENTIAL_CLASS};
         std::vector<MilliFunds> weight;
         std::vector<std::int32_t> ownedTurn;
+        // Empty means no movement detail, which never breaks a tie.
+        std::vector<SequentialApproach> approach;
     };
 
     struct SequentialInstance

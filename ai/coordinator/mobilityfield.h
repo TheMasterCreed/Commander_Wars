@@ -377,23 +377,21 @@ namespace Coordinator
         // UNREACHABLE also covers a tile the activation limit cut off, which books the same exact zero.
         std::int32_t activations(std::int32_t x, std::int32_t y) const
         {
-            const TileState* pState = readTileState(x, y);
-            if (pState == nullptr || pState->label.boundaries == UNREACHABLE)
-            {
-                return UNREACHABLE;
-            }
-            return arrivalActivationsOf(pState->label.boundaries);
+            const ActivationLabel* pLabel = reachedLabel(x, y);
+            return pLabel == nullptr ? UNREACHABLE : arrivalActivationsOf(pLabel->boundaries);
+        }
+
+        std::int32_t spent(std::int32_t x, std::int32_t y) const
+        {
+            const ActivationLabel* pLabel = reachedLabel(x, y);
+            return pLabel == nullptr ? UNREACHABLE : pLabel->spent;
         }
 
         // Summed entry cost of the very route this arrival was credited to, not the cheapest route.
         std::int32_t routeCost(std::int32_t x, std::int32_t y) const
         {
-            const TileState* pState = readTileState(x, y);
-            if (pState == nullptr || pState->label.boundaries == UNREACHABLE)
-            {
-                return UNREACHABLE;
-            }
-            return pState->label.cost;
+            const ActivationLabel* pLabel = reachedLabel(x, y);
+            return pLabel == nullptr ? UNREACHABLE : pLabel->cost;
         }
 
     private:
@@ -495,6 +493,12 @@ namespace Coordinator
                 state = TileState{m_generation, ActivationLabel{UNREACHABLE, 0, 0}, false, false};
             }
             return state;
+        }
+
+        const ActivationLabel* reachedLabel(std::int32_t x, std::int32_t y) const
+        {
+            const TileState* pState = readTileState(x, y);
+            return pState == nullptr || pState->label.boundaries == UNREACHABLE ? nullptr : &pState->label;
         }
 
         // Only tiles the caller asked for are settled when the loop stops, so nothing else may be read.
