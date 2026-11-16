@@ -852,7 +852,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/capturedangerauditmode.h ai/coordinator/capturedangerpricing.h
     ai/coordinator/replypredictionmode.h ai/coordinator/replyfacts.h ai/coordinator/replyprediction.h
     ai/coordinator/ownactionmeasurement.h ai/coordinator/stockreplykeys.h ai/coordinator/replypassevaluation.h
-    ai/coordinator/masterreplyactions.h
+    ai/coordinator/masterreplyactions.h ai/coordinator/replypass.h ai/coordinator/replypass.cpp
     ai/coordinator/replyfactsbuilder.h ai/coordinator/replyfactsbuilder.cpp ai/coordinator/replycheck.h
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
@@ -1535,6 +1535,22 @@ if (BUILD_TESTING)
     add_test(NAME CoordinatorAiMasterAssignmentProblemTests COMMAND CoordinatorAiMasterAssignmentProblemTests)
     cow_set_arena_test_path(CoordinatorAiMasterAssignmentProblemTests)
 
+    add_executable(CoordinatorAiReplyPassTests
+        tests/coordinator_ai/replypasstests.cpp
+        tests/coordinator_ai/propertystockdiagnosticfixture.h
+        ai/coordinator/replypass.cpp
+        ai/coordinator/masterassignmentproblem.cpp
+        ai/coordinator/propertystockpricing.cpp
+        ai/coordinator/masterassignmentfuture.cpp
+        ai/coordinator/masterplanpricing.cpp
+    )
+    target_compile_definitions(CoordinatorAiReplyPassTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
+    target_include_directories(CoordinatorAiReplyPassTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiReplyPassTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiReplyPassTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiReplyPassTests COMMAND CoordinatorAiReplyPassTests)
+    cow_set_arena_test_path(CoordinatorAiReplyPassTests)
+
     set(MASTER_ASSIGNMENT_ORACLE_SRCS
         tests/coordinator_ai/masterassignmentoracle.cpp
         tests/coordinator_ai/masterassignmentreference.cpp
@@ -1686,6 +1702,7 @@ if (BUILD_TESTING)
 
     add_executable(CoordinatorAiPropertyStockTests
         tests/coordinator_ai/propertystocktests.cpp
+        tests/coordinator_ai/propertystockdiagnosticfixture.h
         ai/coordinator/propertystockpricing.cpp
         ai/coordinator/masterassignmentfuture.cpp
         ai/coordinator/masterplanpricing.cpp

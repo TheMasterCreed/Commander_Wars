@@ -114,6 +114,20 @@ namespace Coordinator
         std::int64_t work{0};
     };
 
+    inline constexpr MilliFunds REPLY_STOCK_PARTS_PER_MILLION = 1'000'000;
+
+    // Splitting the division keeps the product from overflowing for any non-negative ceiling.
+    constexpr std::optional<MilliFunds> replyStockTargetGap(MilliFunds ceiling, MilliFunds ppm)
+    {
+        if (ppm < 0 || ppm > REPLY_STOCK_PARTS_PER_MILLION)
+        {
+            return std::nullopt;
+        }
+        const MilliFunds base = ceiling < 0 ? 0 : ceiling;
+        return base / REPLY_STOCK_PARTS_PER_MILLION * ppm +
+            base % REPLY_STOCK_PARTS_PER_MILLION * ppm / REPLY_STOCK_PARTS_PER_MILLION;
+    }
+
     struct ReplyStockTuneLimits
     {
         std::int64_t evaluationWork{0};
@@ -167,6 +181,8 @@ namespace Coordinator
         ReplyStockCeiling ceiling(const ContinuationKey & key);
         ReplyStockOwned owned(const ContinuationKey & key);
         ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr);
+        // Needs no prices: a witness's value depends only on the key's rows.
+        ReplyStockFloor replayWitness(const ContinuationKey & key, std::span<const SequentialRowWitness> witness);
         ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds,
                             ReplyStockTuneStart start = ReplyStockTuneStart::Zero,
                             const ReplyStockFloor * reference = nullptr, MilliFunds targetGap = 0);

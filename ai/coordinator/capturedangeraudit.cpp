@@ -58,7 +58,6 @@ namespace
     constexpr std::int32_t STOCK_CONTEXT_BASE_ROUNDS = Coordinator::MASTER_PLAN_PRICING_ROUNDS;
     constexpr std::int32_t STOCK_CONTEXT_RETUNE_ROUNDS = 25;
     constexpr Coordinator::MilliFunds STOCK_CONTEXT_TARGET_GAP_PPM = 5'000;
-    constexpr Coordinator::MilliFunds PARTS_PER_MILLION = 1'000'000;
     constexpr std::int64_t STOCK_REPLY_REFINEMENT_STATE_CAP = Coordinator::LIVE_PAIR_REFINEMENT_BUDGET;
     constexpr Coordinator::DiagnosticRefinementLimits STOCK_REPLY_REFINEMENT_LIMITS{
         .stateCap = STOCK_REPLY_REFINEMENT_STATE_CAP,
@@ -2174,14 +2173,6 @@ namespace
         return record;
     }
 
-    // Splitting the division keeps the product from overflowing for any non-negative ceiling.
-    Coordinator::MilliFunds targetGapOf(Coordinator::MilliFunds ceiling)
-    {
-        const auto base = std::max<Coordinator::MilliFunds>(ceiling, 0);
-        return base / PARTS_PER_MILLION * STOCK_CONTEXT_TARGET_GAP_PPM +
-            base % PARTS_PER_MILLION * STOCK_CONTEXT_TARGET_GAP_PPM / PARTS_PER_MILLION;
-    }
-
     // Reinstalls the base prices when a re-tune replaced them, so every key is quoted and re-tuned from them.
     bool restoreBasePrices(Coordinator::ReplyStockContext & context, std::span<const Coordinator::MilliFunds> prices,
                            std::uint64_t & version, QJsonObject & record)
@@ -2260,7 +2251,7 @@ namespace
             record.insert(KEY_TARGET_TUNE, restored);
             return record;
         }
-        const MilliFunds targetGap = targetGapOf(ceiling.ceiling);
+        const MilliFunds targetGap = replyStockTargetGap(ceiling.ceiling, STOCK_CONTEXT_TARGET_GAP_PPM).value();
         const auto targetStarted = std::chrono::steady_clock::now();
         const ReplyStockTune targeted = context.tune(key, STOCK_CONTEXT_BASE_ROUNDS,
                                                      ReplyStockTuneStart::InstalledPrices, &floor, targetGap);

@@ -1164,6 +1164,32 @@ namespace Coordinator
         return result;
     }
 
+    ReplyStockFloor ReplyStockContext::replayWitness(const ContinuationKey & key,
+                                                     std::span<const SequentialRowWitness> witness)
+    {
+        ReplyStockFloor result;
+        const std::int64_t workBefore = work();
+        result.key = key;
+        result.priceVersion = m_priceVersion;
+        result.status = extend(key, result.pricing);
+        SequentialInstance instance;
+        if (result.status == ReplyStockStatus::Valid)
+        {
+            result.status = keyInstance(key, instance);
+        }
+        if (result.status == ReplyStockStatus::Valid)
+        {
+            result.status = publishFloor(instance, witness, result);
+        }
+        if (result.status != ReplyStockStatus::Valid)
+        {
+            result.floor = 0;
+            result.witness.clear();
+        }
+        result.work = work() - workBefore;
+        return result;
+    }
+
     ReplyStockTune ReplyStockContext::tune(const ContinuationKey & key, std::int32_t rounds, ReplyStockTuneStart start,
                                            const ReplyStockFloor * reference, MilliFunds targetGap)
     {
