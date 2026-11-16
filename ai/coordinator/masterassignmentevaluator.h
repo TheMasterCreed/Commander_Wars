@@ -53,7 +53,18 @@ namespace Coordinator
         std::int64_t quote{1};
         std::int64_t witness{1};
         std::int64_t certificateIdentity{1};
+        // The part of witness that only an enemy sequential replay can use.
+        std::int64_t witnessEnemyPart{0};
     };
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct MasterWitnessCharges
+    {
+        std::int64_t enemyPart{0};
+        std::int64_t full{0};
+        std::int64_t reduced{0};
+    };
+#endif
 
     enum class MasterRefinementTerm : std::int8_t
     {
@@ -231,6 +242,9 @@ namespace Coordinator
         MasterObjectiveStatus replayRetainedEvaluation(const MasterAssignmentEvaluation & evaluation);
         const std::optional<MasterRefinementRefusal> & refinementRefusal() const;
         const std::optional<RelativeStockCertificatePreparation> & certificatePreparation() const;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MasterWitnessCharges witnessCharges() const;
+#endif
 
     private:
         struct OursCap
@@ -287,6 +301,11 @@ namespace Coordinator
         MasterOperationOutcome runOperation(MasterAssignmentEvaluation & evaluation,
                                            const MasterOperationOffer & offer);
         static bool retainedWitnessFits(const RelativeStockProofSnapshot & proof, std::int64_t work);
+        bool witnessTariffValid() const;
+        std::int64_t witnessCharge(bool enemyReplay) const;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        void noteWitnessCharge(std::int64_t amount);
+#endif
         static std::optional<std::int64_t> candidateReplayWork(const MasterCandidate & candidate);
         std::optional<std::int64_t> replayWork(std::int64_t payload) const;
         std::optional<std::int64_t> replayTariff(const MasterAssignmentState & state);
@@ -303,5 +322,8 @@ namespace Coordinator
         std::optional<RelativeStockCertificatePreparation> m_certificatePreparation;
         std::vector<OursCap> m_oursCaps;
         std::uint64_t m_oursCapContradictions{0};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MasterWitnessCharges m_witnessCharges;
+#endif
     };
 }

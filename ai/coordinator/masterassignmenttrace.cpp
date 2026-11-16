@@ -106,6 +106,9 @@ namespace
     constexpr auto TRACE_TIMING = "timing";
     constexpr auto TRACE_FLOOD_NANOS = "floodNanos";
     constexpr auto TRACE_PREPARATION_NANOS = "preparationNanos";
+    constexpr auto TRACE_WITNESS_ENEMY_PART = "witnessEnemyPart";
+    constexpr auto TRACE_FULL_CHARGES = "fullCharges";
+    constexpr auto TRACE_REDUCED_CHARGES = "reducedCharges";
 
     QJsonObject planWitnessStatsRecord(const Coordinator::MasterPlanWitnessStats & stats)
     {
@@ -1178,6 +1181,13 @@ namespace Coordinator
             {TRACE_MOST_QUALIFYING_NODES, QString::number(measure.mostQualifyingNodes)},
             {TRACE_TIMING, QJsonObject{{TRACE_FLOOD_NANOS, QString::number(measure.floodNanos)},
                 {TRACE_PREPARATION_NANOS, QString::number(measure.preparationNanos)}}}};
+    }
+
+    QJsonObject masterWitnessChargesRecord(const MasterWitnessCharges & charges)
+    {
+        return {{TRACE_WITNESS_ENEMY_PART, QString::number(charges.enemyPart)},
+            {TRACE_FULL_CHARGES, QString::number(charges.full)},
+            {TRACE_REDUCED_CHARGES, QString::number(charges.reduced)}};
     }
 #endif
 }

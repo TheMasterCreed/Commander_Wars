@@ -110,6 +110,17 @@ namespace Coordinator
         std::shared_ptr<const PackingDualCertificate> ourUpperCertificate;
     };
 
+    // Only a quote with an enemy lower above zero leads a proof into the enemy sequential replay.
+    inline bool entersEnemyReplay(const RelativeStockQuote & quote)
+    {
+        return quote.enemy.lower != 0;
+    }
+
+    inline bool entersEnemyReplay(const RelativeStockProofSnapshot & proof)
+    {
+        return entersEnemyReplay(proof.quote) || !proof.enemyWitness.empty();
+    }
+
     class RelativeStockSession
     {
     public:

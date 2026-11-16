@@ -115,6 +115,9 @@ namespace
         std::int64_t finalizationNanos{0};
         std::int64_t reservedWork{0};
         bool staleProbeApplied{false};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::optional<MasterWitnessCharges> witnessCharges;
+#endif
     };
 
     struct ControlContext
@@ -198,6 +201,12 @@ namespace
                 record.insert("relativeUpper", masterValueRecord(installed.proof->comparison.deltaUpper));
             }
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (attempt.witnessCharges)
+        {
+            record.insert(TRACE_WITNESS_CHARGES, masterWitnessChargesRecord(*attempt.witnessCharges));
+        }
+#endif
         return record;
     }
 
@@ -350,6 +359,9 @@ namespace
         }
         MasterAssignmentEvaluator evaluator(problem, context.ledger, *stock.session(), stock.tariffs(), &context.profile);
         searchAndInstall(context, attempt, problem, evaluator);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        attempt.witnessCharges = evaluator.witnessCharges();
+#endif
         return finishAttempt(context, attempt);
     }
 

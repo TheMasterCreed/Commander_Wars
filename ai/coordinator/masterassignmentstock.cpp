@@ -100,6 +100,7 @@ namespace Coordinator
         {
             return false;
         }
+        m_tariffs.witnessEnemyPart = enemy;
         auto admissionWork = m_tariffs.witness;
         if (!RelativeStockDetail::checkedAdd(admissionWork, m_tariffs.quote))
         {

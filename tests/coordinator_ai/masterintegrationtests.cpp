@@ -1790,6 +1790,118 @@ namespace
         }
     }
 
+    void witnessChargesFollowEnemyReplay()
+    {
+        constexpr std::int64_t LEDGER_WORK = 1000000;
+        constexpr std::int64_t ENEMY_ALLOWANCE = 4096;
+        constexpr MasterValuationTariffs tariffs{.quote = 32, .witness = 32, .witnessEnemyPart = 20};
+        constexpr auto WITNESS = static_cast<std::size_t>(RefinementWork::MasterWitness);
+        constexpr auto VALUATION = static_cast<std::size_t>(RefinementWork::MasterValuation);
+        const auto reduced = tariffs.witness - tariffs.witnessEnemyPart;
+        const auto fixture = stockInstallationFixture();
+        const auto problem = fixture.extract();
+        const auto reference = stockInstallationReference(problem);
+        const MasterAssignmentState incoming{problem.identity(), std::vector<std::int32_t>(
+            problem.incumbentChoices().begin(), problem.incumbentChoices().end())};
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        RefinementLedger ledger;
+        require(ledger.open(LEDGER_WORK), "witness charge ledger");
+        NativeStockSession session(field, enemy, reference.continuation.cases, ledger);
+        MasterAssignmentEvaluator evaluator(problem, ledger, session, tariffs);
+        auto start = ledger.stats();
+        const auto drawn = [&](std::size_t work) { return ledger.stats().grantedByWork[work] - start.grantedByWork[work]; };
+        const auto consumed = [&] { return ledger.stats().consumed - start.consumed; };
+        auto evaluated = evaluator.evaluate(incoming);
+        require(evaluated.proof && !entersEnemyReplay(*evaluated.proof), "the first quote has no enemy part");
+        expect(drawn(WITNESS) == reduced && drawn(VALUATION) == tariffs.quote,
+               "a quote whose enemy lower is zero draws the witness tariff without its enemy part");
+        const auto beforeRefinement = evaluated;
+        start = ledger.stats();
+        expect(evaluator.refresh(evaluated) && drawn(WITNESS) == 0, "a reused proof draws no witness charge");
+        auto refined = evaluated;
+        require(evaluator.refine(refined, MasterRefinementTerm::Enemy, ENEMY_ALLOWANCE) == MasterRefinementStatus::Updated &&
+                refined.quote()->enemy.lower > 0 && !refined.proof->enemyWitness.empty(),
+                "enemy refinement leaves an enemy lower above zero");
+        start = ledger.stats();
+        expect(evaluator.refresh(evaluated) && evaluated.quote()->enemy.lower > 0 && drawn(WITNESS) == tariffs.witness &&
+                   drawn(VALUATION) == tariffs.quote,
+               "a quote whose enemy lower is above zero draws the full witness tariff");
+        start = ledger.stats();
+        expect(evaluator.replayRetainedEvaluation(beforeRefinement) == MasterObjectiveStatus::Verified &&
+                   consumed() == reduced, "a retained proof without an enemy part is replayed at the reduced charge");
+        start = ledger.stats();
+        expect(evaluator.replayRetainedEvaluation(evaluated) == MasterObjectiveStatus::Verified &&
+                   consumed() == tariffs.witness, "a retained proof with an enemy lower is charged in full");
+        auto planted = beforeRefinement;
+        auto plantedProof = std::make_shared<RelativeStockProofSnapshot>(*beforeRefinement.proof);
+        plantedProof->enemyWitness = refined.proof->enemyWitness;
+        planted.proof = plantedProof;
+        start = ledger.stats();
+        evaluator.replayRetainedEvaluation(planted);
+        expect(consumed() == tariffs.witness, "an enemy witness beside a zero enemy lower is charged in full");
+
+        auto payload = static_cast<std::int64_t>(beforeRefinement.proof->cheapOurWitness.size() +
+                                                 beforeRefinement.proof->ourWitness.size());
+        for (const auto & row : beforeRefinement.proof->cheapOurWitness)
+        {
+            payload += static_cast<std::int64_t>(row.nodes.size());
+        }
+        for (const auto & row : beforeRefinement.proof->ourWitness)
+        {
+            payload += static_cast<std::int64_t>(row.steps.size());
+        }
+        require(payload > 0, "the retained proof carries a payload");
+        struct VariantOutcome
+        {
+            MasterObjectiveStatus evaluated{MasterObjectiveStatus::Unavailable};
+            bool finalization{false};
+            MasterObjectiveStatus retained{MasterObjectiveStatus::Unavailable};
+            MasterOperationStatus offered{MasterOperationStatus::Invalid};
+            MasterRefinementStatus adopted{MasterRefinementStatus::Invalid};
+            MasterRefinementStatus refined{MasterRefinementStatus::Invalid};
+        };
+        const auto variantOutcome = [&](const MasterValuationTariffs & variant)
+        {
+            RefinementLedger variantLedger;
+            require(variantLedger.open(LEDGER_WORK), "witness variant ledger");
+            NativeStockSession variantSession(field, enemy, reference.continuation.cases, variantLedger);
+            variantSession.operationServiceEnabled = true;
+            MasterAssignmentEvaluator seed(problem, variantLedger, variantSession, tariffs);
+            auto retained = seed.evaluate(incoming);
+            MasterAssignmentEvaluator checked(problem, variantLedger, variantSession, variant);
+            std::shared_ptr<const MasterOperationReadiness> readiness;
+            VariantOutcome outcome{.evaluated = checked.evaluate(incoming).objectiveStatus};
+            outcome.finalization = checked.finalizationWork().has_value();
+            outcome.retained = checked.replayRetainedEvaluation(retained);
+            outcome.offered = checked.operationOffer(retained, MasterRefinementTerm::Enemy, ENEMY_ALLOWANCE,
+                                                     readiness).status;
+            outcome.adopted = checked.adoptFriendlyWitness(retained, {}, retained.quote()->ours.lower + 1);
+            outcome.refined = checked.refine(retained, MasterRefinementTerm::Enemy, ENEMY_ALLOWANCE);
+            return outcome;
+        };
+        expect(variantOutcome({.quote = tariffs.quote, .witness = payload, .witnessEnemyPart = payload}).retained ==
+                   MasterObjectiveStatus::Verified, "a payload above the reduced charge still fits the full witness tariff");
+        const auto valid = variantOutcome(tariffs);
+        const auto negative = variantOutcome({.quote = tariffs.quote, .witness = -1});
+        require(valid.retained == MasterObjectiveStatus::Verified && valid.offered == MasterOperationStatus::Ready &&
+                valid.refined == MasterRefinementStatus::Updated && negative.finalization != valid.finalization &&
+                negative.retained != valid.retained && negative.offered != valid.offered &&
+                negative.refined != valid.refined, "valid tariffs reach every entry point a negative witness tariff fails");
+        for (const auto enemyPart : {std::int64_t{-1}, tariffs.witness + 1})
+        {
+            const auto outcome = variantOutcome(
+                {.quote = tariffs.quote, .witness = tariffs.witness, .witnessEnemyPart = enemyPart});
+            expect(outcome.evaluated == negative.evaluated && outcome.finalization == negative.finalization,
+                   "an invalid enemy part fails evaluation and finalization like a negative witness tariff");
+            expect(outcome.retained == negative.retained,
+                   "an invalid enemy part fails a retained replay like a negative witness tariff");
+            expect(outcome.offered == negative.offered && outcome.adopted == negative.adopted &&
+                       outcome.refined == negative.refined,
+                   "an invalid enemy part fails operations and refinements like a negative witness tariff");
+        }
+    }
+
     void observationalProfile()
     {
         Fixture fixture(2);
@@ -5783,6 +5895,7 @@ int main(int argc, char** argv)
     sharedTargetInstallation();
     stockInstallationAuthentication();
     stockFinalizationBudgets();
+    witnessChargesFollowEnemyReplay();
     ownedCertificateSerialization();
     observationalProfile();
     reservationFailureExport();

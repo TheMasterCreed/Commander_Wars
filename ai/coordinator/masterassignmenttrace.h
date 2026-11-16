@@ -99,5 +99,7 @@ namespace Coordinator
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     inline constexpr auto TRACE_LATER_LIST = "laterList";
     QJsonObject masterLaterListRecord(const LaterListMeasure & measure);
+    inline constexpr auto TRACE_WITNESS_CHARGES = "witnessCharges";
+    QJsonObject masterWitnessChargesRecord(const MasterWitnessCharges & charges);
 #endif
 }

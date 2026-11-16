@@ -117,7 +117,7 @@ namespace Coordinator
         result.enemy = enemy->bounds;
         result.enemySearchCompleted = enemy->searchCompleted;
         const auto enemyWitness = m_owner.m_refinedEnemyWitnesses.find(initial.capturedColumns);
-        result.enemyLowerWitnessReplays = result.enemy.lower == 0 ||
+        result.enemyLowerWitnessReplays = !entersEnemyReplay(result) ||
             (enemyWitness != m_owner.m_refinedEnemyWitnesses.end() && enemyWitness->second.replays &&
              enemyWitness->second.value == result.enemy.lower);
         result.valid = result.ourLowerWitnessReplays && RelativeStockDetail::canonical(result) &&
@@ -408,7 +408,7 @@ namespace Coordinator
         {
             return false;
         }
-        if (expected.enemy.lower == 0)
+        if (!entersEnemyReplay(expected))
         {
             return true;
         }
@@ -449,7 +449,7 @@ namespace Coordinator
             MasterProfileScope copyTiming(m_owner.m_masterProfile, MasterPhase::ProofCopy);
             proof->ourWitness = witness->second.rows;
         }
-        if (expected.enemy.lower != 0)
+        if (entersEnemyReplay(expected))
         {
             const auto witness = m_owner.m_refinedEnemyWitnesses.find(expected.capturedColumns);
             if (witness == m_owner.m_refinedEnemyWitnesses.end() || witness->second.value != expected.enemy.lower)
@@ -510,7 +510,7 @@ namespace Coordinator
         {
             return false;
         }
-        if (expected.enemy.lower == 0 && proof.enemyWitness.empty())
+        if (!entersEnemyReplay(proof))
         {
             return true;
         }

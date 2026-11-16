@@ -204,7 +204,7 @@ namespace Coordinator
     std::optional<std::int64_t> MasterAssignmentEvaluator::operationRequiredWork(
         const MasterOperationOffer & offer) const
     {
-        if (offer.allowance <= 0 || m_tariffs.quote < 0 || m_tariffs.witness < 0 ||
+        if (offer.allowance <= 0 || m_tariffs.quote < 0 || !witnessTariffValid() ||
             (offer.term != MasterRefinementTerm::Friendly && offer.term != MasterRefinementTerm::Enemy &&
              offer.term != MasterRefinementTerm::FutureDual))
         {
@@ -681,6 +681,31 @@ namespace Coordinator
         return true;
     }
 
+    bool MasterAssignmentEvaluator::witnessTariffValid() const
+    {
+        return m_tariffs.witness >= 0 && m_tariffs.witnessEnemyPart >= 0 &&
+            m_tariffs.witnessEnemyPart <= m_tariffs.witness;
+    }
+
+    std::int64_t MasterAssignmentEvaluator::witnessCharge(bool enemyReplay) const
+    {
+        return enemyReplay ? m_tariffs.witness : m_tariffs.witness - m_tariffs.witnessEnemyPart;
+    }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    void MasterAssignmentEvaluator::noteWitnessCharge(std::int64_t amount)
+    {
+        ++(amount < m_tariffs.witness ? m_witnessCharges.reduced : m_witnessCharges.full);
+    }
+
+    MasterWitnessCharges MasterAssignmentEvaluator::witnessCharges() const
+    {
+        auto result = m_witnessCharges;
+        result.enemyPart = m_tariffs.witnessEnemyPart;
+        return result;
+    }
+#endif
+
     MasterObjectiveStatus MasterAssignmentEvaluator::replayRetainedEvaluation(
         const MasterAssignmentEvaluation & evaluation)
     {
@@ -692,14 +717,18 @@ namespace Coordinator
         {
             return MasterObjectiveStatus::Verified;
         }
-        if (m_tariffs.witness < 0 || m_ledger.balance() != m_session->remainingWork())
+        if (!witnessTariffValid() || m_ledger.balance() != m_session->remainingWork())
         {
             return MasterObjectiveStatus::InvalidIdentity;
         }
-        if (!m_ledger.consume(m_tariffs.witness, RefinementWork::MasterWitness))
+        const auto charge = witnessCharge(entersEnemyReplay(*evaluation.proof));
+        if (!m_ledger.consume(charge, RefinementWork::MasterWitness))
         {
             return MasterObjectiveStatus::BudgetExhausted;
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        noteWitnessCharge(charge);
+#endif
         MasterProfileScope timing(m_profile, MasterPhase::LowerWitness);
         if (!retainedWitnessFits(*evaluation.proof, m_tariffs.witness) ||
             !m_session->replayLowerProof(*evaluation.proof))
@@ -741,7 +770,7 @@ namespace Coordinator
     std::optional<std::int64_t> MasterAssignmentEvaluator::finalizationWork()
     {
         if (!m_problemIdentity.sameLiveProblem(m_problem.identity()) ||
-            (m_session != nullptr && (m_tariffs.quote < 0 || m_tariffs.witness < 0 ||
+            (m_session != nullptr && (m_tariffs.quote < 0 || !witnessTariffValid() ||
                                      m_session->remainingWork() != m_ledger.balance())) ||
             !chargeMasterWork(m_ledger, m_problem.actors().size() + 1, 1, RefinementWork::MasterReplay))
         {
@@ -925,7 +954,7 @@ namespace Coordinator
             evaluation.exact = true;
             return true;
         }
-        if (m_tariffs.quote < 0 || m_tariffs.witness < 0 ||
+        if (m_tariffs.quote < 0 || !witnessTariffValid() ||
             m_ledger.balance() != m_session->remainingWork())
         {
             evaluation.objectiveStatus = MasterObjectiveStatus::InvalidIdentity;
@@ -948,11 +977,15 @@ namespace Coordinator
         if (!proof || !evaluation.lowerReplayed || !evaluation.upperVerified ||
             !sameRelativeStockQuote(proof->quote, quote))
         {
-            if (m_ledger.draw(m_tariffs.witness, RefinementWork::MasterWitness) == NO_GRANT)
+            const auto charge = witnessCharge(entersEnemyReplay(quote));
+            if (m_ledger.draw(charge, RefinementWork::MasterWitness) == NO_GRANT)
             {
                 evaluation.objectiveStatus = MasterObjectiveStatus::BudgetExhausted;
                 return false;
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            noteWitnessCharge(charge);
+#endif
             MasterProfileScope witnessTiming(m_profile, MasterPhase::LowerWitness);
             proof = m_session->captureProof(quote);
             if (!proof || !sameRelativeStockQuote(proof->quote, quote) || !m_session->replayLowerProof(*proof))
@@ -1054,7 +1087,7 @@ namespace Coordinator
     std::optional<std::int64_t> MasterAssignmentEvaluator::rerunTotal(std::int64_t tariff, std::int64_t allowance) const
     {
         auto total = allowance;
-        if (tariff < 0 || m_tariffs.quote < 0 || m_tariffs.witness < 0 ||
+        if (tariff < 0 || m_tariffs.quote < 0 || !witnessTariffValid() ||
             !RelativeStockDetail::checkedAdd(total, tariff) ||
             !RelativeStockDetail::checkedAdd(total, m_tariffs.quote) ||
             !RelativeStockDetail::checkedAdd(total, m_tariffs.witness) ||
@@ -1082,7 +1115,7 @@ namespace Coordinator
             return MasterRefinementStatus::Unavailable;
         }
         auto overhead = m_tariffs.quote;
-        if (overhead < 0 || m_tariffs.witness < 0 ||
+        if (overhead < 0 || !witnessTariffValid() ||
             !RelativeStockDetail::checkedAdd(overhead, m_tariffs.witness))
         {
             return MasterRefinementStatus::Invalid;
