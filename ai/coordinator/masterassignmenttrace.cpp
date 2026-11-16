@@ -44,6 +44,127 @@ namespace
     constexpr auto TRACE_INCUMBENT_OURS_CAP = "incumbentOursCap";
     constexpr auto TRACE_CHALLENGER_OURS_CAP = "challengerOursCap";
     constexpr auto TRACE_FOLLOWS = "follows";
+    constexpr auto TRACE_GATE = "gate";
+    constexpr auto TRACE_WITNESS_WORK = "witnessWork";
+    constexpr auto TRACE_ACTIONS = "actions";
+    constexpr auto TRACE_NODES = "nodes";
+    constexpr auto TRACE_HORIZON = "horizon";
+    constexpr auto TRACE_PREPARATION_WORK = "preparationWork";
+    constexpr auto TRACE_MODEL = "model";
+    constexpr auto TRACE_INCUMBENT = "incumbent";
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    constexpr auto TRACE_DIAGNOSTICS = "diagnostics";
+    constexpr auto TRACE_ROUND_LIMIT = "roundLimit";
+    constexpr auto TRACE_MAXIMUM_WORK = "maximumWork";
+    constexpr auto TRACE_WITNESS_BUILD_WORK = "witnessBuildWork";
+    constexpr auto TRACE_STOPPED_ON_TARGET = "stoppedOnTarget";
+    constexpr auto TRACE_CEILING = "ceiling";
+    constexpr auto TRACE_FLOOR = "floor";
+    constexpr auto TRACE_PRICING_WORK = "pricingWork";
+    constexpr auto TRACE_WITNESS_STATS = "witnessStats";
+    constexpr auto TRACE_BUILDS = "builds";
+    constexpr auto TRACE_ABANDONED_BUILDS = "abandonedBuilds";
+    constexpr auto TRACE_RESPONSES = "responses";
+    constexpr auto TRACE_SKIPPED_RESPONSES = "skippedResponses";
+    constexpr auto TRACE_TIE_SWITCHES = "tieSwitches";
+    constexpr auto TRACE_SKIP_VIOLATIONS = "skipViolations";
+    constexpr auto TRACE_STATES = "states";
+    constexpr auto TRACE_TABLES = "tables";
+    constexpr auto TRACE_TABLE_WORK = "tableWork";
+    constexpr auto TRACE_PICK_SEARCH_WORK = "pickSearchWork";
+    constexpr auto TRACE_POLISH_SEARCH_WORK = "polishSearchWork";
+    constexpr auto TRACE_SEATS = "seats";
+    constexpr auto TRACE_OPTIONS = "options";
+    constexpr auto TRACE_CLASSES = "classes";
+    constexpr auto TRACE_PER_CLASS = "perClass";
+    constexpr auto TRACE_DAY_ROWS = "dayRows";
+    constexpr auto TRACE_ACTION_ROWS = "actionRows";
+    constexpr auto TRACE_ENTRY_BALANCE = "entryBalance";
+    constexpr auto TRACE_INSTALLATION_RESERVED = "installationReserved";
+    constexpr auto TRACE_ADAPTER_BALANCE = "adapterBalance";
+    constexpr auto TRACE_WITNESS_VALID = "witnessValid";
+    constexpr auto TRACE_CONVERTED = "converted";
+    constexpr auto TRACE_SAME_CHOICES = "sameChoices";
+    constexpr auto TRACE_RESERVE_BALANCE = "reserveBalance";
+    constexpr auto TRACE_RESERVE_REQUIRED = "reserveRequired";
+    constexpr auto TRACE_FRIENDLY_VALUE = "friendlyValue";
+    constexpr auto TRACE_OURS_LOWER_BEFORE = "oursLowerBefore";
+    constexpr auto TRACE_OURS_LOWER_AFTER = "oursLowerAfter";
+    constexpr auto TRACE_INCUMBENT_STATUS = "incumbentStatus";
+
+    QJsonObject planWitnessStatsRecord(const Coordinator::MasterPlanWitnessStats & stats)
+    {
+        return {{TRACE_BUILDS, QString::number(stats.builds)},
+            {TRACE_ABANDONED_BUILDS, QString::number(stats.abandonedBuilds)},
+            {TRACE_RESPONSES, QString::number(stats.responses)},
+            {TRACE_SKIPPED_RESPONSES, QString::number(stats.skippedResponses)},
+            {TRACE_TIE_SWITCHES, QString::number(stats.tieSwitches)},
+            {TRACE_SKIP_VIOLATIONS, QString::number(stats.skipViolations)},
+            {TRACE_STATES, QString::number(stats.states)}, {TRACE_TABLES, QString::number(stats.tables)},
+            {TRACE_TABLE_WORK, QString::number(stats.tableWork)},
+            {TRACE_PICK_SEARCH_WORK, QString::number(stats.pickSearchWork)},
+            {TRACE_POLISH_SEARCH_WORK, QString::number(stats.polishSearchWork)}};
+    }
+
+    QJsonValue planTuningRecord(const std::optional<Coordinator::MasterPlanTuningDiagnostics> & tuning)
+    {
+        if (!tuning)
+        {
+            return {};
+        }
+        return QJsonObject{{TRACE_ROUND_LIMIT, tuning->limits.rounds},
+            {TRACE_MAXIMUM_WORK, QString::number(tuning->limits.maximumWork)},
+            {TRACE_WITNESS_BUILD_WORK, QString::number(tuning->limits.witnessBuildWork)},
+            {TRACE_STATUS,
+             QLatin1String(Coordinator::MASTER_PLAN_PRICING_STATUS_NAMES[static_cast<std::size_t>(tuning->status)])},
+            {TRACE_ROUNDS, tuning->rounds}, {TRACE_STOPPED_ON_TARGET, tuning->stoppedOnTarget},
+            {TRACE_CEILING, QString::number(tuning->ceiling)},
+            {TRACE_FLOOR, Coordinator::masterValueRecord(tuning->floor)},
+            {TRACE_PRICING_WORK, QString::number(tuning->pricingWork)},
+            {TRACE_WITNESS_WORK, QString::number(tuning->witnessWork)},
+            {TRACE_WITNESS_STATS, planWitnessStatsRecord(tuning->witnessStats)}};
+    }
+
+    QJsonValue planModelRecord(const std::optional<Coordinator::MasterPlanModelDiagnostics> & model)
+    {
+        if (!model)
+        {
+            return {};
+        }
+        QJsonArray perClass;
+        for (const auto & entry : model->perClass)
+        {
+            perClass.append(QJsonObject{{TRACE_NODES, entry.nodes},
+                {TRACE_DAY_ROWS, QString::number(entry.dayRows)},
+                {TRACE_ACTION_ROWS, QString::number(entry.actionRows)}});
+        }
+        return QJsonObject{{TRACE_SEATS, QString::number(model->seats)},
+            {TRACE_OPTIONS, QString::number(model->options)}, {TRACE_ACTIONS, QString::number(model->actions)},
+            {TRACE_NODES, QString::number(model->nodes)}, {TRACE_CLASSES, QString::number(model->classes)},
+            {TRACE_HORIZON, model->horizon}, {TRACE_PER_CLASS, perClass}};
+    }
+
+    QJsonObject planDiagnosticsRecord(const Coordinator::MasterPlanPricingDiagnostics & diagnostics)
+    {
+        return {{TRACE_ENTRY_BALANCE, QString::number(diagnostics.entryBalance)},
+            {TRACE_PREPARATION_WORK, QString::number(diagnostics.preparationWork)},
+            {TRACE_INSTALLATION_RESERVED, QString::number(diagnostics.installationReserved)},
+            {TRACE_ADAPTER_BALANCE, Coordinator::masterValueRecord(diagnostics.adapterBalance)},
+            {TRACE_MODEL, planModelRecord(diagnostics.model)},
+            {TRACE_CHALLENGER, planTuningRecord(diagnostics.challenger)},
+            {TRACE_WITNESS_VALID, diagnostics.witnessValid},
+            {TRACE_WITNESS_VALUE, Coordinator::masterValueRecord(diagnostics.witnessValue)},
+            {TRACE_CONVERTED, diagnostics.converted}, {TRACE_SAME_CHOICES, diagnostics.sameChoices},
+            {TRACE_RESERVE_BALANCE, Coordinator::masterValueRecord(diagnostics.reserveBalance)},
+            {TRACE_RESERVE_REQUIRED, Coordinator::masterValueRecord(diagnostics.reserveRequired)},
+            {TRACE_FRIENDLY_VALUE, Coordinator::masterValueRecord(diagnostics.friendlyValue)},
+            {TRACE_OURS_LOWER_BEFORE, Coordinator::masterValueRecord(diagnostics.oursLowerBefore)},
+            {TRACE_OURS_LOWER_AFTER, Coordinator::masterValueRecord(diagnostics.oursLowerAfter)},
+            {TRACE_INCUMBENT_STATUS, diagnostics.incumbentStatus != nullptr
+                ? QJsonValue(QLatin1String(diagnostics.incumbentStatus)) : QJsonValue()},
+            {TRACE_INCUMBENT, planTuningRecord(diagnostics.incumbent)}};
+    }
+#endif
 
     QJsonObject planBoundCapRecord(const Coordinator::MasterPlanBoundCapStats & cap)
     {
@@ -153,7 +274,7 @@ namespace
             {TRACE_ALLOWANCE, QString::number(offer.allowance)},
             {"remainingRequiredWork", QString::number(offer.remainingRequiredWork)},
             {"inspectionWork", QString::number(offer.inspectionWork)},
-            {"preparationWork", QString::number(offer.preparationWork)},
+            {TRACE_PREPARATION_WORK, QString::number(offer.preparationWork)},
             {"quotaWork", QString::number(offer.quotaWork)},
             {"metadata", QJsonObject{{"valid", metadata.valid},
                 {TRACE_ROW_REVISION, QString::number(metadata.rowCacheRevision)},
@@ -292,7 +413,7 @@ namespace
         return {{"session", QString::number(identity.session)}, {"immutableField", packingFieldRecord(identity.immutableField)},
             {"key", keyRecord(identity.key)}, {"capturedColumns", Coordinator::masterChoicesRecord(identity.capturedColumns)},
             {"rowDomains", rowDomains}, {"nodeColumns", stockColumnsRecord(identity.nodeColumns)},
-            {"usedNodes", QJsonObject{{"nodeCount", identity.usedNodes.nodeCount()}, {"nodes", usedNodes}}},
+            {"usedNodes", QJsonObject{{"nodeCount", identity.usedNodes.nodeCount()}, {TRACE_NODES, usedNodes}}},
             {"economic", QString::number(identity.economic)}, {"owned", QString::number(identity.owned)},
             {"incumbentFloor", QString::number(identity.incumbentFloor)}, {"fixedValue", QString::number(identity.fixedValue)}};
     }
@@ -330,7 +451,7 @@ namespace Coordinator
         : m_output(path),
           m_ledger(ledger),
           m_identity{{"day", identity.day}, {"player", identity.playerId},
-              {"planSequence", QString::number(identity.planSequence)}, {"horizon", identity.horizonTurns}}
+              {"planSequence", QString::number(identity.planSequence)}, {TRACE_HORIZON, identity.horizonTurns}}
     {
         m_identity.insert("attempt", attempt);
         m_timer.start();
@@ -339,7 +460,7 @@ namespace Coordinator
             failed();
         }
         write(Event::Begin, ledger.stats().spent(), {{"schemaVersion", 1},
-            {"model", masterModelRecord(problem)}, {"reservedWork", QString::number(reservedWork)},
+            {TRACE_MODEL, masterModelRecord(problem)}, {"reservedWork", QString::number(reservedWork)},
             {"initialChoices", masterChoicesRecord(problem.incumbentChoices())},
             {"ledger", masterWorkRecord(ledger.stats())}});
     }
@@ -838,8 +959,9 @@ namespace Coordinator
             const auto & pricing = result.stats.planPricing;
             QJsonObject planPricing{{TRACE_ROUNDS, result.schedule.planPricingRounds},
                 {TRACE_WORK, QString::number(result.schedule.planPricingWork)},
-                {"witnessWork", QString::number(result.schedule.planPricingWitnessWork)},
+                {TRACE_WITNESS_WORK, QString::number(result.schedule.planPricingWitnessWork)},
                 {"outcome", static_cast<int>(pricing.outcome)},
+                {TRACE_GATE, QLatin1String(MASTER_PLAN_PRICING_GATE_NAMES[static_cast<std::size_t>(pricing.gate)])},
                 {"adapterWork", QString::number(pricing.adapterWork)},
                 {"restrictionWork", QString::number(pricing.restrictionWork)},
                 {"challengerRounds", pricing.challengerRounds},
@@ -856,6 +978,9 @@ namespace Coordinator
             {
                 planPricing.insert(TRACE_NEIGHBOR_AUDIT, planNeighborAuditRecord(*pricing.neighborAudit));
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            planPricing.insert(TRACE_DIAGNOSTICS, planDiagnosticsRecord(pricing.diagnostics));
+#endif
             record.insert(TRACE_PLAN_PRICING, planPricing);
         }
         const auto work = masterWorkRecord(result.stats.work);
@@ -903,7 +1028,7 @@ namespace Coordinator
             actors.append(QJsonObject{
                 {"actor", actor.engineUnitId}, {"knowledgeIndex", actor.knowledgeUnitIndex},
                 {TRACE_SLOT, actor.canonicalSlot}, {"role", static_cast<int>(actor.role)}, {"mutable", changeable},
-                {"stockRow", actor.stockRow}, {"incumbent", actor.incumbentCandidateIndex},
+                {"stockRow", actor.stockRow}, {TRACE_INCUMBENT, actor.incumbentCandidateIndex},
                 {"canonicalCandidates", masterChoicesRecord(actor.canonicalCandidates)}, {"candidates", candidates}});
         }
         return {{"actors", actors}, {"actorCount", static_cast<qint64>(problem.actors().size())},
@@ -936,7 +1061,7 @@ namespace Coordinator
         }
         QJsonObject record{
             {"choices", masterChoicesRecord(evaluation.state.choices)}, {"status", static_cast<int>(evaluation.status)},
-            {"objectiveStatus", static_cast<int>(evaluation.objectiveStatus)}, {"actions", actions},
+            {"objectiveStatus", static_cast<int>(evaluation.objectiveStatus)}, {TRACE_ACTIONS, actions},
             {"seatedEconomic", masterValueRecord(evaluation.replay
                 ? std::optional<MilliFunds>{evaluation.replay->seatedEconomicTotal} : std::nullopt)},
             {"lowerReplayed", evaluation.lowerReplayed}, {"upperVerified", evaluation.upperVerified},
@@ -962,7 +1087,7 @@ namespace Coordinator
             QJsonArray cheapWitness;
             for (const auto & row : proof.cheapOurWitness)
             {
-                cheapWitness.append(QJsonObject{{"row", row.row}, {"nodes", masterChoicesRecord(row.nodes)},
+                cheapWitness.append(QJsonObject{{"row", row.row}, {TRACE_NODES, masterChoicesRecord(row.nodes)},
                     {"value", QString::number(row.value)}});
             }
             QJsonObject quoted{

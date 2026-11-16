@@ -2,6 +2,11 @@
 
 #include "ai/coordinator/masterassignmentbounds.h"
 #include "ai/coordinator/masterassignmentevaluator.h"
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+#include "ai/coordinator/masterplanpricing.h"
+#endif
+
+#include <array>
 
 namespace Coordinator
 {
@@ -179,6 +184,100 @@ namespace Coordinator
         ValuerFailure,
     };
 
+    enum class MasterPlanPricingGate : std::int8_t
+    {
+        NotReached,
+        ZeroRounds,
+        NoStockModel,
+        NoCatalog,
+        GuardedStock,
+        BoundsNotReady,
+        IncumbentNotFeasible,
+        IncumbentUnquoted,
+        NoChallengerAllowance,
+        AdapterRefused,
+        NoValidWitness,
+        ConversionEmpty,
+        SameChoicesAsIncumbent,
+        ReserveOverflow,
+        ReserveTooSmall,
+        LookupOutOfBudget,
+        EvaluationOutOfBudget,
+        ChallengerInfeasible,
+        ChallengerUnquoted,
+        NoFriendlyWitness,
+        Adopted,
+        AdoptionDeclined,
+        AdoptionOutOfBudget,
+        ValuerFailure,
+        DeferralFailed,
+        FirstComparisonFailed,
+        IncumbentCapFailed,
+    };
+
+    inline constexpr std::array MASTER_PLAN_PRICING_GATE_NAMES{
+        "NOT_REACHED", "ZERO_ROUNDS", "NO_STOCK_MODEL", "NO_CATALOG", "GUARDED_STOCK", "BOUNDS_NOT_READY",
+        "INCUMBENT_NOT_FEASIBLE", "INCUMBENT_UNQUOTED", "NO_CHALLENGER_ALLOWANCE", "ADAPTER_REFUSED",
+        "NO_VALID_WITNESS", "CONVERSION_EMPTY", "SAME_CHOICES_AS_INCUMBENT", "RESERVE_OVERFLOW", "RESERVE_TOO_SMALL",
+        "LOOKUP_OUT_OF_BUDGET", "EVALUATION_OUT_OF_BUDGET", "CHALLENGER_INFEASIBLE", "CHALLENGER_UNQUOTED",
+        "NO_FRIENDLY_WITNESS", "ADOPTED", "ADOPTION_DECLINED", "ADOPTION_OUT_OF_BUDGET", "VALUER_FAILURE",
+        "DEFERRAL_FAILED", "FIRST_COMPARISON_FAILED", "INCUMBENT_CAP_FAILED",
+    };
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct MasterPlanTuningDiagnostics
+    {
+        MasterPlanPricingLimits limits;
+        MasterPlanPricingStatus status{MasterPlanPricingStatus::Unavailable};
+        std::int32_t rounds{0};
+        bool stoppedOnTarget{false};
+        MilliFunds ceiling{0};
+        std::optional<MilliFunds> floor;
+        std::int64_t pricingWork{0};
+        std::int64_t witnessWork{0};
+        MasterPlanWitnessStats witnessStats;
+    };
+
+    struct MasterPlanClassDiagnostics
+    {
+        std::int32_t nodes{0};
+        std::int64_t dayRows{0};
+        std::int64_t actionRows{0};
+    };
+
+    struct MasterPlanModelDiagnostics
+    {
+        std::size_t seats{0};
+        std::size_t options{0};
+        std::size_t actions{0};
+        std::size_t nodes{0};
+        std::size_t classes{0};
+        std::int32_t horizon{0};
+        std::vector<MasterPlanClassDiagnostics> perClass;
+    };
+
+    struct MasterPlanPricingDiagnostics
+    {
+        std::int64_t entryBalance{0};
+        std::int64_t preparationWork{0};
+        std::int64_t installationReserved{0};
+        std::optional<std::int64_t> adapterBalance;
+        std::optional<MasterPlanModelDiagnostics> model;
+        std::optional<MasterPlanTuningDiagnostics> challenger;
+        bool witnessValid{false};
+        std::optional<MilliFunds> witnessValue;
+        bool converted{false};
+        bool sameChoices{false};
+        std::optional<std::int64_t> reserveBalance;
+        std::optional<std::int64_t> reserveRequired;
+        std::optional<MilliFunds> friendlyValue;
+        std::optional<MilliFunds> oursLowerBefore;
+        std::optional<MilliFunds> oursLowerAfter;
+        const char* incumbentStatus{nullptr};
+        std::optional<MasterPlanTuningDiagnostics> incumbent;
+    };
+#endif
+
     enum class MasterPlanBoundCapStatus : std::int8_t
     {
         NotAttempted,
@@ -263,6 +362,7 @@ namespace Coordinator
     struct MasterPlanPricingStats
     {
         MasterPlanPricingOutcome outcome{MasterPlanPricingOutcome::Disabled};
+        MasterPlanPricingGate gate{MasterPlanPricingGate::NotReached};
         std::int64_t adapterWork{0};
         std::int64_t restrictionWork{0};
         std::int32_t challengerRounds{0};
@@ -274,6 +374,9 @@ namespace Coordinator
         bool firstComparisonImproved{false};
         std::optional<MasterPlanBoundCapStats> boundCap;
         std::optional<MasterPlanNeighborAuditStats> neighborAudit;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MasterPlanPricingDiagnostics diagnostics;
+#endif
     };
 
     struct MasterAssignmentSearchStats

@@ -4012,6 +4012,7 @@ namespace
         MasterAssignmentOracle::Request reference;
         std::optional<MilliFunds> optimum;
         MasterPlanPricingOutcome seededOutcome{MasterPlanPricingOutcome::Seeded};
+        MasterPlanPricingGate seededGate{MasterPlanPricingGate::Adopted};
     };
 
     struct PlanPricingRun
@@ -4109,6 +4110,7 @@ namespace
                 }));
             // The capture plan's witness is no better than its cheap lower, so the session declines it.
             result.back().seededOutcome = MasterPlanPricingOutcome::WitnessDeclined;
+            result.back().seededGate = MasterPlanPricingGate::AdoptionDeclined;
         }
         {
             Fixture fixture(LARGE_ACTORS);
@@ -4437,7 +4439,8 @@ namespace
                 const auto defaults = runPlanPricing(test, unrounded);
                 const auto unset = runPlanPricing(test, allocationSchedule(allocation));
                 expect(plain.record == unset.record && !plain.record.contains(QStringLiteral("planPricing")) &&
-                           plain.result.stats.planPricing.outcome == MasterPlanPricingOutcome::Disabled,
+                           plain.result.stats.planPricing.outcome == MasterPlanPricingOutcome::Disabled &&
+                           plain.result.stats.planPricing.gate == MasterPlanPricingGate::ZeroRounds,
                        "zero rounds is byte-identical to an unset pre-pass");
                 expect(defaults.result.stats.work == plain.result.stats.work &&
                            defaults.result.lower == plain.result.lower && defaults.result.upper == plain.result.upper,
@@ -4450,7 +4453,8 @@ namespace
                        "funded searches report both bounds");
                 expect(seeded.record == repeat.record, "two seeded searches export identical records");
                 const auto & seededPricing = seeded.result.stats.planPricing;
-                expect(seededPricing.outcome == test.seededOutcome && seededPricing.adapterWork > 0 &&
+                expect(seededPricing.outcome == test.seededOutcome && seededPricing.gate == test.seededGate &&
+                           seededPricing.adapterWork > 0 &&
                            seededPricing.challengerWork > 0 && seededPricing.hintStored &&
                            seededPricing.adoptedValue.has_value() ==
                                (test.seededOutcome == MasterPlanPricingOutcome::Seeded),
@@ -4484,7 +4488,8 @@ namespace
                                                         PLAN_PRICING_TEST_LEDGER, FriendlySearch::Deferred);
                 checkPlanPricingSoundness(test, loosePlain);
                 checkPlanPricingSoundness(test, looseSeeded);
-                expect(looseSeeded.result.stats.planPricing.outcome == test.seededOutcome,
+                expect(looseSeeded.result.stats.planPricing.outcome == test.seededOutcome &&
+                           looseSeeded.result.stats.planPricing.gate == test.seededGate,
                        "a loose seeded search reaches its expected pre-pass outcome");
                 expect(looseSeeded.refusals == loosePlain.refusals && noWorse(looseSeeded, loosePlain),
                        "a seeded loose search records no extra refusal and loses no bound");
@@ -4516,23 +4521,27 @@ namespace
                     MasterAssignmentSchedule schedule;
                     std::int64_t allowance;
                     MasterPlanPricingOutcome expected;
+                    MasterPlanPricingGate gate;
                 };
                 for (const auto & limited : {
                          Limited{"tiny work", planPricingSchedule(allocation, PLAN_PRICING_TEST_ROUNDS, 2),
-                                 PLAN_PRICING_TEST_LEDGER, MasterPlanPricingOutcome::NoChallenger},
+                                 PLAN_PRICING_TEST_LEDGER, MasterPlanPricingOutcome::NoChallenger,
+                                 MasterPlanPricingGate::NoValidWitness},
                          Limited{"tiny witness work", planPricingSchedule(allocation, PLAN_PRICING_TEST_ROUNDS,
                                                                           PLAN_PRICING_TEST_WORK, 1),
-                                 PLAN_PRICING_TEST_LEDGER, MasterPlanPricingOutcome::NoChallenger},
+                                 PLAN_PRICING_TEST_LEDGER, MasterPlanPricingOutcome::NoChallenger,
+                                 MasterPlanPricingGate::NoValidWitness},
                          Limited{"tiny ledger", planPricingSchedule(allocation, PLAN_PRICING_TEST_ROUNDS),
                                  PLAN_PRICING_TEST_WORK / MASTER_PLAN_PRICING_CHALLENGER_SHARE - 1,
-                                 MasterPlanPricingOutcome::Unavailable}})
+                                 MasterPlanPricingOutcome::Unavailable, MasterPlanPricingGate::AdapterRefused}})
                 {
                     const auto bounded = runPlanPricing(test, limited.schedule, limited.allowance);
                     const auto reference = limited.allowance == PLAN_PRICING_TEST_LEDGER
                         ? plain : runPlanPricing(test, planPricingSchedule(allocation, 0), limited.allowance);
                     checkPlanPricingSoundness(test, bounded);
                     const auto & pricing = bounded.result.stats.planPricing;
-                    expect(pricing.outcome == limited.expected && !pricing.adoptedValue &&
+                    expect(pricing.outcome == limited.expected && pricing.gate == limited.gate &&
+                               !pricing.adoptedValue &&
                                (limited.expected != MasterPlanPricingOutcome::Unavailable ||
                                 (pricing.adapterWork == 0 && pricing.challengerWork == 0 && !pricing.hintStored)),
                            "a starved pre-pass stops at its expected gate without adopting");

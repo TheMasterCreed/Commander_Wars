@@ -108,6 +108,44 @@ namespace
         return left && right ? std::min(*left, *right) : left ? left : right;
     }
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    MasterPlanModelDiagnostics planModelDiagnostics(const MasterPlanPricingModel & model)
+    {
+        const auto & catalog = model.catalog;
+        MasterPlanModelDiagnostics result{.seats = model.rowActors.size(), .actions = catalog.actions.size(),
+                                          .nodes = catalog.columns.size(), .classes = catalog.classes.size(),
+                                          .horizon = catalog.horizon};
+        for (const auto & actor : model.actors)
+        {
+            result.options += actor.candidates.size();
+        }
+        for (const auto & table : catalog.classes)
+        {
+            result.perClass.push_back({.nodes = table.nodeCount()});
+        }
+        const auto classOf = [&result](const SequentialRow & row) -> MasterPlanClassDiagnostics*
+        {
+            const auto index = static_cast<std::size_t>(row.classIndex);
+            return row.classIndex < 0 || index >= result.perClass.size() ? nullptr : &result.perClass[index];
+        };
+        for (const auto & row : catalog.dayRows)
+        {
+            if (auto* entry = classOf(row))
+            {
+                ++entry->dayRows;
+            }
+        }
+        for (const auto & action : catalog.actions)
+        {
+            if (auto* entry = classOf(action.row))
+            {
+                ++entry->actionRows;
+            }
+        }
+        return result;
+    }
+#endif
+
     class Search final
     {
     public:
@@ -393,12 +431,61 @@ namespace
             return true;
         }
 
+        // Order matters: the first failing condition names the gate, and later ones are not evaluated.
+        std::optional<MasterPlanPricingGate> planPricingEntryGate(const CheapPricingModel* stock,
+                                                                  const MasterFutureCatalog* catalog,
+                                                                  std::int64_t challengerLimit) const
+        {
+            if (stock == nullptr)
+            {
+                return MasterPlanPricingGate::NoStockModel;
+            }
+            if (catalog == nullptr)
+            {
+                return MasterPlanPricingGate::NoCatalog;
+            }
+            if (m_evaluator.hasGuardedStock())
+            {
+                return MasterPlanPricingGate::GuardedStock;
+            }
+            if (!m_bounds.ready())
+            {
+                return MasterPlanPricingGate::BoundsNotReady;
+            }
+            if (m_incumbent->status != MasterEvaluationStatus::Feasible)
+            {
+                return MasterPlanPricingGate::IncumbentNotFeasible;
+            }
+            if (m_incumbent->quote() == nullptr)
+            {
+                return MasterPlanPricingGate::IncumbentUnquoted;
+            }
+            if (challengerLimit <= 0)
+            {
+                return MasterPlanPricingGate::NoChallengerAllowance;
+            }
+            return std::nullopt;
+        }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MasterPlanTuningDiagnostics planTuningDiagnostics(const MasterPlanPricingResult & priced,
+                                                          std::int64_t maximumWork) const
+        {
+            return {.limits = {.rounds = m_options.schedule.planPricingRounds, .maximumWork = maximumWork,
+                               .witnessBuildWork = m_options.schedule.planPricingWitnessWork},
+                    .status = priced.status, .rounds = priced.rounds, .stoppedOnTarget = priced.stoppedOnTarget,
+                    .ceiling = priced.ceiling, .floor = priced.floor, .pricingWork = priced.pricingWork,
+                    .witnessWork = priced.witnessWork, .witnessStats = priced.witnessStats};
+        }
+#endif
+
         bool seedFromPlanPricing()
         {
             const auto & schedule = m_options.schedule;
             auto & stats = m_result.stats.planPricing;
             if (schedule.planPricingRounds == 0)
             {
+                stats.gate = MasterPlanPricingGate::ZeroRounds;
                 return true;
             }
             if (schedule.planBoundCap == MasterPlanBoundCap::Verified)
@@ -410,19 +497,34 @@ namespace
             const auto* catalog = m_evaluator.futureCatalog();
             const auto challengerLimit = schedule.planPricingWork / MASTER_PLAN_PRICING_CHALLENGER_SHARE;
             const auto preparationWork = m_ledger.stats().spent() - m_workBefore;
-            if (stock == nullptr || catalog == nullptr || m_evaluator.hasGuardedStock() || !m_bounds.ready() ||
-                m_incumbent->status != MasterEvaluationStatus::Feasible || m_incumbent->quote() == nullptr ||
-                challengerLimit <= 0)
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            auto & diagnostics = stats.diagnostics;
+            const auto & ledgerStats = m_ledger.stats();
+            constexpr auto INSTALLATION = static_cast<std::size_t>(RefinementWork::MasterInstallation);
+            diagnostics.entryBalance = m_ledger.balance();
+            diagnostics.preparationWork = preparationWork;
+            diagnostics.installationReserved =
+                ledgerStats.grantedByWork[INSTALLATION] - ledgerStats.refundedByWork[INSTALLATION];
+#endif
+            if (const auto failed = planPricingEntryGate(stock, catalog, challengerLimit))
             {
+                stats.gate = *failed;
                 return true;
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            diagnostics.adapterBalance = m_ledger.balance();
+#endif
             const auto adapterStart = m_ledger.stats().spent();
             const auto instance = buildMasterPlanPricingInstance(m_problem, *stock, *catalog, m_ledger, challengerLimit);
             stats.adapterWork = m_ledger.stats().spent() - adapterStart;
             if (!instance)
             {
+                stats.gate = MasterPlanPricingGate::AdapterRefused;
                 return true;
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            diagnostics.model = planModelDiagnostics(instance->model);
+#endif
             stats.outcome = MasterPlanPricingOutcome::NoChallenger;
             const auto challengerStart = m_ledger.stats().spent();
             const auto priced = tuneMasterPlanPrices(instance->model,
@@ -430,14 +532,28 @@ namespace
                  .witnessBuildWork = schedule.planPricingWitnessWork}, m_ledger);
             stats.challengerRounds = priced.rounds;
             stats.challengerWork = m_ledger.stats().spent() - challengerStart;
-            if (priced.witness.valid && !seedChallenger(*instance, priced.witness, preparationWork))
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            diagnostics.challenger = planTuningDiagnostics(priced, challengerLimit);
+            diagnostics.witnessValid = priced.witness.valid;
+            diagnostics.witnessValue = priced.witness.valid ? std::optional(priced.witness.value) : std::nullopt;
+#endif
+            if (!priced.witness.valid)
+            {
+                stats.gate = MasterPlanPricingGate::NoValidWitness;
+            }
+            else if (!seedChallenger(*instance, priced.witness, preparationWork))
             {
                 return false;
             }
             if (stats.outcome != MasterPlanPricingOutcome::ValuerFailure)
             {
                 const auto prices = hintIncumbent(*instance, schedule.planPricingWork - stats.challengerWork);
-                return capIncumbentOurs(prices);
+                if (!capIncumbentOurs(prices))
+                {
+                    stats.gate = MasterPlanPricingGate::IncumbentCapFailed;
+                    return false;
+                }
+                return true;
             }
             return true;
         }
@@ -447,24 +563,41 @@ namespace
         {
             auto & stats = m_result.stats.planPricing;
             const auto state = masterPlanWitnessState(m_problem, instance, witness);
-            if (!state || state->choices == m_incumbent->state.choices)
+            const auto sameChoices = state && state->choices == m_incumbent->state.choices;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            auto & diagnostics = stats.diagnostics;
+            diagnostics.converted = state.has_value();
+            diagnostics.sameChoices = sameChoices;
+#endif
+            if (!state || sameChoices)
             {
+                stats.gate = state ? MasterPlanPricingGate::SameChoicesAsIncumbent
+                                   : MasterPlanPricingGate::ConversionEmpty;
                 return true;
             }
             const auto reserve = masterWorkProduct(static_cast<std::size_t>(preparationWork), PLAN_PRICING_RESERVE_FACTOR);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            diagnostics.reserveBalance = m_ledger.balance();
+            diagnostics.reserveRequired = reserve;
+#endif
             if (!reserve || m_ledger.balance() < *reserve)
             {
+                stats.gate = reserve ? MasterPlanPricingGate::ReserveTooSmall : MasterPlanPricingGate::ReserveOverflow;
                 stats.outcome = MasterPlanPricingOutcome::Unavailable;
                 return true;
             }
             const auto evaluation = evaluationFor(*state);
             if (!evaluation || evaluation->status == MasterEvaluationStatus::BudgetExhausted)
             {
+                stats.gate = evaluation ? MasterPlanPricingGate::EvaluationOutOfBudget
+                                        : MasterPlanPricingGate::LookupOutOfBudget;
                 m_result.budgetExhausted = true;
                 return false;
             }
             if (evaluation->status != MasterEvaluationStatus::Feasible || evaluation->quote() == nullptr)
             {
+                stats.gate = evaluation->status != MasterEvaluationStatus::Feasible
+                    ? MasterPlanPricingGate::ChallengerInfeasible : MasterPlanPricingGate::ChallengerUnquoted;
                 stats.outcome = MasterPlanPricingOutcome::ChallengerInfeasible;
                 return true;
             }
@@ -473,28 +606,44 @@ namespace
                 m_planChallenger = evaluation;
             }
             const auto friendly = masterPlanFriendlyWitness(witness);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            diagnostics.friendlyValue = friendly ? std::optional(friendly->value) : std::nullopt;
+            diagnostics.oursLowerBefore = evaluation->quote()->ours.lower;
+#endif
             const auto adopted = friendly
                 ? m_evaluator.adoptFriendlyWitness(*evaluation, friendly->rows, friendly->value)
                 : MasterRefinementStatus::Unavailable;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            if (const auto* quote = evaluation->quote())
+            {
+                diagnostics.oursLowerAfter = quote->ours.lower;
+            }
+#endif
             switch (adopted)
             {
                 case MasterRefinementStatus::Updated:
+                    stats.gate = MasterPlanPricingGate::Adopted;
                     stats.outcome = MasterPlanPricingOutcome::Seeded;
                     stats.adoptedValue = friendly->value;
                     break;
                 case MasterRefinementStatus::Unavailable:
+                    stats.gate = friendly ? MasterPlanPricingGate::AdoptionDeclined
+                                          : MasterPlanPricingGate::NoFriendlyWitness;
                     stats.outcome = MasterPlanPricingOutcome::WitnessDeclined;
                     break;
                 case MasterRefinementStatus::BudgetExhausted:
+                    stats.gate = MasterPlanPricingGate::AdoptionOutOfBudget;
                     stats.outcome = MasterPlanPricingOutcome::AdoptionBudgetExhausted;
                     break;
                 case MasterRefinementStatus::Invalid:
+                    stats.gate = MasterPlanPricingGate::ValuerFailure;
                     stats.outcome = MasterPlanPricingOutcome::ValuerFailure;
                     return true;
             }
             consider(evaluation);
             if (!defer(evaluation, m_rootUpper))
             {
+                stats.gate = MasterPlanPricingGate::DeferralFailed;
                 return false;
             }
             if (stats.outcome == MasterPlanPricingOutcome::Seeded)
@@ -505,6 +654,7 @@ namespace
             RelativeStockComparison comparison;
             if (!compare(evaluation, &comparison))
             {
+                stats.gate = MasterPlanPricingGate::FirstComparisonFailed;
                 return false;
             }
             stats.firstComparisonImproved = comparison.improves();
@@ -519,12 +669,21 @@ namespace
             Tuned,
         };
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        static constexpr std::array RESTRICTED_TUNE_STATUS_NAMES{
+            "OVERFLOW", "UNAFFORDABLE", "RESTRICTION_FAILED", "TUNED",
+        };
+#endif
+
         struct RestrictedPricing
         {
             RestrictedTuneStatus status{RestrictedTuneStatus::Unaffordable};
             std::int64_t restrictionWork{0};
             MasterPlanPricingResult priced;
             std::int64_t tuneWork{0};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            std::int64_t maximumWork{0};
+#endif
         };
 
         RestrictedPricing tuneRestricted(const MasterPlanPricingInstance & instance,
@@ -556,6 +715,9 @@ namespace
                 result.status = RestrictedTuneStatus::RestrictionFailed;
                 return result;
             }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            result.maximumWork = work;
+#endif
             const auto start = ledger.stats().spent();
             result.priced = tuneMasterPlanPrices(*restricted,
                 {.rounds = m_options.schedule.planPricingRounds, .maximumWork = work,
@@ -570,6 +732,13 @@ namespace
             auto & stats = m_result.stats.planPricing;
             const auto tuned = tuneRestricted(instance, masterPlanStateChoices(m_problem, instance, m_incumbent->state),
                                               work, PLAN_PRICING_INCUMBENT_SHARE, m_ledger);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            stats.diagnostics.incumbentStatus = RESTRICTED_TUNE_STATUS_NAMES[static_cast<std::size_t>(tuned.status)];
+            if (tuned.status == RestrictedTuneStatus::Tuned)
+            {
+                stats.diagnostics.incumbent = planTuningDiagnostics(tuned.priced, tuned.maximumWork);
+            }
+#endif
             if (tuned.status == RestrictedTuneStatus::RestrictionFailed || tuned.status == RestrictedTuneStatus::Tuned)
             {
                 stats.restrictionWork = tuned.restrictionWork;
