@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -247,7 +249,55 @@ namespace Coordinator
         DecisionTrace* pTrace{nullptr};
         // Null when reply prediction is off, so no reply facts are built.
         ReplyFactsBuilder* pReplyFacts{nullptr};
+        // Tiles of our plannable units; empty unless the Master plans, so ordinary play offers no follow move.
+        std::span<const TilePoint> followTiles{};
     };
+
+    struct PlannableUnitFacts
+    {
+        Relation relation{Relation::Neutral};
+        bool movedInSnapshot{false};
+        // False when the live tile no longer answers with the unit the snapshot recorded.
+        bool mapped{false};
+        bool movedLive{false};
+        bool normalAi{false};
+        bool firesOrCaptures{false};
+    };
+
+    constexpr bool unitPlannable(const PlannableUnitFacts & facts)
+    {
+        return facts.relation == Relation::Own && !facts.movedInSnapshot && facts.mapped && !facts.movedLive &&
+               facts.normalAi && facts.firesOrCaptures;
+    }
+
+    inline bool followTileOffered(std::span<const TilePoint> followTiles, const TilePoint & tile,
+                                  const TilePoint & actorTile)
+    {
+        return tile != actorTile && std::find(followTiles.begin(), followTiles.end(), tile) != followTiles.end();
+    }
+
+    inline std::vector<TilePoint> followTilesFor(bool masterControlsStock, std::vector<TilePoint> plannableTiles)
+    {
+        if (!masterControlsStock)
+        {
+            return {};
+        }
+        return plannableTiles;
+    }
+
+    template <typename AddToday, typename AddFollowers>
+    std::optional<std::size_t> appendFollowersBehind(std::vector<CandidateBundle> & result, AddToday && addToday,
+                                                     AddFollowers && addFollowers)
+    {
+        addToday(result);
+        const std::size_t todayCount = result.size();
+        addFollowers(result);
+        if (result.size() == todayCount)
+        {
+            return std::nullopt;
+        }
+        return todayCount;
+    }
 
     struct BundleBuildStats
     {
@@ -265,5 +315,6 @@ namespace Coordinator
     std::int32_t resolveRemainingTurnLimit(GameMap & map);
     ValuationContext makeValuationContext(GameMap & map);
     std::vector<CandidateBundle> buildCandidateBundles(const BundleBuildContext & context, std::int32_t actorUnitIndex,
-                                                      BundleBuildStats & stats);
+                                                      BundleBuildStats & stats,
+                                                      std::optional<std::size_t>* pTodayCount = nullptr);
 }

@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -20,7 +21,13 @@ namespace
     using Coordinator::ceilHpSteps;
     using Coordinator::damageStepsFrom;
     using Coordinator::DistanceField;
+    using Coordinator::appendFollowersBehind;
+    using Coordinator::BundleComponent;
+    using Coordinator::ComponentKind;
     using Coordinator::FieldExpansion;
+    using Coordinator::FireFacts;
+    using Coordinator::followTileOffered;
+    using Coordinator::followTilesFor;
     using Coordinator::hpStepsAfterDamage;
     using Coordinator::inFireRange;
     using Coordinator::lostShotContinuation;
@@ -34,6 +41,7 @@ namespace
     using Coordinator::NO_TURN_LIMIT;
     using Coordinator::opposingSide;
     using Coordinator::OwnerSign;
+    using Coordinator::PlannableUnitFacts;
     using Coordinator::PositionFacts;
     using Coordinator::positionFacts;
     using Coordinator::PropertyFacts;
@@ -47,6 +55,7 @@ namespace
     using Coordinator::TilePoint;
     using Coordinator::toMilliFunds;
     using Coordinator::UNIT_HP_STEPS;
+    using Coordinator::unitPlannable;
 
     constexpr std::int32_t NO_ENGINE_TURN_LIMIT = 0;
     constexpr std::int32_t NEGATIVE_ENGINE_TURN_LIMIT = -1;
@@ -400,6 +409,103 @@ namespace
         expect(facts.actorNextShotsAtOrigin.data() == origin, "a reallocated candidate keeps its span buffer");
         expect(facts.enemyShotsOnActorAtDestination.front() == ENEMY_DESTINATION_SHOT, "moved spans keep their values");
     }
+
+    PlannableUnitFacts plannableOccupant()
+    {
+        return PlannableUnitFacts{
+            .relation = Relation::Own,
+            .movedInSnapshot = false,
+            .mapped = true,
+            .movedLive = false,
+            .normalAi = true,
+            .firesOrCaptures = true,
+        };
+    }
+
+    void testOnlyAPlannableOccupantIsFollowed()
+    {
+        expect(unitPlannable(plannableOccupant()), "an unmoved own normal unit that acts is plannable");
+        using Refusal = void (*)(PlannableUnitFacts &);
+        const std::vector<std::pair<Refusal, const char*>> refusals{
+            {[](PlannableUnitFacts & facts) { facts.relation = Relation::Allied; }, "an allied occupant blocks"},
+            {[](PlannableUnitFacts & facts) { facts.relation = Relation::Enemy; }, "an enemy occupant blocks"},
+            {[](PlannableUnitFacts & facts) { facts.relation = Relation::Neutral; }, "a neutral occupant blocks"},
+            {[](PlannableUnitFacts & facts) { facts.movedInSnapshot = true; }, "an occupant that already acted blocks"},
+            {[](PlannableUnitFacts & facts) { facts.movedLive = true; }, "an occupant moved since the snapshot blocks"},
+            {[](PlannableUnitFacts & facts) { facts.mapped = false; }, "an occupant that cannot be mapped blocks"},
+            {[](PlannableUnitFacts & facts) { facts.normalAi = false; }, "an occupant in another AI mode blocks"},
+            {[](PlannableUnitFacts & facts) { facts.firesOrCaptures = false; }, "an occupant that cannot act blocks"},
+        };
+        for (const auto & [refuse, description] : refusals)
+        {
+            PlannableUnitFacts occupant = plannableOccupant();
+            refuse(occupant);
+            expect(!unitPlannable(occupant), description);
+        }
+        const TilePoint actorTile{0, 0};
+        const TilePoint leaderTile{1, 0};
+        const TilePoint blockedTile{0, 1};
+        const std::vector<TilePoint> followTiles{actorTile, leaderTile};
+        expect(followTileOffered(followTiles, leaderTile, actorTile), "a plannable unit's tile is offered");
+        expect(!followTileOffered(followTiles, actorTile, actorTile), "the actor's own tile is its stay, not a follow");
+        expect(!followTileOffered(followTiles, blockedTile, actorTile), "a tile outside the plannable set is blocked");
+    }
+
+    void testFollowTilesOnlyUnderStockControl()
+    {
+        const std::vector<TilePoint> plannableTiles{TilePoint{0, 0}, TilePoint{1, 0}};
+        expect(followTilesFor(true, plannableTiles) == plannableTiles, "stock control collects every plannable tile");
+        expect(followTilesFor(false, plannableTiles).empty(), "without stock control no tile is offered to follow");
+    }
+
+    void testFollowersAppendBehindToday()
+    {
+        constexpr std::size_t TODAY_COUNT = 3;
+        constexpr std::size_t FIRE_ENTRY = 1;
+        constexpr std::size_t CAPTURE_ENTRY = 2;
+        std::int32_t generation = 0;
+        // The destination column repeats the generation index, so order and numbering are checked together.
+        const auto add = [&](std::vector<CandidateBundle> & candidates, std::optional<BundleComponent> component)
+        {
+            CandidateBundle candidate;
+            candidate.generationIndex = generation;
+            candidate.bundle.destination = TilePoint{generation, 0};
+            ++generation;
+            if (component)
+            {
+                candidate.bundle.components.push_back(*component);
+            }
+            candidates.push_back(std::move(candidate));
+        };
+        const auto addToday = [&](std::vector<CandidateBundle> & candidates)
+        {
+            add(candidates, std::nullopt);
+            add(candidates, Coordinator::fireComponent(FireFacts{}));
+            add(candidates, Coordinator::captureComponent(CaptureFacts{}));
+        };
+        std::vector<CandidateBundle> followed;
+        const auto count = appendFollowersBehind(followed, addToday,
+                                                 [&](std::vector<CandidateBundle> & candidates)
+                                                 {
+                                                     add(candidates, std::nullopt);
+                                                 });
+        bool ordered = followed.size() == TODAY_COUNT + 1;
+        for (std::size_t index = 0; ordered && index < followed.size(); ++index)
+        {
+            const auto & bundle = followed[index].bundle;
+            const auto expectedIndex = static_cast<std::int32_t>(index);
+            ordered = followed[index].generationIndex == expectedIndex && bundle.destination.x == expectedIndex &&
+                (index == FIRE_ENTRY || index == CAPTURE_ENTRY) == !bundle.components.empty();
+        }
+        ordered = ordered && followed[FIRE_ENTRY].bundle.components.front().kind == ComponentKind::Fire &&
+            followed[CAPTURE_ENTRY].bundle.components.front().kind == ComponentKind::Capture;
+        expect(count == TODAY_COUNT && ordered,
+               "positional, fire and capture come first in generation order, then the follower, counted before it");
+        generation = 0;
+        std::vector<CandidateBundle> alone;
+        const auto none = appendFollowersBehind(alone, addToday, [](std::vector<CandidateBundle> &) {});
+        expect(!none.has_value() && alone.size() == TODAY_COUNT, "with no surviving follower there is no count");
+    }
 }
 
 int main()
@@ -407,6 +513,9 @@ int main()
     testPositionFactsAliasTheOwnedVectors();
     testCaptureIncomePricesEveryOwner();
     testMovingACandidateKeepsItsSpansValid();
+    testOnlyAPlannableOccupantIsFollowed();
+    testFollowTilesOnlyUnderStockControl();
+    testFollowersAppendBehindToday();
     testEnemyShotEnumeration();
     testMovedShotDistanceMatchesTheAttackField(DIRECT_MIN_RANGE, DIRECT_MAX_RANGE, "direct reach matches the field");
     testMovedShotDistanceMatchesTheAttackField(INDIRECT_MIN_RANGE, INDIRECT_MAX_RANGE,

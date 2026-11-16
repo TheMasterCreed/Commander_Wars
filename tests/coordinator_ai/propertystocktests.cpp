@@ -1346,6 +1346,7 @@ namespace
         std::vector<std::int32_t> ownedTurn;
         std::vector<Coordinator::SequentialApproach> approach;
         std::vector<Coordinator::MasterResourceUsage> resources;
+        bool follows{false};
     };
 
     TieCandidate headZero(Coordinator::SequentialApproach approach, MilliFunds immediate = 0)
@@ -1392,6 +1393,7 @@ namespace
                     CanonicalPlanActionKey::fromAction(rowIndex, static_cast<std::int32_t>(index), 0, false);
                 candidate.resources = source.resources;
                 candidate.immediateValue = source.immediate;
+                candidate.follows = source.follows;
                 candidate.row = SequentialRow{.classIndex = 0, .weight = source.weight,
                                               .ownedTurn = source.ownedTurn, .approach = source.approach};
                 actor.candidates.push_back(std::move(candidate));
@@ -1571,6 +1573,34 @@ namespace
         }
     }
 
+    void polishRefusesASuppliedFollower()
+    {
+        using namespace Coordinator;
+        constexpr MilliFunds FOLLOWER_IMMEDIATE = 100;
+        constexpr std::int32_t FOLLOWER = 1;
+        auto follower = idleCandidate(FOLLOWER_IMMEDIATE);
+        follower.follows = true;
+        auto cleared = follower;
+        cleared.follows = false;
+        const auto flagged = tieModel({{idleCandidate(0), follower}});
+        const auto unflagged = tieModel({{idleCandidate(0), cleared}});
+        if (!flagged || !unflagged)
+        {
+            expect(false, "the supplied follower models index");
+            return;
+        }
+        const MasterPlanWitness start{true, {FOLLOWER}, {{0, {}, 0}}, FOLLOWER_IMMEDIATE};
+        for (const auto mode : {MasterPlanSearchMode::Pruned, MasterPlanSearchMode::Exhaustive})
+        {
+            const auto refused = polishTie(*flagged, start, mode);
+            expect(refused.status == MasterPlanPricingStatus::Invalid && !refused.witness.valid,
+                   "a supplied seating that holds a follower is refused before it is occupied");
+            const auto kept = polishTie(*unflagged, start, mode);
+            expect(kept.status == MasterPlanPricingStatus::Valid && kept.witness.candidateIndices.front() == FOLLOWER,
+                   "the same seating without the flag is accepted and keeps its choice");
+        }
+    }
+
     void productionRowsPreferTheCloserApproach()
     {
         using namespace Coordinator;
@@ -1635,6 +1665,7 @@ namespace
 int main()
 {
     testSolverMatchesBruteForce();
+    polishRefusesASuppliedFollower();
     testColumnWithdrawalIsExact();
     testMarginalTableMatchesFreshSolves();
     testCaptureClockAndHorizon();

@@ -43,6 +43,7 @@ namespace
     constexpr auto TRACE_CHANGES = "changes";
     constexpr auto TRACE_INCUMBENT_OURS_CAP = "incumbentOursCap";
     constexpr auto TRACE_CHALLENGER_OURS_CAP = "challengerOursCap";
+    constexpr auto TRACE_FOLLOWS = "follows";
 
     QJsonObject planBoundCapRecord(const Coordinator::MasterPlanBoundCapStats & cap)
     {
@@ -882,7 +883,7 @@ namespace Coordinator
                 {
                     resources.append(QJsonArray{use.resourceIndex, use.demand, use.capacity});
                 }
-                candidates.append(QJsonObject{
+                QJsonObject record{
                     {"index", candidate.identity.originalCandidateIndex},
                     {"generation", candidate.identity.generationIndex}, {"kind", static_cast<int>(candidate.actionKind)},
                     {"origin", tile(candidate.origin)}, {"destination", tile(candidate.destination)},
@@ -890,7 +891,13 @@ namespace Coordinator
                     {"stockEndpoint", tile(candidate.stockEndpoint)}, {"capture", candidate.capture.has_value()},
                     {"economic", QString::number(candidate.immediateValue.economicValue)},
                     {"terminal", static_cast<int>(candidate.immediateValue.terminal)},
-                    {"plannable", candidate.plannable}, {"resources", resources}});
+                    {"plannable", candidate.plannable}, {"resources", resources}};
+                // Written only for followers, so a model without them records exactly as before.
+                if (candidate.follows)
+                {
+                    record.insert(TRACE_FOLLOWS, true);
+                }
+                candidates.append(record);
             }
             candidateCount += static_cast<std::int64_t>(actor.candidates.size());
             actors.append(QJsonObject{

@@ -1902,11 +1902,8 @@ namespace
                 targetContinuationCharged += entry.pCandidate->valuation.continuation.targetContinuationRemoved;
             }
             const Coordinator::AssignmentActor* pActor = actorOf(entry.unitId);
-            std::span<const Coordinator::CandidateBundle> candidates;
-            if (entry.pCandidate != nullptr && pActor != nullptr)
-            {
-                candidates = pActor->candidates;
-            }
+            const std::span<const Coordinator::CandidateBundle> candidates =
+                Coordinator::replacementAlternatives(pActor, entry.pCandidate);
             const Coordinator::ChangeReason reason =
                 shot ? Coordinator::ChangeReason::Shot : Coordinator::ChangeReason::HitsShooter;
             std::int32_t considered = 0;

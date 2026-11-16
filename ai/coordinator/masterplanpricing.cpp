@@ -180,6 +180,11 @@ namespace
         {
             return true;
         }
+        // The witness does not yet order a follower behind its leader, so it never seats one.
+        if (candidate.follows)
+        {
+            return false;
+        }
         for (const auto & resource : candidate.resources)
         {
             std::int64_t demand = 0;
@@ -1032,7 +1037,8 @@ namespace
                 seat.chosen = findMasterPlanCandidate(actor, index);
             }
             const auto & source = start.rows[row];
-            if (seat.chosen == nullptr || source.row != seat.row ||
+            // Held choices are kept without passing fits, so a supplied follower must be refused here.
+            if (seat.chosen == nullptr || seat.chosen->follows || source.row != seat.row ||
                 !sumSteps(source.steps, seat.itinerary.value))
             {
                 return std::nullopt;

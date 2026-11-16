@@ -1548,6 +1548,80 @@ namespace
         return evaluation.reason == reason && evaluation.actorSlot == actorSlot;
     }
 
+    constexpr std::int32_t CHAIN_ACTORS = 3;
+    constexpr TilePoint CHAIN_EXIT{CHAIN_ACTORS, 0};
+    constexpr std::int32_t CHAIN_LEADER_UNIT = 101;
+
+    AssignmentInput chainInput(bool followers)
+    {
+        auto input = inputWith(CHAIN_ACTORS);
+        input.actors[2].candidates.push_back(candidate(2, {2, 0}, CHAIN_EXIT, 1));
+        if (followers)
+        {
+            const std::array<TilePoint, CHAIN_ACTORS> followTo{TilePoint{1, 0}, TilePoint{2, 0}, TilePoint{1, 0}};
+            for (std::size_t slot = 0; slot < input.actors.size(); ++slot)
+            {
+                auto & actor = input.actors[slot];
+                actor.todayCandidates = actor.candidates.size();
+                actor.candidates.push_back(
+                    candidate(actor.knowledgeUnitIndex, input.unitLinks[slot].tile, followTo[slot], 1));
+            }
+        }
+        for (auto & actor : input.actors)
+        {
+            for (std::size_t index = 0; index < actor.candidates.size(); ++index)
+            {
+                actor.candidates[index].generationIndex = static_cast<std::int32_t>(index);
+            }
+        }
+        return input;
+    }
+
+    void testFollowCandidatesTrailTodaysCandidates()
+    {
+        const auto today = chainInput(false);
+        const auto followed = chainInput(true);
+        const auto fixture = planFrom(today);
+        const auto base = extract(today, fixture);
+        const auto extended = extract(followed, fixture);
+        expect(base.valid() && extended.valid(), "follow candidates extract beside today's");
+        if (!base.valid() || !extended.valid())
+        {
+            return;
+        }
+        const auto & problem = *extended.problem;
+        bool prefixKept = std::ranges::equal(base.problem->incumbentChoices(), problem.incumbentChoices());
+        for (std::size_t slot = 0; slot < problem.actors().size(); ++slot)
+        {
+            const auto & before = base.problem->actors()[slot];
+            const auto & after = problem.actors()[slot];
+            const auto todayCount = before.candidates.size();
+            prefixKept = prefixKept && after.candidates.size() == todayCount + 1 && after.candidates.back().follows &&
+                std::equal(before.canonicalCandidates.begin(), before.canonicalCandidates.end(),
+                           after.canonicalCandidates.begin()) &&
+                after.canonicalCandidates.back() == static_cast<std::int32_t>(todayCount);
+            for (std::size_t index = 0; index < todayCount; ++index)
+            {
+                prefixKept = prefixKept && !after.candidates[index].follows &&
+                    after.candidates[index].identity == before.candidates[index].identity &&
+                    after.candidates[index].dependencies == before.candidates[index].dependencies;
+            }
+        }
+        expect(prefixKept, "today's candidates keep their indices, canonical order and incumbent behind no follower");
+        expect(problem.actors()[0].candidates[1].dependencies ==
+                   std::vector<MasterVacateRequirement>{{.tile = {1, 0}, .occupantUnitId = CHAIN_LEADER_UNIT}},
+               "a follow candidate requires its leader to vacate");
+        const auto chain = replayMasterAssignment(problem, std::vector<std::int32_t>{1, 1, 1});
+        expect(chain.complete() && chain.ordering.order == std::vector<std::int32_t>{2, 1, 0},
+               "a legal chain of three replays complete with each leader before its follower");
+        const auto swap = replayMasterAssignment(problem, std::vector<std::int32_t>{0, 1, 2});
+        expect(swap.valid() && !swap.complete(), "two units trading tiles replay incomplete");
+        const auto staying = evaluateReplyPassPlan(problem, std::vector<std::int32_t>{1, 0, 0}, EVALUATION_BOARD);
+        expect(staying.reason == ReplyPassNoValue::ReplayInvalid &&
+                   staying.replay.error == MasterAssignmentReplayError::ClaimRejected,
+               "a follower onto a tile whose occupant stays has no value because its replay is invalid");
+    }
+
     void testReplyPassNoValueReasons()
     {
         constexpr auto missing = "a chosen candidate without reply facts has no value, named by its slot";
@@ -1987,6 +2061,7 @@ int main()
     testReplyPassReplyKillsCapturer();
     testReplyPassOwnActionDeath();
     testReplyPassCorrectionRebuildsCandidate();
+    testFollowCandidatesTrailTodaysCandidates();
     testReplyPassNoValueReasons();
     testReplyPassRefusesOverflowingAmounts();
     testReplyPassBoundsReplyArithmeticInputs();

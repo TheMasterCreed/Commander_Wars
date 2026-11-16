@@ -107,6 +107,8 @@ namespace Coordinator
         std::int32_t stockRow{NO_STOCK_ROW};
         TilePoint stockEndpoint{INVALID_TILE};
         bool plannable{false};
+        // Moves onto a tile one of our units leaves, behind every candidate the constructor sees.
+        bool follows{false};
         CandidateBundle source;
     };
 

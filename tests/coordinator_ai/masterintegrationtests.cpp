@@ -10,6 +10,7 @@
 #include "ai/coordinator/masterassignmentcapture.h"
 #include "ai/coordinator/masterassignmentinstallation.h"
 #include "ai/coordinator/masterassignmentshadow.h"
+#include "ai/coordinator/masterassignmenttrace.h"
 #include "ai/coordinator/masternativesource.h"
 #include "ai/coordinator/masterplanhandoff.h"
 #include "ai/coordinator/masterplanpricingadapter.h"
@@ -4335,6 +4336,94 @@ namespace
         }
     }
 
+    constexpr std::int32_t FOLLOW_ACTORS = 3;
+    constexpr MilliFunds FOLLOW_VALUE = 100;
+    constexpr std::int32_t FOLLOW_CANDIDATE = 2;
+
+    Fixture followFixture(bool flagged)
+    {
+        auto fixture = stockMoveFixture(FOLLOW_ACTORS, [](std::int32_t) { return MilliFunds{0}; });
+        for (std::int32_t actor = 0; actor + 1 < FOLLOW_ACTORS; ++actor)
+        {
+            auto & source = fixture.input.actors[actor];
+            if (flagged)
+            {
+                source.todayCandidates = source.candidates.size();
+            }
+            source.candidates.push_back(
+                moveCandidate(actor, {actor, 0}, {actor + 1, 0}, FOLLOW_VALUE, FOLLOW_CANDIDATE));
+        }
+        return fixture;
+    }
+
+    std::optional<MasterPlanPricingInstance> adapterPricing(const PlanPricingCase & test, RefinementLedger & ledger)
+    {
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        NativeStockSession session(field, enemy, test.reference.continuation.cases, ledger);
+        return buildMasterPlanPricingInstance(test.problem, *session.pricingModel(), *session.futureCatalog(), ledger);
+    }
+
+    bool seatsAFollower(const MasterPlanWitness & witness)
+    {
+        return std::find(witness.candidateIndices.begin(), witness.candidateIndices.end(), FOLLOW_CANDIDATE) !=
+               witness.candidateIndices.end();
+    }
+
+    void modelRecordMarksOnlyFollowers()
+    {
+        const auto followFlags = [](const QJsonObject & record)
+        {
+            std::vector<std::pair<std::int32_t, QJsonValue>> flags;
+            for (const auto & actor : record.value("actors").toArray())
+            {
+                for (const auto & candidate : actor.toObject().value("candidates").toArray())
+                {
+                    const auto entry = candidate.toObject();
+                    const QJsonValue follows = entry.value("follows");
+                    if (!follows.isUndefined())
+                    {
+                        flags.emplace_back(entry.value("index").toInt(), follows);
+                    }
+                }
+            }
+            return flags;
+        };
+        const auto plain = followFlags(masterModelRecord(followFixture(false).extract()));
+        const auto followed = followFlags(masterModelRecord(followFixture(true).extract()));
+        const std::vector<std::pair<std::int32_t, QJsonValue>> expected(static_cast<std::size_t>(FOLLOW_ACTORS - 1),
+                                                                         {FOLLOW_CANDIDATE, QJsonValue(true)});
+        expect(plain.empty(), "a model without followers records no follows key");
+        expect(followed == expected, "each follower, and only a follower, records follows as true");
+    }
+
+    void planPricingNeverSeatsAFollower()
+    {
+        const auto flagged = planPricingCase("followers", followFixture(true));
+        const auto unflagged = planPricingCase("unflagged followers", followFixture(false));
+        RefinementLedger ledger;
+        require(ledger.open(PLAN_PRICING_TEST_LEDGER), "follow pricing ledger");
+        const auto followers = adapterPricing(flagged, ledger);
+        const auto open = adapterPricing(unflagged, ledger);
+        require(followers.has_value() && open.has_value(), "the adapter prices follow candidates");
+        const MasterPlanPricingLimits limits{.rounds = PLAN_PRICING_TEST_ROUNDS, .maximumWork = PLAN_PRICING_TEST_WORK,
+                                             .witnessBuildWork = PLAN_PRICING_TEST_WITNESS_WORK};
+        const auto tuned = tuneMasterPlanPrices(followers->model, limits, ledger);
+        const auto reference = tuneMasterPlanPrices(open->model, limits, ledger);
+        bool sameCeilings = tuned.prices.size() == reference.prices.size();
+        for (const auto & prices : {std::vector<MilliFunds>(tuned.prices.size(), 0), tuned.prices, reference.prices})
+        {
+            const auto restricted = priceMasterPlan(followers->model, prices, ledger);
+            const auto unrestricted = priceMasterPlan(open->model, prices, ledger);
+            sameCeilings = sameCeilings && restricted.status == MasterPlanPricingStatus::Valid &&
+                unrestricted.status == MasterPlanPricingStatus::Valid && restricted.ceiling == unrestricted.ceiling;
+        }
+        expect(sameCeilings, "follow candidates price into every ceiling as if they could be seated");
+        expect(tuned.witness.valid && !seatsAFollower(tuned.witness), "no witness seats a follow candidate");
+        expect(reference.witness.valid && seatsAFollower(reference.witness),
+               "the same candidates unflagged are seated, so the refusal is what keeps them out");
+    }
+
     void planPricingSearch()
     {
         for (const auto & test : planPricingCases())
@@ -5703,6 +5792,8 @@ int main(int argc, char** argv)
     suggestedFriendlyBounds();
     untrustedSuggestionSafety();
     planPricingAdapter();
+    planPricingNeverSeatsAFollower();
+    modelRecordMarksOnlyFollowers();
     planPricingSearch();
     planBoundCap();
     planBoundCapRejections();

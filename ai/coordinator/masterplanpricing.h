@@ -29,6 +29,7 @@ namespace Coordinator
         std::int32_t capturedNode{NO_SEQUENTIAL_NODE};
         SequentialRow row;
         std::int32_t actionIndex{0};
+        bool follows{false};
     };
 
     struct MasterPlanPricingActor

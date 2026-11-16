@@ -767,6 +767,7 @@ namespace Coordinator
                     input.actionIds,
                     input.unitLinks,
                     sourceCandidate);
+                candidate.follows = isFollowCandidate(sourceActor, candidateSlot);
                 candidate.source = sourceCandidate;
 
                 const std::int32_t occupant = occupantAt(

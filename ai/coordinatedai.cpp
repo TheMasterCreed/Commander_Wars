@@ -561,9 +561,28 @@ void CoordinatedAi::buildTurnPlan()
     std::int32_t maxCandidatesPerActor = 0;
     const std::vector<Coordinator::KnownUnit> & units =
         m_dayStartKnowledge.units();
+    // Follow tiles must be known before the first unit's candidates; without stock control nothing runs ahead.
+    const bool stockControl = masterShadow.controlsStock();
+    std::vector<Unit*> plannableUnits;
+    std::vector<Coordinator::TilePoint> plannableTiles;
+    if (stockControl)
+    {
+        plannableUnits.reserve(units.size());
+        for (const Coordinator::KnownUnit & known : units)
+        {
+            Unit* pUnit = plannableUnit(known);
+            plannableUnits.push_back(pUnit);
+            if (pUnit != nullptr)
+            {
+                plannableTiles.push_back(Coordinator::TilePoint{known.x, known.y});
+            }
+        }
+    }
+    const std::vector<Coordinator::TilePoint> followTiles =
+        Coordinator::followTilesFor(stockControl, std::move(plannableTiles));
     for (std::size_t slot = 0; slot < units.size(); ++slot)
     {
-        Unit* pUnit = plannableUnit(units[slot]);
+        Unit* pUnit = stockControl ? plannableUnits[slot] : plannableUnit(units[slot]);
         if (m_decisionTrace != nullptr &&
             m_dayStartKnowledge.relation(
                 units[slot].ownerId) ==
@@ -626,7 +645,9 @@ void CoordinatedAi::buildTurnPlan()
             oracle,
             actor.knowledgeUnitIndex,
             buildStats,
-            replyFacts ? &*replyFacts : nullptr);
+            replyFacts ? &*replyFacts : nullptr,
+            followTiles,
+            &actor.todayCandidates);
         if (timed)
         {
             const std::int32_t generatedCandidateCount =
@@ -732,6 +753,10 @@ void CoordinatedAi::buildTurnPlan()
     }
     if (legacyPlanning)
     {
+        if (stockControl)
+        {
+            Coordinator::dropFollowCandidates(input);
+        }
         Clock::time_point continuationStart;
         if (timed)
         {
@@ -1014,20 +1039,31 @@ void CoordinatedAi::buildTurnPlan()
 Unit* CoordinatedAi::plannableUnit(
     const Coordinator::KnownUnit & known) const
 {
-    if (known.hasMoved ||
-        m_dayStartKnowledge.relation(known.ownerId) !=
-            Coordinator::Relation::Own)
+    // Each fact is read only where every earlier one admits the unit, so the engine and script calls stop early.
+    Coordinator::PlannableUnitFacts facts{.movedInSnapshot = known.hasMoved};
+    if (!facts.movedInSnapshot)
     {
-        return nullptr;
+        facts.relation = m_dayStartKnowledge.relation(known.ownerId);
     }
-    Unit* pUnit = Coordinator::liveUnitFor(*m_pMap, known);
-    if (pUnit == nullptr ||
-        pUnit->getHasMoved() ||
-        pUnit->getAiMode() != GameEnums::GameAi_Normal)
+    Unit* pUnit = nullptr;
+    if (!facts.movedInSnapshot && facts.relation == Coordinator::Relation::Own)
     {
-        return nullptr;
+        pUnit = Coordinator::liveUnitFor(*m_pMap, known);
+        facts.mapped = pUnit != nullptr;
     }
-    if (!known.canFire && !pUnit->canCapture())
+    if (facts.mapped)
+    {
+        facts.movedLive = pUnit->getHasMoved();
+    }
+    if (facts.mapped && !facts.movedLive)
+    {
+        facts.normalAi = pUnit->getAiMode() == GameEnums::GameAi_Normal;
+    }
+    if (facts.normalAi)
+    {
+        facts.firesOrCaptures = known.canFire || pUnit->canCapture();
+    }
+    if (!Coordinator::unitPlannable(facts))
     {
         return nullptr;
     }
@@ -1063,7 +1099,9 @@ CoordinatedAi::candidatesFor(
     Coordinator::DamageOracle & oracle,
     qint32 actorUnitIndex,
     Coordinator::BundleBuildStats & stats,
-    Coordinator::ReplyFactsBuilder* pReplyFacts)
+    Coordinator::ReplyFactsBuilder* pReplyFacts,
+    std::span<const Coordinator::TilePoint> followTiles,
+    std::optional<std::size_t>* pTodayCount)
 {
     const Coordinator::BundleBuildContext context{
         .map = *m_pMap,
@@ -1077,9 +1115,10 @@ CoordinatedAi::candidatesFor(
         .valuation = Coordinator::makeValuationContext(*m_pMap),
         .pTrace = m_decisionTrace.get(),
         .pReplyFacts = pReplyFacts,
+        .followTiles = followTiles,
     };
     return Coordinator::buildCandidateBundles(
-        context, actorUnitIndex, stats);
+        context, actorUnitIndex, stats, pTodayCount);
 }
 
 const Coordinator::AssignmentResult::Selection*

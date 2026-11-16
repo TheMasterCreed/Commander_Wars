@@ -58,7 +58,24 @@ namespace Coordinator
         std::int32_t knowledgeUnitIndex{NO_UNIT};
         std::int32_t engineUnitId{NO_UNIT};
         std::vector<CandidateBundle> candidates;
+        // Candidates from this count on follow a unit off its tile; empty means every candidate is today's.
+        std::optional<std::size_t> todayCandidates;
     };
+
+    inline std::size_t todayCandidateCount(const AssignmentActor & actor)
+    {
+        return std::min(actor.todayCandidates.value_or(actor.candidates.size()), actor.candidates.size());
+    }
+
+    inline bool isFollowCandidate(const AssignmentActor & actor, std::size_t candidateIndex)
+    {
+        return candidateIndex >= todayCandidateCount(actor);
+    }
+
+    inline std::span<const CandidateBundle> todayCandidateSpan(const AssignmentActor & actor)
+    {
+        return std::span<const CandidateBundle>(actor.candidates).first(todayCandidateCount(actor));
+    }
 
     struct AssignmentInput
     {
@@ -82,6 +99,23 @@ namespace Coordinator
             return 0;
         }
         return input.pStockValuer->planStock(plan) - input.pStockValuer->originStock();
+    }
+
+    inline bool hasFollowCandidates(const AssignmentInput & input)
+    {
+        return std::any_of(input.actors.begin(), input.actors.end(), [](const AssignmentActor & actor)
+        {
+            return todayCandidateCount(actor) < actor.candidates.size();
+        });
+    }
+
+    inline void dropFollowCandidates(AssignmentInput & input)
+    {
+        for (AssignmentActor & actor : input.actors)
+        {
+            actor.candidates.resize(todayCandidateCount(actor));
+            actor.todayCandidates.reset();
+        }
     }
 
     inline bool stockCoupled(const AssignmentInput & input, std::int32_t engineUnitId)
@@ -892,11 +926,19 @@ namespace Coordinator
 
         static AssignmentResult assign(const AssignmentInput & input)
         {
+            if (hasFollowCandidates(input))
+            {
+                return assign(todayInput(input), AssignmentPolicy::Legacy);
+            }
             return assign(input, AssignmentPolicy::Legacy);
         }
 
         static AssignmentResult constructStockIncumbent(const AssignmentInput & input, RefinementLedger & ledger)
         {
+            if (hasFollowCandidates(input))
+            {
+                return constructStockIncumbent(todayInput(input), ledger);
+            }
             AssignmentResult result;
             const auto before = ledger.stats().spent();
             if (prepayStockConstruction(input, ledger, result.stockConstructionStatus))
@@ -913,6 +955,35 @@ namespace Coordinator
             Legacy,
             StockIncumbent,
         };
+
+        // The constructor, its charges included, only ever sees today's candidates.
+        static AssignmentInput todayInput(const AssignmentInput & input)
+        {
+            AssignmentInput today{
+                .actionIds = input.actionIds,
+                .unitLinks = input.unitLinks,
+                .actors = {},
+                .pStockValuer = input.pStockValuer,
+                .pTrace = input.pTrace,
+                .measureTimings = input.measureTimings,
+                .relativeStockWorkLimit = input.relativeStockWorkLimit,
+                .relativeStockSchedule = input.relativeStockSchedule,
+                .pRelativeStockObserver = input.pRelativeStockObserver,
+                .retainSelections = input.retainSelections,
+                .replyPrediction = input.replyPrediction,
+            };
+            today.actors.reserve(input.actors.size());
+            for (const AssignmentActor & actor : input.actors)
+            {
+                const auto prefix = todayCandidateSpan(actor);
+                today.actors.push_back(AssignmentActor{
+                    .knowledgeUnitIndex = actor.knowledgeUnitIndex,
+                    .engineUnitId = actor.engineUnitId,
+                    .candidates = {prefix.begin(), prefix.end()},
+                });
+            }
+            return today;
+        }
 
         static AssignmentResult assign(const AssignmentInput & input, AssignmentPolicy policy)
         {

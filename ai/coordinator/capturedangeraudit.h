@@ -29,6 +29,17 @@ namespace Coordinator
         ReplyPredictionTelemetry reply{};
     };
 
+    // Change pricing never orders a vacate, so a follower is never offered as a replacement.
+    inline std::span<const CandidateBundle> replacementAlternatives(const AssignmentActor * pActor,
+                                                                    const CandidateBundle * pInstalled)
+    {
+        if (pActor == nullptr || pInstalled == nullptr)
+        {
+            return {};
+        }
+        return todayCandidateSpan(*pActor);
+    }
+
     // Measure only: nothing it computes reaches the planner and it owns its damage memo, but EXACT calls run CO scripts that can append blank variables.
     void recordCaptureDangerAudit(const CaptureDangerAuditView & view);
 }

@@ -52,6 +52,7 @@ namespace
         result.key = CanonicalPlanActionKey::fromAction(actor.stockRow, source.stockEndpoint.x, source.stockEndpoint.y,
                                                         source.capture.has_value());
         result.resources = source.resources;
+        result.follows = source.follows;
         const auto* action = findMasterFutureAction(catalog, result.key);
         const auto* terms = stock.actionTerms(result.key);
         if (action == nullptr || terms == nullptr || action->row.weight.size() != catalog.columns.size() ||

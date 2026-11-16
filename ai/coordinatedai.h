@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -92,7 +93,9 @@ private:
         Coordinator::DamageOracle & oracle,
         qint32 actorUnitIndex,
         Coordinator::BundleBuildStats & stats,
-        Coordinator::ReplyFactsBuilder* pReplyFacts);
+        Coordinator::ReplyFactsBuilder* pReplyFacts,
+        std::span<const Coordinator::TilePoint> followTiles = {},
+        std::optional<std::size_t>* pTodayCount = nullptr);
     bool useStartOfDayCoPower();
     bool executeNextPlannedAction();
     bool performPlannedAction(qint32 actionIndex, bool & replanAllowed);

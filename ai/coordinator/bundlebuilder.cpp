@@ -112,7 +112,8 @@ namespace
         {
         }
 
-        std::vector<Coordinator::CandidateBundle> build(std::int32_t actorUnitIndex);
+        std::vector<Coordinator::CandidateBundle> build(std::int32_t actorUnitIndex,
+                                                        std::optional<std::size_t> & todayCount);
 
     private:
         struct CaptureTraceFacts
@@ -152,7 +153,8 @@ namespace
                                              std::int32_t excludedVictimIndex);
         std::vector<MilliFunds> enemyShotSpan(const ShotSource & actor, const VictimOverride & damaged);
         MilliFunds targetBestShot(std::int32_t targetUnitIndex, std::int32_t hpSteps, std::int32_t excludedVictimIndex);
-        std::vector<MoveOption> collectMoveOptions(const ShotSource & actor, UnitPathFindingSystem & pfs);
+        std::vector<MoveOption> collectMoveOptions(const ShotSource & actor, UnitPathFindingSystem & pfs,
+                                                   std::vector<MoveOption> & followOptions);
         void addCandidate(Coordinator::CandidateBundle && candidate,
                           std::vector<Coordinator::CandidateBundle> & result,
                           const CaptureTraceFacts* pCapture = nullptr);
@@ -378,7 +380,8 @@ namespace
         return best;
     }
 
-    std::vector<MoveOption> CandidateBuilder::collectMoveOptions(const ShotSource & actor, UnitPathFindingSystem & pfs)
+    std::vector<MoveOption> CandidateBuilder::collectMoveOptions(const ShotSource & actor, UnitPathFindingSystem & pfs,
+                                                                 std::vector<MoveOption> & followOptions)
     {
         std::vector<MoveOption> options;
         MoveOption stay;
@@ -394,7 +397,12 @@ namespace
                 continue;
             }
             Terrain* pTerrain = m_context.map.getTerrain(destination.x, destination.y);
-            if (pTerrain == nullptr || pTerrain->getUnit() != nullptr)
+            if (pTerrain == nullptr)
+            {
+                continue;
+            }
+            const bool follows = pTerrain->getUnit() != nullptr;
+            if (follows && !Coordinator::followTileOffered(m_context.followTiles, destination, actor.tile))
             {
                 continue;
             }
@@ -407,7 +415,14 @@ namespace
             }
             option.costs = pfs.getCosts(option.enginePath);
             option.path = Coordinator::pathFromEngineOrder(option.enginePath);
-            options.push_back(std::move(option));
+            if (follows)
+            {
+                followOptions.push_back(std::move(option));
+            }
+            else
+            {
+                options.push_back(std::move(option));
+            }
         }
         return options;
     }
@@ -732,7 +747,8 @@ namespace
         }
     }
 
-    std::vector<Coordinator::CandidateBundle> CandidateBuilder::build(std::int32_t actorUnitIndex)
+    std::vector<Coordinator::CandidateBundle> CandidateBuilder::build(std::int32_t actorUnitIndex,
+                                                                      std::optional<std::size_t> & todayCount)
     {
         std::vector<Coordinator::CandidateBundle> result;
         const std::int64_t oracleCallsBefore = m_context.oracle.callCount();
@@ -770,10 +786,21 @@ namespace
         m_enemyShotsAtOrigin = enemyShotSpan(actor, VictimOverride{});
         UnitPathFindingSystem pfs(&m_context.map, actor.pUnit, &m_context.player);
         pfs.explore();
-        const std::vector<MoveOption> options = collectMoveOptions(actor, pfs);
-        addPositionalCandidates(actor, options, result);
-        addFireCandidates(actor, options, result);
-        addCaptureCandidates(actor, options, result);
+        std::vector<MoveOption> followOptions;
+        const std::vector<MoveOption> options = collectMoveOptions(actor, pfs, followOptions);
+        todayCount = Coordinator::appendFollowersBehind(
+            result,
+            [&](std::vector<Coordinator::CandidateBundle> & candidates)
+            {
+                addPositionalCandidates(actor, options, candidates);
+                addFireCandidates(actor, options, candidates);
+                addCaptureCandidates(actor, options, candidates);
+            },
+            // Fire and capture need an empty endpoint, so onto an occupied tile only a positional move exists.
+            [&](std::vector<Coordinator::CandidateBundle> & candidates)
+            {
+                addPositionalCandidates(actor, followOptions, candidates);
+            });
         m_stats.oracleCalls += m_context.oracle.callCount() - oracleCallsBefore;
         m_stats.oracleHits += m_context.oracle.hitCount() - oracleHitsBefore;
         return result;
@@ -828,9 +855,16 @@ namespace Coordinator
     }
 
     std::vector<CandidateBundle> buildCandidateBundles(const BundleBuildContext & context, std::int32_t actorUnitIndex,
-                                                       BundleBuildStats & stats)
+                                                       BundleBuildStats & stats,
+                                                       std::optional<std::size_t>* pTodayCount)
     {
         CandidateBuilder builder(context, stats);
-        return builder.build(actorUnitIndex);
+        std::optional<std::size_t> todayCount;
+        std::vector<CandidateBundle> candidates = builder.build(actorUnitIndex, todayCount);
+        if (pTodayCount != nullptr)
+        {
+            *pTodayCount = todayCount;
+        }
+        return candidates;
     }
 }

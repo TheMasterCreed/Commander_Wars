@@ -532,6 +532,86 @@ namespace
             "SUCCESSIVE_REPLACEMENTS_REQUIRE_FRESH_CERTIFICATES");
     }
 
+    constexpr MilliFunds FOLLOW_VALUE = 1000;
+    constexpr std::int64_t FOLLOW_TEST_ALLOWANCE = 1000000;
+
+    void addFollowCandidates(AssignmentInput & input)
+    {
+        for (std::size_t slot = 0; slot < input.actors.size(); ++slot)
+        {
+            auto & actor = input.actors[slot];
+            auto follow = actor.candidates.front();
+            follow.bundle.destination = input.unitLinks[(slot + 1) % input.unitLinks.size()].tile;
+            follow.bundle.path = {follow.bundle.origin, follow.bundle.destination};
+            follow.valuation.ledger.enemyCapital = FOLLOW_VALUE;
+            actor.todayCandidates = actor.candidates.size();
+            actor.candidates.push_back(std::move(follow));
+        }
+    }
+
+    struct FollowRun
+    {
+        AssignmentResult legacy;
+        AssignmentResult constructed;
+        std::int64_t constructionSpent{0};
+        QStringList receipts;
+        QStringList trace;
+        std::int32_t quotes{0};
+    };
+
+    FollowRun runReversal(bool followers, std::int64_t constructionAllowance)
+    {
+        PropertyStockField field;
+        PropertyStockInstance enemy;
+        Session session(field, enemy);
+        Valuer valuer(session);
+        auto input = reversalInput(session);
+        if (followers)
+        {
+            addFollowCandidates(input);
+        }
+        input.pStockValuer = &valuer;
+        Recorder recorder;
+        input.pTrace = &recorder;
+        input.pRelativeStockObserver = &recorder;
+        FollowRun run;
+        run.legacy = MaximumValueAssignment::assign(input);
+        RefinementLedger ledger;
+        expect(ledger.open(constructionAllowance), "the follow comparison opens its construction ledger");
+        run.constructed = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+        run.constructionSpent = ledger.stats().spent();
+        run.receipts = recorder.receipts;
+        run.trace = recorder.trace;
+        run.quotes = session.ourCalls + session.enemyCalls;
+        return run;
+    }
+
+    bool sameResult(const AssignmentResult & left, const AssignmentResult & right)
+    {
+        return samePlan(left, right) && left.stats == right.stats &&
+            left.selections.size() == right.selections.size() &&
+            std::equal(left.selections.begin(), left.selections.end(), right.selections.begin(), sameSelection);
+    }
+
+    void testConstructorSeesOnlyTodaysCandidates()
+    {
+        const auto today = runReversal(false, FOLLOW_TEST_ALLOWANCE);
+        const auto followed = runReversal(true, FOLLOW_TEST_ALLOWANCE);
+        expect(sameResult(followed.legacy, today.legacy), "FOLLOW_CANDIDATES_LEAVE_LEGACY_PLANNING_UNCHANGED");
+        expect(today.constructed.stockConstructionStatus == StockConstructionStatus::Complete &&
+                   followed.constructed.stockConstructionStatus == StockConstructionStatus::Complete &&
+                   sameResult(followed.constructed, today.constructed) &&
+                   followed.constructed.stockConstructionWork == today.constructed.stockConstructionWork &&
+                   followed.constructionSpent == today.constructionSpent,
+               "FOLLOW_CANDIDATES_LEAVE_STOCK_CONSTRUCTION_AND_ITS_CHARGE_UNCHANGED");
+        expect(followed.receipts == today.receipts && followed.trace == today.trace && followed.quotes == today.quotes,
+               "FOLLOW_CANDIDATES_REACH_NO_CONSTRUCTOR_PRICING_OR_TRACE");
+        const auto exact = runReversal(true, today.constructed.stockConstructionWork);
+        expect(exact.constructed.stockConstructionStatus == StockConstructionStatus::Complete &&
+                   sameResult(exact.constructed, today.constructed),
+               "AN_ALLOWANCE_FUNDING_EXACTLY_TODAYS_INPUT_STILL_CONSTRUCTS");
+    }
+
     AssignmentInput nonMemberInput(Session & session)
     {
         auto input = makeInput(0);
@@ -1302,6 +1382,7 @@ int main()
     testBoundedSkips();
     testNonStockExact();
     testSuccessiveDependencyReversal();
+    testConstructorSeesOnlyTodaysCandidates();
     testNonMemberDependentSurvivesTrial();
     testRebuiltOrderRollback();
     testLaterNonRelativeStage();
