@@ -38,13 +38,6 @@ namespace Coordinator
         std::vector<std::int32_t> nodes;
     };
 
-    struct MasterFuturePricing
-    {
-        MasterFutureStatus status{MasterFutureStatus::Unavailable};
-        std::vector<MasterFutureRowPrice> dayRows;
-        std::vector<MasterFutureRowPrice> actions;
-    };
-
     struct MasterFuturePricedCell
     {
         MilliFunds value{0};
@@ -52,6 +45,15 @@ namespace Coordinator
     };
 
     using MasterFuturePricedClass = std::vector<MasterFuturePricedCell>;
+
+    struct MasterFuturePricing
+    {
+        MasterFutureStatus status{MasterFutureStatus::Unavailable};
+        std::vector<MasterFutureRowPrice> dayRows;
+        std::vector<MasterFutureRowPrice> actions;
+        // Populated by successful future pricing, one table per catalog class.
+        std::vector<MasterFuturePricedClass> classes;
+    };
 
     MasterFuturePricing priceMasterFuture(
         const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,

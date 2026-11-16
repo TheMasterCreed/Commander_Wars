@@ -91,8 +91,6 @@ namespace Coordinator
         std::int64_t skipViolations{0};
 #endif
         std::int64_t states{0};
-        std::int64_t tables{0};
-        std::int64_t tableWork{0};
         std::int64_t pickSearchWork{0};
         std::int64_t polishSearchWork{0};
     };

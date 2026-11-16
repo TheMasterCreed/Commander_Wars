@@ -357,17 +357,27 @@ namespace
     class ItinerarySearch final
     {
     public:
-        ItinerarySearch(const MasterFutureCatalog & catalog, std::span<const MilliFunds> prices, WorkMeter & meter,
+        ItinerarySearch(const MasterFutureCatalog & catalog, std::span<const MilliFunds> prices,
+                        std::span<const MasterFuturePricedClass> pricedClasses, WorkMeter & meter,
                         MasterPlanSearchMode mode, TailSource source, MasterPlanWitnessStats & stats,
                         std::int64_t & searchWork)
-            : m_catalog(catalog), m_prices(prices), m_meter(meter), m_mode(mode), m_source(source),
-              m_stats(stats), m_searchWork(searchWork), m_tails(catalog.classes.size())
+            : m_catalog(catalog), m_prices(prices), m_pricedClasses(pricedClasses), m_meter(meter), m_mode(mode),
+              m_source(source), m_stats(stats), m_searchWork(searchWork)
         {
         }
 
         // Ties keep the first maximum so pruned and exhaustive searches agree.
         SearchStatus best(const SequentialRow & row, std::vector<bool> & used, std::optional<MilliFunds> threshold)
         {
+            m_tail = nullptr;
+            if (pruning() && m_source == TailSource::PricedTable)
+            {
+                m_tail = pricedTail(row.classIndex);
+                if (m_tail == nullptr)
+                {
+                    return SearchStatus::Failed;
+                }
+            }
             m_table = &m_catalog.classes[static_cast<std::size_t>(row.classIndex)];
             m_used = &used;
             m_failed = false;
@@ -376,15 +386,6 @@ namespace
             if (!m_found)
             {
                 m_best.objective = *threshold;
-            }
-            m_tail = nullptr;
-            if (pruning() && m_source == TailSource::PricedTable)
-            {
-                m_tail = tail(static_cast<std::size_t>(row.classIndex));
-                if (m_tail == nullptr)
-                {
-                    return SearchStatus::Failed;
-                }
             }
             std::vector<Branch> heads;
             for (std::size_t head = 0; head < used.size(); ++head)
@@ -446,61 +447,22 @@ namespace
             {
                 return std::max<MilliFunds>(m_table->valueAt(node, turn), 0);
             }
-            return (*m_tail)[cell(node, turn)];
+            // The pick only removes nodes, so the ceiling's all-node table at the same prices stays an upper bound.
+            return (*m_tail)[cell(node, turn)].value;
         }
 
-        const std::vector<MilliFunds>* tail(std::size_t classIndex)
+        // Checked before the row's class is dereferenced, so a missing or misshapen table is never read.
+        const MasterFuturePricedClass* pricedTail(std::int32_t classIndex) const
         {
-            auto & values = m_tails[classIndex];
-            if (values.empty() && !buildTail(m_catalog.classes[classIndex], values))
+            const auto index = static_cast<std::size_t>(classIndex);
+            const auto cells = masterWorkProduct(m_catalog.columns.size(),
+                                                 static_cast<std::size_t>(std::max(m_catalog.horizon, 0)));
+            if (classIndex < 0 || index >= m_pricedClasses.size() || index >= m_catalog.classes.size() || !cells ||
+                m_pricedClasses[index].size() != static_cast<std::size_t>(*cells))
             {
-                values.clear();
                 return nullptr;
             }
-            return &values;
-        }
-
-        // The pick only removes nodes, so the all-node tail stays an upper bound.
-        bool buildTail(const SequentialClassTable & table, std::vector<MilliFunds> & values)
-        {
-            ++m_stats.tables;
-            const auto horizon = m_catalog.horizon;
-            const auto nodes = table.nodeCount();
-            const auto cells = static_cast<std::size_t>(nodes) * static_cast<std::size_t>(std::max(horizon, 1));
-            if (!chargeWitness(m_meter, cells + 1, m_stats.tableWork))
-            {
-                return false;
-            }
-            values.assign(cells, 0);
-            for (std::int32_t turn = horizon - 1; turn >= 1; --turn)
-            {
-                for (std::int32_t node = 0; node < nodes; ++node)
-                {
-                    MilliFunds best = 0;
-                    for (std::int32_t next = 0; next < nodes; ++next)
-                    {
-                        if (!chargeWitness(m_meter, 1, m_stats.tableWork))
-                        {
-                            return false;
-                        }
-                        const auto nextTurn = table.continuationOwnedTurn(node, turn, next);
-                        if (nextTurn == NO_CAPTURE_TURNS)
-                        {
-                            continue;
-                        }
-                        auto value = columnStreamValue(m_catalog.columns[static_cast<std::size_t>(next)], nextTurn,
-                                                       horizon);
-                        if (!RelativeStockDetail::checkedSubtract(value, nodePrice(next)) ||
-                            !RelativeStockDetail::checkedAdd(value, values[cell(next, nextTurn)]))
-                        {
-                            return false;
-                        }
-                        best = std::max(best, value);
-                    }
-                    values[cell(node, turn)] = best;
-                }
-            }
-            return true;
+            return &m_pricedClasses[index];
         }
 
         bool addBranch(std::vector<Branch> & branches, std::int32_t node, std::int32_t turn, MilliFunds gain,
@@ -596,13 +558,13 @@ namespace
 
         const MasterFutureCatalog & m_catalog;
         std::span<const MilliFunds> m_prices;
+        std::span<const MasterFuturePricedClass> m_pricedClasses;
         WorkMeter & m_meter;
         MasterPlanSearchMode m_mode;
         TailSource m_source;
         MasterPlanWitnessStats & m_stats;
         std::int64_t & m_searchWork;
-        std::vector<std::vector<MilliFunds>> m_tails;
-        const std::vector<MilliFunds>* m_tail{nullptr};
+        const MasterFuturePricedClass* m_tail{nullptr};
         const SequentialClassTable* m_table{nullptr};
         std::vector<bool>* m_used{nullptr};
         std::vector<SequentialWitnessStep> m_steps;
@@ -965,13 +927,14 @@ namespace
         auto seats = buildSeats(model, priced, idle);
         Occupancy occupancy{masterPlanOccupiedUsage(model), std::vector<bool>(catalog.columns.size(), false)};
         const ChoiceContext context{meter, stats, policy, options.mode};
-        ItinerarySearch reduced(catalog, prices, meter, options.mode, TailSource::PricedTable, stats,
-                                stats.pickSearchWork);
+        ItinerarySearch reduced(catalog, prices, priced.pricing.classes, meter, options.mode, TailSource::PricedTable,
+                                stats, stats.pickSearchWork);
         if (!pickSeats(seats, occupancy, reduced, context))
         {
             return {};
         }
-        ItinerarySearch exact(catalog, {}, meter, options.mode, TailSource::Unpriced, stats, stats.polishSearchWork);
+        ItinerarySearch exact(catalog, {}, {}, meter, options.mode, TailSource::Unpriced, stats,
+                              stats.polishSearchWork);
         if (!polishSeats(seats, occupancy, exact, context, options))
         {
             return {};
@@ -1420,7 +1383,8 @@ namespace Coordinator
         MasterPlanWitnessStats stats;
         WorkMeter meter(ledger, maximumWork);
         const ChoiceContext context{meter, stats, ResourcePolicy::Enforced, options.mode};
-        ItinerarySearch exact(catalog, {}, meter, options.mode, TailSource::Unpriced, stats, stats.polishSearchWork);
+        ItinerarySearch exact(catalog, {}, {}, meter, options.mode, TailSource::Unpriced, stats,
+                              stats.polishSearchWork);
         if (!polishSeats(seats, occupancy, exact, context, options) || meter.stopped())
         {
             result.status = meter.stopped() ? MasterPlanPricingStatus::LimitReached : MasterPlanPricingStatus::Invalid;

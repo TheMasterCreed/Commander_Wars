@@ -1601,6 +1601,111 @@ namespace
         }
     }
 
+    constexpr std::int32_t SHARED_NODE = 0;
+    constexpr std::int32_t CHAIN_HEAD = 1;
+    constexpr std::int32_t CHAIN_TAIL = 2;
+    constexpr std::int32_t CHAIN_NODES = 3;
+    constexpr std::int32_t PLAIN_CLASS = 0;
+    constexpr std::int32_t CHAIN_CLASS = 1;
+    constexpr std::int32_t CHAIN_TAIL_TURN = TIE_TURN + 1;
+    constexpr MilliFunds CHAIN_INCOME = 10;
+    constexpr MilliFunds CHAIN_TAIL_VALUE = 40;
+    constexpr MilliFunds CHAIN_HEAD_WEIGHT = 10;
+    constexpr MilliFunds LEAD_SHARED_WEIGHT = 60;
+    constexpr MilliFunds SECOND_SHARED_WEIGHT = 45;
+    constexpr MilliFunds SEEDED_TAIL_PRICE = 30;
+    constexpr MilliFunds STEPPED_SHARED_PRICE = 25;
+    constexpr MilliFunds STEPPED_TAIL_PRICE = 5;
+    constexpr std::int32_t OUT_OF_CATALOG_CLASS = 2;
+
+    // The leader prefers the shared node alone; only a price on it, read through the chain class, frees it.
+    std::optional<Coordinator::MasterPlanPricingModel> chainModel()
+    {
+        using namespace Coordinator;
+        MasterPlanPricingModel model;
+        auto & catalog = model.catalog;
+        catalog.horizon = TIE_HORIZON;
+        catalog.complete = true;
+        for (std::int32_t node = 0; node < CHAIN_NODES; ++node)
+        {
+            const MilliFunds income = node == CHAIN_TAIL ? CHAIN_INCOME : 1;
+            catalog.columns.push_back(PropertyStockColumn{.slot = node, .tile = {node, 0}, .income = {income, income}});
+        }
+        std::vector<std::int32_t> arrivals(static_cast<std::size_t>(CHAIN_NODES * CHAIN_NODES), 0);
+        SequentialClassTable plain;
+        plain.build(catalog.columns, arrivals, NO_CAPTURE_TURNS, TIE_HORIZON);
+        arrivals[static_cast<std::size_t>(CHAIN_HEAD * CHAIN_NODES + CHAIN_TAIL)] = 1;
+        SequentialClassTable chain;
+        chain.build(catalog.columns, arrivals, 1, TIE_HORIZON);
+        catalog.classes = {std::move(plain), std::move(chain)};
+        std::vector<MilliFunds> lead(CHAIN_NODES, 0);
+        lead[SHARED_NODE] = LEAD_SHARED_WEIGHT;
+        lead[CHAIN_HEAD] = CHAIN_HEAD_WEIGHT;
+        std::vector<MilliFunds> second(CHAIN_NODES, 0);
+        second[SHARED_NODE] = SECOND_SHARED_WEIGHT;
+        std::vector<std::int32_t> leadTurns(CHAIN_NODES, NO_CAPTURE_TURNS);
+        leadTurns[SHARED_NODE] = TIE_TURN;
+        leadTurns[CHAIN_HEAD] = TIE_TURN;
+        std::vector<std::int32_t> secondTurns(CHAIN_NODES, NO_CAPTURE_TURNS);
+        secondTurns[SHARED_NODE] = TIE_TURN;
+        const std::array rows{SequentialRow{.classIndex = CHAIN_CLASS, .weight = lead, .ownedTurn = leadTurns},
+                              SequentialRow{.classIndex = PLAIN_CLASS, .weight = second, .ownedTurn = secondTurns}};
+        for (std::int32_t row = 0; row < static_cast<std::int32_t>(rows.size()); ++row)
+        {
+            const std::vector<MilliFunds> idleWeight(CHAIN_NODES, 0);
+            const std::vector<std::int32_t> idleTurns(CHAIN_NODES, NO_CAPTURE_TURNS);
+            catalog.dayRows.push_back(
+                SequentialRow{.classIndex = PLAIN_CLASS, .weight = idleWeight, .ownedTurn = idleTurns});
+            model.rowActors.push_back(row);
+            MasterPlanPricingCandidate candidate;
+            candidate.key = CanonicalPlanActionKey::fromAction(row, 0, 0, false);
+            candidate.row = rows[static_cast<std::size_t>(row)];
+            model.actors.push_back(MasterPlanPricingActor{row, {std::move(candidate)}});
+        }
+        if (!indexMasterPlanActions(model))
+        {
+            return std::nullopt;
+        }
+        return model;
+    }
+
+    void witnessReadsTheCeilingTables()
+    {
+        using namespace Coordinator;
+        const auto model = chainModel();
+        if (!model)
+        {
+            expect(false, "the chain model indexes");
+            return;
+        }
+        expect(columnStreamValue(model->catalog.columns[CHAIN_TAIL], CHAIN_TAIL_TURN, TIE_HORIZON) == CHAIN_TAIL_VALUE,
+               "the chain tail earns its stated value");
+        // The seed prices the tail, so the second round's ceiling prices the chain differently from the first.
+        const std::vector<MilliFunds> seed{0, 0, SEEDED_TAIL_PRICE};
+        const std::vector<MilliFunds> stepped{STEPPED_SHARED_PRICE, 0, STEPPED_TAIL_PRICE};
+        const MasterPlanWitness expected{true, {0, 0},
+            {{0, {{CHAIN_HEAD, TIE_TURN, CHAIN_HEAD_WEIGHT}, {CHAIN_TAIL, CHAIN_TAIL_TURN, CHAIN_TAIL_VALUE}},
+              CHAIN_HEAD_WEIGHT + CHAIN_TAIL_VALUE},
+             {1, {{SHARED_NODE, TIE_TURN, SECOND_SHARED_WEIGHT}}, SECOND_SHARED_WEIGHT}},
+            CHAIN_HEAD_WEIGHT + CHAIN_TAIL_VALUE + SECOND_SHARED_WEIGHT};
+        for (const auto mode : {MasterPlanSearchMode::Pruned, MasterPlanSearchMode::Exhaustive})
+        {
+            RefinementLedger ledger;
+            ledger.open(2 * MASTER_PLAN_PRICING_WORK);
+            const auto tuned = tuneMasterPlanPrices(*model, pricingLimits(), ledger, {.mode = mode}, seed);
+            expect(tuned.status == MasterPlanPricingStatus::Valid && tuned.prices == stepped &&
+                       sameWitness(tuned.witness, expected),
+                   "the pick prices the chain with its class table at the round's prices and frees the shared node");
+        }
+        auto stray = *model;
+        stray.actors.front().candidates.front().row.classIndex = OUT_OF_CATALOG_CLASS;
+        RefinementLedger ledger;
+        ledger.open(2 * MASTER_PLAN_PRICING_WORK);
+        const auto refused = tuneMasterPlanPrices(stray, pricingLimits(), ledger, {}, seed);
+        expect(refused.status == MasterPlanPricingStatus::Valid && !refused.witness.valid,
+               "a pick row whose class has no priced table fails the build instead of reading past the tables");
+    }
+
     void productionRowsPreferTheCloserApproach()
     {
         using namespace Coordinator;
@@ -1690,6 +1795,7 @@ int main()
     polishSwitchesToCloserTie();
     exhaustiveArithmeticMatchesHead();
     productionRowsPreferTheCloserApproach();
+    witnessReadsTheCeilingTables();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -121,6 +121,7 @@ namespace
                 result.actions.push_back(std::move(price));
             }
             result.status = MasterFutureStatus::Valid;
+            result.classes = std::move(m_values);
             return result;
         }
 

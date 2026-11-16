@@ -69,8 +69,6 @@ namespace
     constexpr auto TRACE_TIE_SWITCHES = "tieSwitches";
     constexpr auto TRACE_SKIP_VIOLATIONS = "skipViolations";
     constexpr auto TRACE_STATES = "states";
-    constexpr auto TRACE_TABLES = "tables";
-    constexpr auto TRACE_TABLE_WORK = "tableWork";
     constexpr auto TRACE_PICK_SEARCH_WORK = "pickSearchWork";
     constexpr auto TRACE_POLISH_SEARCH_WORK = "polishSearchWork";
     constexpr auto TRACE_SEATS = "seats";
@@ -100,8 +98,7 @@ namespace
             {TRACE_SKIPPED_RESPONSES, QString::number(stats.skippedResponses)},
             {TRACE_TIE_SWITCHES, QString::number(stats.tieSwitches)},
             {TRACE_SKIP_VIOLATIONS, QString::number(stats.skipViolations)},
-            {TRACE_STATES, QString::number(stats.states)}, {TRACE_TABLES, QString::number(stats.tables)},
-            {TRACE_TABLE_WORK, QString::number(stats.tableWork)},
+            {TRACE_STATES, QString::number(stats.states)},
             {TRACE_PICK_SEARCH_WORK, QString::number(stats.pickSearchWork)},
             {TRACE_POLISH_SEARCH_WORK, QString::number(stats.polishSearchWork)}};
     }
