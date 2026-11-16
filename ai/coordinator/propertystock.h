@@ -64,25 +64,46 @@ namespace Coordinator
         std::int32_t ratePerTurn{0};
     };
 
+    enum class RawOwnershipStatus : std::int8_t
+    {
+        Owned,
+        Never,
+        Overflow,
+    };
+
+    struct RawOwnership
+    {
+        RawOwnershipStatus status{RawOwnershipStatus::Never};
+        std::int32_t turns{NO_CAPTURE_TURNS};
+    };
+
+    // First ownership with no horizon cut; Owned can still be below 1 when the capture completes today.
+    constexpr RawOwnership rawOwnedTurns(std::int32_t arrivalActivations, std::int32_t carriedPoints,
+                                         std::int32_t ratePerTurn, std::int32_t pointsToCapture)
+    {
+        if (arrivalActivations <= 0 || ratePerTurn <= 0)
+        {
+            return {};
+        }
+        const std::int64_t ownedTurns = static_cast<std::int64_t>(arrivalActivations) +
+            widenedCaptureTurns(carriedPoints, ratePerTurn, pointsToCapture) - 1;
+        if (ownedTurns > std::numeric_limits<std::int32_t>::max())
+        {
+            return {RawOwnershipStatus::Overflow, NO_CAPTURE_TURNS};
+        }
+        return {RawOwnershipStatus::Owned, static_cast<std::int32_t>(ownedTurns)};
+    }
+
     constexpr std::int32_t ownedTurnsUntil(std::int32_t arrivalActivations, std::int32_t carriedPoints,
                                            std::int32_t ratePerTurn, std::int32_t pointsToCapture,
                                            std::int32_t horizonTurns)
     {
-        if (arrivalActivations <= 0 || ratePerTurn <= 0)
+        const RawOwnership raw = rawOwnedTurns(arrivalActivations, carriedPoints, ratePerTurn, pointsToCapture);
+        if (raw.status != RawOwnershipStatus::Owned || raw.turns >= horizonTurns)
         {
             return NO_CAPTURE_TURNS;
         }
-        const std::int32_t captureTurns = captureTurnsFor(carriedPoints, ratePerTurn, pointsToCapture);
-        if (captureTurns == NO_CAPTURE_TURNS)
-        {
-            return NO_CAPTURE_TURNS;
-        }
-        const std::int32_t ownedTurns = arrivalActivations + captureTurns - 1;
-        if (ownedTurns >= horizonTurns)
-        {
-            return NO_CAPTURE_TURNS;
-        }
-        return ownedTurns;
+        return raw.turns;
     }
 
     constexpr MilliFunds columnStreamValue(const PropertyStockColumn & column, std::int32_t ownedTurns,

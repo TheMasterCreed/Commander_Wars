@@ -6,6 +6,7 @@
 #include <QFile>
 
 #include "ai/coordinator/masterassignmentsearch.h"
+#include "ai/coordinator/propertystockfield.h"
 
 namespace Coordinator
 {
@@ -95,4 +96,8 @@ namespace Coordinator
     QJsonObject masterRefinementRefusalRecord(const std::optional<MasterRefinementRefusal> & refusal);
     QJsonObject masterCertificatePreparationRecord(
         const std::optional<RelativeStockCertificatePreparation> & preparation);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    inline constexpr auto TRACE_LATER_LIST = "laterList";
+    QJsonObject masterLaterListRecord(const LaterListMeasure & measure);
+#endif
 }

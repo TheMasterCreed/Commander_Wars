@@ -1706,6 +1706,416 @@ namespace
                "a pick row whose class has no priced table fails the build instead of reading past the tables");
     }
 
+    using LaterFixture = Coordinator::PropertyStockDiagnosticFixture;
+    using LaterEntries = std::vector<Coordinator::SequentialLaterEntry>;
+
+    LaterEntries laterEntries(const Coordinator::SequentialLaterList & later)
+    {
+        return {later.entries.begin(), later.entries.begin() + later.count};
+    }
+
+    bool sameRowData(const Coordinator::SequentialRow & left, const Coordinator::SequentialRow & right)
+    {
+        return left.classIndex == right.classIndex && left.weight == right.weight &&
+            left.ownedTurn == right.ownedTurn && left.approach == right.approach && left.later == right.later;
+    }
+
+    constexpr std::int32_t CROWDED_CORRIDOR = 13;
+    constexpr std::int32_t CROWDED_ROW_X = 6;
+    constexpr Coordinator::MilliFunds CROWDED_RICH_INCOME = 3;
+
+    // Twelve properties past a horizon of two around the mover, more than the list holds.
+    LaterFixture::LineSpec crowdedLine()
+    {
+        LaterFixture::LineSpec spec{.width = CROWDED_CORRIDOR, .horizon = 2, .rowX = CROWDED_ROW_X};
+        for (std::int32_t x = 0; x < CROWDED_CORRIDOR; ++x)
+        {
+            if (x != CROWDED_ROW_X)
+            {
+                spec.columns.push_back({.x = x, .income = x == CROWDED_ROW_X + 1 ? CROWDED_RICH_INCOME : 2});
+            }
+        }
+        return spec;
+    }
+
+    Coordinator::CanonicalPlanActionKey crowdedStay()
+    {
+        return Coordinator::CanonicalPlanActionKey::fromAction(0, CROWDED_ROW_X, 0, false);
+    }
+
+    std::optional<Coordinator::SequentialRow> laterRow(const Coordinator::PropertyStockField & field,
+                                                      const Coordinator::CanonicalPlanActionKey & action,
+                                                      Coordinator::DiagnosticPricingModels* pModels = nullptr)
+    {
+        const Coordinator::ContinuationKey key{action};
+        auto models = Coordinator::JointPlanStockValuer::diagnosticPricingModels(field, std::span(&key, 1));
+        if (!models.models[0])
+        {
+            return std::nullopt;
+        }
+        auto row = models.models[0]->actors.front().candidates.front().row;
+        if (pModels != nullptr)
+        {
+            *pModels = std::move(models);
+        }
+        return row;
+    }
+
+    void rawArrivalsBesideClipped()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t CORRIDOR = 10;
+        constexpr std::int32_t LIMIT = 2;
+        constexpr std::int32_t STRIDE = 2;
+        constexpr std::int32_t ROW_X = 1;
+        constexpr std::int32_t EDGE_X = 4;
+        constexpr std::int32_t BEYOND_X = 5;
+        constexpr std::int32_t WALL_X = 8;
+        constexpr std::int32_t ISLAND_X = 9;
+        constexpr std::int32_t BEYOND_ACTIVATIONS = 3;
+        constexpr TilePoint ENDPOINT{0, 0};
+        const LaterFixture::LineSpec spec{.width = CORRIDOR, .horizon = LIMIT, .movementPoints = STRIDE,
+            .rowX = ROW_X, .wallX = WALL_X,
+            .columns = {{.x = 2, .income = 1}, {.x = EDGE_X, .income = 1}, {.x = BEYOND_X, .income = 1},
+                        {.x = ISLAND_X, .income = 1}}};
+        const LaterFixture::Arrivals clipped{{1, LIMIT, UNREACHABLE, UNREACHABLE},
+                                             {STRIDE, STRIDE, UNREACHABLE, UNREACHABLE}};
+        const LaterFixture::Arrivals raw{{1, LIMIT, BEYOND_ACTIVATIONS, UNREACHABLE},
+                                         {STRIDE, STRIDE, 1, UNREACHABLE}};
+        auto clippedFirst = LaterFixture::line(spec);
+        const auto clippedA = LaterFixture::clippedArrivals(clippedFirst, STRIDE, ENDPOINT);
+        const auto rawA = LaterFixture::rawArrivals(clippedFirst, STRIDE, ENDPOINT);
+        expect(clippedA == clipped && rawA == raw,
+               "after a clipped request the raw request still reaches past the limit, spent points included");
+        auto rawFirst = LaterFixture::line(spec);
+        const auto rawB = LaterFixture::rawArrivals(rawFirst, STRIDE, ENDPOINT);
+        const auto clippedB = LaterFixture::clippedArrivals(rawFirst, STRIDE, ENDPOINT);
+        expect(rawB == raw && clippedB == clipped,
+               "after a raw request the clipped request reads UNREACHABLE past the limit for activations and spent");
+
+        constexpr std::int32_t GRID_WIDTH = 4;
+        constexpr std::int32_t GRID_HEIGHT = 3;
+        constexpr std::int32_t COST_CYCLE = 3;
+        constexpr std::int32_t ALLOWANCE = 3;
+        constexpr TilePoint WALL{1, 1};
+        constexpr std::int32_t TWO_ENTRY_ROUTE_COST = 5;
+        MobilityCostGrid grid(GRID_WIDTH, GRID_HEIGHT);
+        std::vector<TilePoint> everyTile;
+        for (std::int32_t y = 0; y < GRID_HEIGHT; ++y)
+        {
+            for (std::int32_t x = 0; x < GRID_WIDTH; ++x)
+            {
+                everyTile.push_back({x, y});
+                if (TilePoint{x, y} == WALL)
+                {
+                    continue;
+                }
+                for (const EntryDirection direction : ENTRY_DIRECTIONS)
+                {
+                    grid.setCost(x, y, direction, 1 + (x + 2 * y) % COST_CYCLE);
+                }
+            }
+        }
+        ActivationField wide;
+        wide.build(grid, ENDPOINT, ALLOWANCE, UNBOUNDED_ACTIVATIONS, everyTile);
+        std::int32_t largest = 0;
+        for (const TilePoint & tile : everyTile)
+        {
+            largest = std::max(largest, wide.activations(tile.x, tile.y));
+        }
+        bool same = true;
+        for (std::int32_t limit = 0; limit <= largest + 1; ++limit)
+        {
+            ActivationField limited;
+            limited.build(grid, ENDPOINT, ALLOWANCE, limit, everyTile);
+            for (const TilePoint & tile : everyTile)
+            {
+                same = same && wide.activations(tile.x, tile.y, limit) == limited.activations(tile.x, tile.y) &&
+                    wide.spent(tile.x, tile.y, limit) == limited.spent(tile.x, tile.y);
+            }
+        }
+        ActivationField partial;
+        partial.build(grid, ENDPOINT, ALLOWANCE, UNBOUNDED_ACTIVATIONS, {{GRID_WIDTH - 1, GRID_HEIGHT - 1}});
+        expect(same && largest > 1 && wide.routeCost(2, 0) == TWO_ENTRY_ROUTE_COST &&
+                   partial.activations(1, 0) == UNREACHABLE,
+               "a wide flood read with any limit equals the flood built with it, and unrequested tiles stay hidden");
+
+        constexpr std::int32_t STILL_WIDTH = 3;
+        const LaterFixture::LineSpec still{.width = STILL_WIDTH, .horizon = 0, .rowX = 2,
+                                           .columns = {{.x = 0, .income = 1}}};
+        const LaterFixture::Arrivals origin{{1}, {0}};
+        auto stillClipped = LaterFixture::line(still);
+        const auto stillClippedFirst = LaterFixture::clippedArrivals(stillClipped, 1, ENDPOINT);
+        const auto stillRawSecond = LaterFixture::rawArrivals(stillClipped, 1, ENDPOINT);
+        auto stillRaw = LaterFixture::line(still);
+        const auto stillRawFirst = LaterFixture::rawArrivals(stillRaw, 1, ENDPOINT);
+        const auto stillClippedSecond = LaterFixture::clippedArrivals(stillRaw, 1, ENDPOINT);
+        expect(stillClippedFirst == origin && stillRawSecond == origin && stillRawFirst == origin &&
+                   stillClippedSecond == origin,
+               "at horizon zero both caches still expose the origin in either request order");
+
+        // Each entry fills a whole activation, so the third step arrives on activation three.
+        constexpr std::int32_t STEEP = std::numeric_limits<std::int32_t>::max();
+        constexpr std::int32_t CLIMB_LENGTH = 4;
+        constexpr std::int32_t TOP_X = CLIMB_LENGTH - 1;
+        MobilityCostGrid steep(CLIMB_LENGTH, 1);
+        for (std::int32_t x = 0; x < CLIMB_LENGTH; ++x)
+        {
+            steep.setCost(x, 0, EntryDirection::East, STEEP);
+        }
+        ActivationField climb;
+        climb.build(steep, ENDPOINT, STEEP, UNBOUNDED_ACTIVATIONS, {{TOP_X, 0}});
+        expect(climb.activations(TOP_X, 0) == TOP_X && climb.spent(TOP_X, 0) == STEEP &&
+                   climb.routeCost(TOP_X, 0) == STEEP,
+               "entry costs at the integer limit keep exact labels and saturate the route cost");
+    }
+
+    void candidateRowsCarryTheLaterList()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t CORRIDOR = 5;
+        constexpr std::int32_t HORIZON = 3;
+        constexpr std::int32_t FAR_X = 3;
+        constexpr MilliFunds FAR_INCOME = 5;
+        constexpr std::int32_t FAR_TURN = 4;
+        LaterFixture::LineSpec spec{.width = CORRIDOR, .horizon = HORIZON,
+            .columns = {{.x = 1, .income = 1}, {.x = FAR_X, .income = FAR_INCOME}}};
+        const auto stay = CanonicalPlanActionKey::fromAction(0, 0, 0, false);
+        DiagnosticPricingModels models;
+        const auto row = laterRow(LaterFixture::line(spec), stay, &models);
+        if (!row)
+        {
+            expect(false, "the later-list key has a pricing model");
+            return;
+        }
+        expect(laterEntries(row->later) == LaterEntries{{1, FAR_TURN, FAR_INCOME}} && !row->later.truncated &&
+                   row->later.check == SequentialLaterCheck::Passed &&
+                   row->later.state == SequentialLaterState::Complete,
+               "a property past the horizon is listed with its raw turn and one-turn stream, the near one is not");
+        expect(models.models[0]->catalog.dayRows.front().later == SequentialLaterList{},
+               "a day row from another builder carries no list and stays Unknown");
+        spec.columns.front().owner = STOCK_OWNER_AFTER;
+        const auto filtered = laterRow(LaterFixture::line(spec), stay);
+        expect(filtered && laterEntries(filtered->later) == LaterEntries{{0, FAR_TURN, FAR_INCOME}} &&
+                   filtered->later.state == SequentialLaterState::Complete,
+               "with a filtered column the entry names the node, not the column slot");
+    }
+
+    void laterTurnFollowsProgressAndRate()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t CORRIDOR = 4;
+        constexpr std::int32_t HORIZON = 3;
+        constexpr std::int32_t SLOW_POINTS = 8;
+        constexpr std::int32_t FAR_X = 3;
+        constexpr MilliFunds HOME_INCOME = 3;
+        constexpr std::int32_t CARRIED_TURN = 3;
+        constexpr std::int32_t FAR_TURN = 6;
+        constexpr std::int32_t DAMAGED_HOME_TURN = 6;
+        constexpr std::int32_t DAMAGED_FAR_TURN = 10;
+        const LaterFixture::LineSpec spec{.width = CORRIDOR, .horizon = HORIZON, .points = SLOW_POINTS, .carried = 2,
+            .columns = {{.x = 0, .income = HOME_INCOME}, {.x = FAR_X, .income = 1}}};
+        const auto field = LaterFixture::line(spec);
+        const auto healthy = laterRow(field, CanonicalPlanActionKey::fromAction(0, 0, 0, false));
+        const auto damaged = laterRow(field, *CanonicalPlanActionKey::checkedFromAction(0, 0, 0, false, 1, false));
+        if (!healthy || !damaged)
+        {
+            expect(false, "the carried and damaged keys have pricing models");
+            return;
+        }
+        expect(laterEntries(healthy->later) == LaterEntries{{0, CARRIED_TURN, HOME_INCOME}, {1, FAR_TURN, 1}} &&
+                   healthy->later.state == SequentialLaterState::Complete,
+               "carried progress on the mover's tile shortens that node's raw turn");
+        expect(laterEntries(damaged->later) ==
+                   LaterEntries{{0, DAMAGED_HOME_TURN, HOME_INCOME}, {1, DAMAGED_FAR_TURN, 1}} &&
+                   damaged->later.state == SequentialLaterState::Complete,
+               "a damaged capture rate lengthens every raw turn");
+    }
+
+    void laterListKeepsTheBestEntries()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t ROW_X = CROWDED_ROW_X;
+        constexpr MilliFunds RICH_INCOME = CROWDED_RICH_INCOME;
+        const auto row = laterRow(LaterFixture::line(crowdedLine()), crowdedStay());
+        if (!row)
+        {
+            expect(false, "the truncation key has a pricing model");
+            return;
+        }
+        // Nodes left of the mover keep their x; nodes right of it sit one lower. The first pair ties on turn.
+        LaterEntries expected{{ROW_X, 2, RICH_INCOME}, {ROW_X - 1, 2, 2}};
+        for (std::int32_t distance = 2; expected.size() < static_cast<std::size_t>(LATER_KEY_NODES); ++distance)
+        {
+            expected.push_back({ROW_X - distance, distance + 1, 2});
+            expected.push_back({ROW_X - 1 + distance, distance + 1, 2});
+        }
+        expect(laterEntries(row->later) == expected && row->later.truncated &&
+                   row->later.state == SequentialLaterState::Complete,
+               "more qualifying nodes than the list holds keep the best in turn, stream, node order and set the flag");
+
+        constexpr std::int32_t REMOVED = ROW_X - 2;
+        auto cleared = *row;
+        removeCapturedNode(cleared, REMOVED);
+        auto twice = cleared;
+        removeCapturedNode(twice, REMOVED);
+        std::erase_if(expected, [](const SequentialLaterEntry & entry) { return entry.node == REMOVED; });
+        expect(laterEntries(cleared.later) == expected && cleared.later.entries.back() == SequentialLaterEntry{} &&
+                   cleared.later.truncated && cleared.later.state == SequentialLaterState::Complete &&
+                   cleared.weight.size() == row->weight.size() && cleared.approach.size() == row->approach.size(),
+               "removing a captured node closes the gap in the list and keeps the rest aligned");
+        expect(sameRowData(cleared, twice), "clearing a prepared row twice equals clearing it once");
+    }
+
+    void laterStatesSettleAfterClearing()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t CORRIDOR = 4;
+        constexpr std::int32_t HORIZON = 3;
+        constexpr std::int32_t FAR_X = 3;
+        constexpr std::int32_t FAR_TURN = 4;
+        const auto stay = CanonicalPlanActionKey::fromAction(0, 0, 0, false);
+        const auto capture = CanonicalPlanActionKey::fromAction(0, 0, 0, true);
+        LaterFixture::LineSpec spec{.width = CORRIDOR, .horizon = HORIZON,
+            .carried = LaterFixture::POINTS, .columns = {{.x = 0, .income = 1}, {.x = FAR_X, .income = 1}}};
+        // Progress already complete without this action capturing leaves a raw turn of zero nobody clears.
+        const auto complete = laterRow(LaterFixture::line(spec), stay);
+        spec.carried = 2;
+        DiagnosticPricingModels captureModels;
+        const auto captured = laterRow(LaterFixture::line(spec), capture, &captureModels);
+        auto duplicate = spec;
+        duplicate.columns.insert(duplicate.columns.begin(), LaterFixture::LineColumn{.x = 0, .income = 1});
+        DiagnosticPricingModels duplicateModels;
+        const auto doubled = laterRow(LaterFixture::line(duplicate), capture, &duplicateModels);
+        if (!complete || !captured || !doubled || !captureModels.catalog)
+        {
+            expect(false, "the raw-zero keys have pricing models");
+            return;
+        }
+        expect(complete->later.state == SequentialLaterState::Unknown && complete->later.earlyNodes == 1 &&
+                   complete->later.earlyNode == 0 && laterEntries(complete->later) == LaterEntries{{1, FAR_TURN, 1}},
+               "an uncleared raw turn of zero keeps the row Unknown");
+        auto settled = *complete;
+        removeCapturedNode(settled, 0);
+        auto settledTwice = settled;
+        removeCapturedNode(settledTwice, 0);
+        expect(settled.later.state == SequentialLaterState::Complete && settled.later.earlyNodes == 0 &&
+                   settled.later.earlyNode == NO_SEQUENTIAL_NODE && sameRowData(settled, settledTwice),
+               "clearing the single blocker settles the row Complete, and clearing again changes nothing");
+        auto elsewhere = *complete;
+        removeCapturedNode(elsewhere, 1);
+        expect(elsewhere.later.state == SequentialLaterState::Unknown && elsewhere.later.earlyNodes == 1 &&
+                   elsewhere.later.earlyNode == 0,
+               "clearing a different node leaves the single blocker in place");
+        const auto* pBuilt = findMasterFutureAction(*captureModels.catalog, capture);
+        expect(pBuilt != nullptr && pBuilt->row.later.state == SequentialLaterState::Unknown &&
+                   pBuilt->row.later.earlyNode == 0 && captured->later.state == SequentialLaterState::Complete &&
+                   laterEntries(captured->later) == LaterEntries{{1, FAR_TURN, 1}},
+               "a completing capture is Unknown as built and Complete once pricing removes its captured node");
+        const auto & doubledCandidate = duplicateModels.models[0]->actors.front().candidates.front();
+        auto clearedOther = *doubled;
+        removeCapturedNode(clearedOther, 0);
+        expect(doubledCandidate.capturedNode == 1 && doubled->later.earlyNodes == 2 &&
+                   doubled->later.state == SequentialLaterState::Unknown &&
+                   clearedOther.later.state == SequentialLaterState::Unknown,
+               "two raw-zero nodes stay Unknown after clearing either of them");
+
+        constexpr std::int32_t OVERFLOW_X = 2;
+        const LaterFixture::LineSpec overflow{.width = CORRIDOR, .horizon = 2,
+            .points = std::numeric_limits<std::int32_t>::max(), .rate = 1, .columns = {{.x = OVERFLOW_X, .income = 1}}};
+        const auto overflowed = laterRow(LaterFixture::line(overflow), stay);
+        expect(overflowed && overflowed->later.check == SequentialLaterCheck::Overflow &&
+                   overflowed->later.state == SequentialLaterState::Unknown,
+               "a raw turn past the integer range makes the row Unknown");
+        constexpr std::int32_t WIDE_CORRIDOR = 5;
+        const LaterFixture::LineSpec fastest{.width = WIDE_CORRIDOR, .horizon = 2,
+            .rate = std::numeric_limits<std::int32_t>::max(), .columns = {{.x = FAR_X, .income = 1}}};
+        // Three activations to the node and one capture turn, owned from turn three.
+        constexpr std::int32_t FASTEST_TURN = 3;
+        const auto widened = laterRow(LaterFixture::line(fastest), stay);
+        expect(widened && laterEntries(widened->later) == LaterEntries{{0, FASTEST_TURN, 1}} &&
+                   widened->later.state == SequentialLaterState::Complete,
+               "a capture rate at the integer limit still takes one turn");
+        constexpr MilliFunds FAR_INCOME = 5;
+        const LaterFixture::LineSpec losing{.width = WIDE_CORRIDOR, .horizon = HORIZON,
+            .columns = {{.x = 1, .income = -1}, {.x = FAR_X, .income = FAR_INCOME}}};
+        const auto negative = laterRow(LaterFixture::line(losing), stay);
+        expect(negative && negative->later.check == SequentialLaterCheck::NegativeStream &&
+                   negative->later.state == SequentialLaterState::Unknown,
+               "a routed node with a negative one-turn stream makes the row Unknown");
+
+        const auto dead = laterRow(LaterFixture::make(), LaterFixture::replyKeys().dead);
+        if (!dead)
+        {
+            expect(false, "the destroyed key has a pricing model");
+            return;
+        }
+        auto deadOnce = *dead;
+        removeCapturedNode(deadOnce, 0);
+        auto deadTwice = deadOnce;
+        removeCapturedNode(deadTwice, 0);
+        expect(dead->later.check == SequentialLaterCheck::Unprepared &&
+                   deadOnce.later.state == SequentialLaterState::Unknown && sameRowData(deadOnce, deadTwice),
+               "an unprepared row stays Unknown, and clearing it twice equals clearing it once");
+
+        const LaterFixture::LineSpec idle{.width = CORRIDOR, .horizon = HORIZON, .rate = 0,
+            .columns = {{.x = FAR_X, .income = 1}}};
+        DiagnosticPricingModels idleModels;
+        const auto unable = laterRow(LaterFixture::line(idle), stay, &idleModels);
+        expect(unable && unable->later.check == SequentialLaterCheck::Unprepared &&
+                   idleModels.laterList.endpointFloods == 0 && idleModels.laterList.unpreparedRows == 1,
+               "a mover that cannot capture is not prepared and floods no endpoint");
+    }
+
+    void laterListSurvivesEveryCopy()
+    {
+        using namespace Coordinator;
+        const auto stay = crowdedStay();
+        const std::array keys{ContinuationKey{stay}, ContinuationKey{stay}};
+        const auto models = JointPlanStockValuer::diagnosticPricingModels(LaterFixture::line(crowdedLine()), keys);
+        if (!models.models[0] || !models.models[1] || !models.catalog)
+        {
+            expect(false, "the duplicate keys have pricing models");
+            return;
+        }
+        const auto* pBuilt = findMasterFutureAction(*models.catalog, stay);
+        const auto & first = models.models[0]->actors.front().candidates.front().row.later;
+        const auto & second = models.models[1]->actors.front().candidates.front().row.later;
+        expect(pBuilt != nullptr && first.count == LATER_KEY_NODES && first.truncated && first == pBuilt->row.later &&
+                   second == first &&
+                   models.models[0]->catalog.actions.front().row.later == first,
+               "duplicate action keys carry equal lists into every model and its indexed actions");
+        const std::array<std::int32_t, 1> forced{0};
+        const auto restricted = restrictMasterPlanModel(*models.models[0], forced);
+        expect(restricted && restricted->actors.front().candidates.front().row.later == first &&
+                   restricted->catalog.actions.front().row.later == first,
+               "a restricted model carries list, flag and state unchanged");
+    }
+
+    void replyContextReadsTheClippedArrivals()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t CORRIDOR = 8;
+        constexpr std::int32_t FAR_X = 5;
+        constexpr TilePoint ENDPOINT{2, 0};
+        const LaterFixture::LineSpec spec{.width = CORRIDOR, .horizon = 2,
+            .columns = {{.x = 1, .income = 1}, {.x = FAR_X, .income = 2}}};
+        const auto field = LaterFixture::line(spec);
+        auto widened = field;
+        LaterFixture::rawArrivals(widened, 1, ENDPOINT);
+        const ContinuationKey key{CanonicalPlanActionKey::fromAction(0, ENDPOINT.x, ENDPOINT.y, false)};
+        ReplyStockContext plain(field);
+        ReplyStockContext afterRaw(widened);
+        const auto plainTune = plain.tune(key, MASTER_PLAN_PRICING_ROUNDS);
+        const auto rawTune = afterRaw.tune(key, MASTER_PLAN_PRICING_ROUNDS);
+        const auto plainFloor = plain.floor(key);
+        const auto rawFloor = afterRaw.floor(key);
+        expect(plainTune.status == rawTune.status && plainTune.rounds == rawTune.rounds &&
+                   plainTune.ceiling == rawTune.ceiling && plainTune.floor.floor == rawTune.floor.floor &&
+                   plainFloor.status == rawFloor.status && plainFloor.floor == rawFloor.floor,
+               "the reply stock context prices the same after a raw flood filled its clipped entry");
+    }
+
     void productionRowsPreferTheCloserApproach()
     {
         using namespace Coordinator;
@@ -1796,6 +2206,13 @@ int main()
     exhaustiveArithmeticMatchesHead();
     productionRowsPreferTheCloserApproach();
     witnessReadsTheCeilingTables();
+    rawArrivalsBesideClipped();
+    candidateRowsCarryTheLaterList();
+    laterTurnFollowsProgressAndRate();
+    laterListKeepsTheBestEntries();
+    laterStatesSettleAfterClearing();
+    laterListSurvivesEveryCopy();
+    replyContextReadsTheClippedArrivals();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

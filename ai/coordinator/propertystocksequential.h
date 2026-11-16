@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -228,6 +229,117 @@ namespace Coordinator
         friend constexpr auto operator<=>(const SequentialApproach &, const SequentialApproach &) = default;
     };
 
+    constexpr std::int32_t LATER_KEY_NODES = 8;
+
+    enum class SequentialLaterState : std::int8_t
+    {
+        Unknown,
+        Complete,
+    };
+
+    // The checks no captured-node clearing can repair; the first one to fail is kept.
+    enum class SequentialLaterCheck : std::int8_t
+    {
+        Unprepared,
+        Overflow,
+        NegativeStream,
+        Passed,
+    };
+
+    struct SequentialLaterEntry
+    {
+        std::int32_t node{NO_SEQUENTIAL_NODE};
+        std::int32_t turn{NO_CAPTURE_TURNS};
+        MilliFunds stream{0};
+
+        friend constexpr bool operator==(const SequentialLaterEntry &, const SequentialLaterEntry &) = default;
+    };
+
+    // Nodes first owned at or past the horizon, in key order: turn ascending, stream descending, node ascending.
+    struct SequentialLaterList
+    {
+        std::array<SequentialLaterEntry, LATER_KEY_NODES> entries{};
+        std::int32_t count{0};
+        bool truncated{false};
+        SequentialLaterCheck check{SequentialLaterCheck::Unprepared};
+        // Routed positive-stream nodes owned below turn 1 that no clearing has removed yet.
+        std::int32_t earlyNodes{0};
+        std::int32_t earlyNode{NO_SEQUENTIAL_NODE};
+        SequentialLaterState state{SequentialLaterState::Unknown};
+
+        friend constexpr bool operator==(const SequentialLaterList &, const SequentialLaterList &) = default;
+    };
+
+    constexpr bool laterEntryBefore(const SequentialLaterEntry & left, const SequentialLaterEntry & right)
+    {
+        if (left.turn != right.turn)
+        {
+            return left.turn < right.turn;
+        }
+        if (left.stream != right.stream)
+        {
+            return left.stream > right.stream;
+        }
+        return left.node < right.node;
+    }
+
+    constexpr void settleLaterState(SequentialLaterList & later)
+    {
+        later.state = later.check == SequentialLaterCheck::Passed && later.earlyNodes == 0
+            ? SequentialLaterState::Complete : SequentialLaterState::Unknown;
+    }
+
+    constexpr void offerLaterEntry(SequentialLaterList & later, const SequentialLaterEntry & entry)
+    {
+        auto slot = static_cast<std::size_t>(later.count);
+        if (later.count == LATER_KEY_NODES)
+        {
+            later.truncated = true;
+            if (!laterEntryBefore(entry, later.entries[slot - 1]))
+            {
+                return;
+            }
+            --slot;
+        }
+        else
+        {
+            ++later.count;
+        }
+        while (slot > 0 && laterEntryBefore(entry, later.entries[slot - 1]))
+        {
+            later.entries[slot] = later.entries[slot - 1];
+            --slot;
+        }
+        later.entries[slot] = entry;
+    }
+
+    constexpr void noteEarlyLaterNode(SequentialLaterList & later, std::int32_t node)
+    {
+        ++later.earlyNodes;
+        later.earlyNode = later.earlyNodes == 1 ? node : NO_SEQUENTIAL_NODE;
+    }
+
+    // Idempotent: a second clearing of the same node finds neither its entry nor its blocker id.
+    constexpr void clearLaterNode(SequentialLaterList & later, std::int32_t node)
+    {
+        auto kept = later.entries.begin();
+        for (auto entry = later.entries.begin(); entry != later.entries.begin() + later.count; ++entry)
+        {
+            if (entry->node != node)
+            {
+                *kept++ = *entry;
+            }
+        }
+        later.count = static_cast<std::int32_t>(kept - later.entries.begin());
+        std::fill(kept, later.entries.end(), SequentialLaterEntry{});
+        if (later.earlyNodes == 1 && later.earlyNode == node)
+        {
+            later.earlyNodes = 0;
+            later.earlyNode = NO_SEQUENTIAL_NODE;
+        }
+        settleLaterState(later);
+    }
+
     struct SequentialRow
     {
         std::int32_t classIndex{NO_SEQUENTIAL_CLASS};
@@ -235,6 +347,7 @@ namespace Coordinator
         std::vector<std::int32_t> ownedTurn;
         // Empty means no movement detail, which never breaks a tie.
         std::vector<SequentialApproach> approach;
+        SequentialLaterList later;
     };
 
     struct SequentialInstance

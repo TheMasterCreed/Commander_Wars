@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <queue>
 #include <vector>
 
@@ -289,6 +290,12 @@ namespace Coordinator
         return completedBoundaries + 1;
     }
 
+    // Strictly greater, so an arrival exactly on the limit still gets a label to be priced.
+    constexpr bool beyondActivationLimit(std::int32_t arrivalActivations, std::int32_t activationLimit)
+    {
+        return activationLimit != UNBOUNDED_ACTIVATIONS && arrivalActivations > activationLimit;
+    }
+
     // Turn boundaries, not summed cost. One instance is reused across builds; a generation stamp replaces clearing.
     class ActivationField
     {
@@ -300,6 +307,7 @@ namespace Coordinator
             resize(grid.width(), grid.height());
             ++m_generation;
             m_heap.clear();
+            m_origin = origin;
             if (!grid.onGrid(origin.x, origin.y))
             {
                 return;
@@ -358,7 +366,7 @@ namespace Coordinator
                     const ActivationLabel candidate =
                         enteredLabel(ActivationLabel{current.boundaries, current.spent, current.cost}, cost,
                                      movementPoints);
-                    if (exceedsLimit(candidate.boundaries, activationLimit))
+                    if (beyondActivationLimit(arrivalActivationsOf(candidate.boundaries), activationLimit))
                     {
                         continue;
                     }
@@ -375,24 +383,44 @@ namespace Coordinator
         }
 
         // UNREACHABLE also covers a tile the activation limit cut off, which books the same exact zero.
-        std::int32_t activations(std::int32_t x, std::int32_t y) const
+        // A read limit masks a wider build exactly as a build with that limit would have left the tile.
+        std::int32_t activations(std::int32_t x, std::int32_t y,
+                                 std::int32_t readLimit = UNBOUNDED_ACTIVATIONS) const
         {
-            const ActivationLabel* pLabel = reachedLabel(x, y);
+            const ActivationLabel* pLabel = reachedLabel(x, y, readLimit);
             return pLabel == nullptr ? UNREACHABLE : arrivalActivationsOf(pLabel->boundaries);
         }
 
-        std::int32_t spent(std::int32_t x, std::int32_t y) const
+        std::int32_t spent(std::int32_t x, std::int32_t y, std::int32_t readLimit = UNBOUNDED_ACTIVATIONS) const
         {
-            const ActivationLabel* pLabel = reachedLabel(x, y);
+            const ActivationLabel* pLabel = reachedLabel(x, y, readLimit);
             return pLabel == nullptr ? UNREACHABLE : pLabel->spent;
         }
 
         // Summed entry cost of the very route this arrival was credited to, not the cheapest route.
         std::int32_t routeCost(std::int32_t x, std::int32_t y) const
         {
-            const ActivationLabel* pLabel = reachedLabel(x, y);
+            const ActivationLabel* pLabel = reachedLabel(x, y, UNBOUNDED_ACTIVATIONS);
             return pLabel == nullptr ? UNREACHABLE : pLabel->cost;
         }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        // Tiles the last build settled whose label a build with this limit would also have settled.
+        std::int64_t settledTiles(std::int32_t activationLimit) const
+        {
+            std::int64_t settled = 0;
+            for (std::size_t slot = 0; slot < m_states.size(); ++slot)
+            {
+                const TileState & state = m_states[slot];
+                if (state.generation == m_generation && state.settled &&
+                    !clippedAway(slot, state.label, activationLimit))
+                {
+                    ++settled;
+                }
+            }
+            return settled;
+        }
+#endif
 
     private:
         struct ActivationLabel
@@ -447,23 +475,16 @@ namespace Coordinator
             return candidate.spent < known.spent;
         }
 
+        // Route cost only feeds diagnostics, so it saturates instead of widening the label.
         static ActivationLabel enteredLabel(const ActivationLabel & from, std::int32_t cost, std::int32_t movementPoints)
         {
-            if (from.spent + cost <= movementPoints)
+            const std::int32_t routeCost = static_cast<std::int32_t>(std::min<std::int64_t>(
+                static_cast<std::int64_t>(from.cost) + cost, std::numeric_limits<std::int32_t>::max()));
+            if (static_cast<std::int64_t>(from.spent) + cost <= movementPoints)
             {
-                return ActivationLabel{from.boundaries, from.spent + cost, from.cost + cost};
+                return ActivationLabel{from.boundaries, from.spent + cost, routeCost};
             }
-            return ActivationLabel{from.boundaries + 1, cost, from.cost + cost};
-        }
-
-        static bool exceedsLimit(std::int32_t boundaries, std::int32_t activationLimit)
-        {
-            if (activationLimit == UNBOUNDED_ACTIVATIONS)
-            {
-                return false;
-            }
-            // Strictly greater, so an arrival exactly on the limit still gets a label to be priced.
-            return arrivalActivationsOf(boundaries) > activationLimit;
+            return ActivationLabel{from.boundaries + 1, cost, routeCost};
         }
 
         static constexpr std::array<EntryDirection, ENTRY_DIRECTION_COUNT> EXPANSION_ORDER{
@@ -495,10 +516,22 @@ namespace Coordinator
             return state;
         }
 
-        const ActivationLabel* reachedLabel(std::int32_t x, std::int32_t y) const
+        // The origin's label is written before any limit test, so no read limit hides it.
+        bool clippedAway(std::size_t slot, const ActivationLabel & label, std::int32_t readLimit) const
+        {
+            return slot != index(m_origin.x, m_origin.y) &&
+                beyondActivationLimit(arrivalActivationsOf(label.boundaries), readLimit);
+        }
+
+        const ActivationLabel* reachedLabel(std::int32_t x, std::int32_t y, std::int32_t readLimit) const
         {
             const TileState* pState = readTileState(x, y);
-            return pState == nullptr || pState->label.boundaries == UNREACHABLE ? nullptr : &pState->label;
+            if (pState == nullptr || pState->label.boundaries == UNREACHABLE ||
+                clippedAway(index(x, y), pState->label, readLimit))
+            {
+                return nullptr;
+            }
+            return &pState->label;
         }
 
         // Only tiles the caller asked for are settled when the loop stops, so nothing else may be read.
@@ -537,6 +570,7 @@ namespace Coordinator
 
         std::int32_t m_width{0};
         std::int32_t m_height{0};
+        TilePoint m_origin{INVALID_TILE};
         std::int64_t m_generation{0};
         std::vector<TileState> m_states;
         std::vector<HeapEntry> m_heap;

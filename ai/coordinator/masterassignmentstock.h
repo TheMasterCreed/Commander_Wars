@@ -33,6 +33,10 @@ namespace Coordinator
         {
             return m_valuer ? m_valuer->diagnosticLastWarmStart() : nullptr;
         }
+        const LaterListMeasure* laterListMeasure() const
+        {
+            return m_valuer ? m_valuer->laterListMeasure() : nullptr;
+        }
 #endif
 
     private:

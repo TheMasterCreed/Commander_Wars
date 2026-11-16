@@ -1448,7 +1448,8 @@ namespace Coordinator
                 static_cast<std::int32_t>(rowIndex),
                 nullptr,
                 nodeSlots,
-                classIndices[rowIndex]));
+                classIndices[rowIndex],
+                LaterListPreparation::Skip));
         }
         setupTiming.finish();
         if (pReplay != nullptr)
@@ -1831,7 +1832,8 @@ namespace Coordinator
                 static_cast<std::int32_t>(rowIndex),
                 pMover,
                 m_ourNodeSlots,
-                classIndices[rowIndex]));
+                classIndices[rowIndex],
+                LaterListPreparation::Skip));
         }
         return problem;
     }

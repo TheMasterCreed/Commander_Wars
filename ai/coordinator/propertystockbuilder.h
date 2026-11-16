@@ -196,6 +196,10 @@ namespace Coordinator
         {
             return m_diagnosticLastWarmStart ? &*m_diagnosticLastWarmStart : nullptr;
         }
+        const LaterListMeasure* laterListMeasure() const
+        {
+            return m_pricingField ? &m_pricingField->m_laterMeasure : nullptr;
+        }
         static std::int64_t diagnosticWarmStartTariff(std::size_t witnesses, std::size_t keyWidth,
                                                     std::size_t rows, std::size_t columns)
         {
@@ -373,7 +377,8 @@ namespace Coordinator
             std::vector<SequentialClassKey> & classKeys, std::vector<SequentialClassTable> & classTables);
         static SequentialRow actionSequentialRow(PropertyStockField & field, const PlanRowAction & action,
                                                  const std::vector<std::int32_t> & nodeSlots,
-                                                 std::int32_t classIndex, std::int32_t & capturedColumn);
+                                                 std::int32_t classIndex, std::int32_t & capturedColumn,
+                                                 LaterListPreparation preparation);
         static std::optional<CheapModelBuild> buildCheapModelFor(
             const PropertyStockField & source, std::span<const PlanRowAction> actions, bool retainSequentialRows,
             std::size_t* classesBuilt, EnemyCeiling priceEnemy);
@@ -457,7 +462,8 @@ namespace Coordinator
             std::int32_t rowIndex,
             const PropertyStockActor* pMover,
             const std::vector<std::int32_t> & nodeSlots,
-            std::int32_t classIndex);
+            std::int32_t classIndex,
+            LaterListPreparation preparation);
         MilliFunds enemySequentialOptimum() const;
         EnemySequentialSolve solveEnemySequential(
             std::int64_t stateCap,

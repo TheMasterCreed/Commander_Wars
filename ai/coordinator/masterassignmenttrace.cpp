@@ -89,6 +89,23 @@ namespace
     constexpr auto TRACE_OURS_LOWER_BEFORE = "oursLowerBefore";
     constexpr auto TRACE_OURS_LOWER_AFTER = "oursLowerAfter";
     constexpr auto TRACE_INCUMBENT_STATUS = "incumbentStatus";
+    constexpr auto TRACE_ENDPOINT_FLOODS = "endpointFloods";
+    constexpr auto TRACE_SETTLED_WITH_LIMIT = "settledWithLimit";
+    constexpr auto TRACE_SETTLED_WITHOUT_LIMIT = "settledWithoutLimit";
+    constexpr auto TRACE_ROWS_PREPARED = "rowsPrepared";
+    constexpr auto TRACE_COMPLETE_ROWS = "completeRows";
+    constexpr auto TRACE_UNKNOWN_ROWS = "unknownRows";
+    constexpr auto TRACE_UNKNOWN_CAUSES = "unknownCauses";
+    constexpr auto TRACE_UNPREPARED = "unprepared";
+    constexpr auto TRACE_OVERFLOW = "overflow";
+    constexpr auto TRACE_NEGATIVE_STREAM = "negativeStream";
+    constexpr auto TRACE_EARLY_NODE = "earlyNode";
+    constexpr auto TRACE_EARLY_NODES = "earlyNodes";
+    constexpr auto TRACE_TRUNCATED_ROWS = "truncatedRows";
+    constexpr auto TRACE_MOST_QUALIFYING_NODES = "mostQualifyingNodes";
+    constexpr auto TRACE_TIMING = "timing";
+    constexpr auto TRACE_FLOOD_NANOS = "floodNanos";
+    constexpr auto TRACE_PREPARATION_NANOS = "preparationNanos";
 
     QJsonObject planWitnessStatsRecord(const Coordinator::MasterPlanWitnessStats & stats)
     {
@@ -1140,4 +1157,27 @@ namespace Coordinator
         }
         return result;
     }
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    QJsonObject masterLaterListRecord(const LaterListMeasure & measure)
+    {
+        const auto unknown = measure.unpreparedRows + measure.overflowRows + measure.negativeStreamRows +
+            measure.earlyNodeRows + measure.earlyNodesRows;
+        return {{TRACE_ENDPOINT_FLOODS, QString::number(measure.endpointFloods)},
+            {TRACE_SETTLED_WITH_LIMIT, QString::number(measure.settledWithLimit)},
+            {TRACE_SETTLED_WITHOUT_LIMIT, QString::number(measure.settledWithoutLimit)},
+            {TRACE_ROWS_PREPARED, QString::number(measure.rowsPrepared)},
+            {TRACE_COMPLETE_ROWS, QString::number(measure.completeRows)},
+            {TRACE_UNKNOWN_ROWS, QString::number(unknown)},
+            {TRACE_UNKNOWN_CAUSES, QJsonObject{{TRACE_UNPREPARED, QString::number(measure.unpreparedRows)},
+                {TRACE_OVERFLOW, QString::number(measure.overflowRows)},
+                {TRACE_NEGATIVE_STREAM, QString::number(measure.negativeStreamRows)},
+                {TRACE_EARLY_NODE, QString::number(measure.earlyNodeRows)},
+                {TRACE_EARLY_NODES, QString::number(measure.earlyNodesRows)}}},
+            {TRACE_TRUNCATED_ROWS, QString::number(measure.truncatedRows)},
+            {TRACE_MOST_QUALIFYING_NODES, QString::number(measure.mostQualifyingNodes)},
+            {TRACE_TIMING, QJsonObject{{TRACE_FLOOD_NANOS, QString::number(measure.floodNanos)},
+                {TRACE_PREPARATION_NANOS, QString::number(measure.preparationNanos)}}}};
+    }
+#endif
 }

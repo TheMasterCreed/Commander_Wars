@@ -7,6 +7,7 @@
 
 #include "ai/coordinator/mobilityfield.h"
 #include "ai/coordinator/propertystock.h"
+#include "ai/coordinator/propertystocksequential.h"
 
 class GameMap;
 
@@ -90,6 +91,33 @@ namespace Coordinator
             .destroyed = action.destroyed,
         };
     }
+
+    // Only rows of candidate actions in a retained future catalog prepare a later list.
+    enum class LaterListPreparation : std::int8_t
+    {
+        Skip,
+        Prepare,
+    };
+
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    struct LaterListMeasure
+    {
+        std::int64_t endpointFloods{0};
+        std::int64_t settledWithLimit{0};
+        std::int64_t settledWithoutLimit{0};
+        std::int64_t rowsPrepared{0};
+        std::int64_t completeRows{0};
+        std::int64_t unpreparedRows{0};
+        std::int64_t overflowRows{0};
+        std::int64_t negativeStreamRows{0};
+        std::int64_t earlyNodeRows{0};
+        std::int64_t earlyNodesRows{0};
+        std::int64_t truncatedRows{0};
+        std::int64_t mostQualifyingNodes{0};
+        std::int64_t floodNanos{0};
+        std::int64_t preparationNanos{0};
+    };
+#endif
 
     struct JointStockDecomposition
     {
@@ -194,6 +222,11 @@ namespace Coordinator
 
         const ArrivalVectors & arrivalsFrom(std::int32_t gridIdentity, std::int32_t movementPoints,
                                             const TilePoint & tile);
+        const ArrivalVectors & rawArrivalsFrom(std::int32_t gridIdentity, std::int32_t movementPoints,
+                                               const TilePoint & tile);
+        ArrivalVectors readArrivals(std::int32_t readLimit) const;
+        void prepareLaterList(const PropertyStockRow & row, const PropertyStockActor & mover,
+                              std::span<const std::int32_t> nodeSlots, SequentialLaterList & later);
         PropertyStockActor actionMover(const PlanRowAction & action, std::int32_t & capturedColumn) const;
         JointActionFacts jointActionFacts(std::span<const PlanRowAction> actions) const;
         MilliFunds ourOpenOptimum(const JointActionFacts & facts);
@@ -225,7 +258,12 @@ namespace Coordinator
         std::vector<MobilityCostGrid> m_grids;
         ActivationField m_reach;
         std::map<ArrivalKey, ArrivalVectors> m_arrivals;
+        // Kept apart from m_arrivals so a raw request never answers a clipped one, nor the reverse.
+        std::map<ArrivalKey, ArrivalVectors> m_rawArrivals;
         std::map<MarginalKey, MarginalTable> m_marginals;
         std::map<std::int32_t, MilliFunds> m_enemyOptimaWithoutRow;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        LaterListMeasure m_laterMeasure;
+#endif
     };
 }

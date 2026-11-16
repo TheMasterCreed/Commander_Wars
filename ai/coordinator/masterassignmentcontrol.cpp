@@ -127,6 +127,9 @@ namespace
         MasterStockControlTiming & timing;
         QElapsedTimer & total;
         QJsonArray attempts;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        LaterListMeasure laterList;
+#endif
     };
 
     QJsonObject attemptRecord(const ControlContext & context, const ControlAttempt & attempt)
@@ -330,6 +333,12 @@ namespace
         auto attempt = beginAttempt(context, MasterStockAuthority::RelativeStock);
         MasterAssignmentStockContext stock;
         attempt.stockStatus = stock.prepare(field, input, context.ledger, &context.profile, context.config.tierAuditMode);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (const auto* measure = stock.laterListMeasure())
+        {
+            context.laterList = *measure;
+        }
+#endif
         if (attempt.stockStatus != MasterStockSetupStatus::Prepared)
         {
             return finishAttempt(context, attempt);
@@ -385,6 +394,9 @@ namespace
         {
             record.insert(field.key(), field.value());
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        record.insert(TRACE_LATER_LIST, masterLaterListRecord(context.laterList));
+#endif
         if (capture)
         {
             record.insert("extractionWork", QString::number(capture->workUsed));

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include "ai/coordinator/propertystock.h"
 #include "ai/coordinator/propertystockbuilder.h"
@@ -79,6 +80,97 @@ namespace Coordinator
             }
             rebuildMarginals(field);
             return field;
+        }
+
+        static constexpr std::int32_t NO_WALL = -1;
+
+        struct LineColumn
+        {
+            std::int32_t x{0};
+            MilliFunds income{0};
+            OwnerSign owner{OwnerSign::Neutral};
+        };
+
+        // One row on a corridor one tile high; the wall tile cannot be entered from either side.
+        struct LineSpec
+        {
+            std::int32_t width{WIDTH};
+            std::int32_t horizon{HORIZON};
+            std::int32_t points{POINTS};
+            std::int32_t rate{RATE};
+            std::int32_t movementPoints{1};
+            std::int32_t rowX{0};
+            std::int32_t carried{0};
+            std::int32_t wallX{NO_WALL};
+            std::vector<LineColumn> columns;
+        };
+
+        static PropertyStockField line(const LineSpec & spec)
+        {
+            PropertyStockField field;
+            field.m_horizonTurns = spec.horizon;
+            field.m_width = spec.width;
+            field.m_height = 1;
+            field.m_capturePointsToCapture = spec.points;
+            field.m_columnAtTile.assign(static_cast<std::size_t>(spec.width), NO_STOCK_COLUMN);
+            field.m_propertyAtTile.assign(static_cast<std::size_t>(spec.width), NO_PROPERTY_INDEX);
+            const TilePoint rowTile{spec.rowX, 0};
+            for (const LineColumn & column : spec.columns)
+            {
+                const auto slot = static_cast<std::int32_t>(field.m_ours.columns.size());
+                const TilePoint tile{column.x, 0};
+                const bool carried = tile == rowTile && spec.carried > 0;
+                field.m_columnAtTile[static_cast<std::size_t>(column.x)] = slot;
+                field.m_propertyAtTile[static_cast<std::size_t>(column.x)] = slot;
+                field.m_columnTiles.push_back(tile);
+                field.m_columnCapturer.push_back(carried ? 0 : NO_UNIT);
+                field.m_columnCapturePoints.push_back(carried ? spec.carried : 0);
+                field.m_ours.columns.push_back(PropertyStockColumn{
+                    .slot = slot, .tile = tile, .income = {column.income, column.income}, .ownerBefore = column.owner});
+            }
+            MobilityCostGrid grid(spec.width, 1);
+            for (std::int32_t x = 0; x < spec.width; ++x)
+            {
+                if (x != spec.wallX)
+                {
+                    grid.setCost(x, 0, EntryDirection::East, 1);
+                    grid.setCost(x, 0, EntryDirection::West, 1);
+                }
+            }
+            field.m_grids.push_back(std::move(grid));
+            const PropertyStockRow row{.knowledgeIndex = 0, .gridIdentity = 0, .movementPoints = spec.movementPoints,
+                                       .capturePoints = spec.carried, .captureRate = spec.rate, .tile = rowTile};
+            field.m_ours.rows.push_back(row);
+            const auto & arrivals = field.arrivalsFrom(0, spec.movementPoints, rowTile);
+            for (std::size_t slot = 0; slot < field.m_ours.columns.size(); ++slot)
+            {
+                const ArrivalFacts arrival{arrivals.activations[slot],
+                                           field.carriedFor(row, static_cast<std::int32_t>(slot)), spec.rate};
+                field.m_ours.weights.push_back(
+                    columnWeight(field.m_ours.columns[slot], arrival, spec.points, spec.horizon));
+            }
+            rebuildMarginals(field);
+            return field;
+        }
+
+        struct Arrivals
+        {
+            std::vector<std::int32_t> activations;
+            std::vector<std::int32_t> spent;
+
+            friend bool operator==(const Arrivals &, const Arrivals &) = default;
+        };
+
+        static Arrivals clippedArrivals(PropertyStockField & field, std::int32_t movementPoints, const TilePoint & tile)
+        {
+            const auto & arrivals = field.arrivalsFrom(0, movementPoints, tile);
+            return {arrivals.activations, arrivals.spent};
+        }
+
+        static Arrivals rawArrivals(PropertyStockField & field, std::int32_t movementPoints, const TilePoint & tile)
+        {
+            const auto & arrivals = field.rawArrivalsFrom(0, movementPoints, tile);
+            return {arrivals.activations, arrivals.spent};
         }
 
         static void rebuildMarginals(PropertyStockField & field)

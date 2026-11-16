@@ -163,6 +163,9 @@ namespace Coordinator
     {
         std::size_t classes{0};
         std::vector<std::optional<MasterPlanPricingModel>> models;
+        // The built catalog, its action rows as built and before any captured node is cleared.
+        std::shared_ptr<const MasterFutureCatalog> catalog;
+        LaterListMeasure laterList;
     };
 #endif
 

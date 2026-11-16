@@ -1232,6 +1232,7 @@ namespace Coordinator
         {
             row.approach[static_cast<std::size_t>(node)] = {};
         }
+        clearLaterNode(row.later, node);
     }
 
     bool MasterPlanPricingDetail::addMasterPlanTerms(MilliFunds & total, std::span<const MilliFunds> terms)

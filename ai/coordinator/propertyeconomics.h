@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 #include <QString>
 #include <QStringList>
@@ -46,14 +47,21 @@ namespace Coordinator
         qint32 captureTurnsRemaining{NO_CAPTURE_TURNS};
     };
 
+    // Widened so that neither the remainder nor the rounding can overflow; needs a positive rate.
+    constexpr qint64 widenedCaptureTurns(qint32 points, qint32 ratePerTurn, qint32 pointsToCapture)
+    {
+        const qint64 remaining = std::max<qint64>(static_cast<qint64>(pointsToCapture) - points, 0);
+        return (remaining + ratePerTurn - 1) / ratePerTurn;
+    }
+
     constexpr qint32 captureTurnsFor(qint32 points, qint32 ratePerTurn, qint32 pointsToCapture)
     {
         if (ratePerTurn <= 0)
         {
             return NO_CAPTURE_TURNS;
         }
-        const qint32 remaining = std::max(pointsToCapture - points, 0);
-        return (remaining + ratePerTurn - 1) / ratePerTurn;
+        const qint64 turns = widenedCaptureTurns(points, ratePerTurn, pointsToCapture);
+        return turns > std::numeric_limits<qint32>::max() ? NO_CAPTURE_TURNS : static_cast<qint32>(turns);
     }
 
     constexpr bool repairsUnitType(qint32 repairTypeMask, qint32 unitTypeFlag)

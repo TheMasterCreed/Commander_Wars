@@ -73,6 +73,37 @@ namespace
         return capturedColumn == NO_STOCK_COLUMN ? NO_SEQUENTIAL_NODE : futureNodeOfColumn(columns, capturedColumn);
     }
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    // Counts the state a pricing copy reaches once it clears the action's own captured node.
+    void countLaterState(LaterListMeasure & measure, SequentialLaterList later, std::int32_t capturedNode)
+    {
+        if (capturedNode != NO_SEQUENTIAL_NODE)
+        {
+            clearLaterNode(later, capturedNode);
+        }
+        if (later.state == SequentialLaterState::Complete)
+        {
+            ++measure.completeRows;
+            return;
+        }
+        switch (later.check)
+        {
+            case SequentialLaterCheck::Unprepared:
+                ++measure.unpreparedRows;
+                return;
+            case SequentialLaterCheck::Overflow:
+                ++measure.overflowRows;
+                return;
+            case SequentialLaterCheck::NegativeStream:
+                ++measure.negativeStreamRows;
+                return;
+            case SequentialLaterCheck::Passed:
+                break;
+        }
+        ++(later.earlyNodes == 1 ? measure.earlyNodeRows : measure.earlyNodesRows);
+    }
+#endif
+
     // The ceiling refunds each captured node price once, so a second capturer of it would be unsound.
     bool claimCapturedNode(std::vector<bool> & capturedNodes, std::int32_t node)
     {
@@ -312,15 +343,116 @@ namespace Coordinator
         }
         const MobilityCostGrid & grid = m_grids[static_cast<std::size_t>(gridIdentity)];
         m_reach.build(grid, tile, movementPoints, m_horizonTurns, m_columnTiles);
+        return m_arrivals.emplace(key, readArrivals(m_horizonTurns)).first->second;
+    }
+
+    // Labels inside the limit never improve through tiles beyond it, so one wide flood serves both caches.
+    const PropertyStockField::ArrivalVectors & PropertyStockField::rawArrivalsFrom(std::int32_t gridIdentity,
+                                                                                   std::int32_t movementPoints,
+                                                                                   const TilePoint & tile)
+    {
+        const ArrivalKey key{gridIdentity, movementPoints, tile.x, tile.y};
+        const auto known = m_rawArrivals.find(key);
+        if (known != m_rawArrivals.end())
+        {
+            return known->second;
+        }
+        const MobilityCostGrid & grid = m_grids[static_cast<std::size_t>(gridIdentity)];
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        const auto started = std::chrono::steady_clock::now();
+#endif
+        m_reach.build(grid, tile, movementPoints, UNBOUNDED_ACTIVATIONS, m_columnTiles);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        m_laterMeasure.floodNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        ++m_laterMeasure.endpointFloods;
+        m_laterMeasure.settledWithLimit += m_reach.settledTiles(m_horizonTurns);
+        m_laterMeasure.settledWithoutLimit += m_reach.settledTiles(UNBOUNDED_ACTIVATIONS);
+#endif
+        if (!m_arrivals.contains(key))
+        {
+            m_arrivals.emplace(key, readArrivals(m_horizonTurns));
+        }
+        return m_rawArrivals.emplace(key, readArrivals(UNBOUNDED_ACTIVATIONS)).first->second;
+    }
+
+    PropertyStockField::ArrivalVectors PropertyStockField::readArrivals(std::int32_t readLimit) const
+    {
         ArrivalVectors arrivals;
         arrivals.activations.reserve(m_columnTiles.size());
         arrivals.spent.reserve(m_columnTiles.size());
         for (const TilePoint & column : m_columnTiles)
         {
-            arrivals.activations.push_back(m_reach.activations(column.x, column.y));
-            arrivals.spent.push_back(m_reach.spent(column.x, column.y));
+            arrivals.activations.push_back(m_reach.activations(column.x, column.y, readLimit));
+            arrivals.spent.push_back(m_reach.spent(column.x, column.y, readLimit));
         }
-        return m_arrivals.emplace(key, std::move(arrivals)).first->second;
+        return arrivals;
+    }
+
+    void PropertyStockField::prepareLaterList(const PropertyStockRow & row, const PropertyStockActor & mover,
+                                              std::span<const std::int32_t> nodeSlots, SequentialLaterList & later)
+    {
+        const ArrivalVectors & raw = rawArrivalsFrom(row.gridIdentity, mover.movementPoints, mover.tile);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        const auto started = std::chrono::steady_clock::now();
+#endif
+        later = {};
+        later.check = SequentialLaterCheck::Passed;
+        const auto fail = [&later](SequentialLaterCheck cause)
+        {
+            if (later.check == SequentialLaterCheck::Passed)
+            {
+                later.check = cause;
+            }
+        };
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::int64_t qualifying = 0;
+#endif
+        for (std::size_t node = 0; node < nodeSlots.size(); ++node)
+        {
+            const auto slot = static_cast<std::size_t>(nodeSlots[node]);
+            if (raw.activations[slot] == UNREACHABLE)
+            {
+                continue;
+            }
+            const MilliFunds stream = columnStreamValue(m_ours.columns[slot], m_horizonTurns - 1, m_horizonTurns);
+            if (stream <= 0)
+            {
+                if (stream < 0)
+                {
+                    fail(SequentialLaterCheck::NegativeStream);
+                }
+                continue;
+            }
+            const ArrivalFacts arrival = planRowArrival(mover, row.captureRate, m_columnTiles[slot],
+                                                         raw.activations[slot]);
+            const RawOwnership owned = rawOwnedTurns(arrival.arrivalActivations, arrival.carriedPoints,
+                                                     arrival.ratePerTurn, m_capturePointsToCapture);
+            const auto nodeIndex = static_cast<std::int32_t>(node);
+            if (owned.status == RawOwnershipStatus::Overflow)
+            {
+                fail(SequentialLaterCheck::Overflow);
+            }
+            else if (owned.status == RawOwnershipStatus::Owned && owned.turns < 1)
+            {
+                noteEarlyLaterNode(later, nodeIndex);
+            }
+            else if (owned.status == RawOwnershipStatus::Owned && owned.turns >= m_horizonTurns)
+            {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                ++qualifying;
+#endif
+                offerLaterEntry(later, SequentialLaterEntry{nodeIndex, owned.turns, stream});
+            }
+        }
+        settleLaterState(later);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        ++m_laterMeasure.rowsPrepared;
+        m_laterMeasure.truncatedRows += later.truncated ? 1 : 0;
+        m_laterMeasure.mostQualifyingNodes = std::max(m_laterMeasure.mostQualifyingNodes, qualifying);
+        m_laterMeasure.preparationNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+#endif
     }
 
     std::vector<MilliFunds> PropertyStockField::actingWeights(std::int32_t row, const PropertyStockActor & actor)
@@ -651,6 +783,8 @@ namespace Coordinator
             result.models[selected.validIndices[valid]] = dualModel(*build->future, build->model, key,
                 capturedNodesOf(build->future->columns, facts.capturedColumns));
         }
+        result.catalog = build->future;
+        result.laterList = build->field->m_laterMeasure;
         return result;
     }
 #endif
@@ -700,7 +834,8 @@ namespace Coordinator
             rowIndex,
             nullptr,
             nodeSlots,
-            classIndex);
+            classIndex,
+            LaterListPreparation::Skip);
     }
 
     std::int32_t JointPlanStockValuer::actionClassIndexFor(
@@ -724,7 +859,8 @@ namespace Coordinator
 
     SequentialRow JointPlanStockValuer::actionSequentialRow(PropertyStockField & field, const PlanRowAction & action,
                                                             const std::vector<std::int32_t> & nodeSlots,
-                                                            std::int32_t classIndex, std::int32_t & capturedColumn)
+                                                            std::int32_t classIndex, std::int32_t & capturedColumn,
+                                                            LaterListPreparation preparation)
     {
         const PropertyStockRow & source =
             field.m_ours.rows[
@@ -738,7 +874,8 @@ namespace Coordinator
             action.row,
             &mover,
             nodeSlots,
-            classIndex);
+            classIndex,
+            preparation);
     }
 
     SequentialClassTable JointPlanStockValuer::buildOurClassTable(
@@ -790,6 +927,9 @@ namespace Coordinator
     {
         std::unique_ptr<PropertyStockField> pricingField =
             std::make_unique<PropertyStockField>(source);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        pricingField->m_laterMeasure = {};
+#endif
         std::vector<std::int32_t> nodeSlots;
         std::vector<PropertyStockColumn> nodeColumns;
         ourStockNodes(*pricingField, nodeSlots, nodeColumns);
@@ -861,10 +1001,14 @@ namespace Coordinator
         {
             std::int32_t capturedColumn = NO_STOCK_COLUMN;
             const SequentialRow row =
-                actionSequentialRow(*pricingField, action, nodeSlots, classOfAction[actionIndex++], capturedColumn);
+                actionSequentialRow(*pricingField, action, nodeSlots, classOfAction[actionIndex++], capturedColumn,
+                                    future ? LaterListPreparation::Prepare : LaterListPreparation::Skip);
             if (future)
             {
                 future->actions.push_back({canonicalPlanActionKey(action), row});
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+                countLaterState(pricingField->m_laterMeasure, row.later, capturedNodeOf(nodeColumns, capturedColumn));
+#endif
             }
             CheapRowTerms terms =
                 cheapRowTerms(templateInstance,
@@ -947,7 +1091,8 @@ namespace Coordinator
         std::int32_t rowIndex,
         const PropertyStockActor* pMover,
         const std::vector<std::int32_t> & nodeSlots,
-        std::int32_t classIndex)
+        std::int32_t classIndex,
+        LaterListPreparation preparation)
     {
         SequentialRow result;
         result.classIndex = classIndex;
@@ -996,6 +1141,11 @@ namespace Coordinator
             return result;
         }
 
+        // Prepared first, so its wide flood also fills the clipped entry the readers below look up.
+        if (preparation == LaterListPreparation::Prepare && pMover->effectiveCaptureRate(row.captureRate) > 0)
+        {
+            field.prepareLaterList(row, *pMover, nodeSlots, result.later);
+        }
         const std::vector<MilliFunds> acting =
             field.actingWeights(rowIndex, *pMover);
         const PropertyStockField::ArrivalVectors & arrivals =
@@ -1143,7 +1293,8 @@ namespace Coordinator
             counters.classesAdded += static_cast<std::int64_t>(m_classTables.size() - classesBefore);
             ActionEntry entry;
             entry.row = JointPlanStockValuer::actionSequentialRow(
-                *m_field, actions[index], m_nodeSlots, classIndex, entry.capturedColumn);
+                *m_field, actions[index], m_nodeSlots, classIndex, entry.capturedColumn,
+                LaterListPreparation::Skip);
             entry.capturedNode = capturedNodeOf(m_nodeColumns, entry.capturedColumn);
             if (entry.capturedNode != NO_SEQUENTIAL_NODE)
             {
