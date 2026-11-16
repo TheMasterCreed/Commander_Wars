@@ -15,6 +15,7 @@
 #include "ai/coordinator/propertyeconomicsbuilder.h"
 #include "ai/coordinator/refinementledger.h"
 #include "ai/coordinator/replyfactsbuilder.h"
+#include "ai/coordinator/replypassrecord.h"
 #include "ai/coordinator/masterassignmentcontrol.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masterassignmenttrace.h"
@@ -319,7 +320,8 @@ void CoordinatedAi::ensureTurnPlan()
     m_planDay = m_pMap->getCurrentDay();
     if (timed)
     {
-        const auto nanos = preparationNanos + planningNanosSince(started, true) - m_captureDangerAuditNanos;
+        const auto nanos =
+            preparationNanos + planningNanosSince(started, true) - m_captureDangerAuditNanos - m_replyPassNanos;
         const Coordinator::DecisionTraceIdentity identity{
             .day = m_planDay, .playerId = m_pPlayer->getPlayerID(),
             .planSequence = m_planSequence, .horizonTurns = m_propertyStock.horizonTurns()};
@@ -401,6 +403,7 @@ void CoordinatedAi::buildTurnPlan()
 
     Clock::time_point planningStart;
     m_captureDangerAuditNanos = 0;
+    m_replyPassNanos = 0;
     m_executionCursor = 0;
     ++m_planSequence;
     const Coordinator::DecisionTraceIdentity traceIdentity{
@@ -528,17 +531,27 @@ void CoordinatedAi::buildTurnPlan()
     // A separate oracle keeps reply facts from warming the planner's damage memo.
     std::optional<Coordinator::DamageOracle> replyOracle;
     std::optional<Coordinator::ReplyFactsBuilder> replyFacts;
-    const bool replyRecorded =
-        masterShadow.replyPrediction == Coordinator::ReplyPrediction::Recorded && localSessionMenu();
-    if (replyRecorded)
+    std::shared_ptr<const Coordinator::ReplyBoard> replyBoard;
+    const bool predictionRecorded = masterShadow.replyPrediction == Coordinator::ReplyPrediction::Recorded;
+    // Asked only when a reply switch is on, so the Off path makes no call it did not make before.
+    const bool localReplySession =
+        (predictionRecorded || masterShadow.replyPass == Coordinator::ReplyPassMode::Recorded) && localSessionMenu();
+    const bool replyRecorded = predictionRecorded && localReplySession;
+    const auto replyPassWiring =
+        Coordinator::replyPassWiring(masterShadow.replyPrediction, masterShadow.replyPass, localReplySession);
+    if (replyPassWiring.replyFacts)
     {
         replyOracle.emplace(*m_pMap);
         replyOracle->clear();
         replyFacts.emplace(*m_pMap, m_dayStartKnowledge, m_attackOpportunities, m_properties, m_propertyStock,
                            *replyOracle);
+        replyBoard = std::make_shared<const Coordinator::ReplyBoard>(Coordinator::replyBoardOf(m_dayStartKnowledge));
+    }
+    if (replyRecorded)
+    {
         input.replyPrediction = {
             .mode = Coordinator::ReplyPrediction::Recorded,
-            .board = std::make_shared<const Coordinator::ReplyBoard>(Coordinator::replyBoardOf(m_dayStartKnowledge)),
+            .board = replyBoard,
             .tally = std::make_shared<Coordinator::ReplyPredictionTally>(),
         };
     }
@@ -662,6 +675,7 @@ void CoordinatedAi::buildTurnPlan()
     Coordinator::RefinementLedger masterLedger;
     Coordinator::MasterShadowTiming masterTiming;
     Coordinator::MasterStockControlTiming controlTiming;
+    Coordinator::MasterPlanHandoffResult planHandoff;
     std::int64_t stockControlCallNanos = 0;
     std::int64_t continuationPricingPrepareNanos = 0;
     std::int64_t legacyPreparationNanos = 0;
@@ -677,8 +691,13 @@ void CoordinatedAi::buildTurnPlan()
             phaseStart = Clock::now();
         }
         controlTiming = Coordinator::controlMasterAssignment(
-            masterShadow, *m_pMap, input, m_assignment, m_propertyStock, m_properties, traceIdentity);
+            masterShadow, *m_pMap, input, m_assignment, m_propertyStock, m_properties, traceIdentity,
+            replyPassWiring.handoff ? &planHandoff : nullptr);
         stockControlCallNanos = planningNanosSince(phaseStart, timed);
+        if (timed)
+        {
+            stockControlCallNanos -= planHandoff.nanos;
+        }
         if (masterShadow.runtime == Coordinator::MasterStockControlRuntime::Play &&
             controlTiming.status != Coordinator::MasterStockControlStatus::Installed)
         {
@@ -691,6 +710,7 @@ void CoordinatedAi::buildTurnPlan()
             stockValuer.emplace(m_propertyStock, input.unitLinks, tierAudit);
             input.pStockValuer = &*stockValuer;
             legacyPlanning = true;
+            planHandoff.handoff.reset();
         }
         else if (masterShadow.runtime != Coordinator::MasterStockControlRuntime::Play &&
                  !controlTiming.constructorComplete)
@@ -763,6 +783,25 @@ void CoordinatedAi::buildTurnPlan()
 #endif
         arenaProbeNanos = planningNanosSince(phaseStart, timed);
     }
+    if (replyPassWiring.record)
+    {
+        const auto passStart = Clock::now();
+        const std::int64_t handoffNanos = planHandoff.nanos;
+        {
+            const Coordinator::ReplyPassRun replyPass = Coordinator::recordedReplyPass(
+                localReplySession, legacyPlanning, planHandoff, replyBoard.get(), m_propertyStock);
+            const auto record = QJsonDocument(Coordinator::replyPassRecord(traceIdentity, replyPass));
+            const QString path =
+                Settings::getInstance()->getUserPath() + QLatin1String(Coordinator::REPLY_PASS_RECORD_FILE);
+            if (!Coordinator::appendTraceRecords(path, {QString::fromUtf8(record.toJson(QJsonDocument::Compact))}))
+            {
+                qWarning() << "Reply pass record write failed:" << path;
+            }
+            // The handoff copy is torn down here so its cost stays inside the measured pass time.
+            planHandoff = {};
+        }
+        m_replyPassNanos = handoffNanos + planningNanosSince(passStart, true);
+    }
     if (timed)
     {
         phaseStart = Clock::now();
@@ -776,7 +815,7 @@ void CoordinatedAi::buildTurnPlan()
             : std::chrono::duration_cast<
                   std::chrono::nanoseconds>(
                   Clock::now() - planningStart)
-                  .count();
+                  .count() - m_replyPassNanos;
     const Coordinator::AssignmentResult::PhaseTiming &
         assignmentTiming = m_assignment.phaseTiming;
     const Coordinator::AssignmentStats & stats =

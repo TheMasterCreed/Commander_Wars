@@ -67,10 +67,10 @@ namespace
     };
     constexpr auto DANGER_AUDIT_FILE = "coordinated-ai-danger.jsonl";
 
-    constexpr auto KEY_SCHEMA = "schema";
-    constexpr auto KEY_DAY = "day";
-    constexpr auto KEY_PLAYER = "player";
-    constexpr auto KEY_PLAN_SEQUENCE = "planSequence";
+    using Record::KEY_SCHEMA;
+    using Record::KEY_DAY;
+    using Record::KEY_PLAYER;
+    using Record::KEY_PLAN_SEQUENCE;
     constexpr auto KEY_HORIZON = "horizon";
     constexpr auto KEY_POINTS_TO_CAPTURE = "pointsToCapture";
     constexpr auto KEY_TERRAIN_LUCK = "terrainLuck";
@@ -85,9 +85,9 @@ namespace
     constexpr auto KEY_INCOME_OURS = "incomeOurs";
     constexpr auto KEY_INCOME_ENEMY = "incomeEnemy";
     constexpr auto KEY_SHOOTERS = "shooters";
-    constexpr auto KEY_ACTORS = "actors";
+    using Record::KEY_ACTORS;
     constexpr auto KEY_KNOWLEDGE = "knowledge";
-    constexpr auto KEY_UNIT = "unit";
+    using Record::KEY_UNIT;
     constexpr auto KEY_TYPE = "type";
     constexpr auto KEY_HP_REAL = "hpReal";
     constexpr auto KEY_DISTANCE = "distance";
@@ -120,7 +120,7 @@ namespace
     constexpr auto KEY_ENEMY_ATTACKER_ENGINE_CALLS = "enemyAttackerEngineCalls";
     constexpr auto KEY_MISSING_LOADED = "missingLoadedUnits";
     constexpr auto KEY_MISSING_ABSENT = "missingAbsentUnits";
-    constexpr auto KEY_NANOS = "nanos";
+    using Record::KEY_NANOS;
     constexpr auto KEY_ALLIED_OCCUPANTS = "alliedOccupantsHeldInPlace";
     constexpr auto KEY_WALK_RATE_TILE = "walkCaptureRateTile";
     constexpr auto RATE_TILE_ORIGIN = "ORIGIN";
@@ -198,11 +198,11 @@ namespace
     constexpr auto KEY_NEXT_SHOT = "nextShot";
     constexpr auto KEY_TOTAL = "total";
     constexpr auto KEY_EXPOSURE_CHARGED = "exposureCharged";
-    constexpr auto KEY_UNITS_SHOT = "unitsShot";
+    using Record::KEY_UNITS_SHOT;
     constexpr auto KEY_UNITS_DESTROYED = "unitsDestroyed";
     constexpr auto KEY_UNITS = "units";
     constexpr auto KEY_SLOT = "slot";
-    constexpr auto KEY_REASON = "reason";
+    using Record::KEY_REASON;
     constexpr auto KEY_HP_BEFORE = "hpBefore";
     constexpr auto KEY_LOSS = "loss";
     constexpr auto KEY_CANDIDATES = "candidates";
@@ -217,7 +217,7 @@ namespace
     constexpr auto KEY_CHANGES_PRICED = "changesPriced";
     constexpr auto KEY_PAIRS_EXAMINED = "pairsExamined";
     constexpr auto KEY_UNMATCHED_ENTRIES = "unmatchedEntries";
-    constexpr auto KEY_CANDIDATE = "candidate";
+    using Record::KEY_CANDIDATE;
     constexpr auto KEY_TARGET = "target";
     constexpr auto KEY_STOCK_KEY_UNCHANGED = "stockKeyUnchanged";
     constexpr auto KEY_CHAIN_INTERACTION = "chainInteraction";
@@ -233,17 +233,15 @@ namespace
     constexpr auto KEY_INSTALLED_PAIRS_EXAMINED = "installedPairsExamined";
     constexpr auto KEY_INVALID = "invalid";
     constexpr auto KEY_HAS_STOCK_ROW = "hasStockRow";
-    constexpr auto REASON_SHOT = "SHOT";
-    constexpr auto REASON_HITS_SHOOTER = "HITS_SHOOTER";
     constexpr auto OMITTED_DESTINATION_TAKEN = "DESTINATION_TAKEN";
     constexpr auto OMITTED_TARGET_GONE = "TARGET_GONE";
     constexpr auto OMITTED_BREAKS_LATER_ACTION = "BREAKS_LATER_ACTION";
     constexpr auto KEY_STOCK_REPLY_QUOTE = "stockReplyQuote";
     constexpr auto KEY_TODAY = "today";
-    constexpr auto KEY_AFTER_OWN_ACTIONS = "afterOwnActions";
-    constexpr auto KEY_AFTER_REPLY = "afterReply";
+    using Record::KEY_AFTER_OWN_ACTIONS;
+    using Record::KEY_AFTER_REPLY;
     constexpr auto KEY_COUNTER_LOSS = "counterLoss";
-    constexpr auto KEY_REPLY_LOSS = "replyLoss";
+    using Record::KEY_REPLY_LOSS;
     constexpr auto KEY_COUNTER_STEPS = "counterSteps";
     constexpr auto KEY_REPLY_STEPS = "replySteps";
     constexpr auto KEY_DEATH_CAUSE = "deathCause";
@@ -254,7 +252,7 @@ namespace
     constexpr auto KEY_ROW = "row";
     constexpr auto KEY_KEY = "key";
     constexpr auto KEY_OURS = "ours";
-    constexpr auto KEY_OWNED = "owned";
+    using Record::KEY_OWNED;
     constexpr auto KEY_VALID = "valid";
     constexpr auto KEY_WITNESS_REPLAYS = "witnessReplays";
     constexpr auto KEY_AVAILABLE = "available";
@@ -291,7 +289,7 @@ namespace
     constexpr auto KEY_DUAL_NANOS = "dualNanos";
     constexpr auto KEY_CHAIN_NANOS = "chainNanos";
     constexpr auto KEY_PLAN_REPLAY = "planReplay";
-    constexpr auto KEY_PRESENT = "present";
+    using Record::KEY_PRESENT;
     constexpr auto KEY_COMPLETE = "complete";
     constexpr auto KEY_ENTRIES = "entries";
     constexpr auto KEY_AGREES = "agrees";
@@ -317,8 +315,8 @@ namespace
     constexpr auto KEY_STATUS = "status";
     constexpr auto KEY_TUNER_STATUS = "tunerStatus";
     constexpr auto KEY_ROUNDS = "rounds";
-    constexpr auto KEY_FLOOR = "floor";
-    constexpr auto KEY_CEILING = "ceiling";
+    using Record::KEY_FLOOR;
+    using Record::KEY_CEILING;
     constexpr auto KEY_FLOOR_SOURCE = "floorSource";
     constexpr auto KEY_MAXIMUM_WORK = "maximumWork";
     constexpr auto KEY_WITNESS_BUILD_WORK = "witnessBuildWork";
@@ -343,7 +341,7 @@ namespace
     constexpr auto KEY_INTERVAL = "interval";
     constexpr auto KEY_COMPARISONS = "comparisons";
     constexpr auto KEY_DISAGREEMENTS = "disagreements";
-    constexpr auto KEY_WORK = "work";
+    using Record::KEY_WORK;
     constexpr auto REASON_BASE_PRICE_QUOTE_INVALID = "BASE_PRICE_QUOTE_INVALID";
     constexpr auto REASON_BASE_PRICES_UNAVAILABLE = "BASE_PRICES_UNAVAILABLE";
     constexpr std::array STOCK_REPLY_KEY_NAMES{KEY_TODAY, KEY_AFTER_OWN_ACTIONS, KEY_AFTER_REPLY};
@@ -434,7 +432,7 @@ namespace
 
     const char* reasonName(Coordinator::ChangeReason reason)
     {
-        return reason == Coordinator::ChangeReason::Shot ? REASON_SHOT : REASON_HITS_SHOOTER;
+        return Coordinator::CHANGE_REASON_NAMES[static_cast<std::size_t>(reason)];
     }
 
     constexpr std::array OMISSIONS{
@@ -2361,16 +2359,6 @@ namespace
         {
             return QJsonArray{static_cast<qint64>(interval.lower), static_cast<qint64>(interval.upper)};
         };
-        const auto keyRecord = [](const ContinuationKey & key)
-        {
-            QJsonArray encoded;
-            for (const auto & action : key)
-            {
-                encoded.append(QJsonArray{action.row(), action.x(), action.y(), action.captures(),
-                                           action.stepsLost(), action.destroyed()});
-            }
-            return encoded;
-        };
         ContinuationKey today;
         ContinuationKey afterOwnActions;
         ContinuationKey afterReply;
@@ -2509,7 +2497,7 @@ namespace
         const auto & names = STOCK_REPLY_KEY_NAMES;
         for (std::size_t index = 0; index < keys.size(); ++index)
         {
-            QJsonObject quoteRecord{{KEY_KEY, keyRecord(keys[index])}, {KEY_VALID, false},
+            QJsonObject quoteRecord{{KEY_KEY, Record::continuationKeyRecord(keys[index])}, {KEY_VALID, false},
                                     {KEY_WITNESS_REPLAYS, false}};
             if (index < quotes.quotes.size())
             {

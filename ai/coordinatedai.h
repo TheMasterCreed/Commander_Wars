@@ -121,6 +121,7 @@ private:
     std::int64_t m_coPowerCheckNanos{0};
     // Subtracted from planningCallNanos so the measure-only audit never counts as planning time.
     std::int64_t m_captureDangerAuditNanos{0};
+    std::int64_t m_replyPassNanos{0};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     std::int64_t m_testRefinementWorkLimit{Coordinator::DEFAULT_RELATIVE_STOCK_WORK_LIMIT};
     std::shared_ptr<Coordinator::RelativeStockObserver> m_testRefinementObserver;

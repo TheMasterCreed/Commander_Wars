@@ -22,16 +22,21 @@ namespace
     constexpr auto NEIGHBOR_AUDIT_VARIABLE = "COW_MASTER_PLAN_NEIGHBOR_AUDIT";
     constexpr auto DANGER_AUDIT_VARIABLE = "COW_COORDINATED_DANGER_AUDIT";
     constexpr auto REPLY_PREDICTION_VARIABLE = "COW_COORDINATED_REPLY_PREDICTION";
+    constexpr auto REPLY_PASS_VARIABLE = "COW_COORDINATED_REPLY_PASS";
     constexpr auto AUDIT_RECORDED = "1";
     constexpr auto STOCK_CONTROL_MODE = "stockControl";
     constexpr auto BATTLE_ANIMATION_SPEED_PROBE = "battleAnimationSpeed";
     constexpr std::int64_t PLAY_STOCK_CONTROL_ALLOWANCE = 60000000;
 
+    bool measuredRuntime(Coordinator::MasterStockControlRuntime runtime)
+    {
+        return runtime == Coordinator::MasterStockControlRuntime::Arena ||
+               runtime == Coordinator::MasterStockControlRuntime::PlayableTrial;
+    }
+
     bool auditRecorded(const QByteArray & value, Coordinator::MasterStockControlRuntime runtime)
     {
-        const bool measuredRuntime = runtime == Coordinator::MasterStockControlRuntime::Arena ||
-                                     runtime == Coordinator::MasterStockControlRuntime::PlayableTrial;
-        return measuredRuntime && value == AUDIT_RECORDED;
+        return measuredRuntime(runtime) && value == AUDIT_RECORDED;
     }
 }
 
@@ -63,6 +68,12 @@ namespace Coordinator
     ReplyPrediction parseReplyPrediction(const QByteArray & value, MasterStockControlRuntime runtime)
     {
         return auditRecorded(value, runtime) ? ReplyPrediction::Recorded : ReplyPrediction::Off;
+    }
+
+    ReplyPassMode parseReplyPassMode(const QByteArray & value, MasterStockControlRuntime runtime)
+    {
+        const auto recorded = REPLY_PASS_MODE_NAMES[static_cast<std::size_t>(ReplyPassMode::Recorded)];
+        return measuredRuntime(runtime) && value == recorded ? ReplyPassMode::Recorded : ReplyPassMode::Off;
     }
 
     bool isolatedMasterTrialPath(const QString & applicationDirectory, const QString & explicitUserPath,
@@ -172,6 +183,7 @@ namespace Coordinator
         result.planNeighborAudit = parseMasterPlanNeighborAudit(qgetenv(NEIGHBOR_AUDIT_VARIABLE), runtime);
         result.captureDangerAudit = parseCaptureDangerAudit(qgetenv(DANGER_AUDIT_VARIABLE), runtime);
         result.replyPrediction = parseReplyPrediction(qgetenv(REPLY_PREDICTION_VARIABLE), runtime);
+        result.replyPass = parseReplyPassMode(qgetenv(REPLY_PASS_VARIABLE), runtime);
 #ifdef COW_MASTER_ASSIGNMENT_PLAYABLE_TRIAL
         if (result.controlsStock() && runtime == MasterStockControlRuntime::PlayableTrial)
         {

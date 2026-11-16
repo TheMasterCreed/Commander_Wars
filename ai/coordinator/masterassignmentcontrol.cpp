@@ -1,5 +1,7 @@
 #include "ai/coordinator/masterassignmentcontrol.h"
 
+#include <chrono>
+
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QFile>
@@ -420,6 +422,60 @@ namespace
         measured.totalNanos = context.total.nsecsElapsed();
         return measured;
     }
+
+    MasterStockControlTiming controlWithCapture(
+        const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
+        AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
+        const DecisionTraceIdentity & identity, std::optional<MasterCaptureResult> & capture)
+    {
+        MasterStockControlTiming measured;
+        if (!config.controlsStock())
+        {
+            return measured;
+        }
+        QElapsedTimer total;
+        total.start();
+        RefinementLedger ledger;
+        MasterAssignmentProfile profile;
+        MasterProfileScope controlTiming(&profile, MasterPhase::StockControl);
+        CaptureScreen screen{CaptureScreen::Inapplicable};
+        ControlContext context{config, identity, assignment, ledger, profile, measured, total, {}};
+        if (!ledger.open(config.allowance))
+        {
+            assignment = AssignmentResult{};
+            assignment.stockConstructionStatus = StockConstructionStatus::InvalidInput;
+            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ConstructorRefused);
+        }
+        const auto constructorStart = total.nsecsElapsed();
+        {
+            MasterProfileScope timing(&profile, MasterPhase::IncomingConstruction);
+            assignment = MaximumValueAssignment::constructStockIncumbent(input, ledger);
+        }
+        measured.constructorNanos = total.nsecsElapsed() - constructorStart;
+        measured.constructorComplete = assignment.stockConstructionStatus == StockConstructionStatus::Complete;
+        if (!measured.constructorComplete)
+        {
+            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ConstructorRefused);
+        }
+        capture = captureMasterAssignment(input, assignment, identity.planSequence, ledger, &profile);
+        if (!capture->extraction.valid())
+        {
+            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ExtractionRefused);
+        }
+        const auto & problem = *capture->extraction.problem;
+        screen = screenCapture(problem, field, properties, ledger);
+        if (screen == CaptureScreen::BudgetExhausted)
+        {
+            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::StockPreparationRefused);
+        }
+        if (screen == CaptureScreen::Eligible &&
+            attemptCapture(context, problem, map) == MasterStockControlStatus::Installed)
+        {
+            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::Installed);
+        }
+        const auto status = attemptRelativeStock(context, problem, input, field);
+        return finishControl(context, controlTiming, capture, screen, status);
+    }
 }
 
 namespace Coordinator
@@ -463,55 +519,18 @@ namespace Coordinator
     MasterStockControlTiming controlMasterAssignment(
         const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
         AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
-        const DecisionTraceIdentity & identity)
+        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff)
     {
-        MasterStockControlTiming measured;
-        if (!config.controlsStock())
-        {
-            return measured;
-        }
-        QElapsedTimer total;
-        total.start();
-        RefinementLedger ledger;
-        MasterAssignmentProfile profile;
-        MasterProfileScope controlTiming(&profile, MasterPhase::StockControl);
         std::optional<MasterCaptureResult> capture;
-        CaptureScreen screen{CaptureScreen::Inapplicable};
-        ControlContext context{config, identity, assignment, ledger, profile, measured, total, {}};
-        if (!ledger.open(config.allowance))
+        const auto measured = controlWithCapture(config, map, input, assignment, field, properties, identity, capture);
+        // After the receipt, so the receipt and the timing are the same with and without a handoff.
+        if (pHandoff != nullptr)
         {
-            assignment = AssignmentResult{};
-            assignment.stockConstructionStatus = StockConstructionStatus::InvalidInput;
-            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ConstructorRefused);
+            const auto started = std::chrono::steady_clock::now();
+            const bool extracted = capture && capture->extraction.valid();
+            *pHandoff = handOffMasterPlan(extracted ? &*capture->extraction.problem : nullptr, assignment);
+            pHandoff->nanos = nanosSince(started);
         }
-        const auto constructorStart = total.nsecsElapsed();
-        {
-            MasterProfileScope timing(&profile, MasterPhase::IncomingConstruction);
-            assignment = MaximumValueAssignment::constructStockIncumbent(input, ledger);
-        }
-        measured.constructorNanos = total.nsecsElapsed() - constructorStart;
-        measured.constructorComplete = assignment.stockConstructionStatus == StockConstructionStatus::Complete;
-        if (!measured.constructorComplete)
-        {
-            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ConstructorRefused);
-        }
-        capture = captureMasterAssignment(input, assignment, identity.planSequence, ledger, &profile);
-        if (!capture->extraction.valid())
-        {
-            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ExtractionRefused);
-        }
-        const auto & problem = *capture->extraction.problem;
-        screen = screenCapture(problem, field, properties, ledger);
-        if (screen == CaptureScreen::BudgetExhausted)
-        {
-            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::StockPreparationRefused);
-        }
-        if (screen == CaptureScreen::Eligible &&
-            attemptCapture(context, problem, map) == MasterStockControlStatus::Installed)
-        {
-            return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::Installed);
-        }
-        const auto status = attemptRelativeStock(context, problem, input, field);
-        return finishControl(context, controlTiming, capture, screen, status);
+        return measured;
     }
 }

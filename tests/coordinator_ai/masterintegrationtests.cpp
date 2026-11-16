@@ -11,6 +11,7 @@
 #include "ai/coordinator/masterassignmentinstallation.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masternativesource.h"
+#include "ai/coordinator/masterplanhandoff.h"
 #include "ai/coordinator/masterplanpricingadapter.h"
 #include "tests/coordinator_ai/masterassignmentstockfixture.h"
 #include "tests/coordinator_ai/masterassignmenttestexport.h"
@@ -5563,6 +5564,100 @@ namespace
                    MasterShadowConfig{}.replyPrediction == ReplyPrediction::Off,
                "reply prediction follows the danger audit's switch rule and defaults off");
     }
+
+    void replyPassConfig()
+    {
+        for (const auto runtime : {MasterStockControlRuntime::Arena, MasterStockControlRuntime::PlayableTrial})
+        {
+            expect(parseReplyPassMode("recorded", runtime) == ReplyPassMode::Recorded &&
+                       parseReplyPassMode("off", runtime) == ReplyPassMode::Off &&
+                       parseReplyPassMode({}, runtime) == ReplyPassMode::Off &&
+                       parseReplyPassMode("1", runtime) == ReplyPassMode::Off &&
+                       parseReplyPassMode("Recorded", runtime) == ReplyPassMode::Off,
+                   "only the exact value records the pass in the arena and the playable trial");
+        }
+        for (const auto runtime : {MasterStockControlRuntime::Play, MasterStockControlRuntime::None})
+        {
+            expect(parseReplyPassMode("recorded", runtime) == ReplyPassMode::Off,
+                   "the reply pass switch is refused in ordinary play whatever its value");
+        }
+        expect(MasterShadowConfig{}.replyPass == ReplyPassMode::Off &&
+                   playMasterStockControlConfig().replyPass == ReplyPassMode::Off,
+               "the reply pass defaults off");
+    }
+
+    void masterPlanHandoffs()
+    {
+        constexpr std::int64_t budget = 1000000;
+        constexpr MilliFunds moveValue = 500;
+        Fixture fixture(2);
+        fixture.input.actors[0].candidates.push_back(moveCandidate(0, {0, 0}, {0, 1}, moveValue, 1));
+        fixture.seat();
+        const auto problem = fixture.extract();
+        const std::vector<std::int32_t> incumbentChoices(problem.incumbentChoices().begin(),
+                                                         problem.incumbentChoices().end());
+        auto incoming = installationIncoming(fixture, problem);
+        const auto retained = handOffMasterPlan(&problem, incoming);
+        expect(retained.status == MasterPlanHandoffStatus::Ready && retained.handoff &&
+                   retained.handoff->choices == incumbentChoices,
+               "a retained incumbent hands off the incumbent's choices");
+        expect(handOffMasterPlan(nullptr, incoming).status == MasterPlanHandoffStatus::NoProblem &&
+                   !handOffMasterPlan(nullptr, incoming).handoff,
+               "an extraction refusal hands off nothing");
+        RefinementLedger ledger;
+        require(ledger.open(budget), "handoff installation ledger opens");
+        MasterAssignmentEvaluator evaluator(problem, ledger);
+        MasterAssignmentInstallation installation(problem, evaluator, ledger);
+        require(installation.prepare(incoming) == MasterInstallationStatus::Reserved, "handoff installation reserves");
+        const auto search = searchMasterAssignment(problem, evaluator, ledger);
+        const auto finalized = installation.finish(search.improvement, incoming);
+        require(finalized.status == MasterInstallationStatus::Installed && finalized.proof,
+                "the handoff fixture installs its challenger");
+        const auto installed = handOffMasterPlan(&problem, incoming);
+        expect(installed.status == MasterPlanHandoffStatus::Ready && installed.handoff &&
+                   installed.handoff->choices == finalized.proof->challenger.state.choices &&
+                   installed.handoff->choices != incumbentChoices,
+               "an installed challenger hands off the challenger's choices");
+        auto stale = incoming;
+        stale.selections[0].candidateIndex = incumbentChoices[0];
+        const auto mismatch = handOffMasterPlan(&problem, stale);
+        expect(mismatch.status == MasterPlanHandoffStatus::PlanMismatch && !mismatch.handoff,
+               "choices that do not replay to the installed plan hand off nothing");
+        auto invalid = incoming;
+        invalid.selections[0].candidateIndex = static_cast<std::int32_t>(fixture.input.actors[0].candidates.size());
+        expect(handOffMasterPlan(&problem, invalid).status == MasterPlanHandoffStatus::ReplayFailed,
+               "choices that do not replay at all are named");
+        auto missing = incoming;
+        missing.selections.pop_back();
+        expect(handOffMasterPlan(&problem, missing).status == MasterPlanHandoffStatus::SelectionMismatch,
+               "an actor without a selection is named");
+        auto reordered = incoming;
+        std::reverse(reordered.selections.begin(), reordered.selections.end());
+        const auto matched = handOffMasterPlan(&problem, reordered);
+        expect(matched.status == MasterPlanHandoffStatus::Ready && matched.handoff &&
+                   matched.handoff->choices == installed.handoff->choices,
+               "selections are matched to actor slots by unit, not by position");
+        auto reversedOrder = incoming;
+        std::reverse(reversedOrder.executionOrder.begin(), reversedOrder.executionOrder.end());
+        require(reversedOrder.executionOrder != incoming.executionOrder, "the handoff fixture runs two actions");
+        expect(handOffMasterPlan(&problem, reversedOrder).status == MasterPlanHandoffStatus::PlanMismatch,
+               "an execution order other than the replayed one hands off nothing");
+    }
+
+    void masterPlanHandoffKeepsTally()
+    {
+        Fixture fixture(2);
+        const auto tally = std::make_shared<ReplyPredictionTally>();
+        fixture.input.replyPrediction = {.mode = ReplyPrediction::Recorded, .tally = tally};
+        fixture.seat();
+        const auto problem = fixture.extract();
+        const auto replaysBefore = tally->replays;
+        const auto handoff = handOffMasterPlan(&problem, installationIncoming(fixture, problem));
+        expect(handoff.status == MasterPlanHandoffStatus::Ready && tally->replays == replaysBefore,
+               "the handoff replays without the problem's reply prediction, so its tally is untouched");
+        expect(replayMasterAssignment(problem, problem.incumbentChoices()).valid() && tally->replays > replaysBefore,
+               "the fixture's own replay does count, so the check above can fail");
+    }
 }
 
 int main(int argc, char** argv)
@@ -5624,6 +5719,9 @@ int main(int argc, char** argv)
     planNeighborAuditMidLoop();
     planNeighborAuditConfig();
     captureDangerAuditConfig();
+    replyPassConfig();
+    masterPlanHandoffs();
+    masterPlanHandoffKeepsTally();
     testMasterStockReference();
     MasterAssignmentTest::testOfflineStockReference();
     std::printf("Master assignment integration: %d checks, %d failures\n", checks, failures);

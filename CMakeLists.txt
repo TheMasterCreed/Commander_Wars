@@ -853,6 +853,8 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/replypredictionmode.h ai/coordinator/replyfacts.h ai/coordinator/replyprediction.h
     ai/coordinator/ownactionmeasurement.h ai/coordinator/stockreplykeys.h ai/coordinator/replypassevaluation.h
     ai/coordinator/masterreplyactions.h ai/coordinator/replypass.h ai/coordinator/replypass.cpp
+    ai/coordinator/replypassmode.h ai/coordinator/replypassrecord.h ai/coordinator/replypassrecord.cpp
+    ai/coordinator/masterplanhandoff.h ai/coordinator/masterplanhandoff.cpp
     ai/coordinator/replyfactsbuilder.h ai/coordinator/replyfactsbuilder.cpp ai/coordinator/replycheck.h
     ai/coordinator/bundleassignment.h ai/coordinator/bundleassignment.cpp
     ai/coordinator/masterassignmentproblem.h ai/coordinator/masterassignmentproblem.cpp
@@ -1551,6 +1553,22 @@ if (BUILD_TESTING)
     add_test(NAME CoordinatorAiReplyPassTests COMMAND CoordinatorAiReplyPassTests)
     cow_set_arena_test_path(CoordinatorAiReplyPassTests)
 
+    add_executable(CoordinatorAiReplyPassRecordTests
+        tests/coordinator_ai/replypassrecordtests.cpp
+        ai/coordinator/replypassrecord.cpp
+        ai/coordinator/replypass.cpp
+        ai/coordinator/masterassignmentproblem.cpp
+        ai/coordinator/propertystockpricing.cpp
+        ai/coordinator/masterassignmentfuture.cpp
+        ai/coordinator/masterplanpricing.cpp
+    )
+    target_compile_definitions(CoordinatorAiReplyPassRecordTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
+    target_include_directories(CoordinatorAiReplyPassRecordTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(CoordinatorAiReplyPassRecordTests PRIVATE Qt6::Core)
+    set_target_properties(CoordinatorAiReplyPassRecordTests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    add_test(NAME CoordinatorAiReplyPassRecordTests COMMAND CoordinatorAiReplyPassRecordTests)
+    cow_set_arena_test_path(CoordinatorAiReplyPassRecordTests)
+
     set(MASTER_ASSIGNMENT_ORACLE_SRCS
         tests/coordinator_ai/masterassignmentoracle.cpp
         tests/coordinator_ai/masterassignmentreference.cpp
@@ -1614,6 +1632,7 @@ if (BUILD_TESTING)
         ai/coordinator/masterassignmentcapture.cpp
         ai/coordinator/masterassignmentshadowconfig.cpp
         ai/coordinator/masterassignmentinstallation.cpp
+        ai/coordinator/masterplanhandoff.cpp
         ${MASTER_ASSIGNMENT_SEARCH_SRCS}
         ${MASTER_ASSIGNMENT_ORACLE_SRCS}
     )

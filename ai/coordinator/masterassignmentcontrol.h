@@ -3,6 +3,7 @@
 #include "ai/coordinator/masterassignmentinstallation.h"
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masternativesource.h"
+#include "ai/coordinator/masterplanhandoff.h"
 
 namespace Coordinator
 {
@@ -55,5 +56,5 @@ namespace Coordinator
     MasterStockControlTiming controlMasterAssignment(
         const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
         AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
-        const DecisionTraceIdentity & identity);
+        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff = nullptr);
 }

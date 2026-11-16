@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -21,6 +22,8 @@ namespace Coordinator
         Shot,
         HitsShooter,
     };
+
+    inline constexpr std::array CHANGE_REASON_NAMES{"SHOT", "HITS_SHOOTER"};
 
     enum class ChangeOmission : std::int8_t
     {

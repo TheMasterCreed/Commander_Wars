@@ -20,6 +20,25 @@
 
 namespace Coordinator::CaptureDangerRecord
 {
+    // Keys both the danger and the reply pass records write, so the two files join on the same spellings.
+    constexpr auto KEY_SCHEMA = "schema";
+    constexpr auto KEY_DAY = "day";
+    constexpr auto KEY_PLAYER = "player";
+    constexpr auto KEY_PLAN_SEQUENCE = "planSequence";
+    constexpr auto KEY_ACTORS = "actors";
+    constexpr auto KEY_UNIT = "unit";
+    constexpr auto KEY_NANOS = "nanos";
+    constexpr auto KEY_UNITS_SHOT = "unitsShot";
+    constexpr auto KEY_REASON = "reason";
+    constexpr auto KEY_CANDIDATE = "candidate";
+    constexpr auto KEY_AFTER_OWN_ACTIONS = "afterOwnActions";
+    constexpr auto KEY_AFTER_REPLY = "afterReply";
+    constexpr auto KEY_REPLY_LOSS = "replyLoss";
+    constexpr auto KEY_OWNED = "owned";
+    constexpr auto KEY_PRESENT = "present";
+    constexpr auto KEY_FLOOR = "floor";
+    constexpr auto KEY_CEILING = "ceiling";
+    constexpr auto KEY_WORK = "work";
     constexpr auto KEY_HP = "hp";
     constexpr auto KEY_DAMAGE = "damage";
     constexpr auto KEY_APPLIED = "applied";
@@ -233,6 +252,17 @@ namespace Coordinator::CaptureDangerRecord
                 break;
         }
         return INTERRUPTION_RESTARTED;
+    }
+
+    inline QJsonArray continuationKeyRecord(const ContinuationKey & key)
+    {
+        QJsonArray encoded;
+        for (const auto & action : key)
+        {
+            encoded.append(QJsonArray{action.row(), action.x(), action.y(), action.captures(), action.stepsLost(),
+                                      action.destroyed()});
+        }
+        return encoded;
     }
 
     inline QJsonObject outcomeRecord(const ReplyOutcome & outcome)
