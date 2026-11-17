@@ -2430,6 +2430,60 @@ namespace
                    "production rows of equal value take the approach, and the stay when the labels are equal");
         }
     }
+
+    void floorWitnessReplaysOrIsRefused()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t NODES = 3;
+        constexpr std::int32_t HORIZON = 8;
+        constexpr std::int32_t TURN = 2;
+        constexpr std::size_t ROWS = 4;
+        // Rows 0 to 2 match nodes 2, 0 and 1, so emission by node order would not replay; row 3 stays unmatched.
+        constexpr std::array<std::array<MilliFunds, NODES>, ROWS> WEIGHTS{{{1, 1, 5}, {7, 1, 1}, {1, 11, 1}, {1, 1, 1}}};
+        constexpr MilliFunds MATCHED = 23;
+        constexpr MilliFunds REPEATED = 13;
+        std::vector<PropertyStockColumn> columns;
+        for (std::int32_t node = 0; node < NODES; ++node)
+        {
+            columns.push_back(PropertyStockColumn{.slot = node, .tile = {node, 0}, .income = {1, 1}});
+        }
+        std::vector<SequentialClassTable> classes(1);
+        classes.front().buildFromPrizes(NODES, std::vector<MilliFunds>(NODES * HORIZON, 0),
+                                        std::vector<std::int32_t>(NODES * NODES, 0), NO_CAPTURE_TURNS, HORIZON);
+        SequentialInstance instance{HORIZON, columns, classes, {}, std::vector<bool>(NODES, false)};
+        for (const auto & weights : WEIGHTS)
+        {
+            instance.rows.push_back(SequentialRow{.classIndex = 0, .weight = {weights.begin(), weights.end()},
+                                                  .ownedTurn = std::vector<std::int32_t>(NODES, TURN)});
+        }
+        const std::vector<std::int32_t> matching{2, 0, 1, NO_SEQUENTIAL_NODE};
+        const auto floor = replayedFloorWitness(instance, matching, MATCHED);
+        expect(floor && floor->size() == ROWS - 1 && replaySequentialWitness(instance, *floor, MATCHED),
+               "a matching emits one replaying single-node row per matched row, in row order");
+        const auto refused = [&](const std::vector<std::int32_t> & nodes, MilliFunds value)
+        {
+            return !replayedFloorWitness(instance, nodes, value);
+        };
+        expect(refused({2, 0, 0, NO_SEQUENTIAL_NODE}, REPEATED) && refused({2, 0, NODES, NO_SEQUENTIAL_NODE}, MATCHED) &&
+                   refused({2, 0, 1}, MATCHED) && refused(matching, MATCHED + 1),
+               "a repeated node, a node outside the instance, a short matching and a wrong value give nothing");
+    }
+
+    void openOptimumReportsItsMatching()
+    {
+        using namespace Coordinator;
+        using Fixture = PropertyStockDiagnosticFixture;
+        // Row 0 captures column 0, so the one open column, column 1, sits in assignment slot 0.
+        auto field = Fixture::make(2, Fixture::POINTS);
+        const std::vector<PlanRowAction> capture{{.row = 0, .destination = {0, 0}, .captures = true}};
+        std::vector<std::int32_t> columns;
+        const auto optimum = field.diagnosticOpenOptimum(capture, &columns);
+        // Pins the read-out's hookup and slot-to-column translation; with one open column the optimum is the pair's weight.
+        expect(optimum > 0 && optimum == field.diagnosticOpenOptimum(capture, nullptr) &&
+                   std::count(columns.begin(), columns.end(), 1) == 1 &&
+                   std::count(columns.begin(), columns.end(), NO_STOCK_COLUMN) == 1,
+               "the floor's read-out reports its pair by field column, not slot, and the unrequested optimum is the same");
+    }
 }
 
 int main()
@@ -2443,6 +2497,8 @@ int main()
     testInjectivityAndPositionalDelta();
     testActivationScheduleUsesTurnBoundaries();
     testReadSetOnlyBoundsWork();
+    floorWitnessReplaysOrIsRefused();
+    openOptimumReportsItsMatching();
     stockFieldDiagnosticChecks();
     stockFieldRefinementIsExact();
     stockFieldDualCeilingIsSound();

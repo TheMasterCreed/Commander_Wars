@@ -259,6 +259,7 @@ namespace Coordinator
                 const std::vector<std::int32_t> & capturedColumns, std::int64_t stateCap) override;
             RelativeStockRefinedTerm adoptOurWitness(const ContinuationKey & key,
                 std::span<const SequentialRowWitness> witness, MilliFunds value) override;
+            RelativeStockRefinedTerm adoptOurFloor(const ContinuationKey & key) override;
             bool hintOurUpperPrices(const ContinuationKey & key, std::span<const MilliFunds> futureNodePrices) override;
             bool supportsVerifiedDual() const override
             {
@@ -281,6 +282,9 @@ namespace Coordinator
 
         private:
             GrantId grant(std::int64_t tariff, std::int64_t stateCap, RefinementWork work);
+            // No suggested value means the floor adoption.
+            RelativeStockRefinedTerm adoptCharged(const ContinuationKey & key,
+                std::span<const SequentialRowWitness> witness, std::optional<MilliFunds> value);
             bool verifiedUpperMatches(
                 const RelativeStockQuote & quote) const override;
             JointPlanStockValuer & m_owner;
@@ -308,6 +312,13 @@ namespace Coordinator
             std::vector<std::int32_t> capturedColumns;
             std::vector<std::vector<std::int64_t>> rowKeys;
             SequentialInstance instance;
+            std::vector<std::int32_t> floorNodes;
+        };
+
+        enum class FloorMatching : std::int8_t
+        {
+            Skip,
+            Report,
         };
 
         struct RefinedWitness
@@ -322,6 +333,7 @@ namespace Coordinator
             Adopted,
             Declined,
             Failed,
+            BelowFloor,
         };
 
         std::int32_t rowOf(std::int32_t engineUnitId) const;
@@ -415,6 +427,8 @@ namespace Coordinator
             bool* pCompleted = nullptr);
         WitnessAdoption adoptOurWitness(ContinuationEntry & entry, std::span<const SequentialRowWitness> witness,
                                         MilliFunds value);
+        WitnessAdoption adoptOurFloor(ContinuationEntry & entry);
+        void storeOurWitness(ContinuationEntry & entry, RefinedWitness witness);
         MilliFunds sequentialJointStock(std::span<const PlanRowAction> actions) const;
         OurSequentialSolve solveOurSequential(
             std::span<const PlanRowAction> actions,
@@ -423,7 +437,7 @@ namespace Coordinator
             const RefinedWitness* pReplay = nullptr,
             const SequentialWarmStart* pWarmStart = nullptr) const;
         OurSequentialProblem buildOurSequentialProblem(
-            std::span<const PlanRowAction> actions) const;
+            std::span<const PlanRowAction> actions, FloorMatching matching = FloorMatching::Skip) const;
         static const PropertyStockActor* sequentialMover(
             const PropertyStockField::JointActionFacts & facts, std::int32_t row);
         static std::vector<std::int64_t> sequentialRowKey(

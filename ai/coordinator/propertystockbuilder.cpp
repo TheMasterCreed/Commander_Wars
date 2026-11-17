@@ -1765,7 +1765,7 @@ namespace Coordinator
 
     JointPlanStockValuer::OurSequentialProblem
     JointPlanStockValuer::buildOurSequentialProblem(
-        std::span<const PlanRowAction> actions) const
+        std::span<const PlanRowAction> actions, FloorMatching matching) const
     {
         PropertyStockField & field = continuationField();
         OurSequentialProblem problem;
@@ -1779,9 +1779,16 @@ namespace Coordinator
                 field.m_ours.columns[static_cast<std::size_t>(column)],
                 field.m_horizonTurns);
         }
-        problem.floorValue = field.ourOpenOptimum(facts);
+        problem.floorValue = field.ourOpenOptimum(
+            facts, matching == FloorMatching::Report ? &problem.floorNodes : nullptr);
 
         ensureOurSequentialState();
+        for (std::int32_t & entry : problem.floorNodes)
+        {
+            // A column without a node leaves its row unmatched, so the floor witness fails to replay.
+            entry = entry >= 0 && static_cast<std::size_t>(entry) < m_ourNodeOfColumn.size()
+                ? m_ourNodeOfColumn[static_cast<std::size_t>(entry)] : NO_SEQUENTIAL_NODE;
+        }
         std::vector<std::int32_t> classIndices(
             field.m_ours.rows.size(),
             NO_SEQUENTIAL_CLASS);
@@ -2579,21 +2586,57 @@ namespace Coordinator
             m_pricingFailure = true;
             return WitnessAdoption::Failed;
         }
-        // A stored witness below the floor would be refused as the next refinement's warm start.
-        if (!solved.witnessReplays || value < solved.floorValue)
+        if (!solved.witnessReplays)
         {
             return WitnessAdoption::Declined;
+        }
+        // A stored witness below the floor would be refused as the next refinement's warm start.
+        if (value < solved.floorValue)
+        {
+            return WitnessAdoption::BelowFloor;
         }
         if (value > entry.ours.upper)
         {
             m_pricingFailure = true;
             return WitnessAdoption::Failed;
         }
-        entry.ours.lower = value;
-        m_refinedOurWitnesses[entry.key] = std::move(candidate);
+        storeOurWitness(entry, std::move(candidate));
+        return WitnessAdoption::Adopted;
+    }
+
+    JointPlanStockValuer::WitnessAdoption JointPlanStockValuer::adoptOurFloor(ContinuationEntry & entry)
+    {
+        OurSequentialProblem problem = buildOurSequentialProblem(planActions(entry.key), FloorMatching::Report);
+        if (problem.capturedColumns != entry.capturedColumns)
+        {
+            m_pricingFailure = true;
+            return WitnessAdoption::Failed;
+        }
+        if (problem.floorValue <= entry.ours.lower)
+        {
+            return WitnessAdoption::Declined;
+        }
+        if (problem.floorValue > entry.ours.upper)
+        {
+            m_pricingFailure = true;
+            return WitnessAdoption::Failed;
+        }
+        auto witness = replayedFloorWitness(problem.instance, problem.floorNodes, problem.floorValue);
+        if (!witness)
+        {
+            m_pricingFailure = true;
+            return WitnessAdoption::Failed;
+        }
+        storeOurWitness(entry, RefinedWitness{.rows = std::move(*witness), .value = problem.floorValue, .replays = true});
+        return WitnessAdoption::Adopted;
+    }
+
+    void JointPlanStockValuer::storeOurWitness(ContinuationEntry & entry, RefinedWitness witness)
+    {
+        entry.ours.lower = witness.value;
+        m_refinedOurWitnesses[entry.key] = std::move(witness);
         entry.storeBacked = true;
         entry.exact = entry.ours.exact();
-        return WitnessAdoption::Adopted;
     }
 
     bool JointPlanStockValuer::refineEnemy(

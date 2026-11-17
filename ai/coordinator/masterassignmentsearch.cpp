@@ -622,9 +622,10 @@ namespace
             switch (adopted)
             {
                 case MasterRefinementStatus::Updated:
-                    stats.gate = MasterPlanPricingGate::Adopted;
+                    stats.adoptedValue = evaluation->quote()->ours.lower;
+                    stats.gate = *stats.adoptedValue != friendly->value ? MasterPlanPricingGate::AdoptedFloor
+                                                                        : MasterPlanPricingGate::Adopted;
                     stats.outcome = MasterPlanPricingOutcome::Seeded;
-                    stats.adoptedValue = friendly->value;
                     break;
                 case MasterRefinementStatus::Unavailable:
                     stats.gate = friendly ? MasterPlanPricingGate::AdoptionDeclined

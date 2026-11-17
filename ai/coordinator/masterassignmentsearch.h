@@ -213,6 +213,7 @@ namespace Coordinator
         DeferralFailed,
         FirstComparisonFailed,
         IncumbentCapFailed,
+        AdoptedFloor,
     };
 
     inline constexpr std::array MASTER_PLAN_PRICING_GATE_NAMES{
@@ -221,8 +222,9 @@ namespace Coordinator
         "NO_VALID_WITNESS", "CONVERSION_EMPTY", "SAME_CHOICES_AS_INCUMBENT", "RESERVE_OVERFLOW", "RESERVE_TOO_SMALL",
         "LOOKUP_OUT_OF_BUDGET", "EVALUATION_OUT_OF_BUDGET", "CHALLENGER_INFEASIBLE", "CHALLENGER_UNQUOTED",
         "NO_FRIENDLY_WITNESS", "ADOPTED", "ADOPTION_DECLINED", "ADOPTION_OUT_OF_BUDGET", "VALUER_FAILURE",
-        "DEFERRAL_FAILED", "FIRST_COMPARISON_FAILED", "INCUMBENT_CAP_FAILED",
+        "DEFERRAL_FAILED", "FIRST_COMPARISON_FAILED", "INCUMBENT_CAP_FAILED", "ADOPTED_FLOOR",
     };
+    static_assert(MASTER_PLAN_PRICING_GATE_NAMES.size() == static_cast<std::size_t>(MasterPlanPricingGate::AdoptedFloor) + 1);
 
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     struct MasterPlanTuningDiagnostics

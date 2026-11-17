@@ -500,7 +500,7 @@ namespace Coordinator
         return facts;
     }
 
-    MilliFunds PropertyStockField::ourOpenOptimum(const JointActionFacts & facts)
+    MilliFunds PropertyStockField::ourOpenOptimum(const JointActionFacts & facts, std::vector<std::int32_t>* pColumnOfRow)
     {
         std::vector<std::int32_t> openColumns;
         for (std::int32_t column = 0; column < m_ours.columnCount(); ++column)
@@ -538,6 +538,10 @@ namespace Coordinator
         }
         AssignmentSolver solver;
         solver.solve(m_ours.rowCount(), static_cast<std::int32_t>(openColumns.size()), weights);
+        if (pColumnOfRow != nullptr)
+        {
+            *pColumnOfRow = solver.positiveMatching(openColumns);
+        }
         return solver.optimum();
     }
 

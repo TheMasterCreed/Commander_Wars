@@ -1168,7 +1168,16 @@ namespace Coordinator
             return MasterRefinementStatus::BudgetExhausted;
         }
         const auto lower = quote->ours.lower;
-        const auto adopted = m_session->adoptOurWitness(quote->key, witness, value);
+        auto adopted = m_session->adoptOurWitness(quote->key, witness, value);
+        // The floor adoption is admitted only with the refresh's reserve still covered after it.
+        if (adopted.valid && !adopted.budgetExhausted && adopted.belowFloor && m_ledger.balance() >= *total)
+        {
+            if (m_ledger.draw(m_tariffs.quote, RefinementWork::MasterValuation) == NO_GRANT)
+            {
+                return MasterRefinementStatus::BudgetExhausted;
+            }
+            adopted = m_session->adoptOurFloor(quote->key);
+        }
         if (adopted.budgetExhausted)
         {
             return MasterRefinementStatus::BudgetExhausted;

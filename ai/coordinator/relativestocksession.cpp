@@ -254,6 +254,17 @@ namespace Coordinator
     RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::adoptOurWitness(
         const ContinuationKey & key, std::span<const SequentialRowWitness> witness, MilliFunds value)
     {
+        return adoptCharged(key, witness, value);
+    }
+
+    RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::adoptOurFloor(const ContinuationKey & key)
+    {
+        return adoptCharged(key, {}, std::nullopt);
+    }
+
+    RelativeStockRefinedTerm JointPlanStockValuer::RelativeSession::adoptCharged(
+        const ContinuationKey & key, std::span<const SequentialRowWitness> witness, std::optional<MilliFunds> value)
+    {
         RelativeStockRefinedTerm result;
         CheapInitialPrice initial;
         if (!m_owner.livePairSwapIntervals() || m_owner.m_pRefinementLedger == nullptr ||
@@ -268,7 +279,7 @@ namespace Coordinator
         }
         result.interval = entry->ours;
         result.searchCompleted = entry->searchCompleted;
-        if (value <= entry->ours.lower)
+        if (value && *value <= entry->ours.lower)
         {
             result.valid = true;
             return result;
@@ -286,7 +297,9 @@ namespace Coordinator
         }
         result.admitted = true;
         result.workUsed = tariff;
-        result.valid = m_owner.adoptOurWitness(*entry, witness, value) != WitnessAdoption::Failed;
+        const auto adoption = value ? m_owner.adoptOurWitness(*entry, witness, *value) : m_owner.adoptOurFloor(*entry);
+        result.valid = adoption != WitnessAdoption::Failed;
+        result.belowFloor = adoption == WitnessAdoption::BelowFloor;
         result.interval = entry->ours;
         const auto refreshed = quote(key, 0);
         result.lowerWitnessReplays = refreshed.valid && refreshed.ourLowerWitnessReplays;

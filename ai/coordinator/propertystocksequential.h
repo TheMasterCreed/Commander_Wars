@@ -1285,6 +1285,38 @@ namespace Coordinator
         return total == expectedValue;
     }
 
+    // One single-node row per matched row, returned only if it replays at exactly expectedValue.
+    inline std::optional<std::vector<SequentialRowWitness>> replayedFloorWitness(
+        const SequentialInstance & instance, std::span<const std::int32_t> nodeOfRow, MilliFunds expectedValue)
+    {
+        if (nodeOfRow.size() != instance.rows.size())
+        {
+            return std::nullopt;
+        }
+        std::vector<SequentialRowWitness> witness;
+        for (std::size_t rowSlot = 0; rowSlot < nodeOfRow.size(); ++rowSlot)
+        {
+            const std::int32_t node = nodeOfRow[rowSlot];
+            if (node == NO_SEQUENTIAL_NODE)
+            {
+                continue;
+            }
+            if (node < 0 || node >= instance.nodeCount())
+            {
+                return std::nullopt;
+            }
+            const SequentialRow & row = instance.rows[rowSlot];
+            const SequentialDetail::WitnessStep step{node, row.ownedTurn[static_cast<std::size_t>(node)]};
+            witness.push_back(SequentialDetail::ownedWitness(
+                instance, row, static_cast<std::int32_t>(rowSlot), std::span<const SequentialDetail::WitnessStep>(&step, 1)));
+        }
+        if (!replaySequentialWitness(instance, witness, expectedValue))
+        {
+            return std::nullopt;
+        }
+        return witness;
+    }
+
     inline SequentialTierResult solveSequentialPacking(
         const SequentialInstance & instance,
         MilliFunds floorValue,

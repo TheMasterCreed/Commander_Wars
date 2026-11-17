@@ -175,6 +175,13 @@ namespace Coordinator
             return m_theirs.weights[static_cast<std::size_t>(row) * m_theirs.columns.size() + static_cast<std::size_t>(slot)];
         }
 
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        MilliFunds diagnosticOpenOptimum(std::span<const PlanRowAction> actions, std::vector<std::int32_t>* pColumnOfRow)
+        {
+            return ourOpenOptimum(jointActionFacts(actions), pColumnOfRow);
+        }
+#endif
+
         friend PropertyStockField buildPropertyStockField(GameMap & map, const BattlefieldKnowledge & knowledge,
                                                           std::span<const PropertyFacts> properties,
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);
@@ -228,7 +235,7 @@ namespace Coordinator
                               std::span<const std::int32_t> nodeSlots, SequentialLaterList & later);
         PropertyStockActor actionMover(const PlanRowAction & action, std::int32_t & capturedColumn) const;
         JointActionFacts jointActionFacts(std::span<const PlanRowAction> actions) const;
-        MilliFunds ourOpenOptimum(const JointActionFacts & facts);
+        MilliFunds ourOpenOptimum(const JointActionFacts & facts, std::vector<std::int32_t>* pColumnOfRow = nullptr);
         const MarginalTable & marginalFor(std::int32_t row, std::int32_t excludedColumn);
         MilliFunds enemyOptimumWithout(std::int32_t removedRow);
         MilliFunds ourPositionalStock(const PropertyStockActor & actor, const PropertyStockOutcome & outcome);

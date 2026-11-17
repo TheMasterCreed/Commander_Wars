@@ -4067,14 +4067,84 @@ namespace
             };
             search(0);
             require(belowFloor.has_value(), "the cheap lower leaves room for a replaying witness below the floor");
-            expect(evaluator.adoptFriendlyWitness(evaluation, *belowFloor, belowValue) ==
-                       MasterRefinementStatus::Unavailable &&
-                       sameRelativeStockQuote(*evaluation.quote(), before) && !session.pricingFailure,
-                   "a replaying witness below the floor is declined without touching the interval");
-            expect(evaluator.refine(evaluation, MasterRefinementTerm::Friendly, FRIENDLY_WORK) ==
-                       MasterRefinementStatus::Updated && !session.pricingFailure &&
-                       evaluation.quote()->ours.lower >= floor,
-                   "the next friendly refinement after a declined witness keeps the valuer live");
+            std::vector<std::int32_t> floorNodes;
+            model.floorValue(&floorNodes);
+            const auto atFloor = replayedFloorWitness(instance, floorNodes, floor);
+            require(atFloor.has_value(), "the mirror's floor matching replays at the floor");
+            using Then = std::function<void(NativeStockSession &, MasterAssignmentEvaluator &, MasterAssignmentEvaluation &)>;
+            // overRerun sets the balance at the floor admission to one rerun plus it; the attempt pays a quote and a rerun first.
+            const auto runFloor = [&](std::span<const SequentialRowWitness> suggestion, MilliFunds value,
+                                      std::optional<std::int64_t> overRerun, MasterRefinementStatus status,
+                                      std::int64_t quotes, std::int64_t reruns, std::int64_t witnesses,
+                                      const char* message, const Then & then = {})
+            {
+                RefinementLedger floorLedger;
+                require(floorLedger.open(LEDGER_WORK), "floor ledger");
+                NativeStockSession floorSession(field, enemy, cases, floorLedger);
+                MasterAssignmentEvaluator floorEvaluator(problem, floorLedger, floorSession, TARIFFS);
+                auto floorEvaluation = floorEvaluator.evaluate({problem.identity(), incumbentChoices});
+                const auto rerun = floorSession.ourRerunWork();
+                require(!overRerun || floorLedger.consume(floorLedger.balance() - (TARIFFS.quote + rerun + rerun + *overRerun),
+                                                          RefinementWork::SearchSlice), "the ledger is set to the boundary");
+                const auto start = floorLedger.stats();
+                const auto quoted = *floorEvaluation.quote();
+                const auto result = floorEvaluator.adoptFriendlyWitness(floorEvaluation, suggestion, value);
+                const auto & end = floorLedger.stats();
+                const auto & after = *floorEvaluation.quote();
+                const auto delta = [&](RefinementWork work)
+                {
+                    const auto slot = static_cast<std::size_t>(work);
+                    return end.grantedByWork[slot] - start.grantedByWork[slot];
+                };
+                expect(result == status && !floorSession.pricingFailure && end.refusals == start.refusals &&
+                           delta(RefinementWork::MasterValuation) == quotes * TARIFFS.quote &&
+                           delta(RefinementWork::MasterWitness) == reruns * rerun + witnesses * TARIFFS.witness &&
+                           end.spent() - start.spent() == delta(RefinementWork::MasterValuation) +
+                               delta(RefinementWork::MasterWitness) && after.ours.upper == quoted.ours.upper &&
+                           (status == MasterRefinementStatus::Updated
+                                ? after.ours.lower == floor && floorSession.replayLowerProof(*floorEvaluation.proof)
+                                : sameRelativeStockQuote(after, quoted)),
+                       message);
+                if (then)
+                {
+                    then(floorSession, floorEvaluator, floorEvaluation);
+                }
+            };
+            // An attempt and its refresh draw two quotes and one rerun; a floor operation adds one of each.
+            constexpr std::int64_t ATTEMPT_QUOTES = 2;
+            constexpr std::int64_t FLOOR_QUOTES = ATTEMPT_QUOTES + 1;
+            const auto exactReserve = 2 * TARIFFS.quote + TARIFFS.witness;
+            runFloor(*belowFloor, belowValue, exactReserve, MasterRefinementStatus::Updated, FLOOR_QUOTES, 2, 1,
+                     "a below-floor suggestion with the full reserve is certified at the floor by its own quote and rerun");
+            runFloor(*belowFloor, belowValue, exactReserve - 1, MasterRefinementStatus::Unavailable, ATTEMPT_QUOTES, 1, 0,
+                     "one unit short of the reserve skips the floor operation as a plain decline");
+            runFloor(*belowFloor, belowValue, 0, MasterRefinementStatus::Unavailable, ATTEMPT_QUOTES, 1, 0,
+                     "a balance of one bare rerun skips the floor operation as a plain decline");
+            runFloor(*atFloor, floor, std::nullopt, MasterRefinementStatus::Updated, ATTEMPT_QUOTES, 1, 1,
+                     "a suggestion at exactly the floor is adopted as itself");
+            runFloor(*belowFloor, belowValue + 1, std::nullopt, MasterRefinementStatus::Unavailable, ATTEMPT_QUOTES, 1, 0,
+                     "a suggestion that does not replay is declined without a floor operation",
+                     [&](NativeStockSession & floorSession, MasterAssignmentEvaluator & floorEvaluator,
+                         MasterAssignmentEvaluation & floorEvaluation)
+                     {
+                         expect(floorEvaluator.refine(floorEvaluation, MasterRefinementTerm::Friendly, FRIENDLY_WORK) ==
+                                    MasterRefinementStatus::Updated && !floorSession.pricingFailure,
+                                "the next friendly refinement after a declined witness keeps the valuer live");
+                     });
+            runFloor(*belowFloor, belowValue, std::nullopt, MasterRefinementStatus::Updated, FLOOR_QUOTES, 2, 1,
+                     "a funded below-floor suggestion is certified at the floor",
+                     [&](NativeStockSession & floorSession, MasterAssignmentEvaluator & floorEvaluator,
+                         MasterAssignmentEvaluation & floorEvaluation)
+                     {
+                         const auto spent = floorSession.remainingWork();
+                         const auto again = floorSession.adoptOurFloor(incumbentKey);
+                         expect(again.valid && !again.belowFloor && again.interval.lower == floor &&
+                                    spent - floorSession.remainingWork() == floorSession.ourRerunWork(),
+                                "a second floor operation pays its rerun and changes nothing");
+                         expect(floorEvaluator.refine(floorEvaluation, MasterRefinementTerm::Friendly, FRIENDLY_WORK) ==
+                                    MasterRefinementStatus::Updated && !floorSession.pricingFailure,
+                                "the next friendly refinement starts from the stored floor witness");
+                     });
             std::printf("  below-floor witness: cheap lower %lld, witness %lld, floor %lld\n",
                         static_cast<long long>(before.ours.lower), static_cast<long long>(belowValue),
                         static_cast<long long>(floor));
@@ -4590,6 +4660,31 @@ namespace
         expect(tuned.witness.valid && !seatsAFollower(tuned.witness), "no witness seats a follow candidate");
         expect(reference.witness.valid && seatsAFollower(reference.witness),
                "the same candidates unflagged are seated, so the refusal is what keeps them out");
+    }
+
+    void planPricingAdoptsTheFloor()
+    {
+        // One tuning round leaves the suggestion below its plan's floor.
+        const auto test = planPricingCases().front();
+        NativeStockSession* pSession = nullptr;
+        bool adoptedAtFloor = false;
+        PlanPricingHooks hooks;
+        hooks.before = [&](NativeStockSession & session) { pSession = &session; };
+        hooks.tamper = [&](MasterAssignmentSearchResult & result)
+        {
+            const auto adopted = result.stats.planPricing.adoptedValue;
+            for (const auto & source : test.reference.continuation.cases)
+            {
+                adoptedAtFloor = adoptedAtFloor || (adopted && NativeSequentialModel(source.friendly).floorValue() == *adopted &&
+                                                    pSession->quote(source.key, 0).ours.lower >= *adopted);
+            }
+        };
+        const auto run = runPlanPricing(test, planPricingSchedule(MasterRefinementAllocation::Baseline, 1),
+                                        PLAN_PRICING_TEST_LEDGER, FriendlySearch::Immediate, hooks);
+        const auto & pricing = run.result.stats.planPricing;
+        expect(pricing.gate == MasterPlanPricingGate::AdoptedFloor && pricing.outcome == MasterPlanPricingOutcome::Seeded &&
+                   pricing.hintStored && adoptedAtFloor,
+               "a suggestion below its floor seeds the plan at the floor and reports the floor as adopted");
     }
 
     void planPricingSearch()
@@ -5970,6 +6065,7 @@ int main(int argc, char** argv)
     planPricingAdapter();
     planPricingNeverSeatsAFollower();
     modelRecordMarksOnlyFollowers();
+    planPricingAdoptsTheFloor();
     planPricingSearch();
     planBoundCap();
     planBoundCapRejections();

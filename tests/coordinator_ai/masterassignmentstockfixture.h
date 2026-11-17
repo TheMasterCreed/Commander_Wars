@@ -35,14 +35,14 @@ namespace MasterAssignmentTest
         }
 
         // Mirrors the valuer's open-node floor: the best one-node-per-row assignment of capture weights.
-        MilliFunds floorValue() const
+        MilliFunds floorValue(std::vector<std::int32_t>* pNodeOfRow = nullptr) const
         {
-            std::vector<std::size_t> open;
+            std::vector<std::int32_t> open;
             for (std::size_t node = 0; node < input.capturedNodes.size(); ++node)
             {
                 if (!input.capturedNodes[node])
                 {
-                    open.push_back(node);
+                    open.push_back(static_cast<std::int32_t>(node));
                 }
             }
             std::vector<MilliFunds> weights;
@@ -50,11 +50,17 @@ namespace MasterAssignmentTest
             {
                 for (const auto node : open)
                 {
-                    weights.push_back(row.weight[node]);
+                    weights.push_back(row.weight[static_cast<std::size_t>(node)]);
                 }
             }
             AssignmentSolver solver;
             solver.solve(static_cast<std::int32_t>(input.rows.size()), static_cast<std::int32_t>(open.size()), weights);
+            if (pNodeOfRow != nullptr)
+            {
+                // Nodes are columns here, so an unmatched column is an unmatched node.
+                static_assert(NO_STOCK_COLUMN == NO_SEQUENTIAL_NODE);
+                *pNodeOfRow = solver.positiveMatching(open);
+            }
             return solver.optimum();
         }
 
@@ -392,46 +398,12 @@ namespace MasterAssignmentTest
         RelativeStockRefinedTerm adoptOurWitness(const ContinuationKey & key,
             std::span<const SequentialRowWitness> witness, MilliFunds value) override
         {
-            RelativeStockRefinedTerm result;
-            auto* entry = pricedEntry(key);
-            if (entry == nullptr)
-            {
-                return result;
-            }
-            result.interval = entry->ours;
-            result.searchCompleted = entry->ours.exact();
-            if (value <= entry->ours.lower)
-            {
-                result.valid = true;
-                return result;
-            }
-            const auto tariff = ourRerunWork();
-            if (remainingWork() < tariff || !m_ledger.consume(tariff, RefinementWork::MasterWitness))
-            {
-                result.budgetExhausted = true;
-                return result;
-            }
-            result.admitted = true;
-            result.workUsed = tariff;
-            if (!replaySequentialWitness(entry->model.instance(), witness, value) || value < entry->model.floorValue())
-            {
-                result.lowerWitnessReplays = true;
-                result.valid = true;
-                return result;
-            }
-            if (value > entry->ours.upper)
-            {
-                pricingFailure = true;
-                return result;
-            }
-            entry->ours.lower = value;
-            entry->witness.assign(witness.begin(), witness.end());
-            entry->refined = true;
-            result.interval = entry->ours;
-            result.searchCompleted = entry->ours.exact();
-            result.lowerWitnessReplays = true;
-            result.valid = true;
-            return result;
+            return adoptCharged(key, witness, value);
+        }
+
+        RelativeStockRefinedTerm adoptOurFloor(const ContinuationKey & key) override
+        {
+            return adoptCharged(key, {}, std::nullopt);
         }
 
         bool hintOurUpperPrices(const ContinuationKey & key, std::span<const MilliFunds> futureNodePrices) override
@@ -702,6 +674,73 @@ namespace MasterAssignmentTest
                 found->second.proof->identity.economic == quote.economic &&
                 found->second.proof->identity.owned == quote.owned &&
                 quote.ours.upper <= found->second.proof->dualObjective;
+        }
+
+        // No suggested value means the floor adoption.
+        RelativeStockRefinedTerm adoptCharged(const ContinuationKey & key,
+            std::span<const SequentialRowWitness> witness, std::optional<MilliFunds> value)
+        {
+            RelativeStockRefinedTerm result;
+            auto* entry = pricedEntry(key);
+            if (entry == nullptr)
+            {
+                return result;
+            }
+            result.interval = entry->ours;
+            result.searchCompleted = entry->ours.exact();
+            if (value && *value <= entry->ours.lower)
+            {
+                result.valid = true;
+                return result;
+            }
+            const auto tariff = ourRerunWork();
+            if (remainingWork() < tariff || !m_ledger.consume(tariff, RefinementWork::MasterWitness))
+            {
+                result.budgetExhausted = true;
+                return result;
+            }
+            result.admitted = true;
+            result.workUsed = tariff;
+            std::optional<std::vector<SequentialRowWitness>> rows;
+            MilliFunds adopted = 0;
+            bool declined = false;
+            if (value)
+            {
+                const bool replays = replaySequentialWitness(entry->model.instance(), witness, *value);
+                declined = !replays || *value < entry->model.floorValue();
+                result.belowFloor = replays && declined;
+                rows.emplace(witness.begin(), witness.end());
+                adopted = *value;
+            }
+            else
+            {
+                std::vector<std::int32_t> floorNodes;
+                adopted = entry->model.floorValue(&floorNodes);
+                declined = adopted <= entry->ours.lower;
+                if (!declined && adopted <= entry->ours.upper)
+                {
+                    rows = replayedFloorWitness(entry->model.instance(), floorNodes, adopted);
+                }
+            }
+            if (declined)
+            {
+                result.lowerWitnessReplays = true;
+                result.valid = true;
+                return result;
+            }
+            if (adopted > entry->ours.upper || !rows)
+            {
+                pricingFailure = true;
+                return result;
+            }
+            entry->ours.lower = adopted;
+            entry->witness = std::move(*rows);
+            entry->refined = true;
+            result.interval = entry->ours;
+            result.searchCompleted = entry->ours.exact();
+            result.lowerWitnessReplays = true;
+            result.valid = true;
+            return result;
         }
 
         RelativeStockRefinedTerm refineModel(const NativeSequentialModel & model, StockInterval & bounds,

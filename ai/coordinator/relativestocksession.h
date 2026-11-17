@@ -23,6 +23,7 @@ namespace Coordinator
         bool valid{false};
         bool admitted{false};
         bool completed{false};
+        bool belowFloor{false};
     };
 
     struct RelativeStockDualTightening
@@ -152,6 +153,13 @@ namespace Coordinator
             const ContinuationKey &, std::span<const SequentialRowWitness>, MilliFunds)
         {
             return {};
+        }
+        // A session without a floor adoption leaves a below-floor suggestion as an ordinary decline.
+        virtual RelativeStockRefinedTerm adoptOurFloor(const ContinuationKey &)
+        {
+            RelativeStockRefinedTerm result;
+            result.valid = true;
+            return result;
         }
         virtual bool hintOurUpperPrices(const ContinuationKey &, std::span<const MilliFunds>)
         {

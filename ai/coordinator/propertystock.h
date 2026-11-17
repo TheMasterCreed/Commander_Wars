@@ -226,6 +226,25 @@ namespace Coordinator
             return row - 1;
         }
 
+        // One entry per row: the column a positive-weight match pairs it with, else NO_STOCK_COLUMN.
+        std::vector<std::int32_t> positiveMatching(std::span<const std::int32_t> columnOfSlot) const
+        {
+            std::vector<std::int32_t> result(static_cast<std::size_t>(m_rowCount), NO_STOCK_COLUMN);
+            if (columnOfSlot.size() != static_cast<std::size_t>(m_columnCount))
+            {
+                return result;
+            }
+            for (std::int32_t column = 1; column <= m_columnCount; ++column)
+            {
+                const std::int32_t row = m_columnRow[static_cast<std::size_t>(column)];
+                if (row != FREE_COLUMN && weightOf(row, column) > 0)
+                {
+                    result[static_cast<std::size_t>(row - 1)] = columnOfSlot[static_cast<std::size_t>(column - 1)];
+                }
+            }
+            return result;
+        }
+
         MilliFunds optimumWithoutColumn(std::int32_t columnSlot) const
         {
             if (!isColumnMatched(columnSlot))
