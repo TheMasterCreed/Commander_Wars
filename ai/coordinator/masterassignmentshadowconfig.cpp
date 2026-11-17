@@ -1,5 +1,8 @@
 #include "ai/coordinator/masterassignmentshadow.h"
 
+#include <algorithm>
+#include <limits>
+
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -26,7 +29,16 @@ namespace
     constexpr auto AUDIT_RECORDED = "1";
     constexpr auto STOCK_CONTROL_MODE = "stockControl";
     constexpr auto BATTLE_ANIMATION_SPEED_PROBE = "battleAnimationSpeed";
+    constexpr auto WORK_PER_ACTOR_VARIABLE = "COW_MASTER_ASSIGNMENT_WORK_PER_ACTOR";
     constexpr std::int64_t PLAY_STOCK_CONTROL_ALLOWANCE = 60000000;
+    constexpr std::int64_t PLAY_STOCK_CONTROL_ALLOWANCE_PER_ACTOR = 2000000;
+
+    bool parseWork(const QByteArray & value, std::int64_t & work)
+    {
+        bool valid = false;
+        work = value.toLongLong(&valid);
+        return valid && work >= 0;
+    }
 
     bool measuredRuntime(Coordinator::MasterStockControlRuntime runtime)
     {
@@ -122,15 +134,10 @@ namespace Coordinator
             result.error = MasterShadowConfigError::MissingExplicitAllowance;
             return result;
         }
-        if (!work.isEmpty())
+        if (!work.isEmpty() && !parseWork(work, result.allowance))
         {
-            bool valid = false;
-            result.allowance = work.toLongLong(&valid);
-            if (!valid || result.allowance < 0)
-            {
-                result.error = MasterShadowConfigError::InvalidAllowance;
-                return result;
-            }
+            result.error = MasterShadowConfigError::InvalidAllowance;
+            return result;
         }
         if (tierAudit == "counters")
         {
@@ -158,6 +165,27 @@ namespace Coordinator
         }
         result.outputPath = output;
         return result;
+    }
+
+    void applyMasterWorkPerActor(MasterShadowConfig & config, const QByteArray & value)
+    {
+        if (config.controlsStock() && !value.isEmpty() && !parseWork(value, config.allowancePerActor))
+        {
+            config.error = MasterShadowConfigError::InvalidAllowance;
+        }
+    }
+
+    std::int64_t masterTurnAllowance(const MasterShadowConfig & config, std::size_t actors)
+    {
+        if (config.allowancePerActor <= 0)
+        {
+            return config.allowance;
+        }
+        constexpr auto MAXIMUM = std::numeric_limits<std::int64_t>::max();
+        const auto count = static_cast<std::uint64_t>(actors);
+        const auto grown = count > static_cast<std::uint64_t>(MAXIMUM / config.allowancePerActor)
+            ? MAXIMUM : static_cast<std::int64_t>(count) * config.allowancePerActor;
+        return std::max(config.allowance, grown);
     }
 
     MasterShadowConfig readMasterShadowConfig()
@@ -209,6 +237,7 @@ namespace Coordinator
             }
         }
 #endif
+        applyMasterWorkPerActor(result, qgetenv(WORK_PER_ACTOR_VARIABLE));
         if (result.error != MasterShadowConfigError::None)
         {
             qWarning() << "Master assignment configuration rejected:" << static_cast<int>(result.error);
@@ -222,6 +251,7 @@ namespace Coordinator
         result.mode = MasterAssignmentMode::StockControl;
         result.runtime = MasterStockControlRuntime::Play;
         result.allowance = PLAY_STOCK_CONTROL_ALLOWANCE;
+        result.allowancePerActor = PLAY_STOCK_CONTROL_ALLOWANCE_PER_ACTOR;
         result.tierAuditMode = SequentialTierAuditMode::CountersOnly;
         result.exportMode = MasterShadowExportMode::Off;
         return result;

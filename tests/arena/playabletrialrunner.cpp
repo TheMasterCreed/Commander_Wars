@@ -41,6 +41,7 @@ constexpr qint32 STARTUP_DELAY_MS = 250;
 constexpr qint32 PULSE_MS = 100;
 constexpr qint32 STOP_OBSERVATION_MS = 1000;
 constexpr qint32 SHUTDOWN_GRACE_MS = 15000;
+constexpr auto ALLOWANCE_PER_ACTOR_KEY = "allowancePerActor";
 
 QString sha256(const QByteArray & bytes)
 {
@@ -290,7 +291,7 @@ bool PlayableTrialRunner::validateResume(QString & error)
     }
     const auto previousConfig = m_checkpoint.value("nativeConfig").toMap();
     const auto currentConfig = nativeConfig();
-    for (const auto & key : {"mode", "runtime", "error", "allowance", "tierAudit", "export",
+    for (const auto & key : {"mode", "runtime", "error", "allowance", ALLOWANCE_PER_ACTOR_KEY, "tierAudit", "export",
                              "executableSha256", "actionSeedProtocol"})
     {
         if (!previousConfig.contains(key) || previousConfig.value(key) != currentConfig.value(key))
@@ -864,6 +865,7 @@ QVariantMap PlayableTrialRunner::nativeConfig() const
     return {
         {"mode", static_cast<int>(m_master.mode)}, {"runtime", static_cast<int>(m_master.runtime)},
         {"error", static_cast<int>(m_master.error)}, {"allowance", QString::number(m_master.allowance)},
+        {ALLOWANCE_PER_ACTOR_KEY, QString::number(m_master.allowancePerActor)},
         {"tierAudit", static_cast<int>(m_master.tierAuditMode)}, {"export", static_cast<int>(m_master.exportMode)},
         {"profile", m_profile}, {"application", QCoreApplication::applicationFilePath()},
         {"executableSha256", m_executableSha256},

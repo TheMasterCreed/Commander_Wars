@@ -123,6 +123,7 @@ namespace
     struct ControlContext
     {
         const MasterShadowConfig & config;
+        std::int64_t allowance;
         const DecisionTraceIdentity & identity;
         AssignmentResult & assignment;
         RefinementLedger & ledger;
@@ -382,7 +383,7 @@ namespace
             {"status", masterStockControlStatusName(measured.status)},
             {"day", context.identity.day}, {"player", context.identity.playerId},
             {"planSequence", QString::number(context.identity.planSequence)}, {"horizon", context.identity.horizonTurns},
-            {"allowance", QString::number(context.config.allowance)}, {"masterWork", masterWorkRecord(measured.work)},
+            {"allowance", QString::number(context.allowance)}, {"masterWork", masterWorkRecord(measured.work)},
             {"staleProbe", static_cast<int>(context.config.staleProbe)},
             {"anyStaleProbeApplied", measured.staleProbeApplied},
             {"captureDetailPresentation", measured.detailPresentation},
@@ -463,8 +464,10 @@ namespace
         MasterAssignmentProfile profile;
         MasterProfileScope controlTiming(&profile, MasterPhase::StockControl);
         CaptureScreen screen{CaptureScreen::Inapplicable};
-        ControlContext context{config, identity, assignment, ledger, profile, measured, total, {}};
-        if (!ledger.open(config.allowance))
+        ControlContext context{
+            config, masterTurnAllowance(config, input.actors.size()), identity, assignment, ledger, profile, measured,
+            total, {}};
+        if (!ledger.open(context.allowance))
         {
             assignment = AssignmentResult{};
             assignment.stockConstructionStatus = StockConstructionStatus::InvalidInput;

@@ -76,6 +76,7 @@ namespace Coordinator
         MasterAssignmentMode mode{MasterAssignmentMode::Disabled};
         MasterStockControlRuntime runtime{MasterStockControlRuntime::None};
         std::int64_t allowance{MASTER_ASSIGNMENT_INITIAL_ALLOWANCE};
+        std::int64_t allowancePerActor{0};
         QString outputPath;
         MasterShadowConfigError error{MasterShadowConfigError::None};
         SequentialTierAuditMode tierAuditMode{SequentialTierAuditMode::Full};
@@ -157,6 +158,8 @@ namespace Coordinator
     CaptureDangerAudit parseCaptureDangerAudit(const QByteArray & value, MasterStockControlRuntime runtime);
     ReplyPrediction parseReplyPrediction(const QByteArray & value, MasterStockControlRuntime runtime);
     ReplyPassMode parseReplyPassMode(const QByteArray & value, MasterStockControlRuntime runtime);
+    void applyMasterWorkPerActor(MasterShadowConfig & config, const QByteArray & value);
+    std::int64_t masterTurnAllowance(const MasterShadowConfig & config, std::size_t actors);
     MasterShadowConfig readMasterShadowConfig();
     MasterShadowConfig playMasterStockControlConfig();
     void prepareMasterShadow(const MasterShadowConfig & config, AssignmentInput & input, RefinementLedger & ledger);

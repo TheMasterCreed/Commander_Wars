@@ -949,17 +949,23 @@ namespace
     void shadowControlsAndCapture()
     {
         const auto output = QDir::tempPath() + QStringLiteral("/master-shadow-test.jsonl");
+        const QByteArray stock("stockControl");
+        const QByteArray work("60000000");
+        const QByteArray shadow("shadow");
+        const QByteArray unknown("unknown");
+        const QByteArray negative("-1");
+        const QByteArray overflowing("9223372036854775808");
         const auto disabled = parseMasterShadowConfig({}, "invalid", {}, "invalid", "invalid");
         expect(!disabled.enabled() && disabled.error == MasterShadowConfigError::None,
                "default disabled mode ignores inactive diagnostic settings");
-        const auto control = parseMasterShadowConfig("stockControl", "60000000", output, {}, {},
+        const auto control = parseMasterShadowConfig(stock, work, output, {}, {},
                                                     MasterStockControlRuntime::Arena);
         expect(control.controlsStock() && !control.enabled() && control.allowance == 60000000,
                "StockControl requires an explicit mode and allowance without enabling Shadow");
-        expect(parseMasterShadowConfig("stockControl", {}, output, {}, {}, MasterStockControlRuntime::Arena).error ==
+        expect(parseMasterShadowConfig(stock, {}, output, {}, {}, MasterStockControlRuntime::Arena).error ==
                MasterShadowConfigError::MissingExplicitAllowance,
                "StockControl cannot inherit the global initial allowance implicitly");
-        expect(parseMasterShadowConfig("stockControl", "60000000", output).error ==
+        expect(parseMasterShadowConfig(stock, work, output).error ==
                MasterShadowConfigError::StockControlOutsideArena,
                "StockControl cannot activate outside the explicit isolated arena");
         constexpr std::int64_t PLAY_ALLOWANCE = 60000000;
@@ -969,56 +975,104 @@ namespace
                    play.tierAuditMode == SequentialTierAuditMode::CountersOnly &&
                    play.error == MasterShadowConfigError::None && play.outputPath.isEmpty(),
                "the play setting admits StockControl with a fixed allowance and no export");
-        const auto trial = parseMasterShadowConfig("stockControl", "60000000", {}, "counters", "off",
+        constexpr std::int64_t PLAY_PER_ACTOR = 2000000;
+        constexpr std::size_t BASE_ACTORS = 30;
+        expect(play.allowancePerActor == PLAY_PER_ACTOR && masterTurnAllowance(play, 0) == PLAY_ALLOWANCE &&
+                   masterTurnAllowance(play, BASE_ACTORS) == PLAY_ALLOWANCE &&
+                   masterTurnAllowance(play, BASE_ACTORS + 1) == PLAY_ALLOWANCE + PLAY_PER_ACTOR,
+               "the play allowance grows by its per-actor allowance only past the base");
+        constexpr auto INT32_LIMIT = std::numeric_limits<std::int32_t>::max();
+        constexpr auto INT64_LIMIT = std::numeric_limits<std::int64_t>::max();
+        const auto grown = [](std::int64_t base, std::int64_t perActor, std::size_t actors) {
+            return masterTurnAllowance(MasterShadowConfig{.allowance = base, .allowancePerActor = perActor}, actors);
+        };
+        constexpr std::int64_t RATE_PAST_32_BITS = 2 * (std::int64_t{INT32_LIMIT} + 1);
+        expect(grown(0, INT32_LIMIT, 2) == 2 * std::int64_t{INT32_LIMIT} &&
+                   grown(0, RATE_PAST_32_BITS, 1) == RATE_PAST_32_BITS &&
+                   grown(0, INT64_LIMIT / 2, 2) == INT64_LIMIT - 1 && grown(0, INT64_LIMIT, 2) == INT64_LIMIT &&
+                   grown(PLAY_ALLOWANCE, 0, std::numeric_limits<std::size_t>::max()) == PLAY_ALLOWANCE &&
+                   grown(-1, 0, 1) == -1,
+               "exact products are kept, overflowing ones saturate, and no per-actor allowance returns the base");
+        expect(grown(PLAY_ALLOWANCE, -PLAY_PER_ACTOR, BASE_ACTORS) == PLAY_ALLOWANCE &&
+                   grown(-1, -PLAY_PER_ACTOR, 0) == -1,
+               "a negative per-actor allowance counts as none and returns the base");
+        const QByteArray perActor("2000000");
+        const QByteArray junk("x");
+        const auto withPerActor = [&](const QByteArray & mode, const QByteArray & base, const QByteArray & value) {
+            auto config = parseMasterShadowConfig(mode, base, output, {}, {}, MasterStockControlRuntime::Arena);
+            applyMasterWorkPerActor(config, value);
+            return config;
+        };
+        for (const auto & value : {QByteArray(), QByteArray(""), QByteArray("0"), perActor})
+        {
+            const auto given = withPerActor(stock, work, value);
+            expect(given.controlsStock() && given.allowancePerActor == value.toLongLong(),
+                   "the environment route takes zero without the variable and the given value, zero included");
+        }
+        for (const auto & invalid : {negative, junk, overflowing})
+        {
+            expect(withPerActor(stock, work, invalid).error == MasterShadowConfigError::InvalidAllowance,
+                   "a negative, non-numeric or overflowing per-actor allowance fails closed");
+        }
+        expect(withPerActor({}, {}, junk).error == MasterShadowConfigError::None &&
+                   withPerActor("disabled", {}, junk).error == MasterShadowConfigError::None &&
+                   withPerActor(unknown, {}, junk).error == MasterShadowConfigError::UnknownMode &&
+                   withPerActor(shadow, {}, junk).enabled(),
+               "inactive, unknown and shadow modes behave as before with an invalid per-actor value present");
+        const auto badWork = withPerActor(stock, junk, perActor);
+        expect(withPerActor(stock, {}, junk).error == MasterShadowConfigError::MissingExplicitAllowance &&
+                   badWork.error == MasterShadowConfigError::InvalidAllowance && badWork.allowancePerActor == 0,
+               "missing or invalid work is refused before the per-actor allowance is read");
+        const auto trial = parseMasterShadowConfig(stock, work, {}, "counters", "off",
                                                   MasterStockControlRuntime::PlayableTrial);
         expect(trial.controlsStock() && !trial.enabled() && trial.allowance == 60000000 &&
                    trial.runtime == MasterStockControlRuntime::PlayableTrial,
                "explicit playable admission uses the same stock mode and allowance");
-        expect(parseMasterShadowConfig("stockControl", {}, {}, "counters", "off",
+        expect(parseMasterShadowConfig(stock, {}, {}, "counters", "off",
                                        MasterStockControlRuntime::PlayableTrial).error ==
                    MasterShadowConfigError::MissingExplicitAllowance,
                "playable admission cannot inherit the default allowance");
         expect(!disabled.controlsStock() && disabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE,
                "ordinary gameplay remains disabled with the unchanged initial allowance");
-        expect(parseMasterShadowConfig("unknown", "60000000", output).error ==
+        expect(parseMasterShadowConfig(unknown, work, output).error ==
                MasterShadowConfigError::UnknownMode, "unknown modes fail closed");
-        expect(parseMasterShadowConfig("shadow", "-1", output).error ==
+        expect(parseMasterShadowConfig(shadow, negative, output).error ==
                MasterShadowConfigError::InvalidAllowance, "negative work fails closed");
-        expect(parseMasterShadowConfig("shadow", "9223372036854775808", output).error ==
+        expect(parseMasterShadowConfig(shadow, overflowing, output).error ==
                MasterShadowConfigError::InvalidAllowance, "overflowed work fails closed");
-        expect(parseMasterShadowConfig("shadow", {}, "relative.jsonl").error ==
+        expect(parseMasterShadowConfig(shadow, {}, "relative.jsonl").error ==
                MasterShadowConfigError::MissingAbsoluteOutput, "diagnostics require an explicit absolute destination");
         expect(parseMasterStaleProbe({}) == MasterStaleProbe::None, "an absent stale probe changes nothing");
         expect(parseMasterStaleProbe("battleAnimationSpeed") == MasterStaleProbe::BattleAnimationSpeed,
                "the battle speed stale probe is recognized exactly");
         expect(!parseMasterStaleProbe("BattleAnimationSpeed") && !parseMasterStaleProbe("terrain"),
                "unknown stale probes fail closed");
-        const auto enabled = parseMasterShadowConfig("shadow", {}, output);
+        const auto enabled = parseMasterShadowConfig(shadow, {}, output);
         expect(enabled.enabled() && enabled.allowance == MASTER_ASSIGNMENT_INITIAL_ALLOWANCE &&
                    enabled.tierAuditMode == SequentialTierAuditMode::Full &&
                    enabled.exportMode == MasterShadowExportMode::Full,
                "explicit shadow starts at the initial allowance with full diagnostic retention");
-        const auto counters = parseMasterShadowConfig("shadow", {}, output, "counters");
+        const auto counters = parseMasterShadowConfig(shadow, {}, output, "counters");
         expect(counters.enabled() && counters.tierAuditMode == SequentialTierAuditMode::CountersOnly,
                "optional tier copies can be disabled independently of witness capture");
-        const auto full = parseMasterShadowConfig("shadow", {}, output, "full");
+        const auto full = parseMasterShadowConfig(shadow, {}, output, "full");
         expect(full.enabled() && full.tierAuditMode == SequentialTierAuditMode::Full,
                "full diagnostic retention remains explicitly selectable");
-        const auto invalidAudit = parseMasterShadowConfig("shadow", {}, output, "invalid");
+        const auto invalidAudit = parseMasterShadowConfig(shadow, {}, output, "invalid");
         expect(!invalidAudit.enabled() && invalidAudit.error == MasterShadowConfigError::InvalidTierAudit,
                "an unknown audit retention mode fails closed");
         for (const auto tier : {QByteArray("full"), QByteArray("counters")})
         {
-            const auto off = parseMasterShadowConfig("shadow", {}, {}, tier, "off");
+            const auto off = parseMasterShadowConfig(shadow, {}, {}, tier, "off");
             expect(off.enabled() && off.exportMode == MasterShadowExportMode::Off && off.outputPath.isEmpty(),
                    "export-off needs no output path and is independent of tier retention");
-            const auto fullExport = parseMasterShadowConfig("shadow", {}, output, tier, "full");
+            const auto fullExport = parseMasterShadowConfig(shadow, {}, output, tier, "full");
             expect(fullExport.enabled() && fullExport.exportMode == MasterShadowExportMode::Full,
                    "full export remains explicitly selectable for either tier mode");
         }
-        expect(parseMasterShadowConfig("shadow", {}, {}, {}, "full").error ==
+        expect(parseMasterShadowConfig(shadow, {}, {}, {}, "full").error ==
                    MasterShadowConfigError::MissingAbsoluteOutput &&
-                   parseMasterShadowConfig("shadow", {}, output, {}, "invalid").error ==
+                   parseMasterShadowConfig(shadow, {}, output, {}, "invalid").error ==
                        MasterShadowConfigError::InvalidExport,
                "full export requires a path and unknown export controls fail closed");
         QTemporaryDir isolatedRoot;
