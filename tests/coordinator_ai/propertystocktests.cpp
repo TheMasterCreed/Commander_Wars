@@ -1347,6 +1347,8 @@ namespace
         std::vector<Coordinator::SequentialApproach> approach;
         std::vector<Coordinator::MasterResourceUsage> resources;
         bool follows{false};
+        std::int32_t captured{Coordinator::NO_SEQUENTIAL_NODE};
+        Coordinator::SequentialLaterList later;
     };
 
     TieCandidate headZero(Coordinator::SequentialApproach approach, MilliFunds immediate = 0)
@@ -1394,8 +1396,9 @@ namespace
                 candidate.resources = source.resources;
                 candidate.immediateValue = source.immediate;
                 candidate.follows = source.follows;
-                candidate.row = SequentialRow{.classIndex = 0, .weight = source.weight,
-                                              .ownedTurn = source.ownedTurn, .approach = source.approach};
+                candidate.capturedNode = source.captured;
+                candidate.row = SequentialRow{.classIndex = 0, .weight = source.weight, .ownedTurn = source.ownedTurn,
+                                              .approach = source.approach, .later = source.later};
                 actor.candidates.push_back(std::move(candidate));
             }
             model.actors.push_back(std::move(actor));
@@ -1709,38 +1712,34 @@ namespace
     using LaterFixture = Coordinator::PropertyStockDiagnosticFixture;
     using LaterEntries = std::vector<Coordinator::SequentialLaterEntry>;
 
-    LaterEntries laterEntries(const Coordinator::SequentialLaterList & later)
-    {
-        return {later.entries.begin(), later.entries.begin() + later.count};
-    }
-
     bool sameRowData(const Coordinator::SequentialRow & left, const Coordinator::SequentialRow & right)
     {
         return left.classIndex == right.classIndex && left.weight == right.weight &&
             left.ownedTurn == right.ownedTurn && left.approach == right.approach && left.later == right.later;
     }
 
-    constexpr std::int32_t CROWDED_CORRIDOR = 13;
-    constexpr std::int32_t CROWDED_ROW_X = 6;
-    constexpr Coordinator::MilliFunds CROWDED_RICH_INCOME = 3;
+    constexpr std::int32_t LATER_ROW_X = 2;
+    constexpr Coordinator::MilliFunds LATER_RICH_INCOME = 3;
 
-    // Twelve properties past a horizon of two around the mover, more than the list holds.
-    LaterFixture::LineSpec crowdedLine()
+    // Two properties past a horizon of two on each side of the mover, the nearer right one richer.
+    LaterFixture::LineSpec laterLine()
     {
-        LaterFixture::LineSpec spec{.width = CROWDED_CORRIDOR, .horizon = 2, .rowX = CROWDED_ROW_X};
-        for (std::int32_t x = 0; x < CROWDED_CORRIDOR; ++x)
-        {
-            if (x != CROWDED_ROW_X)
-            {
-                spec.columns.push_back({.x = x, .income = x == CROWDED_ROW_X + 1 ? CROWDED_RICH_INCOME : 2});
-            }
-        }
-        return spec;
+        return {.width = 2 * LATER_ROW_X + 1, .horizon = 2, .rowX = LATER_ROW_X,
+            .columns = {{.x = 0, .income = 2}, {.x = 1, .income = 2},
+                        {.x = LATER_ROW_X + 1, .income = LATER_RICH_INCOME}, {.x = 2 * LATER_ROW_X, .income = 2}}};
     }
 
-    Coordinator::CanonicalPlanActionKey crowdedStay()
+    // Nodes left of the mover keep their x, nodes right of it sit one lower; equal turns order by stream, then node.
+    LaterEntries laterLineEntries()
     {
-        return Coordinator::CanonicalPlanActionKey::fromAction(0, CROWDED_ROW_X, 0, false);
+        constexpr std::int32_t FAR_TURN = 3;
+        constexpr std::int32_t FAR_RIGHT = LATER_ROW_X + 1;
+        return {{LATER_ROW_X, 2, LATER_RICH_INCOME}, {1, 2, 2}, {0, FAR_TURN, 2}, {FAR_RIGHT, FAR_TURN, 2}};
+    }
+
+    Coordinator::CanonicalPlanActionKey laterStay()
+    {
+        return Coordinator::CanonicalPlanActionKey::fromAction(0, LATER_ROW_X, 0, false);
     }
 
     std::optional<Coordinator::SequentialRow> laterRow(const Coordinator::PropertyStockField & field,
@@ -1888,7 +1887,7 @@ namespace
             expect(false, "the later-list key has a pricing model");
             return;
         }
-        expect(laterEntries(row->later) == LaterEntries{{1, FAR_TURN, FAR_INCOME}} && !row->later.truncated &&
+        expect(row->later.entries == LaterEntries{{1, FAR_TURN, FAR_INCOME}} &&
                    row->later.check == SequentialLaterCheck::Passed &&
                    row->later.state == SequentialLaterState::Complete,
                "a property past the horizon is listed with its raw turn and one-turn stream, the near one is not");
@@ -1896,7 +1895,7 @@ namespace
                "a day row from another builder carries no list and stays Unknown");
         spec.columns.front().owner = STOCK_OWNER_AFTER;
         const auto filtered = laterRow(LaterFixture::line(spec), stay);
-        expect(filtered && laterEntries(filtered->later) == LaterEntries{{0, FAR_TURN, FAR_INCOME}} &&
+        expect(filtered && filtered->later.entries == LaterEntries{{0, FAR_TURN, FAR_INCOME}} &&
                    filtered->later.state == SequentialLaterState::Complete,
                "with a filtered column the entry names the node, not the column slot");
     }
@@ -1923,45 +1922,35 @@ namespace
             expect(false, "the carried and damaged keys have pricing models");
             return;
         }
-        expect(laterEntries(healthy->later) == LaterEntries{{0, CARRIED_TURN, HOME_INCOME}, {1, FAR_TURN, 1}} &&
+        expect(healthy->later.entries == LaterEntries{{0, CARRIED_TURN, HOME_INCOME}, {1, FAR_TURN, 1}} &&
                    healthy->later.state == SequentialLaterState::Complete,
                "carried progress on the mover's tile shortens that node's raw turn");
-        expect(laterEntries(damaged->later) ==
+        expect(damaged->later.entries ==
                    LaterEntries{{0, DAMAGED_HOME_TURN, HOME_INCOME}, {1, DAMAGED_FAR_TURN, 1}} &&
                    damaged->later.state == SequentialLaterState::Complete,
                "a damaged capture rate lengthens every raw turn");
     }
 
-    void laterListKeepsTheBestEntries()
+    void laterListHoldsEveryNode()
     {
         using namespace Coordinator;
-        constexpr std::int32_t ROW_X = CROWDED_ROW_X;
-        constexpr MilliFunds RICH_INCOME = CROWDED_RICH_INCOME;
-        const auto row = laterRow(LaterFixture::line(crowdedLine()), crowdedStay());
+        const auto row = laterRow(LaterFixture::line(laterLine()), laterStay());
         if (!row)
         {
-            expect(false, "the truncation key has a pricing model");
+            expect(false, "the later line has a pricing model");
             return;
         }
-        // Nodes left of the mover keep their x; nodes right of it sit one lower. The first pair ties on turn.
-        LaterEntries expected{{ROW_X, 2, RICH_INCOME}, {ROW_X - 1, 2, 2}};
-        for (std::int32_t distance = 2; expected.size() < static_cast<std::size_t>(LATER_KEY_NODES); ++distance)
-        {
-            expected.push_back({ROW_X - distance, distance + 1, 2});
-            expected.push_back({ROW_X - 1 + distance, distance + 1, 2});
-        }
-        expect(laterEntries(row->later) == expected && row->later.truncated &&
-                   row->later.state == SequentialLaterState::Complete,
-               "more qualifying nodes than the list holds keep the best in turn, stream, node order and set the flag");
+        auto expected = laterLineEntries();
+        expect(row->later.entries == expected && row->later.state == SequentialLaterState::Complete,
+               "the list holds every qualifying node in turn, stream, node order");
 
-        constexpr std::int32_t REMOVED = ROW_X - 2;
+        constexpr std::int32_t REMOVED = 1;
         auto cleared = *row;
         removeCapturedNode(cleared, REMOVED);
         auto twice = cleared;
         removeCapturedNode(twice, REMOVED);
         std::erase_if(expected, [](const SequentialLaterEntry & entry) { return entry.node == REMOVED; });
-        expect(laterEntries(cleared.later) == expected && cleared.later.entries.back() == SequentialLaterEntry{} &&
-                   cleared.later.truncated && cleared.later.state == SequentialLaterState::Complete &&
+        expect(cleared.later.entries == expected && cleared.later.state == SequentialLaterState::Complete &&
                    cleared.weight.size() == row->weight.size() && cleared.approach.size() == row->approach.size(),
                "removing a captured node closes the gap in the list and keeps the rest aligned");
         expect(sameRowData(cleared, twice), "clearing a prepared row twice equals clearing it once");
@@ -1993,7 +1982,7 @@ namespace
             return;
         }
         expect(complete->later.state == SequentialLaterState::Unknown && complete->later.earlyNodes == 1 &&
-                   complete->later.earlyNode == 0 && laterEntries(complete->later) == LaterEntries{{1, FAR_TURN, 1}},
+                   complete->later.earlyNode == 0 && complete->later.entries == LaterEntries{{1, FAR_TURN, 1}},
                "an uncleared raw turn of zero keeps the row Unknown");
         auto settled = *complete;
         removeCapturedNode(settled, 0);
@@ -2010,7 +1999,7 @@ namespace
         const auto* pBuilt = findMasterFutureAction(*captureModels.catalog, capture);
         expect(pBuilt != nullptr && pBuilt->row.later.state == SequentialLaterState::Unknown &&
                    pBuilt->row.later.earlyNode == 0 && captured->later.state == SequentialLaterState::Complete &&
-                   laterEntries(captured->later) == LaterEntries{{1, FAR_TURN, 1}},
+                   captured->later.entries == LaterEntries{{1, FAR_TURN, 1}},
                "a completing capture is Unknown as built and Complete once pricing removes its captured node");
         const auto & doubledCandidate = duplicateModels.models[0]->actors.front().candidates.front();
         auto clearedOther = *doubled;
@@ -2033,7 +2022,7 @@ namespace
         // Three activations to the node and one capture turn, owned from turn three.
         constexpr std::int32_t FASTEST_TURN = 3;
         const auto widened = laterRow(LaterFixture::line(fastest), stay);
-        expect(widened && laterEntries(widened->later) == LaterEntries{{0, FASTEST_TURN, 1}} &&
+        expect(widened && widened->later.entries == LaterEntries{{0, FASTEST_TURN, 1}} &&
                    widened->later.state == SequentialLaterState::Complete,
                "a capture rate at the integer limit still takes one turn");
         constexpr MilliFunds FAR_INCOME = 5;
@@ -2070,9 +2059,9 @@ namespace
     void laterListSurvivesEveryCopy()
     {
         using namespace Coordinator;
-        const auto stay = crowdedStay();
+        const auto stay = laterStay();
         const std::array keys{ContinuationKey{stay}, ContinuationKey{stay}};
-        const auto models = JointPlanStockValuer::diagnosticPricingModels(LaterFixture::line(crowdedLine()), keys);
+        const auto models = JointPlanStockValuer::diagnosticPricingModels(LaterFixture::line(laterLine()), keys);
         if (!models.models[0] || !models.models[1] || !models.catalog)
         {
             expect(false, "the duplicate keys have pricing models");
@@ -2081,7 +2070,7 @@ namespace
         const auto* pBuilt = findMasterFutureAction(*models.catalog, stay);
         const auto & first = models.models[0]->actors.front().candidates.front().row.later;
         const auto & second = models.models[1]->actors.front().candidates.front().row.later;
-        expect(pBuilt != nullptr && first.count == LATER_KEY_NODES && first.truncated && first == pBuilt->row.later &&
+        expect(pBuilt != nullptr && first.entries == laterLineEntries() && first == pBuilt->row.later &&
                    second == first &&
                    models.models[0]->catalog.actions.front().row.later == first,
                "duplicate action keys carry equal lists into every model and its indexed actions");
@@ -2089,7 +2078,7 @@ namespace
         const auto restricted = restrictMasterPlanModel(*models.models[0], forced);
         expect(restricted && restricted->actors.front().candidates.front().row.later == first &&
                    restricted->catalog.actions.front().row.later == first,
-               "a restricted model carries list, flag and state unchanged");
+               "a restricted model carries list and state unchanged");
     }
 
     void replyContextReadsTheClippedArrivals()
@@ -2114,6 +2103,272 @@ namespace
                    plainTune.ceiling == rawTune.ceiling && plainTune.floor.floor == rawTune.floor.floor &&
                    plainFloor.status == rawFloor.status && plainFloor.floor == rawFloor.floor,
                "the reply stock context prices the same after a raw flood filled its clipped entry");
+    }
+
+    template <typename Run>
+    auto inBothModes(Run run, const std::vector<std::int32_t> & expected, std::string_view message)
+    {
+        const auto pruned = run(Coordinator::MasterPlanSearchMode::Pruned);
+        const auto exhaustive = run(Coordinator::MasterPlanSearchMode::Exhaustive);
+        expect(sameWitness(pruned.witness, exhaustive.witness) && pruned.witness.candidateIndices == expected, message);
+        return pruned;
+    }
+
+    constexpr std::int32_t CORRIDOR_RICH_X = 3;
+    constexpr MilliFunds CORRIDOR_RICH_INCOME = 3;
+
+    // A near node, a richer one a tile further and a far one, all owned past a horizon of two; the copy is walled off.
+    std::array<LaterFixture::LineSpec, 2> laterCorridors()
+    {
+        constexpr std::int32_t CORRIDOR = 6;
+        constexpr MilliFunds FAR_INCOME = 2;
+        const LaterFixture::LineSpec open{.width = CORRIDOR, .horizon = 2,
+            .columns = {{.x = 2, .income = 1}, {.x = CORRIDOR_RICH_X, .income = CORRIDOR_RICH_INCOME},
+                        {.x = CORRIDOR - 1, .income = FAR_INCOME}}};
+        auto walled = open;
+        walled.wallX = 1;
+        return {open, walled};
+    }
+
+    void laterKeyOnTwoCorridors()
+    {
+        using namespace Coordinator;
+        constexpr std::int32_t NEAR_TURN = 3;
+        constexpr std::int32_t RICH_TURN = 4;
+        for (const auto & spec : laterCorridors())
+        {
+            DiagnosticPricingModels models;
+            const auto row = laterRow(LaterFixture::line(spec), CanonicalPlanActionKey::fromAction(0, 0, 0, false),
+                                      &models);
+            if (!row)
+            {
+                expect(false, "the corridor has a pricing model");
+                return;
+            }
+            const auto today = inBothModes([&](MasterPlanSearchMode mode) { return tuneInMode(*models.models[0], mode); },
+                                           {0}, "both modes agree on the corridor");
+            expect(today.witness.valid && today.witness.rows.front().steps.empty(),
+                   "nothing on the corridor is inside the window today");
+            const std::vector<bool> unclaimed(spec.columns.size(), false);
+            const auto funded = [] { return true; };
+            const auto key = sequentialLaterKey(row->later, unclaimed, funded).value_or(SequentialLaterKey{});
+            auto unsure = row->later;
+            unsure.check = SequentialLaterCheck::Overflow;
+            settleLaterState(unsure);
+            const auto refused = [] { return false; };
+            const auto settled = sequentialLaterKey(unsure, unclaimed, refused);
+            expect(settled && settled->state == SequentialLaterKeyState::Unknown && settled->examined == 0,
+                   "a row settled Unknown gives an Unknown key without asking for funding, whatever its free entries");
+            const auto unprepared = sequentialLaterKey(SequentialLaterList{}, unclaimed, refused);
+            expect(unprepared && unprepared->state == SequentialLaterKeyState::Unknown,
+                   "an unprepared empty list gives an Unknown key, not NeverPositive");
+            expect(spec.wallX == LaterFixture::NO_WALL
+                       ? key.state == SequentialLaterKeyState::FirstPositive && key.turn == NEAR_TURN &&
+                             key.stream == 1 && row->later.entries[1] == SequentialLaterEntry{1, RICH_TURN,
+                                                                                               CORRIDOR_RICH_INCOME}
+                       : key.state == SequentialLaterKeyState::NeverPositive,
+                   "the open key is the near node's turn and stream before a richer node, the walled key NeverPositive");
+        }
+    }
+
+    constexpr std::int32_t SOON = TIE_HORIZON + 1;
+    constexpr std::int32_t LATE = SOON + 1;
+    constexpr std::int32_t LATEST = LATE + 1;
+    using TieActors = std::vector<std::vector<TieCandidate>>;
+    using Choices = std::vector<std::int32_t>;
+
+    TieCandidate laterIdle(const LaterEntries & entries, MilliFunds immediate = 0)
+    {
+        auto candidate = idleCandidate(immediate);
+        auto & later = candidate.later;
+        later.entries = entries;
+        later.check = Coordinator::SequentialLaterCheck::Passed;
+        Coordinator::settleLaterState(later);
+        return candidate;
+    }
+
+    Coordinator::MasterPlanPricingResult tunedLater(const TieActors & actors, const Choices & expected,
+                                                    std::string_view message)
+    {
+        const auto model = tieModel(actors);
+        expect(model.has_value(), message);
+        return model ? inBothModes([&](auto mode) { return tuneInMode(*model, mode); }, expected, message)
+                     : Coordinator::MasterPlanPricingResult{};
+    }
+
+    Coordinator::MasterPlanPolishResult polishedLater(const TieActors & actors, const Choices & held,
+                                                      std::vector<Coordinator::SequentialRowWitness> rows,
+                                                      const Choices & expected, std::string_view message)
+    {
+        const auto model = tieModel(actors);
+        const Coordinator::MasterPlanWitness start{true, held, std::move(rows), 0};
+        expect(model.has_value(), message);
+        return model ? inBothModes([&](auto mode) { return polishTie(*model, start, mode); }, expected, message)
+                     : Coordinator::MasterPlanPolishResult{};
+    }
+
+    Coordinator::SequentialRowWitness emptyRow(std::int32_t row)
+    {
+        return {row, {}, 0};
+    }
+
+    // By default one seat holding its first option with nothing found yet; returns the result and the work it consumed.
+    std::pair<Coordinator::MasterPlanPolishResult, std::int64_t> polishWork(
+        const TieActors & actors, Coordinator::MasterPlanSearchMode mode, std::int64_t work,
+        const Choices & held = {0}, std::vector<Coordinator::SequentialRowWitness> rows = {emptyRow(0)})
+    {
+        using namespace Coordinator;
+        const auto model = tieModel(actors);
+        if (!model)
+        {
+            expect(false, "the work model indexes");
+            return {};
+        }
+        RefinementLedger ledger;
+        ledger.open(MASTER_PLAN_PRICING_WITNESS_WORK);
+        std::vector<std::int32_t> order(rows.size());
+        std::iota(order.begin(), order.end(), 0);
+        const MasterPlanWitness start{true, held, std::move(rows), 0};
+        auto result = polishMasterPlanWitness(*model, start, order, work, ledger, {.mode = mode});
+        return {std::move(result), ledger.stats().consumed};
+    }
+
+    void laterDayDecidesEmptyTies()
+    {
+        using namespace Coordinator;
+        const auto stay = laterIdle({{1, LATE, 1}});
+        const auto step = laterIdle({{1, SOON, 1}});
+        const auto never = laterIdle({});
+        const auto claimer = headZero(NO_APPROACH);
+        const auto switched = tunedLater({{stay, step}}, {1}, "a step owning a property sooner past the horizon wins");
+        expect(switched.witnessStats.laterSwitches == switched.witnessStats.builds &&
+                   switched.witnessStats.tieSwitches == 0,
+               "every build counts its switch as a later-day switch");
+        tunedLater({{step, laterIdle({{1, SOON, 2}})}}, {1}, "on an equal turn the larger stream wins");
+        tunedLater({{step, step}}, {0}, "equal keys are undecided and keep the first choice");
+        tunedLater({{never, step}}, {1}, "a choice that becomes positive beats one that never does");
+        tunedLater({{laterIdle({}, 1), step}}, {0}, "one milli-fund more today beats any later key");
+        auto overflowed = step;
+        overflowed.later.check = SequentialLaterCheck::Overflow;
+        auto early = step;
+        noteEarlyLaterNode(early.later, 0);
+        settleLaterState(overflowed.later);
+        settleLaterState(early.later);
+        tunedLater({{idleCandidate(0), step}}, {0}, "a held choice without later data leaves the rule silent");
+        tunedLater({{never, overflowed}}, {0}, "an overflowed row with an available entry is silent");
+        tunedLater({{never, early}}, {0}, "a row with an uncleared raw zero and an available entry is silent");
+        // The head seat picks first and claims node zero, the only entry of each claimed list.
+        const auto claimedSoon = laterIdle({{0, SOON, 1}});
+        tunedLater({{claimedSoon, stay}, {claimer}}, {1, 0},
+                   "a list whose entries are all claimed is NeverPositive and loses to a free entry");
+        tunedLater({{claimedSoon, laterIdle({{0, LATE, 1}})}, {claimer}}, {0, 0},
+                   "two lists whose entries are all claimed leave the rule silent");
+        constexpr std::int32_t RESOURCE = 0;
+        constexpr MilliFunds FIRST_IMMEDIATE = 10;
+        constexpr MilliFunds SECOND_IMMEDIATE = 5;
+        const MasterResourceUsage resource{RESOURCE, 1, 1};
+        auto steppingOn = step;
+        steppingOn.immediate = FIRST_IMMEDIATE;
+        steppingOn.resources = {resource};
+        auto needing = idleCandidate(SECOND_IMMEDIATE);
+        needing.resources = {resource};
+        // Applied at picking, the step would take the resource before the second seat and polish could not undo it.
+        tunedLater({{laterIdle({{1, LATE, 1}}, FIRST_IMMEDIATE), steppingOn},
+                    {needing, idleCandidate(SECOND_IMMEDIATE - 1)}},
+                   {0, 0}, "picking keeps the first equal choice and leaves the resource to the second seat");
+
+        polishedLater({{laterIdle({{0, SOON, 1}, {1, LATEST, 1}}), stay}, {idleCandidate(FIRST_IMMEDIATE), claimer}},
+                      {0, 0}, {emptyRow(0), emptyRow(1)}, {1, 1},
+                      "a claim arriving after the choice is read afresh, its node skipped and the next entry deciding");
+        auto restoring = claimer;
+        restoring.later = laterIdle({{1, LATEST, 1}}).later;
+        const auto worth = idleCandidate(TIE_WEIGHT);
+        polishedLater({{stay, worth, restoring}}, {2}, {emptyRow(0)}, {1},
+                      "options B, C, A with A held and emptied end on C");
+        const auto behind = polishedLater({{stay, restoring}}, {1}, {emptyRow(0)}, {1},
+                                          "an emptied held choice behind a better key ends on it");
+        expect(behind.witness.rows.front() == heldHead(0),
+               "the held candidate's own search restores its itinerary after a provisional later-day switch");
+        auto blocked = laterIdle({{1, LATEST, 1}});
+        blocked.resources = {resource};
+        auto sharing = idleCandidate(0);
+        sharing.resources = {resource};
+        polishedLater({{blocked, stay}, {sharing}}, {0, 0}, {emptyRow(0), emptyRow(1)}, {0, 0},
+                      "a held choice that no longer fits after release leaves the rule silent");
+    }
+
+    void laterDayRuleStaysSilent()
+    {
+        using namespace Coordinator;
+        const auto stay = laterIdle({{1, LATE, 1}});
+        const auto step = laterIdle({{1, SOON, 1}});
+        auto headed = headZero(NO_APPROACH);
+        headed.later = stay.later;
+        polishedLater({{headed, laterIdle({{1, SOON, 1}}, TIE_WEIGHT)}}, {0}, {heldHead(0)}, {0},
+                      "silent when the running choice has a head");
+        auto capturingZero = stay;
+        capturingZero.captured = 0;
+        auto capturingOne = laterIdle({{0, SOON, 1}});
+        capturingOne.captured = 1;
+        auto soonerZero = step;
+        soonerZero.captured = 0;
+        tunedLater({{capturingZero, capturingOne}}, {0}, "silent for choices with different node claims");
+        tunedLater({{capturingZero, soonerZero}}, {1}, "two choices capturing the same node are compared");
+
+        auto heldFar = headZero(FAR_APPROACH);
+        heldFar.later = stay.later;
+        auto closerNear = headZero(NEAR_APPROACH);
+        closerNear.later = step.later;
+        const auto nearer = polishedLater({{heldFar, closerNear}}, {0}, {heldHead(0)}, {1},
+                                          "a closer equal head is decided by the head rule with later data present");
+        const auto bumped = polishedLater({{headZero(NO_APPROACH)}, {stay, step}}, {0, 0},
+                                          {heldHead(0), emptyRow(1)}, {0, 1},
+                                          "a later-day switch beside a fixed claim");
+        constexpr std::int64_t REANSWERED = 3;
+        expect(nearer.witnessStats.tieSwitches == 1 && nearer.witnessStats.laterSwitches == 0 &&
+                   bumped.witnessStats.tieSwitches == 0 && bumped.witnessStats.laterSwitches == 1,
+               "the two rules never both decide one switch");
+        expect(bumped.witness.rows.front() == heldHead(0) && bumped.witness.rows.back() == emptyRow(1) &&
+                   bumped.witnessStats.responses == REANSWERED && bumped.witnessStats.skippedResponses == 1,
+               "a later-day switch keeps every claim and moves the version, so the settled seat answers again");
+
+        // Each key reads its one entry, after the held choice's one feasibility check of a resource-free candidate.
+        constexpr std::int64_t PROBED_ENTRIES = 2;
+        constexpr std::int64_t HELD_FITS_CHECK = 1;
+        constexpr std::int64_t OPTIONS = 2;
+        constexpr std::int64_t LONGEST_LIST = 1;
+        constexpr std::int64_t AMPLE = MASTER_PLAN_PRICING_WITNESS_WORK;
+        for (const auto mode : {MasterPlanSearchMode::Pruned, MasterPlanSearchMode::Exhaustive})
+        {
+            expect(polishWork({{idleCandidate(0), idleCandidate(0)}}, mode, AMPLE).second ==
+                       polishWork({{idleCandidate(0), idleCandidate(-1)}}, mode, AMPLE).second,
+                   "a zero tie between rows without later data costs what the same pair one milli-fund apart costs");
+        }
+        const auto [probed, probedWork] = polishWork({{step, stay}}, MasterPlanSearchMode::Pruned, AMPLE);
+        const auto plainWork = polishWork({{idleCandidate(0), idleCandidate(0)}}, MasterPlanSearchMode::Pruned, AMPLE);
+        const auto starved = polishWork({{step, stay}}, MasterPlanSearchMode::Pruned, probedWork - 1).first;
+        const auto & stats = probed.witnessStats;
+        expect(probed.witness.candidateIndices == Choices{0} &&
+                   probedWork - plainWork.second == PROBED_ENTRIES + HELD_FITS_CHECK &&
+                   stats.laterEntries == PROBED_ENTRIES &&
+                   stats.laterEntries <= (OPTIONS + stats.laterSwitches + 1) * LONGEST_LIST * stats.responses &&
+                   starved.status == MasterPlanPricingStatus::LimitReached && !starved.witness.valid,
+               "the held and candidate probes are charged within the response bound, and a short budget fails");
+
+        // The first seat's head claims node zero, so the held key funds that entry before reading the free one.
+        const TieActors claimed{{headZero(NO_APPROACH)}, {laterIdle({{0, SOON, 1}, {1, LATEST, 1}}), stay}};
+        const auto claimedWork = [&](std::int64_t work) {
+            return polishWork(claimed, MasterPlanSearchMode::Pruned, work, {0, 0}, {heldHead(0), emptyRow(1)});
+        };
+        std::int64_t budget = 1;
+        while (claimedWork(budget).second == budget)
+        {
+            ++budget;
+        }
+        const auto deep = claimedWork(AMPLE).first;
+        expect(claimedWork(budget).first.status == MasterPlanPricingStatus::Valid &&
+                   deep.witness.candidateIndices == Choices{0, 1} && deep.witnessStats.laterDeepestRank == 2,
+               "every budget that runs out is spent to its last unit, including one ending inside a key read");
     }
 
     void productionRowsPreferTheCloserApproach()
@@ -2209,10 +2464,13 @@ int main()
     rawArrivalsBesideClipped();
     candidateRowsCarryTheLaterList();
     laterTurnFollowsProgressAndRate();
-    laterListKeepsTheBestEntries();
+    laterListHoldsEveryNode();
     laterStatesSettleAfterClearing();
     laterListSurvivesEveryCopy();
     replyContextReadsTheClippedArrivals();
+    laterKeyOnTwoCorridors();
+    laterDayDecidesEmptyTies();
+    laterDayRuleStaysSilent();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -416,7 +416,12 @@ namespace
 
         MilliFunds nodePrice(std::int32_t node) const
         {
-            return m_source == TailSource::Unpriced ? 0 : m_prices[static_cast<std::size_t>(node)];
+            return unpriced() ? 0 : m_prices[static_cast<std::size_t>(node)];
+        }
+
+        bool unpriced() const
+        {
+            return m_source == TailSource::Unpriced;
         }
 
     private:
@@ -588,6 +593,7 @@ namespace
         const MasterPlanPricingCandidate* candidate{nullptr};
         Itinerary itinerary;
         MilliFunds score{0};
+        bool laterDay{false};
     };
 
     struct Occupancy
@@ -662,13 +668,92 @@ namespace
         return pLeft != nullptr && pRight != nullptr && pLeft->node == pRight->node;
     }
 
-    // Found means the held choice, if any, was replaced: by a higher score, or by an equal one closer to its head.
+    // A key holds only for the claims of the scan that read it.
+    std::optional<SequentialLaterKey> readLaterKey(const SequentialRow & row, const Occupancy & occupancy,
+                                                   const ChoiceContext & context)
+    {
+        const auto read = sequentialLaterKey(row.later, occupancy.used, [&] {
+            if (!context.meter.charge(1, RefinementWork::MasterWitness))
+            {
+                return false;
+            }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            ++context.stats.laterEntries;
+#endif
+            return true;
+        });
+        if (!read)
+        {
+            return std::nullopt;
+        }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (read->state == SequentialLaterKeyState::FirstPositive)
+        {
+            context.stats.laterDeepestRank = std::max(context.stats.laterDeepestRank, read->examined);
+        }
+#endif
+        return read;
+    }
+
+    struct LaterDayScan
+    {
+        const Choice* pHeld{nullptr};
+        std::optional<bool> heldFits;
+        std::optional<SequentialLaterKey> runningKey;
+    };
+
+    // Decides for both the threshold and the replacement; empty means the work ran out.
+    std::optional<bool> laterDayBetter(const MasterPlanPricingCandidate & candidate, MilliFunds offset,
+                                       const Choice & running, const Occupancy & occupancy,
+                                       const ChoiceContext & context, LaterDayScan & scan,
+                                       std::optional<SequentialLaterKey> & candidateKey)
+    {
+        auto gap = running.score;
+        if (&candidate == running.candidate || !running.itinerary.steps.empty() ||
+            candidate.capturedNode != running.candidate->capturedNode ||
+            !RelativeStockDetail::checkedSubtract(gap, offset) || gap != 0 ||
+            candidate.row.later.state != SequentialLaterState::Complete ||
+            running.candidate->row.later.state != SequentialLaterState::Complete)
+        {
+            return false;
+        }
+        if (&running == scan.pHeld && !scan.heldFits)
+        {
+            const auto resources = running.candidate->resources.size();
+            if (!context.meter.charge(resources * resources + 1, RefinementWork::MasterWitness))
+            {
+                return std::nullopt;
+            }
+            scan.heldFits = fits(*running.candidate, occupancy.usage, occupancy.used, context.policy);
+        }
+        if (&running == scan.pHeld && !*scan.heldFits)
+        {
+            return false;
+        }
+        if (!scan.runningKey)
+        {
+            scan.runningKey = readLaterKey(running.candidate->row, occupancy, context);
+            if (!scan.runningKey)
+            {
+                return std::nullopt;
+            }
+        }
+        candidateKey = readLaterKey(candidate.row, occupancy, context);
+        if (!candidateKey)
+        {
+            return std::nullopt;
+        }
+        return sequentialLaterKeyBetter(*candidateKey, *scan.runningKey);
+    }
+
+    // Found means the held choice, if any, was replaced: by a higher score, or an equal one closer or positive sooner.
     SearchStatus bestChoice(const Seat & seat, Occupancy & occupancy, ItinerarySearch & search,
                             const ChoiceContext & context, const Choice* pHeld, Choice & result)
     {
         ++context.stats.responses;
         auto status = SearchStatus::Dominated;
         std::optional<MilliFunds> unseededBest;
+        LaterDayScan later{pHeld};
         for (const auto * candidate : seat.options)
         {
             const auto resources = candidate->resources.size();
@@ -689,6 +774,19 @@ namespace
             }
             const Choice* pRunning = status == SearchStatus::Found ? &result : pHeld;
             const auto closer = pRunning != nullptr && closerToHead(candidate->row, *pRunning);
+            std::optional<SequentialLaterKey> candidateKey;
+            auto laterDay = false;
+            // A priced empty itinerary proves nothing about today's unpriced optimum, so picking never reads keys.
+            if (search.unpriced() && pRunning != nullptr)
+            {
+                const auto decided =
+                    laterDayBetter(*candidate, offset, *pRunning, occupancy, context, later, candidateKey);
+                if (!decided)
+                {
+                    return SearchStatus::Failed;
+                }
+                laterDay = *decided;
+            }
             // Exhaustive mode ignores the threshold but keeps the overflow failures of its unseeded scan.
             auto threshold = context.mode == MasterPlanSearchMode::Pruned && pRunning != nullptr ?
                 std::optional<MilliFunds>(pRunning->score) : unseededBest;
@@ -699,7 +797,7 @@ namespace
                     return SearchStatus::Failed;
                 }
                 // The search only reports a strict excess, so an equal closer itinerary needs one less.
-                if (closer && *threshold >= 0)
+                if ((closer && *threshold >= 0) || (laterDay && context.mode == MasterPlanSearchMode::Pruned))
                 {
                     --*threshold;
                 }
@@ -730,10 +828,13 @@ namespace
             {
                 unseededBest = score;
             }
+            const auto tie = pRunning != nullptr && score == pRunning->score;
+            const auto laterSwitch = tie && laterDay && search.result().steps.empty();
             if (pRunning == nullptr || score > pRunning->score ||
-                (score == pRunning->score && closer && sameHead(search.result(), pRunning->itinerary)))
+                (tie && closer && sameHead(search.result(), pRunning->itinerary)) || laterSwitch)
             {
-                result = Choice{candidate, search.result(), score};
+                later.runningKey = candidateKey;
+                result = Choice{candidate, search.result(), score, laterSwitch};
                 status = SearchStatus::Found;
             }
         }
@@ -767,7 +868,7 @@ namespace
         {
             if (best.score == current)
             {
-                ++context.stats.tieSwitches;
+                ++(best.laterDay ? context.stats.laterSwitches : context.stats.tieSwitches);
             }
             seat.chosen = best.candidate;
             seat.itinerary = std::move(best.itinerary);

@@ -405,9 +405,6 @@ namespace Coordinator
                 later.check = cause;
             }
         };
-#ifdef COW_COORDINATED_REFINEMENT_TESTING
-        std::int64_t qualifying = 0;
-#endif
         for (std::size_t node = 0; node < nodeSlots.size(); ++node)
         {
             const auto slot = static_cast<std::size_t>(nodeSlots[node]);
@@ -439,17 +436,14 @@ namespace Coordinator
             }
             else if (owned.status == RawOwnershipStatus::Owned && owned.turns >= m_horizonTurns)
             {
-#ifdef COW_COORDINATED_REFINEMENT_TESTING
-                ++qualifying;
-#endif
                 offerLaterEntry(later, SequentialLaterEntry{nodeIndex, owned.turns, stream});
             }
         }
         settleLaterState(later);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         ++m_laterMeasure.rowsPrepared;
-        m_laterMeasure.truncatedRows += later.truncated ? 1 : 0;
-        m_laterMeasure.mostQualifyingNodes = std::max(m_laterMeasure.mostQualifyingNodes, qualifying);
+        m_laterMeasure.mostQualifyingNodes =
+            std::max(m_laterMeasure.mostQualifyingNodes, static_cast<std::int64_t>(later.entries.size()));
         m_laterMeasure.preparationNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
 #endif

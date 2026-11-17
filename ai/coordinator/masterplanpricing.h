@@ -87,8 +87,11 @@ namespace Coordinator
         std::int64_t responses{0};
         std::int64_t skippedResponses{0};
         std::int64_t tieSwitches{0};
+        std::int64_t laterSwitches{0};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         std::int64_t skipViolations{0};
+        std::int64_t laterEntries{0};
+        std::int32_t laterDeepestRank{0};
 #endif
         std::int64_t states{0};
         std::int64_t pickSearchWork{0};

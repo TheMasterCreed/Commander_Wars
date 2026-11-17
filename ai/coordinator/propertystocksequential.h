@@ -229,8 +229,6 @@ namespace Coordinator
         friend constexpr auto operator<=>(const SequentialApproach &, const SequentialApproach &) = default;
     };
 
-    constexpr std::int32_t LATER_KEY_NODES = 8;
-
     enum class SequentialLaterState : std::int8_t
     {
         Unknown,
@@ -255,12 +253,10 @@ namespace Coordinator
         friend constexpr bool operator==(const SequentialLaterEntry &, const SequentialLaterEntry &) = default;
     };
 
-    // Nodes first owned at or past the horizon, in key order: turn ascending, stream descending, node ascending.
+    // Every node first owned at or past the horizon, in key order: turn ascending, stream descending, node ascending.
     struct SequentialLaterList
     {
-        std::array<SequentialLaterEntry, LATER_KEY_NODES> entries{};
-        std::int32_t count{0};
-        bool truncated{false};
+        std::vector<SequentialLaterEntry> entries;
         SequentialLaterCheck check{SequentialLaterCheck::Unprepared};
         // Routed positive-stream nodes owned below turn 1 that no clearing has removed yet.
         std::int32_t earlyNodes{0};
@@ -291,26 +287,8 @@ namespace Coordinator
 
     constexpr void offerLaterEntry(SequentialLaterList & later, const SequentialLaterEntry & entry)
     {
-        auto slot = static_cast<std::size_t>(later.count);
-        if (later.count == LATER_KEY_NODES)
-        {
-            later.truncated = true;
-            if (!laterEntryBefore(entry, later.entries[slot - 1]))
-            {
-                return;
-            }
-            --slot;
-        }
-        else
-        {
-            ++later.count;
-        }
-        while (slot > 0 && laterEntryBefore(entry, later.entries[slot - 1]))
-        {
-            later.entries[slot] = later.entries[slot - 1];
-            --slot;
-        }
-        later.entries[slot] = entry;
+        later.entries.insert(std::upper_bound(later.entries.begin(), later.entries.end(), entry, laterEntryBefore),
+                             entry);
     }
 
     constexpr void noteEarlyLaterNode(SequentialLaterList & later, std::int32_t node)
@@ -322,22 +300,68 @@ namespace Coordinator
     // Idempotent: a second clearing of the same node finds neither its entry nor its blocker id.
     constexpr void clearLaterNode(SequentialLaterList & later, std::int32_t node)
     {
-        auto kept = later.entries.begin();
-        for (auto entry = later.entries.begin(); entry != later.entries.begin() + later.count; ++entry)
-        {
-            if (entry->node != node)
-            {
-                *kept++ = *entry;
-            }
-        }
-        later.count = static_cast<std::int32_t>(kept - later.entries.begin());
-        std::fill(kept, later.entries.end(), SequentialLaterEntry{});
+        std::erase_if(later.entries, [node](const SequentialLaterEntry & entry) { return entry.node == node; });
         if (later.earlyNodes == 1 && later.earlyNode == node)
         {
             later.earlyNodes = 0;
             later.earlyNode = NO_SEQUENTIAL_NODE;
         }
         settleLaterState(later);
+    }
+
+    enum class SequentialLaterKeyState : std::int8_t
+    {
+        Unknown,
+        NeverPositive,
+        FirstPositive,
+    };
+
+    struct SequentialLaterKey
+    {
+        SequentialLaterKeyState state{SequentialLaterKeyState::Unknown};
+        std::int32_t turn{NO_CAPTURE_TURNS};
+        MilliFunds stream{0};
+        std::int32_t examined{0};
+    };
+
+    // Every qualifying node is listed in key order, so the first free one is the best free node; each is funded first.
+    template <typename Fund>
+    std::optional<SequentialLaterKey> sequentialLaterKey(const SequentialLaterList & later,
+                                                         const std::vector<bool> & used, Fund fund)
+    {
+        SequentialLaterKey key;
+        if (later.state != SequentialLaterState::Complete)
+        {
+            return key;
+        }
+        while (static_cast<std::size_t>(key.examined) < later.entries.size())
+        {
+            if (!fund())
+            {
+                return std::nullopt;
+            }
+            const auto & entry = later.entries[static_cast<std::size_t>(key.examined++)];
+            if (!used[static_cast<std::size_t>(entry.node)])
+            {
+                key.state = SequentialLaterKeyState::FirstPositive;
+                key.turn = entry.turn;
+                key.stream = entry.stream;
+                return key;
+            }
+        }
+        key.state = SequentialLaterKeyState::NeverPositive;
+        return key;
+    }
+
+    constexpr bool sequentialLaterKeyBetter(const SequentialLaterKey & candidate, const SequentialLaterKey & running)
+    {
+        if (candidate.state != SequentialLaterKeyState::FirstPositive ||
+            running.state == SequentialLaterKeyState::Unknown)
+        {
+            return false;
+        }
+        return running.state == SequentialLaterKeyState::NeverPositive || candidate.turn < running.turn ||
+            (candidate.turn == running.turn && candidate.stream > running.stream);
     }
 
     struct SequentialRow

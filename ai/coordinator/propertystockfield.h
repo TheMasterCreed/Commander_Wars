@@ -112,7 +112,6 @@ namespace Coordinator
         std::int64_t negativeStreamRows{0};
         std::int64_t earlyNodeRows{0};
         std::int64_t earlyNodesRows{0};
-        std::int64_t truncatedRows{0};
         std::int64_t mostQualifyingNodes{0};
         std::int64_t floodNanos{0};
         std::int64_t preparationNanos{0};

@@ -68,6 +68,9 @@ namespace
     constexpr auto TRACE_SKIPPED_RESPONSES = "skippedResponses";
     constexpr auto TRACE_TIE_SWITCHES = "tieSwitches";
     constexpr auto TRACE_SKIP_VIOLATIONS = "skipViolations";
+    constexpr auto TRACE_LATER_SWITCHES = "laterSwitches";
+    constexpr auto TRACE_LATER_ENTRIES = "laterEntries";
+    constexpr auto TRACE_LATER_DEEPEST_RANK = "laterDeepestRank";
     constexpr auto TRACE_STATES = "states";
     constexpr auto TRACE_PICK_SEARCH_WORK = "pickSearchWork";
     constexpr auto TRACE_POLISH_SEARCH_WORK = "polishSearchWork";
@@ -101,7 +104,6 @@ namespace
     constexpr auto TRACE_NEGATIVE_STREAM = "negativeStream";
     constexpr auto TRACE_EARLY_NODE = "earlyNode";
     constexpr auto TRACE_EARLY_NODES = "earlyNodes";
-    constexpr auto TRACE_TRUNCATED_ROWS = "truncatedRows";
     constexpr auto TRACE_MOST_QUALIFYING_NODES = "mostQualifyingNodes";
     constexpr auto TRACE_TIMING = "timing";
     constexpr auto TRACE_FLOOD_NANOS = "floodNanos";
@@ -118,6 +120,9 @@ namespace
             {TRACE_SKIPPED_RESPONSES, QString::number(stats.skippedResponses)},
             {TRACE_TIE_SWITCHES, QString::number(stats.tieSwitches)},
             {TRACE_SKIP_VIOLATIONS, QString::number(stats.skipViolations)},
+            {TRACE_LATER_SWITCHES, QString::number(stats.laterSwitches)},
+            {TRACE_LATER_ENTRIES, QString::number(stats.laterEntries)},
+            {TRACE_LATER_DEEPEST_RANK, stats.laterDeepestRank},
             {TRACE_STATES, QString::number(stats.states)},
             {TRACE_PICK_SEARCH_WORK, QString::number(stats.pickSearchWork)},
             {TRACE_POLISH_SEARCH_WORK, QString::number(stats.polishSearchWork)}};
@@ -1177,7 +1182,6 @@ namespace Coordinator
                 {TRACE_NEGATIVE_STREAM, QString::number(measure.negativeStreamRows)},
                 {TRACE_EARLY_NODE, QString::number(measure.earlyNodeRows)},
                 {TRACE_EARLY_NODES, QString::number(measure.earlyNodesRows)}}},
-            {TRACE_TRUNCATED_ROWS, QString::number(measure.truncatedRows)},
             {TRACE_MOST_QUALIFYING_NODES, QString::number(measure.mostQualifyingNodes)},
             {TRACE_TIMING, QJsonObject{{TRACE_FLOOD_NANOS, QString::number(measure.floodNanos)},
                 {TRACE_PREPARATION_NANOS, QString::number(measure.preparationNanos)}}}};
