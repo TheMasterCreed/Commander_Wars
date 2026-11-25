@@ -44,6 +44,17 @@ void VirtualPaths::setSearchPath(const QString& userPath, const QStringList& mod
     for (const auto & mod : std::as_const(mods))
     {
         m_searchPath.append({ userPath + mod, true });
+#ifdef DEPLOY_RESOURCES_AS_FOLDER
+        // Also mount mods installed beside the executable when launched with an isolated --userPath.
+        const QString appModPath = QCoreApplication::applicationDirPath() + "/" + mod;
+        if (normalizedPath(QFileInfo(appModPath)) != normalizedPath(QFileInfo(userPath + mod)))
+        {
+            m_searchPath.append({ appModPath, true });
+        }
+#ifdef __linux__
+        m_searchPath.append({ QCoreApplication::applicationDirPath() + "/../share/commander_wars/" + mod, true });
+#endif
+#endif
         m_searchPath.append({ oxygine::Resource::RCC_PREFIX_PATH + mod, true });
     }
 

@@ -32,6 +32,7 @@ namespace Coordinator
     inline constexpr std::int32_t UNIFIED_INFANTRY_BASE_MOVE = 3;
     inline constexpr std::int32_t UNIFIED_STOCK_TUNE_ROUNDS = 40;
     inline constexpr std::int32_t UNIFIED_TRAP_FOLLOWUP_TURNS = 2;
+    inline constexpr std::int32_t UNIFIED_CITY_REPAIR_STEPS = 2;
 
     struct UnifiedTeamScore
     {
@@ -58,9 +59,9 @@ namespace Coordinator
 
         auto rankingKey() const
         {
-            return std::tie(worstHqRank, hqCaptureStartSafe, worstEconomicValue,
-                            activeCaptures, unitsRepairing, combatUnitsInThreatRange,
-                            stagingScore, negativeClumpPairs, terrainCoverScore);
+            return std::tuple{std::get<0>(worstHqRank), hqCaptureStartSafe, worstEconomicValue,
+                              activeCaptures, unitsRepairing, combatUnitsInThreatRange,
+                              stagingScore, negativeClumpPairs, terrainCoverScore};
         }
 
         bool strictlyBetterThan(const UnifiedTeamScore & other) const
@@ -188,7 +189,10 @@ namespace Coordinator
             {
                 const auto & pawn = local.units[i];
                 if (pawn.present && pawn.enemy && pawn.tile != INVALID_TILE)
+                {
                     m_enemyPositions.push_back(pawn.tile);
+                    m_enemyUnits.emplace_back(static_cast<int>(i), pawn.tile);
+                }
                 if (m_sampleCapperKi == NO_UNIT && pawn.present && !pawn.enemy && pawn.capper)
                     m_sampleCapperKi = static_cast<int>(i);
             }
@@ -204,6 +208,8 @@ namespace Coordinator
                 }
                 if (prop.visible && prop.canProduce && prop.ownerId != NO_OWNER && prop.ownerId != knowledge.observerId())
                     m_enemyFactories.push_back({prop.x, prop.y});
+                if (prop.visible && prop.canProduce && prop.ownerId == knowledge.observerId())
+                    m_friendlyFactories.push_back({prop.x, prop.y});
                 if (prop.visible && prop.ownerId == knowledge.observerId() && !prop.canProduce)
                     m_friendlyRepairSites.push_back({prop.x, prop.y});
                 if (prop.visible && prop.capturable && prop.ownerId == knowledge.observerId() && prop.capturePoints <= 0)
@@ -241,25 +247,31 @@ namespace Coordinator
             return pawn.travelGrid >= 0 ? pawn.travelGrid : pawn.grid;
         }
 
+        std::span<const TilePoint> enemyPositionsFor(int ki) const
+        {
+            if (const auto it = m_targetableEnemiesByKi.find(ki);
+                it != m_targetableEnemiesByKi.end() && !it->second.empty())
+                return it->second;
+            return m_enemyPositions;
+        }
+
         int enemyPathDistance(int ki, TilePoint dest) const
         {
             if (ki >= 0 && ki < static_cast<int>(m_local.units.size()) &&
                 m_local.width > 0 && m_local.height > 0 &&
                 dest.x >= 0 && dest.x < m_local.width && dest.y >= 0 && dest.y < m_local.height)
             {
-                const int gridId = pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]);
-                const auto [minR, maxR] = unitAttackRange(ki);
-                if (const auto it = m_enemyPathDistByProfile.find({gridId, minR, maxR});
-                    it != m_enemyPathDistByProfile.end())
+                if (const auto it = m_enemyPathDistByKi.find(ki); it != m_enemyPathDistByKi.end())
                 {
                     const std::size_t idx = static_cast<std::size_t>(dest.y) * static_cast<std::size_t>(m_local.width) +
                         static_cast<std::size_t>(dest.x);
-                    if (idx < it->second.size() && it->second[idx] < std::numeric_limits<std::int32_t>::max())
-                        return it->second[idx];
+                    if (idx < it->second->size() && (*it->second)[idx] < std::numeric_limits<std::int32_t>::max())
+                        return (*it->second)[idx];
                 }
             }
+            const auto targets = enemyPositionsFor(ki);
             int minDist = m_maxDist;
-            for (const TilePoint e : m_enemyPositions)
+            for (const TilePoint e : targets)
                 minDist = std::min(minDist, manhattanDistance(dest, e));
             return m_maxDist * 2 + minDist;
         }
@@ -397,40 +409,53 @@ namespace Coordinator
                 if (m_local.defense && ki >= 0 && ki < static_cast<int>(m_local.units.size()))
                     stars = m_local.defense(ki, dest).stars;
                 out.terrainCoverScore += static_cast<std::int64_t>(stars);
+                const bool hasKnownUnit = ki >= 0 && ki < static_cast<int>(m_knowledge.units().size());
+                const bool damagedUnit = hasKnownUnit &&
+                    m_knowledge.units()[static_cast<std::size_t>(ki)].hpRounded < UNIT_HP_STEPS;
+                if (damagedUnit &&
+                    std::ranges::find(m_friendlyRepairSites, dest) != m_friendlyRepairSites.end())
+                    ++out.unitsRepairing;
                 if (member.stockRow == NO_STOCK_ROW)
                 {
                     const auto & unit = m_knowledge.units()[static_cast<std::size_t>(ki)];
-                    const bool indirect = unit.minRange > 1;
-                    const int maxRange = std::max(1, unit.maxRange);
-                    const int pathDist = !m_enemyPositions.empty()
-                        ? enemyPathDistance(ki, dest)
-                        : unownedPropertyPathDistance(ki, dest);
-                    if (indirect)
+                    const bool heavilyDamagedCombat =
+                        unit.hpRounded <= UNIT_HP_STEPS / 2 && !m_friendlyRepairSites.empty();
+                    if (heavilyDamagedCombat)
                     {
-                        const bool inFiringRing = !m_enemyPositions.empty() &&
-                            std::ranges::any_of(m_enemyPositions, [&](TilePoint e) {
-                                const int d = manhattanDistance(dest, e);
-                                return d >= unit.minRange && d <= maxRange;
-                            });
-                        if (inFiringRing)
-                            ++out.combatUnitsInThreatRange;
-                        out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                        out.stagingScore -= static_cast<std::int64_t>(repairPathDistance(ki, dest));
                     }
                     else
                     {
-                        const int nextTurnThreatReach = unit.movementPoints + maxRange;
-                        if (!m_enemyPositions.empty() && pathDist <= nextTurnThreatReach)
-                            ++out.combatUnitsInThreatRange;
-                        out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                        const bool indirect = unit.minRange > 1;
+                        const int maxRange = std::max(1, unit.maxRange);
+                        const auto targetEnemies = enemyPositionsFor(ki);
+                        const int pathDist = !targetEnemies.empty()
+                            ? enemyPathDistance(ki, dest)
+                            : unownedPropertyPathDistance(ki, dest);
+                        if (indirect)
+                        {
+                            const bool inFiringRing = !targetEnemies.empty() &&
+                                std::ranges::any_of(targetEnemies, [&](TilePoint e) {
+                                    const int d = manhattanDistance(dest, e);
+                                    return d >= unit.minRange && d <= maxRange;
+                                });
+                            if (inFiringRing)
+                                ++out.combatUnitsInThreatRange;
+                            out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                        }
+                        else
+                        {
+                            const int nextTurnThreatReach = unit.movementPoints + maxRange;
+                            if (!targetEnemies.empty() && pathDist <= nextTurnThreatReach)
+                                ++out.combatUnitsInThreatRange;
+                            out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                        }
                     }
                 }
                 else
                 {
-                    const bool hasKnown = ki >= 0 && ki < static_cast<int>(m_knowledge.units().size());
-                    const bool damaged = hasKnown &&
-                        m_knowledge.units()[static_cast<std::size_t>(ki)].hpRounded < UNIT_HP_STEPS;
-                    const int capRate = hasKnown ? m_knowledge.units()[static_cast<std::size_t>(ki)].captureRate : 0;
-                    const bool heavilyDamaged = hasKnown &&
+                    const int capRate = hasKnownUnit ? m_knowledge.units()[static_cast<std::size_t>(ki)].captureRate : 0;
+                    const bool heavilyDamaged = hasKnownUnit &&
                         (capRate <= 0 || (capPts + capRate - 1) / capRate > fullCapTurns + 1);
                     const auto assignedIt = assignedNeutralBySlot.find(slot);
                     const bool isSurplusCapper = !cand.capture.has_value() && assignedIt == assignedNeutralBySlot.end();
@@ -465,9 +490,6 @@ namespace Coordinator
                                 --out.negativeClumpPairs;
                         }
                     }
-                    if (damaged &&
-                        std::ranges::find(m_friendlyRepairSites, dest) != m_friendlyRepairSites.end())
-                        ++out.unitsRepairing;
                 }
             }
             return out;
@@ -599,12 +621,14 @@ namespace Coordinator
                 const auto [hqCaptureStartSafe, ownRisk] = computeOwnPropertyCaptureRisk(eval);
                 const int buildSlots = m_buildSlotsFn(eval);
                 const MilliFunds factoryVal = static_cast<MilliFunds>(buildSlots) * UNIFIED_FACTORY_SLOT_VALUE;
+                const MilliFunds repairVal = computeRepairValue(eval);
 
                 MilliFunds econTotal = realized;
                 if (!RelativeStockDetail::checkedAdd(econTotal, postStock) ||
                     !RelativeStockDetail::checkedAdd(econTotal, denial) ||
                     !RelativeStockDetail::checkedSubtract(econTotal, ownRisk) ||
-                    !RelativeStockDetail::checkedAdd(econTotal, factoryVal))
+                    !RelativeStockDetail::checkedAdd(econTotal, factoryVal) ||
+                    !RelativeStockDetail::checkedAdd(econTotal, repairVal))
                     return UnifiedTeamScore{};
 
                 UnifiedTeamScore point;
@@ -655,6 +679,7 @@ namespace Coordinator
                 return blocked;
             const std::int32_t capPts = m_stockField.capturePointsToCapture();
             std::vector<bool> finishingNextTurn(nodeCount, false);
+            std::vector<bool> activelyCapturedNeutral(nodeCount, false);
             struct FriendlyCover
             {
                 int ki{NO_UNIT};
@@ -694,15 +719,15 @@ namespace Coordinator
                 const int carried = (cand.destination == cand.origin ? known.capturePoints : 0) + known.captureRate;
                 const int nextRate = replyCaptureRate(known.captureRate,
                     std::max(0, known.hpRounded - actor.stepsAfterReply), false);
-                if (carried < capPts && carried + nextRate >= capPts)
+                for (std::size_t n = 0; n < nodeCount; ++n)
                 {
-                    for (std::size_t n = 0; n < nodeCount; ++n)
+                    if (m_stockContext.nodeTile(n) == cand.destination)
                     {
-                        if (m_stockContext.nodeTile(n) == cand.destination)
-                        {
+                        if (m_stockContext.nodeOwner(n) == OwnerSign::Neutral)
+                            activelyCapturedNeutral[n] = true;
+                        if (carried < capPts && carried + nextRate >= capPts)
                             finishingNextTurn[n] = true;
-                            break;
-                        }
+                        break;
                     }
                 }
             }
@@ -751,6 +776,7 @@ namespace Coordinator
                 const OwnerSign owner = m_stockContext.nodeOwner(n);
                 if (owner == OwnerSign::Neutral)
                 {
+                    if (activelyCapturedNeutral[n]) continue;
                     if (nearEnemyFactory || m_stockContext.enemyClaimsNeutralBeforeUs(n, killedInF0))
                         blocked[n] = 1;
                     continue;
@@ -780,6 +806,7 @@ namespace Coordinator
                         if (afterD <= 0.0) return true;
                         const MilliFunds capLoss = combatCapitalLoss(d.cost, d.hp, afterD);
                         MilliFunds counterLoss = 0;
+                        bool friendlySurvives = true;
                         if (fc.strikeRange == 1)
                         {
                             const double cBase = maxWeaponBaseDamage(d.ki, fc.ki, 1);
@@ -790,10 +817,11 @@ namespace Coordinator
                                 const double rawC = sameActionCounterDamage(
                                     fDef, cBase, d.hp, rawHit, ceilHpSteps(fc.hp));
                                 const double afterF = engineHpAfterReply(fc.hp, engineShotDamage(rawC));
+                                friendlySurvives = afterF > 0.0;
                                 counterLoss = combatCapitalLoss(fc.cost, fc.hp, afterF);
                             }
                         }
-                        return (d.cost == 0 && fc.cost == 0) || capLoss > counterLoss;
+                        return friendlySurvives && ((d.cost == 0 && fc.cost == 0) || capLoss > counterLoss);
                     });
                     if (coveredByFriendlyArmor) continue;
                     const double baseDmg = maxWeaponBaseDamage(d.ki, m_sampleCapperKi, d.strikeRange);
@@ -1494,10 +1522,29 @@ namespace Coordinator
                 if (!m_enemyPositions.empty())
                 {
                     const auto [minR, maxR] = unitAttackRange(ki);
-                    const auto profKey = std::tuple{gridId, minR, maxR};
-                    if (!m_enemyPathDistByProfile.contains(profKey))
-                        m_enemyPathDistByProfile.emplace(
-                            profKey, buildReversePathDistances(gridId, m_enemyPositions, minR, maxR));
+                    std::vector<TilePoint> targetTiles;
+                    std::vector<int> targetIds;
+                    if (m_local.weapon || m_local.weaponSlots)
+                    {
+                        for (const auto & [eKi, eTile] : m_enemyUnits)
+                        {
+                            if (maxWeaponBaseDamage(ki, eKi, minR) > 0.0)
+                            {
+                                targetTiles.push_back(eTile);
+                                targetIds.push_back(eKi);
+                            }
+                        }
+                    }
+                    const std::span<const TilePoint> effectiveTargets = targetTiles.empty()
+                        ? std::span<const TilePoint>(m_enemyPositions)
+                        : std::span<const TilePoint>(targetTiles);
+                    if (!targetTiles.empty())
+                        m_targetableEnemiesByKi.emplace(ki, std::move(targetTiles));
+                    const auto profKey = std::tuple{gridId, minR, maxR, targetIds};
+                    auto [it, inserted] = m_enemyPathDistByTargetSet.emplace(profKey, std::vector<std::int32_t>{});
+                    if (inserted)
+                        it->second = buildReversePathDistances(gridId, effectiveTargets, minR, maxR);
+                    m_enemyPathDistByKi.emplace(ki, &it->second);
                 }
                 if (!m_friendlyRepairSites.empty() && !m_repairPathDistByGrid.contains(gridId))
                     m_repairPathDistByGrid.emplace(gridId, buildReversePathDistances(gridId, m_friendlyRepairSites));
@@ -1707,6 +1754,44 @@ namespace Coordinator
             return {hqCaptureStartSafe, totalRisk};
         }
 
+        // Prices next-turn city healing and lost repairable chassis on zero-factory (pre-deployed) maps.
+        MilliFunds computeRepairValue(const ReplyPassEvaluation & eval) const
+        {
+            if (!m_friendlyFactories.empty() || m_friendlyRepairSites.empty())
+                return 0;
+            MilliFunds total = 0;
+            for (const auto & actor : eval.actors)
+            {
+                const auto & member = m_problem.actors()[static_cast<std::size_t>(actor.actorSlot)];
+                const int ki = member.knowledgeUnitIndex;
+                if (ki < 0 || ki >= static_cast<int>(m_local.units.size()) ||
+                    ki >= static_cast<int>(m_knowledge.units().size()))
+                    continue;
+                const MilliFunds cost = m_local.units[static_cast<std::size_t>(ki)].replacementCost;
+                if (cost <= 0) continue;
+                const auto & cand = member.candidates[static_cast<std::size_t>(actor.candidateIndex)];
+                if (actor.stepsAfterReply > 0)
+                {
+                    if (actor.stepsAfterReply < UNIT_HP_STEPS &&
+                        std::ranges::find(m_friendlyRepairSites, cand.destination) != m_friendlyRepairSites.end())
+                    {
+                        const int healSteps = std::min(UNIFIED_CITY_REPAIR_STEPS, UNIT_HP_STEPS - actor.stepsAfterReply);
+                        RelativeStockDetail::checkedAdd(total, (cost * healSteps) / UNIT_HP_STEPS);
+                    }
+                }
+                else
+                {
+                    const int hpStart = m_knowledge.units()[static_cast<std::size_t>(ki)].hpRounded;
+                    if (hpStart < UNIT_HP_STEPS)
+                    {
+                        const int lostRepairSteps = std::min(UNIFIED_CITY_REPAIR_STEPS, UNIT_HP_STEPS - hpStart);
+                        RelativeStockDetail::checkedSubtract(total, (cost * lostRepairSteps) / UNIT_HP_STEPS);
+                    }
+                }
+            }
+            return total;
+        }
+
         struct OwnCapturableProperty
         {
             TilePoint tile{INVALID_TILE};
@@ -1730,14 +1815,18 @@ namespace Coordinator
         int m_maxDist{1};
         int m_sampleCapperKi{NO_UNIT};
         std::vector<TilePoint> m_enemyPositions;
+        std::vector<std::pair<int, TilePoint>> m_enemyUnits;
         std::vector<TilePoint> m_unownedProperties;
         std::vector<TilePoint> m_unownedNeutralProperties;
         std::vector<TilePoint> m_unownedFactories;
         std::vector<TilePoint> m_deliverableNeutralProperties;
         std::vector<TilePoint> m_enemyFactories;
+        std::vector<TilePoint> m_friendlyFactories;
         std::vector<TilePoint> m_friendlyRepairSites;
         std::vector<OwnCapturableProperty> m_ownCapturableProperties;
-        std::map<std::tuple<int, int, int>, std::vector<std::int32_t>> m_enemyPathDistByProfile;
+        std::map<int, std::vector<TilePoint>> m_targetableEnemiesByKi;
+        std::map<std::tuple<int, int, int, std::vector<int>>, std::vector<std::int32_t>> m_enemyPathDistByTargetSet;
+        std::map<int, const std::vector<std::int32_t> *> m_enemyPathDistByKi;
         std::map<int, std::vector<std::int32_t>> m_repairPathDistByGrid;
         std::map<int, std::vector<std::int32_t>> m_unownedPropPathDistByGrid;
         std::map<int, std::vector<std::int32_t>> m_unownedFactoryPathDistByGrid;
