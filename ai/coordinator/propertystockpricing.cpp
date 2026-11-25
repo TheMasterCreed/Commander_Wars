@@ -321,6 +321,23 @@ namespace Coordinator
         return m_columnAtTile[static_cast<std::size_t>(slot)];
     }
 
+    std::vector<MilliFunds> PropertyStockField::rowWeights(const PropertyStockInstance & instance,
+                                                           std::span<const std::int32_t> arrivals,
+                                                           const PropertyStockRow & row) const
+    {
+        std::vector<MilliFunds> weights(instance.columns.size(), 0);
+        for (std::size_t slot = 0; slot < instance.columns.size(); ++slot)
+        {
+            const ArrivalFacts arrival{
+                .arrivalActivations = arrivals[slot],
+                .carriedPoints = carriedFor(row, static_cast<std::int32_t>(slot)),
+                .ratePerTurn = row.captureRate,
+            };
+            weights[slot] = columnWeight(instance.columns[slot], arrival, m_capturePointsToCapture, m_horizonTurns);
+        }
+        return weights;
+    }
+
     std::int32_t PropertyStockField::carriedFor(const PropertyStockRow & row, std::int32_t slot) const
     {
         const std::size_t index = static_cast<std::size_t>(slot);
@@ -1166,9 +1183,41 @@ namespace Coordinator
         return result;
     }
 
-    ReplyStockContext::ReplyStockContext(const PropertyStockField & field)
-        : m_field(std::make_unique<PropertyStockField>(field))
+    ReplyStockContext::ReplyStockContext(const PropertyStockField & field, std::int64_t allowance,
+        std::span<const MobilityCostGrid> projectedGrids, std::span<const int> gridOfUnit)
+        : m_field(nullptr)
     {
+        if (!m_meter.open(allowance)) return;
+        if (allowance != std::numeric_limits<std::int64_t>::max())
+        {
+            std::set<std::tuple<int,int,int>> classes;
+            for (const auto & row : field.m_ours.rows)
+                classes.emplace(gridOfUnit.empty() ? row.gridIdentity : gridOfUnit[row.knowledgeIndex], row.movementPoints,row.captureRate);
+            const auto columns = static_cast<std::int64_t>(field.m_columnTiles.size());
+            const auto copies = static_cast<std::int64_t>(field.m_grids.size()+projectedGrids.size()+field.m_ours.rows.size());
+            const auto floods = static_cast<std::int64_t>(classes.size())*(columns+1);
+            const auto cells = masterWorkProduct(static_cast<std::size_t>(field.m_width)*field.m_height,copies+floods+1);
+            const auto tables = masterWorkProduct(static_cast<std::size_t>(columns)*columns,classes.size()*field.m_horizonTurns);
+            if (!cells || !tables || !chargeMasterWork(m_meter,*cells+1,1,REPLY_STOCK_WORK) ||
+                !chargeMasterWork(m_meter,*tables+1,1,REPLY_STOCK_WORK)) return;
+        }
+        m_field=std::make_unique<PropertyStockField>(field);
+        if (!gridOfUnit.empty())
+        {
+            // Appended slots keep cached terrain-only or day-start arrival keys distinct.
+            const auto offset = static_cast<int>(m_field->m_grids.size());
+            m_field->m_grids.insert(m_field->m_grids.end(), projectedGrids.begin(), projectedGrids.end());
+            m_field->m_ours.weights.clear();
+            for (auto & row : m_field->m_ours.rows)
+            {
+                const int grid = gridOfUnit[static_cast<std::size_t>(row.knowledgeIndex)];
+                if (grid < 0 || static_cast<std::size_t>(grid) >= projectedGrids.size()) return;
+                row.gridIdentity = offset + grid;
+                const auto & arrivals = m_field->arrivalsFrom(row.gridIdentity,row.movementPoints,row.tile);
+                const auto weights = m_field->rowWeights(m_field->m_ours,arrivals.activations,row);
+                m_field->m_ours.weights.insert(m_field->m_ours.weights.end(),weights.begin(),weights.end());
+            }
+        }
         JointPlanStockValuer::ourStockNodes(*m_field, m_nodeSlots, m_nodeColumns);
         m_classOfRow =
             JointPlanStockValuer::dayClassIndices(*m_field, m_nodeSlots, m_nodeColumns, m_classKeys, m_classTables);
@@ -1179,7 +1228,7 @@ namespace Coordinator
                 *m_field, static_cast<std::int32_t>(row), m_nodeSlots, m_classOfRow[row]));
         }
         m_pricedDayRows.resize(m_dayRows.size());
-        m_valid = m_meter.open(std::numeric_limits<std::int64_t>::max());
+        m_valid = true;
     }
 
     ReplyStockPriceInstall ReplyStockContext::installPrices(std::span<const MilliFunds> prices)
@@ -1306,7 +1355,8 @@ namespace Coordinator
         return ReplyStockStatus::Valid;
     }
 
-    ReplyStockFloor ReplyStockContext::floor(const ContinuationKey & key, const ReplyStockFloor * reference)
+    ReplyStockFloor ReplyStockContext::floor(const ContinuationKey & key, const ReplyStockFloor * reference,
+                                             std::span<const std::uint8_t> blockedNodes)
     {
         ReplyStockFloor result;
         const std::int64_t workBefore = work();
@@ -1315,7 +1365,7 @@ namespace Coordinator
         result.status = m_priceVersion == 0 ? ReplyStockStatus::NoPrices : extend(key, result.pricing);
         if (result.status == ReplyStockStatus::Valid)
         {
-            result.status = composeFloor(key, reference, result);
+            result.status = composeFloor(key, reference, result, blockedNodes);
         }
         if (result.status != ReplyStockStatus::Valid)
         {
@@ -1366,7 +1416,7 @@ namespace Coordinator
     }
 
     ReplyStockStatus ReplyStockContext::claimKey(const ContinuationKey & key, std::vector<bool> & capturedNodes,
-                                                 std::vector<bool> & acting) const
+                                                 std::vector<bool> & acting, std::span<const std::uint8_t> blockedNodes) const
     {
         capturedNodes.assign(m_nodeColumns.size(), false);
         acting.assign(m_dayRows.size(), false);
@@ -1379,13 +1429,21 @@ namespace Coordinator
             }
             acting[static_cast<std::size_t>(action.row())] = true;
         }
+        for (std::size_t n = 0; n < blockedNodes.size() && n < capturedNodes.size(); ++n)
+        {
+            if (blockedNodes[n])
+            {
+                capturedNodes[n] = true;
+            }
+        }
         return ReplyStockStatus::Valid;
     }
 
-    ReplyStockStatus ReplyStockContext::keyInstance(const ContinuationKey & key, SequentialInstance & instance) const
+    ReplyStockStatus ReplyStockContext::keyInstance(const ContinuationKey & key, SequentialInstance & instance,
+                                                    std::span<const std::uint8_t> blockedNodes) const
     {
         std::vector<bool> acting;
-        const ReplyStockStatus status = claimKey(key, instance.capturedNodes, acting);
+        const ReplyStockStatus status = claimKey(key, instance.capturedNodes, acting, blockedNodes);
         if (status != ReplyStockStatus::Valid)
         {
             return status;
@@ -1397,6 +1455,17 @@ namespace Coordinator
         for (const CanonicalPlanActionKey & action : key)
         {
             instance.rows[static_cast<std::size_t>(action.row())] = m_actions.at(action).row;
+        }
+        for (std::size_t n = 0; n < blockedNodes.size() && n < m_nodeColumns.size(); ++n)
+        {
+            if (!blockedNodes[n])
+            {
+                continue;
+            }
+            for (SequentialRow & row : instance.rows)
+            {
+                removeCapturedNode(row, static_cast<std::int32_t>(n));
+            }
         }
         return ReplyStockStatus::Valid;
     }
@@ -1459,7 +1528,7 @@ namespace Coordinator
     }
 
     ReplyStockStatus ReplyStockContext::composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
-                                                     ReplyStockFloor & result)
+                                                     ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes)
     {
         ReplyStockCeiling priced;
         priced.counters = result.pricing;
@@ -1468,7 +1537,7 @@ namespace Coordinator
         SequentialInstance instance;
         if (status == ReplyStockStatus::Valid)
         {
-            status = keyInstance(key, instance);
+            status = keyInstance(key, instance, blockedNodes);
         }
         if (status != ReplyStockStatus::Valid)
         {
@@ -1658,17 +1727,18 @@ namespace Coordinator
         const ReplyStockStatus published = publishFloor(instance, rows, result);
         if (published == ReplyStockStatus::Valid)
         {
-            polishFloor(key, instance, reused, result);
+            polishFloor(key, instance, reused, result, blockedNodes);
         }
         return published;
     }
 
     // Changed rows go first so they reclaim their natural nodes before unchanged rows extend onto them.
     void ReplyStockContext::polishFloor(const ContinuationKey & key, const SequentialInstance & instance,
-                                        const std::vector<bool> & reused, ReplyStockFloor & result)
+                                        const std::vector<bool> & reused, ReplyStockFloor & result,
+                                        std::span<const std::uint8_t> blockedNodes)
     {
         const std::size_t rowCount = instance.rows.size();
-        const std::optional<MasterPlanPricingModel> model = forcedModel(key);
+        const std::optional<MasterPlanPricingModel> model = forcedModel(key, blockedNodes);
         if (!model || model->rowActors.size() != rowCount)
         {
             result.polish = ReplyStockFloorPolish::Rejected;
@@ -1774,14 +1844,57 @@ namespace Coordinator
         return chargeMasterWork(m_meter, work, 1, REPLY_FLOOR_WORK);
     }
 
-    std::optional<MasterPlanPricingModel> ReplyStockContext::forcedModel(const ContinuationKey & key) const
+    std::optional<MasterPlanPricingModel> ReplyStockContext::forcedModel(const ContinuationKey & key,
+                                                                         std::span<const std::uint8_t> blockedNodes) const
     {
-        return forcedPricingModel(m_field->m_horizonTurns, m_nodeColumns, m_classTables, m_dayRows, key,
+        const bool hasBlocked = std::ranges::any_of(blockedNodes, [](std::uint8_t b) { return b != 0; });
+        if (!hasBlocked)
+        {
+            return forcedPricingModel(m_field->m_horizonTurns, m_nodeColumns, m_classTables, m_dayRows, key,
+                [&](const CanonicalPlanActionKey & action)
+            {
+                const auto found = m_actions.find(action);
+                return found == m_actions.end() ? ForcedAction{} :
+                    ForcedAction{&found->second.row, found->second.capturedNode};
+            }, nullptr);
+        }
+        std::vector<PropertyStockColumn> deliverableColumns = m_nodeColumns;
+        for (std::size_t n = 0; n < blockedNodes.size() && n < deliverableColumns.size(); ++n)
+        {
+            if (blockedNodes[n])
+            {
+                deliverableColumns[n].income = {0, 0};
+            }
+        }
+        std::vector<SequentialRow> deliverableDayRows = m_dayRows;
+        std::map<CanonicalPlanActionKey, SequentialRow> deliverableActionRows;
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const auto found = m_actions.find(action);
+            if (found != m_actions.end())
+            {
+                SequentialRow copy = found->second.row;
+                for (std::size_t n = 0; n < blockedNodes.size() && n < deliverableColumns.size(); ++n)
+                {
+                    if (blockedNodes[n]) removeCapturedNode(copy, static_cast<std::int32_t>(n));
+                }
+                deliverableActionRows.emplace(action, std::move(copy));
+            }
+        }
+        for (SequentialRow & row : deliverableDayRows)
+        {
+            for (std::size_t n = 0; n < blockedNodes.size() && n < deliverableColumns.size(); ++n)
+            {
+                if (blockedNodes[n]) removeCapturedNode(row, static_cast<std::int32_t>(n));
+            }
+        }
+        return forcedPricingModel(m_field->m_horizonTurns, deliverableColumns, m_classTables, deliverableDayRows, key,
             [&](const CanonicalPlanActionKey & action)
         {
             const auto found = m_actions.find(action);
-            return found == m_actions.end() ? ForcedAction{} :
-                ForcedAction{&found->second.row, found->second.capturedNode};
+            const auto filtered = deliverableActionRows.find(action);
+            return found == m_actions.end() || filtered == deliverableActionRows.end() ? ForcedAction{} :
+                ForcedAction{&filtered->second, found->second.capturedNode};
         }, nullptr);
     }
 
@@ -1834,11 +1947,17 @@ namespace Coordinator
         const auto pricing =
             masterWorkProduct(static_cast<std::size_t>(*evaluation), static_cast<std::size_t>(rounds) + 1);
         const auto witness = masterWorkProduct(static_cast<std::size_t>(*build), static_cast<std::size_t>(*builds));
-        const auto maximum = pricing ? addWork(*pricing, witness) : std::nullopt;
+        // The tuning prepares its catalog once; a prepared round never costs more than a full evaluation at the same prices.
+        const auto preparation = masterFuturePreparationWork(catalog);
+        const auto priced = pricing ? addWork(*pricing, witness) : std::nullopt;
+        const auto maximum = priced && preparation ? addWork(*preparation, priced) : std::nullopt;
         if (!maximum)
         {
             return ReplyStockStatus::ArithmeticFailure;
         }
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.preparationWork = *preparation;
+#endif
         result.evaluationWork = *evaluation;
         result.pricingWork = *pricing;
         result.buildWork = *build;
@@ -1898,6 +2017,7 @@ namespace Coordinator
         result.tunerWork = ledger.stats().granted;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         result.tunerPricingWork = tuned.pricingWork;
+        result.tunerPreparationWork = tuned.preparationWork;
         result.tunerWitnessWork = tuned.witnessWork;
         result.witnessStats = tuned.witnessStats;
 #endif
@@ -2007,5 +2127,297 @@ namespace Coordinator
         m_classPriced[slot] = true;
         ++counters.classTablesPriced;
         return ReplyStockStatus::Valid;
+    }
+
+    bool ReplyStockContext::enemyClaimsNeutralBeforeUs(std::size_t node,
+                                                       std::span<const std::int32_t> killedEnemyKnowledge) const
+    {
+        if (!m_valid || !m_field || node >= m_nodeSlots.size() || node >= m_nodeColumns.size() ||
+            m_nodeColumns[node].ownerBefore != OwnerSign::Neutral)
+        {
+            return false;
+        }
+        const std::int32_t slot = m_nodeSlots[node];
+        const std::size_t colCount = m_field->m_theirs.columns.size();
+        const std::size_t rowCount = m_field->m_theirs.rows.size();
+        if (slot < 0 || static_cast<std::size_t>(slot) >= colCount || rowCount == 0 ||
+            m_field->m_enemyArrivals.size() < rowCount * colCount)
+        {
+            return false;
+        }
+        std::int32_t minOurTurn = std::numeric_limits<std::int32_t>::max();
+        for (const SequentialRow & row : m_dayRows)
+        {
+            if (node < row.ownedTurn.size() && row.ownedTurn[node] != NO_CAPTURE_TURNS &&
+                row.ownedTurn[node] < minOurTurn)
+            {
+                minOurTurn = row.ownedTurn[node];
+            }
+        }
+        if (minOurTurn <= 1)
+        {
+            return false;
+        }
+        std::int32_t minEnemyTurn = std::numeric_limits<std::int32_t>::max();
+        for (std::size_t r = 0; r < rowCount; ++r)
+        {
+            const PropertyStockRow & eRow = m_field->m_theirs.rows[r];
+            if (std::ranges::find(killedEnemyKnowledge, eRow.knowledgeIndex) != killedEnemyKnowledge.end())
+            {
+                continue;
+            }
+            const std::int32_t arrival = m_field->m_enemyArrivals[r * colCount + static_cast<std::size_t>(slot)];
+            if (arrival == UNREACHABLE)
+            {
+                continue;
+            }
+            const std::int32_t carried = m_field->carriedFor(eRow, slot);
+            const RawOwnership owned = rawOwnedTurns(arrival, carried, eRow.captureRate,
+                                                     m_field->m_capturePointsToCapture);
+            if (owned.status == RawOwnershipStatus::Owned && owned.turns < minEnemyTurn)
+            {
+                minEnemyTurn = owned.turns;
+            }
+        }
+        // Enemy completes capture strictly before our fastest capper can even begin its final turn.
+        return minEnemyTurn < std::numeric_limits<std::int32_t>::max() && minEnemyTurn + 1 < minOurTurn;
+    }
+
+    MilliFunds ReplyStockContext::futureFactorySpawnGain(const ContinuationKey & key, const ReplyStockFloor & floor,
+                                                         std::span<const PropertyFacts> properties,
+                                                         std::int32_t observerId,
+                                                         std::span<const std::uint8_t> blockedNodes) const
+    {
+        if (!m_valid || !m_field || floor.status != ReplyStockStatus::Valid ||
+            m_nodeSlots.empty() || m_classTables.empty())
+        {
+            return 0;
+        }
+        const std::int32_t horizon = m_field->m_horizonTurns;
+        if (horizon <= 2)
+        {
+            return 0;
+        }
+        const auto isBlocked = [&](std::size_t n) {
+            return n < blockedNodes.size() && blockedNodes[n] != 0;
+        };
+        std::vector<std::int32_t> neutralFactories;
+        std::vector<std::int32_t> enemyFactories;
+        for (const PropertyFacts & prop : properties)
+        {
+            if (!prop.visible || !prop.capturable || !prop.canProduce || prop.ownerId == observerId)
+            {
+                continue;
+            }
+            const bool buildsCapper = prop.productionList.isEmpty() ||
+                prop.productionList.contains(QStringLiteral("INFANTRY"), Qt::CaseInsensitive) ||
+                prop.productionList.contains(QStringLiteral("MECH"), Qt::CaseInsensitive);
+            if (!buildsCapper)
+            {
+                continue;
+            }
+            const std::int32_t slot = m_field->columnSlotAt({prop.x, prop.y});
+            if (slot == NO_STOCK_COLUMN)
+            {
+                continue;
+            }
+            for (std::size_t node = 0; node < m_nodeSlots.size(); ++node)
+            {
+                if (m_nodeSlots[node] == slot)
+                {
+                    if (m_nodeColumns[node].ownerBefore == OwnerSign::Neutral)
+                    {
+                        if (!isBlocked(node))
+                        {
+                            neutralFactories.push_back(static_cast<std::int32_t>(node));
+                        }
+                    }
+                    else
+                    {
+                        enemyFactories.push_back(static_cast<std::int32_t>(node));
+                    }
+                    break;
+                }
+            }
+        }
+        if (neutralFactories.empty() && enemyFactories.empty())
+        {
+            return 0;
+        }
+        SequentialInstance instance;
+        if (keyInstance(key, instance, blockedNodes) != ReplyStockStatus::Valid)
+        {
+            return 0;
+        }
+        std::int32_t baseClass = NO_SEQUENTIAL_CLASS;
+        for (std::size_t c = 0; c < m_classKeys.size(); ++c)
+        {
+            if (m_classKeys[c].movementPoints <= 0 || m_classKeys[c].ratePerTurn <= 0)
+            {
+                continue;
+            }
+            if (baseClass == NO_SEQUENTIAL_CLASS ||
+                m_classKeys[c].movementPoints < m_classKeys[static_cast<std::size_t>(baseClass)].movementPoints ||
+                (m_classKeys[c].movementPoints == m_classKeys[static_cast<std::size_t>(baseClass)].movementPoints &&
+                 m_classKeys[c].ratePerTurn > m_classKeys[static_cast<std::size_t>(baseClass)].ratePerTurn))
+            {
+                baseClass = static_cast<std::int32_t>(c);
+            }
+        }
+        if (baseClass == NO_SEQUENTIAL_CLASS)
+        {
+            return 0;
+        }
+        const SequentialClassTable & table = m_classTables[static_cast<std::size_t>(baseClass)];
+        const std::size_t nodeCount = m_nodeColumns.size();
+        std::vector<std::int32_t> claimedTurn(nodeCount, horizon);
+        for (std::size_t n = 0; n < nodeCount; ++n)
+        {
+            if (instance.capturedNodes[n])
+            {
+                claimedTurn[n] = 0;
+            }
+        }
+        for (const SequentialRowWitness & row : floor.witness)
+        {
+            for (const SequentialWitnessStep & step : row.steps)
+            {
+                if (step.node >= 0 && static_cast<std::size_t>(step.node) < nodeCount &&
+                    step.turn >= 0 && step.turn < claimedTurn[static_cast<std::size_t>(step.node)])
+                {
+                    claimedTurn[static_cast<std::size_t>(step.node)] = step.turn;
+                }
+            }
+        }
+        // Track rows committed to a partial capture on another tile so they do not double-count reaching a factory.
+        std::vector<std::int32_t> partialCaptureNode(instance.rows.size(), NO_SEQUENTIAL_NODE);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            if (!action.captures() || action.destroyed())
+            {
+                continue;
+            }
+            const auto it = m_actions.find(action);
+            if (it == m_actions.end() || it->second.capturedNode != NO_SEQUENTIAL_NODE)
+            {
+                continue;
+            }
+            const std::int32_t slot = m_field->columnSlotAt({action.x(), action.y()});
+            if (slot == NO_STOCK_COLUMN)
+            {
+                continue;
+            }
+            for (std::size_t n = 0; n < m_nodeSlots.size(); ++n)
+            {
+                if (m_nodeSlots[n] == slot)
+                {
+                    partialCaptureNode[static_cast<std::size_t>(action.row())] = static_cast<std::int32_t>(n);
+                    break;
+                }
+            }
+        }
+        std::vector<std::pair<std::int32_t, std::int32_t>> activeFactories;
+        for (const std::int32_t fNode : neutralFactories)
+        {
+            std::int32_t tc = claimedTurn[static_cast<std::size_t>(fNode)];
+            for (std::size_t r = 0; r < instance.rows.size(); ++r)
+            {
+                const std::int32_t partial = partialCaptureNode[r];
+                std::int32_t direct = instance.rows[r].ownedTurn[static_cast<std::size_t>(fNode)];
+                if (partial != NO_SEQUENTIAL_NODE && partial != fNode)
+                {
+                    const std::int32_t finishPartial = instance.rows[r].ownedTurn[static_cast<std::size_t>(partial)];
+                    direct = finishPartial != NO_CAPTURE_TURNS
+                        ? table.continuationOwnedTurn(partial, finishPartial, fNode)
+                        : NO_CAPTURE_TURNS;
+                }
+                if (direct != NO_CAPTURE_TURNS && direct < tc)
+                {
+                    tc = direct;
+                }
+            }
+            if (tc < horizon - 2)
+            {
+                activeFactories.emplace_back(tc, fNode);
+            }
+        }
+        std::vector<bool> capturedOnF0(nodeCount, false);
+        for (const CanonicalPlanActionKey & action : key)
+        {
+            const auto it = m_actions.find(action);
+            if (it != m_actions.end() && it->second.capturedNode != NO_SEQUENTIAL_NODE)
+            {
+                capturedOnF0[static_cast<std::size_t>(it->second.capturedNode)] = true;
+            }
+        }
+        for (const std::int32_t fNode : enemyFactories)
+        {
+            if (capturedOnF0[static_cast<std::size_t>(fNode)])
+            {
+                activeFactories.emplace_back(0, fNode);
+            }
+        }
+        if (activeFactories.empty())
+        {
+            return 0;
+        }
+        std::sort(activeFactories.begin(), activeFactories.end());
+        MilliFunds totalGain = 0;
+        for (const auto & [tc, fNode] : activeFactories)
+        {
+            for (std::int32_t spawn = 1; spawn <= MAX_FACTORY_SPAWN_CAPPERS; ++spawn)
+            {
+                const std::int32_t buildTurn = tc + spawn;
+                if (buildTurn >= horizon - 1)
+                {
+                    break;
+                }
+                std::int32_t curNode = fNode;
+                std::int32_t curTurn = buildTurn;
+                for (;;)
+                {
+                    std::int32_t bestNode = NO_SEQUENTIAL_NODE;
+                    std::int32_t bestTurn = horizon;
+                    MilliFunds bestGain = 0;
+                    for (std::size_t p = 0; p < nodeCount; ++p)
+                    {
+                        const std::int32_t pNode = static_cast<std::int32_t>(p);
+                        if (pNode == curNode || pNode == fNode || isBlocked(p) ||
+                            m_nodeColumns[p].ownerBefore != OwnerSign::Neutral)
+                        {
+                            continue;
+                        }
+                        const std::int32_t nextTurn = table.continuationOwnedTurn(curNode, curTurn, pNode);
+                        if (nextTurn == NO_CAPTURE_TURNS || nextTurn >= claimedTurn[p])
+                        {
+                            continue;
+                        }
+                        const MilliFunds afterVal = columnStreamValue(m_nodeColumns[p], nextTurn, horizon);
+                        const MilliFunds beforeVal = claimedTurn[p] < horizon
+                            ? columnStreamValue(m_nodeColumns[p], claimedTurn[p], horizon)
+                            : 0;
+                        const MilliFunds gain = afterVal - beforeVal;
+                        if (gain > bestGain || (gain == bestGain && gain > 0 && nextTurn < bestTurn))
+                        {
+                            bestGain = gain;
+                            bestNode = pNode;
+                            bestTurn = nextTurn;
+                        }
+                    }
+                    if (bestNode == NO_SEQUENTIAL_NODE || bestGain <= 0)
+                    {
+                        break;
+                    }
+                    if (!RelativeStockDetail::checkedAdd(totalGain, bestGain))
+                    {
+                        return totalGain;
+                    }
+                    claimedTurn[static_cast<std::size_t>(bestNode)] = bestTurn;
+                    curNode = bestNode;
+                    curTurn = bestTurn;
+                }
+            }
+        }
+        return totalGain;
     }
 }

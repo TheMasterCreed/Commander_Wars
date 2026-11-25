@@ -10,6 +10,7 @@
 
 #include "ai/coordinator/masterassignmentfuture.h"
 #include "ai/coordinator/masterplanpricing.h"
+#include "ai/coordinator/propertyeconomics.h"
 #include "ai/coordinator/propertystockbuilder.h"
 
 namespace Coordinator
@@ -115,6 +116,7 @@ namespace Coordinator
     };
 
     inline constexpr MilliFunds REPLY_STOCK_PARTS_PER_MILLION = 1'000'000;
+    inline constexpr std::int32_t MAX_FACTORY_SPAWN_CAPPERS = 3;
 
     // Splitting the division keeps the product from overflowing for any non-negative ceiling.
     constexpr std::optional<MilliFunds> replyStockTargetGap(MilliFunds ceiling, MilliFunds ppm)
@@ -135,6 +137,9 @@ namespace Coordinator
         std::int64_t buildWork{0};
         std::int64_t builds{0};
         MasterPlanPricingLimits limits;
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        std::int64_t preparationWork{0};
+#endif
     };
 
     struct ReplyStockTune
@@ -152,6 +157,7 @@ namespace Coordinator
         std::int64_t tunerWork{0};
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         std::int64_t tunerPricingWork{0};
+        std::int64_t tunerPreparationWork{0};
         std::int64_t tunerWitnessWork{0};
         MasterPlanWitnessStats witnessStats;
 #endif
@@ -173,7 +179,9 @@ namespace Coordinator
     class ReplyStockContext final
     {
     public:
-        explicit ReplyStockContext(const PropertyStockField & field);
+        explicit ReplyStockContext(const PropertyStockField & field,
+            std::int64_t allowance = std::numeric_limits<std::int64_t>::max(),
+            std::span<const MobilityCostGrid> projectedGrids = {}, std::span<const int> gridOfUnit = {});
 
         bool valid() const
         {
@@ -183,7 +191,8 @@ namespace Coordinator
         ReplyStockPriceInstall installPrices(std::span<const MilliFunds> prices);
         ReplyStockCeiling ceiling(const ContinuationKey & key);
         ReplyStockOwned owned(const ContinuationKey & key);
-        ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr);
+        ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr,
+                              std::span<const std::uint8_t> blockedNodes = {});
         // Needs no prices: a witness's value depends only on the key's rows.
         ReplyStockFloor replayWitness(const ContinuationKey & key, std::span<const SequentialRowWitness> witness);
         ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds,
@@ -226,6 +235,29 @@ namespace Coordinator
             return m_meter.stats().granted;
         }
 
+        MilliFunds enemyOptimum() const
+        {
+            return m_field ? m_field->enemyOptimum() : 0;
+        }
+
+        TilePoint nodeTile(std::size_t node) const
+        {
+            if (!m_field || node >= m_nodeSlots.size()) return INVALID_TILE;
+            return m_field->m_columnTiles[static_cast<std::size_t>(m_nodeSlots[node])];
+        }
+
+        OwnerSign nodeOwner(std::size_t node) const
+        {
+            return node < m_nodeColumns.size() ? m_nodeColumns[node].ownerBefore : OwnerSign::Neutral;
+        }
+
+        bool enemyClaimsNeutralBeforeUs(std::size_t node,
+                                        std::span<const std::int32_t> killedEnemyKnowledge = {}) const;
+
+        MilliFunds futureFactorySpawnGain(const ContinuationKey & key, const ReplyStockFloor & floor,
+                                          std::span<const PropertyFacts> properties, std::int32_t observerId,
+                                          std::span<const std::uint8_t> blockedNodes = {}) const;
+
     private:
         struct PricedRow
         {
@@ -243,21 +275,24 @@ namespace Coordinator
 
         ReplyStockStatus extend(const ContinuationKey & key, ReplyStockCounters & counters);
         ReplyStockStatus claimKey(const ContinuationKey & key, std::vector<bool> & capturedNodes,
-                                  std::vector<bool> & acting) const;
-        ReplyStockStatus keyInstance(const ContinuationKey & key, SequentialInstance & instance) const;
+                                  std::vector<bool> & acting, std::span<const std::uint8_t> blockedNodes = {}) const;
+        ReplyStockStatus keyInstance(const ContinuationKey & key, SequentialInstance & instance,
+                                     std::span<const std::uint8_t> blockedNodes = {}) const;
         ReplyStockStatus composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result);
         ReplyStockStatus composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
-                                      ReplyStockFloor & result);
+                                      ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes = {});
         ReplyStockStatus tuneKey(const ContinuationKey & key, std::int32_t rounds, const ReplyStockFloor * reference,
                                  ReplyStockTune & result);
-        std::optional<MasterPlanPricingModel> forcedModel(const ContinuationKey & key) const;
+        std::optional<MasterPlanPricingModel> forcedModel(const ContinuationKey & key,
+                                                          std::span<const std::uint8_t> blockedNodes = {}) const;
         ReplyStockStatus tuneLimits(const MasterPlanPricingModel & model, std::int32_t rounds,
                                     ReplyStockTuneLimits & result);
         bool chargeFloor(std::size_t work);
         ReplyStockStatus publishFloor(const SequentialInstance & instance,
                                       std::span<const SequentialRowWitness> source, ReplyStockFloor & result);
         void polishFloor(const ContinuationKey & key, const SequentialInstance & instance,
-                         const std::vector<bool> & reused, ReplyStockFloor & result);
+                         const std::vector<bool> & reused, ReplyStockFloor & result,
+                         std::span<const std::uint8_t> blockedNodes = {});
         ReplyStockStatus rowUpper(const SequentialRow & row, std::optional<PricedRow> & cached,
                                   ReplyStockCounters & counters);
         ReplyStockStatus priceClass(std::int32_t classIndex, ReplyStockCounters & counters);

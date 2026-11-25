@@ -136,6 +136,11 @@ namespace Coordinator
             return m_originStock;
         }
 
+        MilliFunds enemyOptimum() const
+        {
+            return m_enemyOptimum;
+        }
+
         bool actionCompletesCapture(const PlanRowAction & action) const
         {
             std::int32_t capturedColumn = NO_STOCK_COLUMN;
@@ -147,6 +152,7 @@ namespace Coordinator
         MilliFunds jointStock(std::span<const PlanRowAction> actions);
         JointStockDecomposition jointStockDecomposition(
             std::span<const PlanRowAction> actions);
+        MilliFunds enemyStockLoss(std::span<const std::int32_t> removedEnemyKnowledgeIndices);
         MilliFunds stockCeiling() const;
 
         std::int32_t propertyIndexAt(const TilePoint & tile) const;
@@ -187,6 +193,7 @@ namespace Coordinator
                                                           MobilityFieldCache & mobility, std::int32_t horizonTurns);
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         friend struct PropertyStockDiagnosticFixture;
+        friend struct CaptureDangerAuditView;
 #endif
         friend class JointPlanStockValuer;
         friend class MasterAssignmentStockContext;
