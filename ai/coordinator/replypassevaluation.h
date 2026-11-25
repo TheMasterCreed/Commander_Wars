@@ -14,8 +14,9 @@
 #include "ai/coordinator/capturedangerpricing.h"
 #include "ai/coordinator/masterassignmentproblem.h"
 #include "ai/coordinator/masterreplyactions.h"
-#include "ai/coordinator/replyprediction.h"
+#include "ai/coordinator/combatforecast.h"
 #include "ai/coordinator/stockreplykeys.h"
+#include "ai/coordinator/survivorshot.h"
 
 namespace Coordinator
 {
@@ -34,12 +35,13 @@ namespace Coordinator
         KeyRejected,
         Arithmetic,
         NotEvaluated,
+        MovementLimit,
     };
 
     inline constexpr std::array REPLY_PASS_NO_VALUE_NAMES{
         "NONE", "REPLAY_INVALID", "REPLAY_INCOMPLETE", "UNOWNED_ACTION", "MISSING_FACTS", "UNSUPPORTED_ACTION",
         "SELF_SERVICE", "TARGET_ALREADY_GONE", "UNUSABLE_PLAN_CHAIN", "MISSING_NEXT_SHOT_BASIS", "KEY_REJECTED",
-        "ARITHMETIC", "NOT_EVALUATED",
+        "ARITHMETIC", "NOT_EVALUATED", "MOVEMENT_LIMIT",
     };
 
     constexpr std::int32_t NO_REPLY_PASS_ACTOR = -1;
@@ -62,17 +64,21 @@ namespace Coordinator
         std::int32_t actionIndex{NO_ACTION};
         std::int32_t candidateIndex{NO_CANDIDATE};
         std::int32_t grantedDamage{0};
+        OwnShotOutcome ownShot;
         std::int32_t dayStartSteps{0};
         std::int32_t stepsAfterOwnActions{0};
         std::int32_t stepsAfterReply{0};
         StockDeathCause destroyedBy{StockDeathCause::None};
         std::int32_t stockRow{NO_STOCK_ROW};
         ReplyPassTerms terms;
+        bool repricedSurvivor{false};
+        std::array<int, 2> survivorAmmo{};
 
         friend bool operator==(const ReplyPassActor &, const ReplyPassActor &) = default;
     };
 
-    // target is the position of the shot unit in ReplyPassEvaluation::actors.
+    // Submitted defenders occupy the leading E0 target slots. A later target
+    // was already spent on the observed board and has no submitted F0 action.
     struct ReplyPassShot
     {
         std::int32_t shooterIndex{NO_UNIT};
@@ -80,6 +86,11 @@ namespace Coordinator
         std::int32_t hpStepsBefore{0};
         std::int32_t hpStepsAfter{0};
         MilliFunds counterCapital{0};
+        TilePoint firingTile{INVALID_TILE};
+        double realBefore{}, realAfter{};
+        MilliFunds targetCapital{};
+        int targetKnowledge{NO_UNIT},targetEngineUnitId{NO_UNIT};
+        int counterWeapon{-1};
 
         friend bool operator==(const ReplyPassShot &, const ReplyPassShot &) = default;
     };
@@ -96,6 +107,18 @@ namespace Coordinator
         ContinuationKey afterReply;
         MilliFunds exactNonStock{0};
         std::int64_t pairsExamined{0};
+        std::optional<OpeningRecruitFight> openingRecruitFight;
+        std::vector<TilePoint> openingRecruitFiringSquares;
+        std::vector<OpeningRecruitWindow> openingRecruitWindows;
+        std::vector<OpeningLaneAction> servicedStockShots;
+        std::vector<TilePoint> combatLocations;
+        CombatEncirclement encirclement;
+        std::vector<LethalFiringThreat> lethalThreats;
+        CaptureChips captureChips;
+        int enemyWaiting{NO_UNIT};
+        std::map<int, int> enemyReplyHp;
+        std::map<int, int> enemyAfterOwn;
+        std::map<int, double> realAfterReply;
 
         bool valued() const
         {
@@ -306,14 +329,58 @@ namespace Coordinator
             return std::nullopt;
         }
     }
+    struct CombatFireOrder
+    {
+        int first{NO_UNIT}, second{NO_UNIT};
+        bool operator==(const CombatFireOrder &) const = default;
+    };
+
+    inline bool installCombatFireOrder(MasterAssignmentReplayResult &replay, CombatFireOrder order)
+    {
+        if (order == CombatFireOrder{})
+            return true;
+        int first = NO_ACTION, second = NO_ACTION;
+        for (int index : replay.ordering.order)
+        {
+            const auto &action = replay.plan.action(index);
+            if (action.unitId == order.first) first = index;
+            if (action.unitId == order.second) second = index;
+        }
+        if (first == NO_ACTION || second == NO_ACTION || first == second)
+            return false;
+        const auto &a = replay.plan.action(first), &b = replay.plan.action(second);
+        const auto fire = [](PlanBundleKind kind) { return kind == PlanBundleKind::Fire || kind == PlanBundleKind::MoveAndFire; };
+        if (a.state == PlanActionState::Committed || b.state == PlanActionState::Committed ||
+            !fire(a.kind) || !fire(b.kind) || a.targetUnitId == NO_UNIT || a.targetUnitId != b.targetUnitId)
+            return false;
+        for (int i = 0; i < replay.plan.edgeCount(); ++i)
+            if (const auto &e = replay.plan.edge(i); e.from == first && e.to == second)
+                return true;
+        if (!replay.plan.addEdge(first, second, PlanEdgeKind::CombinedFire))
+            return false;
+        replay.ordering = replay.plan.executionOrder();
+        return replay.complete();
+    }
+
+    inline void installCombatFireOrders(MasterAssignmentReplayResult &replay, std::span<const CombatFireOrder> orders)
+    {
+        for (const CombatFireOrder order : orders)
+        {
+            MasterAssignmentReplayResult trial = replay;
+            if (installCombatFireOrder(trial, order))
+                replay = std::move(trial);
+        }
+    }
+
     // Pure: the replay runs without reply prediction, so the problem's shared tally is never touched.
     inline ReplyPassEvaluation evaluateReplyPassPlan(const MasterAssignmentProblem & problem,
                                                      std::span<const std::int32_t> choices,
-                                                     const ReplyBoard & board)
+                                                     const ReplyBoard & board, CombatFireOrder fireOrder = {},
+                                                     std::span<const CombatFireOrder> extraFireOrders = {})
     {
         using namespace ReplyPassEvaluationDetail;
         ReplyPassEvaluation result;
-        result.replay = replayMasterAssignment(problem, choices, ReplyPredictionSetup{});
+        result.replay = replayMasterAssignment(problem, choices, ReplyPredictionSetup{}, board.combat != nullptr);
         const MasterAssignmentReplayResult & replay = result.replay;
         if (!replay.valid())
         {
@@ -323,6 +390,10 @@ namespace Coordinator
         {
             return refuse(result, ReplyPassNoValue::ReplayIncomplete);
         }
+        if (!installCombatFireOrder(result.replay, fireOrder))
+            return refuse(result, ReplyPassNoValue::ReplayInvalid);
+        if (!extraFireOrders.empty())
+            installCombatFireOrders(result.replay, extraFireOrders);
         const std::optional<MasterReplyActions> owned = masterReplyActions(problem.actors(), choices, replay);
         if (!owned)
         {
@@ -353,7 +424,12 @@ namespace Coordinator
                 .stockRow = problem.actors()[slot].stockRow,
             });
         }
-        const ResolvedPlanReply resolved = resolvePlanReply(actions, board);
+        if (board.combat && board.combat->policy == TacticalReply::WaitOnProperty)
+            for (int i = 0; i < static_cast<int>(board.combat->units.size()); ++i)
+                if (board.combat->units[i].enemy && board.combat->units[i].engineUnitId == board.combat->replyTarget)
+                    result.enemyWaiting = i;
+        const auto observed=board.combat?std::span<const ObservedReplyDefender>(board.combat->observedDefenders):std::span<const ObservedReplyDefender>{};
+        const auto resolved=resolvePlanReply(actions,board,board.combat?&board.combat->ownFire:nullptr,observed);
         if (!resolved.complete)
         {
             const bool named = resolved.failedAction < result.actors.size();
@@ -362,29 +438,70 @@ namespace Coordinator
         }
         if (const std::optional<std::size_t> overflow = oneActionOverflowTarget(resolved))
         {
-            return refuse(result, ReplyPassNoValue::Arithmetic, result.actors[*overflow].actorSlot);
+            return refuse(result, ReplyPassNoValue::Arithmetic, *overflow<result.actors.size()?result.actors[*overflow].actorSlot:NO_REPLY_PASS_ACTOR);
         }
-        const PlanReplyRun run = runResolvedPlanReply(resolved);
+        std::vector<int> counterWeapons;
+        std::optional<PlanReplyRun> projected = board.combat
+            ? combatPlanReply(resolved, actions, *board.combat, result.combatLocations, result.enemyReplyHp,
+                              &result.encirclement, &result.realAfterReply, &result.lethalThreats, &result.captureChips,
+                              &result.openingRecruitFight, &result.openingRecruitFiringSquares, &result.openingRecruitWindows, &result.servicedStockShots,&counterWeapons)
+            : std::optional<PlanReplyRun>(runResolvedPlanReply(resolved));
+        if (!projected) return refuse(result, ReplyPassNoValue::MovementLimit);
+        const PlanReplyRun & run = *projected;
+        if (board.combat)
+            for (const auto &[index, target] : resolved.own.chain.chain)
+                result.enemyAfterOwn[index] = target.after;
         result.pairsExamined = run.reply.pairsExamined;
-        for (const OneActionShot & shot : run.reply.shots)
+        for (const OneActionShot &shot : run.reply.shots)
         {
-            result.shots.push_back(ReplyPassShot{
-                run.pool[shot.shooter], shot.target, shot.hpStepsBefore, shot.hpStepsAfter, shot.counterCost});
+            const int victim=shot.target<actions.size()?actions[shot.target].pCandidate->bundle.unitId:
+                observed[shot.target-actions.size()].knowledgeIndex;
+            const int counterWeapon=counterWeapons.empty()?-1:counterWeapons.at(result.shots.size());
+            result.shots.push_back(ReplyPassShot{run.pool[shot.shooter], shot.target, shot.hpStepsBefore,
+                                                 shot.hpStepsAfter, shot.counterCost, shot.firingTile,
+                                                 shot.realBefore, shot.realAfter, shot.targetCapital,
+                                                 board.combat ? victim : NO_UNIT,
+                                                 board.combat ? resolved.targets[shot.target].target.unitId : NO_UNIT,
+                                                 counterWeapon});
         }
         for (std::size_t index = 0; index < result.actors.size(); ++index)
         {
-            ReplyPassActor & entry = result.actors[index];
-            const CandidateBundle & candidate = *actions[index].pCandidate;
+            ReplyPassActor &entry = result.actors[index];
+            const CandidateBundle &candidate = *actions[index].pCandidate;
             entry.stepsAfterOwnActions = resolved.own.chain.outcomes[index].hpSteps;
             entry.stepsAfterReply = run.reply.outcomes[index].hpSteps;
+            if (board.combat)
+                result.realAfterReply[problem.actors()[entry.actorSlot].knowledgeUnitIndex] =
+                    run.reply.outcomes[index].hp;
             entry.destroyedBy = entry.stepsAfterOwnActions <= 0 ? StockDeathCause::OwnAction :
                                 entry.stepsAfterReply <= 0 ? StockDeathCause::Reply : StockDeathCause::None;
             const std::int32_t replyStart = ceilHpSteps(resolved.targets[index].target.hp);
             const MilliFunds cost = candidate.actor.replacementCost;
-            const auto acting = checkedActingSeatedCandidateValue(candidate, entry.grantedDamage);
-            const auto correction =
-                ownCounterCorrection(candidate, entry.dayStartSteps - entry.stepsAfterOwnActions);
-            const auto capital = checkedReplyCapitalLoss(cost, replyStart, entry.stepsAfterReply);
+            auto acting = checkedActingSeatedCandidateValue(candidate, entry.grantedDamage);
+            auto correction = ownCounterCorrection(candidate, entry.dayStartSteps - entry.stepsAfterOwnActions);
+            if (!resolved.own.ownShots.empty() && resolved.own.ownShots[index].target != NO_UNIT)
+            {
+                entry.ownShot = resolved.own.ownShots[index];
+                entry.grantedDamage = ceilHpSteps(entry.ownShot.targetBefore) - ceilHpSteps(entry.ownShot.targetAfter);
+                const auto &fire = candidate.bundle.components.front().fire;
+                entry.ownShot.targetCost = fire.targetReplacementCost;
+                entry.ownShot.actorCost = cost;
+                entry.ownShot.targetCapital = combatCapitalLoss(fire.targetReplacementCost, entry.ownShot.targetBefore,
+                                                               entry.ownShot.targetAfter);
+                entry.ownShot.counterCapital = combatCapitalLoss(cost, entry.ownShot.attackerBefore,
+                                                                entry.ownShot.attackerAfter);
+                const auto base = AssignmentValuationDetail::actingStaticValue(candidate);
+                // Replace both isolated whole-step bookings; reservations are a capacity
+                // check, never a second source of money for the same shot.
+                acting = base ? AssignmentValuationDetail::checkedCapitalAdjustment(fire, *base, 0) : std::nullopt;
+                correction = ownCounterCorrection(candidate, 0);
+                if (!acting || !correction || !RelativeStockDetail::checkedAdd(*acting, entry.ownShot.targetCapital) ||
+                    !RelativeStockDetail::checkedSubtract(*correction, entry.ownShot.counterCapital))
+                    return refuse(result, ReplyPassNoValue::Arithmetic, entry.actorSlot);
+            }
+            const auto capital = board.combat && board.combat->ownFire ? std::optional<MilliFunds>{combatCapitalLoss(
+                cost, resolved.targets[index].target.hp, run.reply.outcomes[index].hp)}
+                : checkedReplyCapitalLoss(cost, replyStart, entry.stepsAfterReply);
             MilliFunds counter = 0;
             bool counted = true;
             for (const ReplyPassShot & shot : result.shots)
@@ -399,14 +516,25 @@ namespace Coordinator
             std::optional<MilliFunds> nextShot = MilliFunds{0};
             if (entry.stepsAfterReply > 0)
             {
-                // Destination shots were generated at the isolated hp, so a unit that view kills has none.
+                // The normal destination estimate is defined at isolated HP. A rescued actor needs a new quote.
                 const std::int32_t basis = hpAfterAction(candidate.bundle, entry.dayStartSteps).hpSteps;
                 if (basis <= 0)
                 {
-                    return refuse(result, ReplyPassNoValue::MissingNextShotBasis, entry.actorSlot);
+                    if (!candidate.replyFacts->survivorWeapon)
+                        return refuse(result, ReplyPassNoValue::MissingNextShotBasis, entry.actorSlot);
+                    const auto &weapon = *candidate.replyFacts->survivorWeapon;
+                    if (board.combat && !board.combat->pay(weapon.work(board.width, board.height)))
+                        return refuse(result, ReplyPassNoValue::MovementLimit, entry.actorSlot);
+                    auto state = survivorReplyPosition(weapon, board, actions, resolved, run, index,
+                                                       result.combatLocations, result.enemyReplyHp);
+                    nextShot = survivorShotValue(weapon, state, candidate.bundle.destination, candidate.movementCost,
+                                                 entry.stepsAfterReply);
+                    entry.repricedSurvivor = true;
+                    entry.survivorAmmo = state.ammo;
                 }
-                nextShot = scaledNextShot(bestShot(candidate.actorNextShotsAtDestination), entry.stepsAfterReply,
-                                          basis);
+                else
+                    nextShot = scaledNextShot(bestShot(candidate.actorNextShotsAtDestination), entry.stepsAfterReply,
+                                              basis);
             }
             entry.terms = ReplyPassTerms{*acting, *correction, *capital, counter, nextShot.value_or(0)};
             const std::optional<MilliFunds> value = checkedTermSum(entry.terms);
@@ -428,6 +556,30 @@ namespace Coordinator
             result.afterOwnActions.push_back(stock->keys.afterOwnActions);
             result.afterReply.push_back(stock->keys.afterReply);
         }
+        for(std::size_t i=0;i<observed.size();++i){
+            const auto &defender=observed[i];
+            const auto target=actions.size()+i;
+            const auto &after=run.reply.outcomes[target];
+            const auto before=defender.facts->actorRealHp;
+            result.realAfterReply[defender.knowledgeIndex]=after.hp;
+            const int start=ceilHpSteps(before);
+            const auto loss=board.combat->ownFire?std::optional<MilliFunds>{combatCapitalLoss(defender.cost,before,after.hp)}:
+                checkedReplyCapitalLoss(defender.cost,start,after.hpSteps);
+            if(!loss || !RelativeStockDetail::checkedSubtract(result.exactNonStock,*loss))
+                return refuse(result,ReplyPassNoValue::Arithmetic);
+            for(const auto &shot:result.shots)if(shot.target==target && !RelativeStockDetail::checkedAdd(result.exactNonStock,shot.counterCapital))
+                return refuse(result,ReplyPassNoValue::Arithmetic);
+            if(defender.stockRow!=NO_STOCK_ROW){
+                // Observed capture carry already includes orders executed before this cut.
+                const auto row=stockReplyRow(defender.stockRow,defender.tile,false,start,start,after.hpSteps);
+                if(!row)return refuse(result,ReplyPassNoValue::KeyRejected);
+                result.afterOwnActions.push_back(row->keys.afterOwnActions);result.afterReply.push_back(row->keys.afterReply);
+            }
+        }
+        if(result.openingRecruitFight &&
+           (!RelativeStockDetail::checkedAdd(result.exactNonStock,result.openingRecruitFight->stockCapitalLost) ||
+            !RelativeStockDetail::checkedSubtract(result.exactNonStock,result.openingRecruitFight->recruitCapitalLost)))
+            return refuse(result,ReplyPassNoValue::Arithmetic);
         std::sort(result.afterOwnActions.begin(), result.afterOwnActions.end());
         std::sort(result.afterReply.begin(), result.afterReply.end());
         result.reason = ReplyPassNoValue::None;

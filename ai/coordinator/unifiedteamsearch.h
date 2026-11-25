@@ -28,6 +28,7 @@ namespace Coordinator
     struct UnifiedTeamSearchResult
     {
         std::vector<int> bestTeam;
+        std::vector<CombatFireOrder> bestFireOrders;
         UnifiedTeamScore bestScore;
         UnifiedTeamScore baselineScore;
         bool improved{false};
@@ -200,9 +201,24 @@ namespace Coordinator
 
         const std::int64_t workBeforeSeeds = work;
         ReplyPassEvaluation bestEconEval;
-        out.baselineScore = evaluator.evaluate(out.bestTeam, nullptr, &bestEconEval);
+        out.baselineScore = evaluator.evaluate(out.bestTeam, nullptr, &bestEconEval, {}, false);
         out.bestScore = out.baselineScore;
         out.winningSeed = QStringLiteral("STARTING_TEAM");
+        {
+            const auto startOrders = evaluator.buildDefaultFireOrders(out.bestTeam);
+            if (!startOrders.empty())
+            {
+                ReplyPassEvaluation orderedEval;
+                const auto orderedScore = evaluator.evaluate(
+                    out.bestTeam, out.bestScore.valid ? &out.bestScore : nullptr, &orderedEval, startOrders);
+                if (orderedScore.strictlyBetterThan(out.bestScore))
+                {
+                    out.bestScore = orderedScore;
+                    bestEconEval = std::move(orderedEval);
+                    out.bestFireOrders = startOrders;
+                }
+            }
+        }
 
         const auto trySeed = [&](std::vector<int> candidate, const char * label) {
             if (candidate == out.bestTeam || !allowedByPrior(candidate)) return;
@@ -348,27 +364,30 @@ namespace Coordinator
             const int capRate = hasKnownCapper ? knowledge.units()[static_cast<std::size_t>(ki)].captureRate : 0;
             const bool heavilyDamagedCapper = hasKnownCapper && !friendlyRepairSites.empty() &&
                 (capRate <= 0 || (capPts + capRate - 1) / capRate > fullCapTurns + 1);
-            const std::span<const TilePoint> goals = member.stockRow == NO_STOCK_ROW
-                ? std::span<const TilePoint>(enemyPositions)
-                : (heavilyDamagedCapper
-                       ? std::span<const TilePoint>(friendlyRepairSites)
-                       : (!unownedProps.empty() ? std::span<const TilePoint>(unownedProps)
-                                                : std::span<const TilePoint>(enemyPositions)));
             const auto posRank = [&](int opt) {
                 const auto & c = member.candidates[static_cast<std::size_t>(opt)];
                 const int safeRank = isSafeCand(c) ? 1 : 0;
                 const int offFactory =
                     std::ranges::find(friendlyFactories, c.destination) == friendlyFactories.end() ? 1 : 0;
                 int minDist = 0;
-                if (member.stockRow == NO_STOCK_ROW && !enemyPositions.empty())
+                if (member.stockRow == NO_STOCK_ROW)
+                {
+                    if (!enemyPositions.empty())
+                        minDist = evaluator.enemyPathDistance(ki, c.destination);
+                    else if (!unownedProps.empty())
+                        minDist = evaluator.unownedPropertyPathDistance(ki, c.destination);
+                }
+                else if (heavilyDamagedCapper)
+                {
+                    minDist = evaluator.repairPathDistance(ki, c.destination);
+                }
+                else if (!unownedProps.empty())
+                {
+                    minDist = evaluator.unownedPropertyPathDistance(ki, c.destination);
+                }
+                else if (!enemyPositions.empty())
                 {
                     minDist = evaluator.enemyPathDistance(ki, c.destination);
-                }
-                else if (!goals.empty())
-                {
-                    minDist = std::numeric_limits<int>::max();
-                    for (const TilePoint g : goals)
-                        minDist = std::min(minDist, manhattanDistance(c.destination, g));
                 }
                 const int stars = (local.defense && ki >= 0 && ki < static_cast<int>(local.units.size()))
                     ? local.defense(ki, c.destination).stars : 0;
@@ -386,9 +405,7 @@ namespace Coordinator
                 {
                     const auto & c = member.candidates[static_cast<std::size_t>(opt)];
                     if (!isSafeCand(c)) continue;
-                    int d = std::numeric_limits<int>::max();
-                    for (const TilePoint f : unownedFactories)
-                        d = std::min(d, manhattanDistance(c.destination, f));
+                    const int d = evaluator.unownedFactoryPathDistance(ki, c.destination);
                     if (d < bestFactoryDist)
                     {
                         bestFactoryDist = d;
@@ -439,9 +456,7 @@ namespace Coordinator
                         if (seen[static_cast<std::size_t>(opt)] || isSafeCand(member.candidates[static_cast<std::size_t>(opt)]))
                             continue;
                         const TilePoint dest = member.candidates[static_cast<std::size_t>(opt)].destination;
-                        int d = std::numeric_limits<int>::max();
-                        for (const TilePoint e : enemyPositions)
-                            d = std::min(d, manhattanDistance(dest, e));
+                        const int d = evaluator.enemyPathDistance(ki, dest);
                         if (d < bestForwardDist)
                         {
                             bestForwardDist = d;
@@ -734,10 +749,31 @@ namespace Coordinator
             }
         }
 
+        // Value-kept multi-attacker fire-order pass: refine attack sequence for every focus-fire pair.
+        out.bestFireOrders = evaluator.buildDefaultFireOrders(out.bestTeam);
+        if (!out.bestFireOrders.empty() && work >= replayTariff)
+        {
+            for (std::size_t i = 0; i < out.bestFireOrders.size(); ++i)
+            {
+                if (work < replayTariff) break;
+                std::vector<CombatFireOrder> trialOrders = out.bestFireOrders;
+                std::swap(trialOrders[i].first, trialOrders[i].second);
+                ReplyPassEvaluation econEval;
+                const auto score = evaluator.evaluate(out.bestTeam, &out.bestScore, &econEval, trialOrders);
+                if (score.strictlyBetterThan(out.bestScore))
+                {
+                    out.bestFireOrders = std::move(trialOrders);
+                    out.bestScore = score;
+                    bestEconEval = std::move(econEval);
+                }
+            }
+        }
+
         out.evals = evaluator.evalCount();
         out.pruned = evaluator.prunedCount();
-        out.improved = out.bestTeam != std::vector<int>(startingTeam.begin(), startingTeam.end()) &&
-                       out.bestScore.strictlyBetterThan(out.baselineScore);
+        const bool teamOrOrderChanged = out.bestTeam != std::vector<int>(startingTeam.begin(), startingTeam.end()) ||
+                                        !out.bestFireOrders.empty();
+        out.improved = teamOrOrderChanged && out.bestScore.strictlyBetterThan(out.baselineScore);
         return out;
     }
 }

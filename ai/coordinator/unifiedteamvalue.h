@@ -199,6 +199,8 @@ namespace Coordinator
                     m_unownedProperties.push_back({prop.x, prop.y});
                     if (prop.ownerId == NO_OWNER)
                         m_unownedNeutralProperties.push_back({prop.x, prop.y});
+                    if (prop.canProduce)
+                        m_unownedFactories.push_back({prop.x, prop.y});
                 }
                 if (prop.visible && prop.canProduce && prop.ownerId != NO_OWNER && prop.ownerId != knowledge.observerId())
                     m_enemyFactories.push_back({prop.x, prop.y});
@@ -231,7 +233,12 @@ namespace Coordinator
             {
                 m_deliverableNeutralProperties = m_unownedNeutralProperties;
             }
-            buildCombatPathDistances();
+            buildPathDistances();
+        }
+
+        static int pawnTravelGrid(const CombatPawn & pawn)
+        {
+            return pawn.travelGrid >= 0 ? pawn.travelGrid : pawn.grid;
         }
 
         int enemyPathDistance(int ki, TilePoint dest) const
@@ -240,8 +247,10 @@ namespace Coordinator
                 m_local.width > 0 && m_local.height > 0 &&
                 dest.x >= 0 && dest.x < m_local.width && dest.y >= 0 && dest.y < m_local.height)
             {
-                const int gridId = m_local.units[static_cast<std::size_t>(ki)].grid;
-                if (const auto it = m_enemyPathDistByGrid.find(gridId); it != m_enemyPathDistByGrid.end())
+                const int gridId = pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]);
+                const auto [minR, maxR] = unitAttackRange(ki);
+                if (const auto it = m_enemyPathDistByProfile.find({gridId, minR, maxR});
+                    it != m_enemyPathDistByProfile.end())
                 {
                     const std::size_t idx = static_cast<std::size_t>(dest.y) * static_cast<std::size_t>(m_local.width) +
                         static_cast<std::size_t>(dest.x);
@@ -252,7 +261,46 @@ namespace Coordinator
             int minDist = m_maxDist;
             for (const TilePoint e : m_enemyPositions)
                 minDist = std::min(minDist, manhattanDistance(dest, e));
-            return minDist;
+            return m_maxDist * 2 + minDist;
+        }
+
+        int repairPathDistance(int ki, TilePoint dest) const
+        {
+            return cachedSetPathDistance(m_repairPathDistByGrid, m_friendlyRepairSites, ki, dest);
+        }
+
+        int unownedPropertyPathDistance(int ki, TilePoint dest) const
+        {
+            return cachedSetPathDistance(m_unownedPropPathDistByGrid, m_unownedProperties, ki, dest);
+        }
+
+        int unownedFactoryPathDistance(int ki, TilePoint dest) const
+        {
+            return cachedSetPathDistance(m_unownedFactoryPathDistByGrid, m_unownedFactories, ki, dest);
+        }
+
+        int tilePathDistance(int ki, TilePoint from, TilePoint goal, bool allowAdjacent = false) const
+        {
+            if (from == goal) return 0;
+            const int gridId = (ki >= 0 && ki < static_cast<int>(m_local.units.size()))
+                ? pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]) : -1;
+            if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size()) ||
+                m_local.width <= 0 || m_local.height <= 0 ||
+                from.x < 0 || from.x >= m_local.width || from.y < 0 || from.y >= m_local.height)
+                return manhattanDistance(from, goal);
+            const auto key = std::tuple{gridId, goal.x, goal.y, allowAdjacent};
+            auto it = m_tilePathDistCache.find(key);
+            if (it == m_tilePathDistCache.end())
+            {
+                const int range = allowAdjacent ? 1 : 0;
+                it = m_tilePathDistCache.emplace(
+                    key, buildReversePathDistances(gridId, std::span<const TilePoint>(&goal, 1), range, range)).first;
+            }
+            const std::size_t idx = static_cast<std::size_t>(from.y) * static_cast<std::size_t>(m_local.width) +
+                static_cast<std::size_t>(from.x);
+            if (idx < it->second.size() && it->second[idx] < std::numeric_limits<std::int32_t>::max())
+                return it->second[idx];
+            return m_maxDist * 2 + manhattanDistance(from, goal);
         }
 
         struct TieBreakerScores
@@ -267,9 +315,15 @@ namespace Coordinator
 
         TieBreakerScores computeTieBreakers(std::span<const int> choices) const
         {
+            struct CapperPos
+            {
+                int slot{0};
+                int ki{NO_UNIT};
+                TilePoint dest{INVALID_TILE};
+            };
             std::vector<TilePoint> claimedProperties;
             std::vector<TilePoint> friendlyArmorPositions;
-            std::vector<std::pair<int, TilePoint>> nonCapturingCappers;
+            std::vector<CapperPos> nonCapturingCappers;
             for (const auto & member : m_problem.actors())
             {
                 const int slot = member.canonicalSlot;
@@ -280,7 +334,7 @@ namespace Coordinator
                 if (member.stockRow == NO_STOCK_ROW)
                     friendlyArmorPositions.push_back(cand.destination);
                 else if (!cand.capture.has_value())
-                    nonCapturingCappers.emplace_back(slot, cand.destination);
+                    nonCapturingCappers.push_back({slot, member.knowledgeUnitIndex, cand.destination});
                 if (cand.capture.has_value() ||
                     (member.stockRow != NO_STOCK_ROW &&
                      std::ranges::find(m_unownedProperties, cand.destination) != m_unownedProperties.end()))
@@ -302,7 +356,7 @@ namespace Coordinator
                 for (std::size_t i = 0; i < nonCapturingCappers.size(); ++i)
                 {
                     if (capperAssigned[i] != 0) continue;
-                    const int d = manhattanDistance(nonCapturingCappers[i].second, neutral);
+                    const int d = tilePathDistance(nonCapturingCappers[i].ki, nonCapturingCappers[i].dest, neutral);
                     if (d < bestDist)
                     {
                         bestDist = d;
@@ -312,7 +366,7 @@ namespace Coordinator
                 if (bestIdx >= 0)
                 {
                     capperAssigned[static_cast<std::size_t>(bestIdx)] = 1;
-                    assignedNeutralBySlot.emplace(nonCapturingCappers[static_cast<std::size_t>(bestIdx)].first, neutral);
+                    assignedNeutralBySlot.emplace(nonCapturingCappers[static_cast<std::size_t>(bestIdx)].slot, neutral);
                 }
             }
             TieBreakerScores out;
@@ -327,10 +381,7 @@ namespace Coordinator
                 const auto & cand = member.candidates[static_cast<std::size_t>(opt)];
                 const TilePoint dest = cand.destination;
                 const int ki = member.knowledgeUnitIndex;
-                int minEnemyDist = m_maxDist;
-                for (const TilePoint e : m_enemyPositions)
-                    minEnemyDist = std::min(minEnemyDist, manhattanDistance(dest, e));
-                int minPropDist = m_maxDist;
+                int minPropDist = std::numeric_limits<int>::max();
                 bool foundUnclaimed = false;
                 for (const TilePoint p : m_unownedProperties)
                 {
@@ -338,10 +389,10 @@ namespace Coordinator
                         std::ranges::find(claimedProperties, p) != claimedProperties.end())
                         continue;
                     foundUnclaimed = true;
-                    minPropDist = std::min(minPropDist, manhattanDistance(dest, p));
+                    minPropDist = std::min(minPropDist, tilePathDistance(ki, dest, p));
                 }
                 if (!foundUnclaimed && member.stockRow != NO_STOCK_ROW)
-                    minPropDist = minEnemyDist;
+                    minPropDist = enemyPathDistance(ki, dest);
                 int stars = 0;
                 if (m_local.defense && ki >= 0 && ki < static_cast<int>(m_local.units.size()))
                     stars = m_local.defense(ki, dest).stars;
@@ -349,13 +400,29 @@ namespace Coordinator
                 if (member.stockRow == NO_STOCK_ROW)
                 {
                     const auto & unit = m_knowledge.units()[static_cast<std::size_t>(ki)];
+                    const bool indirect = unit.minRange > 1;
+                    const int maxRange = std::max(1, unit.maxRange);
                     const int pathDist = !m_enemyPositions.empty()
-                        ? std::min(m_maxDist * 2, enemyPathDistance(ki, dest))
-                        : minPropDist;
-                    const int nextTurnThreatReach = unit.movementPoints + std::max(1, unit.maxRange);
-                    if (!m_enemyPositions.empty() && pathDist <= nextTurnThreatReach)
-                        ++out.combatUnitsInThreatRange;
-                    out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                        ? enemyPathDistance(ki, dest)
+                        : unownedPropertyPathDistance(ki, dest);
+                    if (indirect)
+                    {
+                        const bool inFiringRing = !m_enemyPositions.empty() &&
+                            std::ranges::any_of(m_enemyPositions, [&](TilePoint e) {
+                                const int d = manhattanDistance(dest, e);
+                                return d >= unit.minRange && d <= maxRange;
+                            });
+                        if (inFiringRing)
+                            ++out.combatUnitsInThreatRange;
+                        out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                    }
+                    else
+                    {
+                        const int nextTurnThreatReach = unit.movementPoints + maxRange;
+                        if (!m_enemyPositions.empty() && pathDist <= nextTurnThreatReach)
+                            ++out.combatUnitsInThreatRange;
+                        out.stagingScore -= static_cast<std::int64_t>(pathDist);
+                    }
                 }
                 else
                 {
@@ -373,20 +440,17 @@ namespace Coordinator
                     }
                     else if (heavilyDamaged && !m_friendlyRepairSites.empty())
                     {
-                        int minRepairDist = m_maxDist;
-                        for (const TilePoint r : m_friendlyRepairSites)
-                            minRepairDist = std::min(minRepairDist, manhattanDistance(dest, r));
-                        out.stagingScore -= static_cast<std::int64_t>(minRepairDist);
+                        out.stagingScore -= static_cast<std::int64_t>(repairPathDistance(ki, dest));
                     }
                     else if (assignedIt != assignedNeutralBySlot.end())
                     {
-                        out.stagingScore -= static_cast<std::int64_t>(manhattanDistance(dest, assignedIt->second));
+                        out.stagingScore -= static_cast<std::int64_t>(tilePathDistance(ki, dest, assignedIt->second));
                     }
                     else if (isSurplusCapper && !friendlyArmorPositions.empty())
                     {
-                        int minArmorDist = m_maxDist;
+                        int minArmorDist = std::numeric_limits<int>::max();
                         for (const TilePoint a : friendlyArmorPositions)
-                            minArmorDist = std::min(minArmorDist, manhattanDistance(dest, a));
+                            minArmorDist = std::min(minArmorDist, tilePathDistance(ki, dest, a, true));
                         out.stagingScore -= static_cast<std::int64_t>(std::max(2, minArmorDist) + minPropDist);
                     }
                     else
@@ -395,9 +459,9 @@ namespace Coordinator
                     }
                     if (isSurplusCapper)
                     {
-                        for (const auto & [peerSlot, peerPos] : nonCapturingCappers)
+                        for (const auto & peer : nonCapturingCappers)
                         {
-                            if (peerSlot > slot && manhattanDistance(dest, peerPos) == 1)
+                            if (peer.slot > slot && manhattanDistance(dest, peer.dest) == 1)
                                 --out.negativeClumpPairs;
                         }
                     }
@@ -409,10 +473,72 @@ namespace Coordinator
             return out;
         }
 
+        // Orders same-target attackers by counter-capital exposure (zero-counter / indirect first, then lowest counter loss).
+        std::vector<CombatFireOrder> buildDefaultFireOrders(std::span<const int> choices) const
+        {
+            struct AttackerInfo
+            {
+                int unitId{NO_UNIT};
+                MilliFunds counterCapital{0};
+                std::int32_t damageSteps{0};
+            };
+            std::map<int, std::vector<AttackerInfo>> byTarget;
+            for (const auto & member : m_problem.actors())
+            {
+                const int slot = member.canonicalSlot;
+                if (slot < 0 || slot >= static_cast<int>(choices.size())) continue;
+                const int opt = choices[static_cast<std::size_t>(slot)];
+                if (opt < 0 || opt >= static_cast<int>(member.candidates.size())) continue;
+                const auto & cand = member.candidates[static_cast<std::size_t>(opt)];
+                if (cand.targetUnitId == NO_UNIT) continue;
+                const auto * comp = singleComponentOf(cand.source.bundle);
+                MilliFunds counterCap = 0;
+                std::int32_t dmgSteps = 0;
+                if (comp && comp->kind == ComponentKind::Fire)
+                {
+                    dmgSteps = comp->fire.damageSteps;
+                    const bool indirect = member.knowledgeUnitIndex >= 0 &&
+                        member.knowledgeUnitIndex < static_cast<int>(m_knowledge.units().size()) &&
+                        m_knowledge.units()[static_cast<std::size_t>(member.knowledgeUnitIndex)].minRange > 1;
+                    if (!indirect && comp->fire.counterSteps > 0)
+                    {
+                        const MilliFunds cost = member.knowledgeUnitIndex >= 0 &&
+                            member.knowledgeUnitIndex < static_cast<int>(m_local.units.size())
+                            ? m_local.units[static_cast<std::size_t>(member.knowledgeUnitIndex)].replacementCost
+                            : cand.source.actor.replacementCost;
+                        counterCap = bookDamage(cost, comp->fire.counterSteps);
+                    }
+                }
+                byTarget[cand.targetUnitId].push_back({member.engineUnitId, counterCap, dmgSteps});
+            }
+            std::vector<CombatFireOrder> orders;
+            for (auto & [targetId, attackers] : byTarget)
+            {
+                if (attackers.size() < 2) continue;
+                std::stable_sort(attackers.begin(), attackers.end(), [](const AttackerInfo & a, const AttackerInfo & b) {
+                    const bool aDraws = a.counterCapital > 0;
+                    const bool bDraws = b.counterCapital > 0;
+                    if (aDraws != bDraws) return !aDraws;
+                    if (a.counterCapital != b.counterCapital) return a.counterCapital < b.counterCapital;
+                    if (a.damageSteps != b.damageSteps) return a.damageSteps > b.damageSteps;
+                    return a.unitId < b.unitId;
+                });
+                for (std::size_t i = 0; i + 1 < attackers.size(); ++i)
+                    orders.push_back(CombatFireOrder{attackers[i].unitId, attackers[i + 1].unitId});
+            }
+            return orders;
+        }
+
         UnifiedTeamScore evaluate(std::span<const int> choices, const UnifiedTeamScore * pruneFloor = nullptr,
-                                  ReplyPassEvaluation * economicOut = nullptr)
+                                  ReplyPassEvaluation * economicOut = nullptr,
+                                  std::span<const CombatFireOrder> fireOrdersOverride = {},
+                                  bool useDefaultFireOrders = true)
         {
             UnifiedTeamScore summary;
+            const std::vector<CombatFireOrder> defaultOrders = (fireOrdersOverride.empty() && useDefaultFireOrders)
+                ? buildDefaultFireOrders(choices) : std::vector<CombatFireOrder>{};
+            const std::span<const CombatFireOrder> activeFireOrders = !fireOrdersOverride.empty()
+                ? fireOrdersOverride : std::span<const CombatFireOrder>(defaultOrders);
             const TieBreakerScores ties = computeTieBreakers(choices);
             const auto priorPolicy = m_local.policy;
             const int priorTarget = m_local.replyTarget;
@@ -453,7 +579,7 @@ namespace Coordinator
                 ++m_evals;
                 m_local.policy = policy;
                 m_local.replyTarget = targetId;
-                const auto eval = evaluateReplyPassPlan(m_problem, choices, m_actingBoard);
+                const auto eval = evaluateReplyPassPlan(m_problem, choices, m_actingBoard, {}, activeFireOrders);
                 if (!eval.valued() || !eval.replay.valid() || !eval.replay.complete())
                     return UnifiedTeamScore{};
                 if (policy == TacticalReply::Economic && economicOut)
@@ -534,8 +660,9 @@ namespace Coordinator
                 int ki{NO_UNIT};
                 TilePoint pos{INVALID_TILE};
                 double hp{0.0};
-                int reach{0};
+                int moveBudget{0};
                 int strikeRange{1};
+                int maxRange{1};
                 MilliFunds cost{0};
             };
             std::vector<FriendlyCover> coverUnits;
@@ -551,14 +678,14 @@ namespace Coordinator
                     {
                         const auto & knownF = m_knowledge.units()[static_cast<std::size_t>(ki)];
                         const auto & fp = m_local.units[static_cast<std::size_t>(ki)];
-                        const bool indirect = knownF.minRange > 1;
-                        const int maxRange = std::max(1, knownF.maxRange);
-                        const int reach = indirect ? maxRange : (std::max(0, fp.movement) + maxRange);
+                        const int minR = std::max(1, knownF.minRange);
+                        const int maxR = std::max(1, knownF.maxRange);
+                        const int moveB = minR > 1 ? 0 : std::max(0, fp.movement);
                         double hpF = static_cast<double>(actor.stepsAfterReply);
                         if (const auto it = eval.realAfterReply.find(ki); it != eval.realAfterReply.end())
                             hpF = it->second;
-                        if (reach > 0 && hpF > 0.0)
-                            coverUnits.push_back({ki, cand.destination, hpF, reach, std::max(1, knownF.minRange), fp.replacementCost});
+                        if (hpF > 0.0)
+                            coverUnits.push_back({ki, cand.destination, hpF, moveB, minR, maxR, fp.replacementCost});
                     }
                     continue;
                 }
@@ -584,8 +711,9 @@ namespace Coordinator
                 int ki{NO_UNIT};
                 TilePoint pos{INVALID_TILE};
                 double hp{0.0};
-                int reach{0};
+                int moveBudget{0};
                 int strikeRange{1};
+                int maxRange{1};
                 MilliFunds cost{0};
             };
             std::vector<Defender> defenders;
@@ -606,12 +734,11 @@ namespace Coordinator
                     continue;
                 }
                 const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
-                const bool indirect = knownE.minRange > 1;
-                const int maxRange = std::max(1, knownE.maxRange);
-                const int reach = indirect ? maxRange : (std::max(0, ep.movement) + maxRange);
-                if (reach <= 0) continue;
+                const int minR = std::max(1, knownE.minRange);
+                const int maxR = std::max(1, knownE.maxRange);
+                const int moveB = minR > 1 ? 0 : std::max(0, ep.movement);
                 // Keep pre-E0 position and initial HP for surviving defenders to avoid E0 lure and chip cliffs.
-                defenders.push_back({e, ep.tile, initialHp, reach, std::max(1, knownE.minRange), ep.replacementCost});
+                defenders.push_back({e, ep.tile, initialHp, moveB, minR, maxR, ep.replacementCost});
             }
             for (std::size_t n = 0; n < nodeCount; ++n)
             {
@@ -638,9 +765,10 @@ namespace Coordinator
                     ? m_local.defense(m_sampleCapperKi, tile) : TerrainDefenseRule{};
                 for (const auto & d : defenders)
                 {
-                    if (manhattanDistance(d.pos, tile) > d.reach) continue;
+                    if (!canUnitReachAttack(d.ki, d.pos, tile, d.moveBudget, d.strikeRange, d.maxRange)) continue;
                     const bool coveredByFriendlyArmor = std::ranges::any_of(coverUnits, [&](const FriendlyCover & fc) {
-                        if (manhattanDistance(fc.pos, tile) > fc.reach) return false;
+                        if (!canUnitReachAttack(fc.ki, fc.pos, tile, fc.moveBudget, fc.strikeRange, fc.maxRange))
+                            return false;
                         const double coverBase = maxWeaponBaseDamage(fc.ki, d.ki, fc.strikeRange);
                         if (coverBase <= 0.0) return false;
                         const TerrainDefenseRule dDef = m_local.defense
@@ -772,8 +900,9 @@ namespace Coordinator
                 int ki{NO_UNIT};
                 TilePoint pos{INVALID_TILE};
                 double hp{0.0};
-                int reach{0};
+                int moveBudget{0};
                 int strikeRange{1};
+                int maxRange{1};
             };
             std::vector<EscapeVictim> victims;
             std::vector<FriendlyCoverUnit> friendlyCover;
@@ -794,11 +923,10 @@ namespace Coordinator
                 if (hp <= 0.0) continue;
                 if (member.stockRow == NO_STOCK_ROW)
                 {
-                    const bool indirect = knownF.minRange > 1;
-                    const int reach = indirect ? std::max(1, knownF.maxRange)
-                                               : (std::max(0, fp.movement) + std::max(1, knownF.maxRange));
-                    if (reach > 0)
-                        friendlyCover.push_back({ki, cand.destination, hp, reach, std::max(1, knownF.minRange)});
+                    const int minR = std::max(1, knownF.minRange);
+                    const int maxR = std::max(1, knownF.maxRange);
+                    const int moveB = minR > 1 ? 0 : std::max(0, fp.movement);
+                    friendlyCover.push_back({ki, cand.destination, hp, moveB, minR, maxR});
                 }
                 const int initialSteps = knownF.hpRounded;
                 if (actor.stepsAfterReply < initialSteps)
@@ -822,9 +950,10 @@ namespace Coordinator
                 int ki{NO_UNIT};
                 TilePoint pos{INVALID_TILE};
                 double hp{0.0};
-                int damagedReach{0};
-                int oneTurnReach{0};
+                int damagedMove{0};
+                int oneTurnMove{0};
                 int strikeRange{1};
+                int maxRange{1};
                 bool capper{false};
                 MilliFunds cost{0};
             };
@@ -851,16 +980,13 @@ namespace Coordinator
                     : ep.tile;
                 enemyTiles.push_back(posE);
                 const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
-                const bool indirect = knownE.minRange > 1;
-                const int maxRange = std::max(1, knownE.maxRange);
+                const int minR = std::max(1, knownE.minRange);
+                const int maxR = std::max(1, knownE.maxRange);
                 const int moveE = std::max(0, ep.movement);
                 const int followupMoves = (!firedE0 && !ep.capper) ? UNIFIED_TRAP_FOLLOWUP_TURNS : 1;
-                const int damagedReach = indirect
-                    ? (firedE0 ? maxRange : moveE + maxRange)
-                    : (followupMoves * moveE + maxRange);
-                const int oneTurnReach = indirect ? maxRange : (moveE + maxRange);
-                if (damagedReach <= 0) continue;
-                threats.push_back({e, posE, hpE, damagedReach, oneTurnReach, std::max(1, knownE.minRange),
+                const int damagedMove = minR > 1 ? (firedE0 ? 0 : moveE) : (followupMoves * moveE);
+                const int oneTurnMove = minR > 1 ? 0 : moveE;
+                threats.push_back({e, posE, hpE, damagedMove, oneTurnMove, minR, maxR,
                                    ep.capper, ep.replacementCost});
             }
             if (threats.empty()) return 0;
@@ -882,9 +1008,10 @@ namespace Coordinator
             for (const auto & v : victims)
             {
                 const auto & pawn = m_local.units[static_cast<std::size_t>(v.ki)];
-                if (pawn.grid < 0 || pawn.grid >= static_cast<int>(m_local.grids.size()) || pawn.movement <= 0)
+                const int gridId = pawnTravelGrid(pawn);
+                if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size()) || pawn.movement <= 0)
                     continue;
-                const auto & grid = m_local.grids[static_cast<std::size_t>(pawn.grid)];
+                const auto & grid = m_local.grids[static_cast<std::size_t>(gridId)];
                 if (!grid.onGrid(v.tile.x, v.tile.y)) continue;
 
                 std::vector<std::int32_t> dist(cellCount, std::numeric_limits<std::int32_t>::max());
@@ -927,7 +1054,8 @@ namespace Coordinator
                     if (!v.damaged)
                     {
                         const bool coveredByFriendly = std::ranges::any_of(friendlyCover, [&](const FriendlyCoverUnit & fc) {
-                            return fc.ki != v.ki && manhattanDistance(fc.pos, q) <= fc.reach;
+                            return fc.ki != v.ki &&
+                                canUnitReachAttack(fc.ki, fc.pos, q, fc.moveBudget, fc.strikeRange, fc.maxRange);
                         });
                         if (coveredByFriendly)
                         {
@@ -949,8 +1077,8 @@ namespace Coordinator
                     bool hasCombatUnitThreat = false;
                     for (const auto & th : threats)
                     {
-                        const int reach = v.damaged ? th.damagedReach : th.oneTurnReach;
-                        if (manhattanDistance(th.pos, q) > reach) continue;
+                        const int moveB = v.damaged ? th.damagedMove : th.oneTurnMove;
+                        if (!canUnitReachAttack(th.ki, th.pos, q, moveB, th.strikeRange, th.maxRange)) continue;
                         const double baseDmg = maxWeaponBaseDamage(th.ki, v.ki, th.strikeRange);
                         if (baseDmg <= 0.0) continue;
                         if (!th.capper) hasCombatUnitThreat = true;
@@ -1125,7 +1253,7 @@ namespace Coordinator
             }
             MilliFunds total = std::max(killedStockLoss, killedInterruptFloor);
             RelativeStockDetail::checkedAdd(total, woundedInterruptCredit);
-            // Credit exact expansion/capture turns lost when an enemy capper spends E0 shooting instead of capturing.
+            // Credit exact capture delay + counter-damage slowdown when an active enemy capper shoots on E0.
             std::vector<std::uint8_t> replyShooterSeen(m_local.units.size(), 0);
             for (const ReplyPassShot & shot : eval.shots)
             {
@@ -1138,103 +1266,245 @@ namespace Coordinator
                 const auto & ep = m_local.units[static_cast<std::size_t>(e)];
                 if (!ep.present || !ep.enemy || !ep.capper) continue;
                 const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
-                if (knownE.captureRate <= 0) continue;
-                if (knownE.capturePoints > 0)
+                if (knownE.captureRate <= 0 || knownE.capturePoints <= 0) continue;
+                const TilePoint shotPos = (e < static_cast<int>(eval.combatLocations.size()) &&
+                                           eval.combatLocations[static_cast<std::size_t>(e)] != INVALID_TILE)
+                    ? eval.combatLocations[static_cast<std::size_t>(e)]
+                    : ep.tile;
+                const auto replyHpIt = eval.enemyReplyHp.find(e);
+                const double afterHp = replyHpIt != eval.enemyReplyHp.end()
+                    ? static_cast<double>(replyHpIt->second)
+                    : static_cast<double>(knownE.hpRounded);
+                if (shotPos != ep.tile)
                 {
                     const auto abandoned = openRefinementCaptureInterruptCredit(
                         m_knowledge, m_stockField, m_properties, e, 0.0);
                     RelativeStockDetail::checkedAdd(total, boundedKillInterruptCredit(e, abandoned));
                 }
-                else if (!m_unownedNeutralProperties.empty() &&
-                         (capPts + knownE.captureRate - 1) / knownE.captureRate <= horizon)
+                else
                 {
-                    int lostTurns = 1;
-                    if (const auto it = eval.enemyReplyHp.find(e); it != eval.enemyReplyHp.end())
+                    // Shooting in place preserves progress but skips this turn's capture step.
+                    RelativeStockDetail::checkedAdd(total, UNIFIED_NEUTRAL_PROPERTY_INCOME);
+                    const auto wounded = openRefinementCaptureInterruptCredit(
+                        m_knowledge, m_stockField, m_properties, e, afterHp);
+                    RelativeStockDetail::checkedAdd(total, wounded.delayCredit);
+                }
+                if (!m_unownedNeutralProperties.empty() && replyHpIt != eval.enemyReplyHp.end())
+                {
+                    const int afterSteps = ceilHpSteps(afterHp);
+                    const int beforeRate = knownE.captureRate;
+                    const int afterRate = replyCaptureRate(
+                        beforeRate, std::max(0, knownE.hpRounded - afterSteps), afterSteps <= 0);
+                    const int beforeCapTurns = (capPts + beforeRate - 1) / beforeRate;
+                    const int slowdownTurns = afterRate <= 0
+                        ? horizon
+                        : std::max(0, (capPts + afterRate - 1) / afterRate - beforeCapTurns);
+                    if (slowdownTurns > 0)
                     {
-                        const int afterSteps = ceilHpSteps(static_cast<double>(it->second));
-                        const int beforeRate = knownE.captureRate;
-                        const int afterRate = replyCaptureRate(
-                            beforeRate, std::max(0, knownE.hpRounded - afterSteps), afterSteps <= 0);
-                        const int beforeCapTurns = (capPts + beforeRate - 1) / beforeRate;
-                        if (afterRate <= 0)
-                            lostTurns = horizon;
-                        else
+                        int maxDelay = horizon;
+                        if (!m_enemyFactories.empty())
                         {
-                            const int afterCapTurns = (capPts + afterRate - 1) / afterRate;
-                            lostTurns += std::max(0, afterCapTurns - beforeCapTurns);
+                            const int moveE = std::max(1, knownE.movementPoints);
+                            int minDist = m_maxDist;
+                            for (const TilePoint f : m_enemyFactories)
+                                minDist = std::min(minDist, manhattanDistance({knownE.x, knownE.y}, f));
+                            maxDelay = std::min(horizon, 1 + (minDist + moveE - 1) / moveE);
                         }
+                        RelativeStockDetail::checkedAdd(
+                            total, static_cast<MilliFunds>(std::min(maxDelay, slowdownTurns)) *
+                                UNIFIED_NEUTRAL_PROPERTY_INCOME);
                     }
-                    int maxDelay = horizon;
-                    if (!m_enemyFactories.empty())
-                    {
-                        const int moveE = std::max(1, knownE.movementPoints);
-                        int minDist = m_maxDist;
-                        for (const TilePoint f : m_enemyFactories)
-                            minDist = std::min(minDist, manhattanDistance({knownE.x, knownE.y}, f));
-                        maxDelay = std::min(horizon, 1 + (minDist + moveE - 1) / moveE);
-                    }
-                    RelativeStockDetail::checkedAdd(
-                        total, static_cast<MilliFunds>(std::min(maxDelay, lostTurns)) * UNIFIED_NEUTRAL_PROPERTY_INCOME);
                 }
             }
             return total;
         }
 
-        void buildCombatPathDistances()
+        std::pair<int, int> unitAttackRange(int ki) const
         {
-            if (m_local.width <= 0 || m_local.height <= 0 || m_enemyPositions.empty())
-                return;
+            if (ki >= 0 && ki < static_cast<int>(m_knowledge.units().size()))
+            {
+                const auto & known = m_knowledge.units()[static_cast<std::size_t>(ki)];
+                return {std::max(1, known.minRange), std::max(1, known.maxRange)};
+            }
+            return {1, 1};
+        }
+
+        static bool tileEnterable(const MobilityCostGrid & grid, TilePoint t)
+        {
+            if (!grid.onGrid(t.x, t.y)) return false;
+            for (const EntryDirection dir : ENTRY_DIRECTIONS)
+            {
+                if (grid.cost(t.x, t.y, dir) != IMPASSABLE_COST)
+                    return true;
+            }
+            return false;
+        }
+
+        std::vector<std::int32_t> buildReversePathDistances(
+            int gridId, std::span<const TilePoint> targets, int minRange = 0, int maxRange = 0) const
+        {
             const std::size_t cellCount = static_cast<std::size_t>(m_local.width) * static_cast<std::size_t>(m_local.height);
+            std::vector<std::int32_t> dist(cellCount, std::numeric_limits<std::int32_t>::max());
+            if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size()) || targets.empty())
+                return dist;
+            const auto & grid = m_local.grids[static_cast<std::size_t>(gridId)];
             const auto idxOf = [&](TilePoint t) {
                 return static_cast<std::size_t>(t.y) * static_cast<std::size_t>(m_local.width) + static_cast<std::size_t>(t.x);
             };
-            for (const auto & pawn : m_local.units)
+            using Node = std::pair<std::int32_t, TilePoint>;
+            const auto cmp = [](const Node & a, const Node & b) { return a.first > b.first; };
+            std::priority_queue<Node, std::vector<Node>, decltype(cmp)> pq(cmp);
+            for (const TilePoint t : targets)
             {
-                if (!pawn.present || pawn.enemy || pawn.capper) continue;
-                if (pawn.grid < 0 || pawn.grid >= static_cast<int>(m_local.grids.size())) continue;
-                if (m_enemyPathDistByGrid.contains(pawn.grid)) continue;
-                const auto & grid = m_local.grids[static_cast<std::size_t>(pawn.grid)];
-                std::vector<std::int32_t> dist(cellCount, std::numeric_limits<std::int32_t>::max());
-                using Node = std::pair<std::int32_t, TilePoint>;
-                const auto cmp = [](const Node & a, const Node & b) { return a.first > b.first; };
-                std::priority_queue<Node, std::vector<Node>, decltype(cmp)> pq(cmp);
-                for (const TilePoint e : m_enemyPositions)
+                if (!grid.onGrid(t.x, t.y)) continue;
+                if (minRange > 1)
                 {
-                    if (!grid.onGrid(e.x, e.y)) continue;
-                    dist[idxOf(e)] = 0;
-                    pq.push({0, e});
-                    for (const EntryDirection dir : ENTRY_DIRECTIONS)
+                    const int x0 = std::max(0, t.x - maxRange);
+                    const int x1 = std::min(m_local.width - 1, t.x + maxRange);
+                    const int y0 = std::max(0, t.y - maxRange);
+                    const int y1 = std::min(m_local.height - 1, t.y + maxRange);
+                    for (int y = y0; y <= y1; ++y)
                     {
-                        const StepVector step = entryStep(dir);
-                        const TilePoint adj{e.x + step.dx, e.y + step.dy};
-                        if (grid.onGrid(adj.x, adj.y) && dist[idxOf(adj)] > 1)
+                        for (int x = x0; x <= x1; ++x)
                         {
-                            dist[idxOf(adj)] = 1;
-                            pq.push({1, adj});
+                            const TilePoint p{x, y};
+                            const int d = manhattanDistance(p, t);
+                            if (d < minRange || d > maxRange || !tileEnterable(grid, p)) continue;
+                            if (dist[idxOf(p)] > 0)
+                            {
+                                dist[idxOf(p)] = 0;
+                                pq.push({0, p});
+                            }
                         }
                     }
                 }
-                while (!pq.empty())
+                else
                 {
-                    const auto [d, cur] = pq.top();
-                    pq.pop();
-                    if (d > dist[idxOf(cur)]) continue;
-                    for (const EntryDirection dir : ENTRY_DIRECTIONS)
+                    if (minRange == 0 || tileEnterable(grid, t))
                     {
-                        const StepVector step = entryStep(dir);
-                        const TilePoint prev{cur.x - step.dx, cur.y - step.dy};
-                        if (!grid.onGrid(prev.x, prev.y)) continue;
-                        const std::int32_t c = grid.cost(cur.x, cur.y, dir);
-                        if (c == IMPASSABLE_COST) continue;
-                        const std::int32_t nd = d + c;
-                        if (nd < dist[idxOf(prev)])
+                        if (dist[idxOf(t)] > 0)
                         {
-                            dist[idxOf(prev)] = nd;
-                            pq.push({nd, prev});
+                            dist[idxOf(t)] = 0;
+                            pq.push({0, t});
+                        }
+                    }
+                    if (maxRange >= 1)
+                    {
+                        for (const EntryDirection dir : ENTRY_DIRECTIONS)
+                        {
+                            const StepVector step = entryStep(dir);
+                            const TilePoint adj{t.x + step.dx, t.y + step.dy};
+                            if (tileEnterable(grid, adj) && dist[idxOf(adj)] > 1)
+                            {
+                                dist[idxOf(adj)] = 1;
+                                pq.push({1, adj});
+                            }
                         }
                     }
                 }
-                m_enemyPathDistByGrid.emplace(pawn.grid, std::move(dist));
+            }
+            while (!pq.empty())
+            {
+                const auto [d, cur] = pq.top();
+                pq.pop();
+                if (d > dist[idxOf(cur)]) continue;
+                for (const EntryDirection dir : ENTRY_DIRECTIONS)
+                {
+                    const StepVector step = entryStep(dir);
+                    const TilePoint prev{cur.x - step.dx, cur.y - step.dy};
+                    if (!grid.onGrid(prev.x, prev.y)) continue;
+                    const std::int32_t c = grid.cost(cur.x, cur.y, dir);
+                    if (c == IMPASSABLE_COST) continue;
+                    const std::int32_t nd = d + c;
+                    if (nd < dist[idxOf(prev)])
+                    {
+                        dist[idxOf(prev)] = nd;
+                        pq.push({nd, prev});
+                    }
+                }
+            }
+            return dist;
+        }
+
+        int cachedSetPathDistance(const std::map<int, std::vector<std::int32_t>> & table,
+                                  std::span<const TilePoint> fallbackTargets, int ki, TilePoint dest) const
+        {
+            if (ki >= 0 && ki < static_cast<int>(m_local.units.size()) &&
+                m_local.width > 0 && m_local.height > 0 &&
+                dest.x >= 0 && dest.x < m_local.width && dest.y >= 0 && dest.y < m_local.height)
+            {
+                const int gridId = pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]);
+                if (const auto it = table.find(gridId); it != table.end())
+                {
+                    const std::size_t idx = static_cast<std::size_t>(dest.y) * static_cast<std::size_t>(m_local.width) +
+                        static_cast<std::size_t>(dest.x);
+                    if (idx < it->second.size() && it->second[idx] < std::numeric_limits<std::int32_t>::max())
+                        return it->second[idx];
+                }
+            }
+            int minDist = m_maxDist;
+            for (const TilePoint g : fallbackTargets)
+                minDist = std::min(minDist, manhattanDistance(dest, g));
+            return m_maxDist * 2 + minDist;
+        }
+
+        bool canUnitReachAttack(int ki, TilePoint from, TilePoint target, int moveBudget,
+                                int minRange, int maxRange) const
+        {
+            const int manh = manhattanDistance(from, target);
+            if (minRange > 1)
+            {
+                if (manh >= minRange && manh <= maxRange) return true;
+                if (moveBudget <= 0 || manh > moveBudget + maxRange) return false;
+                const int gridId = (ki >= 0 && ki < static_cast<int>(m_local.units.size()))
+                    ? pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]) : -1;
+                if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size()) ||
+                    m_local.width <= 0 || m_local.height <= 0 ||
+                    from.x < 0 || from.x >= m_local.width || from.y < 0 || from.y >= m_local.height)
+                    return manh <= moveBudget + maxRange;
+                const auto key = std::tuple{gridId, target.x, target.y, minRange, maxRange};
+                auto it = m_indirectTilePathCache.find(key);
+                if (it == m_indirectTilePathCache.end())
+                {
+                    it = m_indirectTilePathCache.emplace(
+                        key, buildReversePathDistances(gridId, std::span<const TilePoint>(&target, 1), minRange, maxRange)).first;
+                }
+                const std::size_t idx = static_cast<std::size_t>(from.y) * static_cast<std::size_t>(m_local.width) +
+                    static_cast<std::size_t>(from.x);
+                return idx < it->second.size() && it->second[idx] <= moveBudget;
+            }
+            if (manh > moveBudget + maxRange) return false;
+            const int gridId = (ki >= 0 && ki < static_cast<int>(m_local.units.size()))
+                ? pawnTravelGrid(m_local.units[static_cast<std::size_t>(ki)]) : -1;
+            if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size()))
+                return manh <= moveBudget + maxRange;
+            return tilePathDistance(ki, from, target, true) <= moveBudget + maxRange;
+        }
+
+        void buildPathDistances()
+        {
+            if (m_local.width <= 0 || m_local.height <= 0)
+                return;
+            for (int ki = 0; ki < static_cast<int>(m_local.units.size()); ++ki)
+            {
+                const auto & pawn = m_local.units[static_cast<std::size_t>(ki)];
+                if (!pawn.present || pawn.enemy) continue;
+                const int gridId = pawnTravelGrid(pawn);
+                if (gridId < 0 || gridId >= static_cast<int>(m_local.grids.size())) continue;
+                if (!m_enemyPositions.empty())
+                {
+                    const auto [minR, maxR] = unitAttackRange(ki);
+                    const auto profKey = std::tuple{gridId, minR, maxR};
+                    if (!m_enemyPathDistByProfile.contains(profKey))
+                        m_enemyPathDistByProfile.emplace(
+                            profKey, buildReversePathDistances(gridId, m_enemyPositions, minR, maxR));
+                }
+                if (!m_friendlyRepairSites.empty() && !m_repairPathDistByGrid.contains(gridId))
+                    m_repairPathDistByGrid.emplace(gridId, buildReversePathDistances(gridId, m_friendlyRepairSites));
+                if (!m_unownedProperties.empty() && !m_unownedPropPathDistByGrid.contains(gridId))
+                    m_unownedPropPathDistByGrid.emplace(gridId, buildReversePathDistances(gridId, m_unownedProperties));
+                if (!m_unownedFactories.empty() && !m_unownedFactoryPathDistByGrid.contains(gridId))
+                    m_unownedFactoryPathDistByGrid.emplace(gridId, buildReversePathDistances(gridId, m_unownedFactories));
             }
         }
 
@@ -1253,8 +1523,9 @@ namespace Coordinator
                 int ki{NO_UNIT};
                 TilePoint pos{INVALID_TILE};
                 double hp{0.0};
-                int reach{0};
+                int moveBudget{0};
                 int strikeRange{1};
+                int maxRange{1};
             };
             std::vector<TilePoint> friendlyOccupied;
             std::vector<FriendlyResponder> responders;
@@ -1267,11 +1538,10 @@ namespace Coordinator
                     return;
                 const auto & fp = m_local.units[static_cast<std::size_t>(ki)];
                 const auto & knownF = m_knowledge.units()[static_cast<std::size_t>(ki)];
-                const bool indirect = knownF.minRange > 1;
-                const int maxRange = std::max(1, knownF.maxRange);
-                const int reach = indirect ? maxRange : (std::max(0, fp.movement) + maxRange);
-                if (reach > 0)
-                    responders.push_back({ki, pos, hpF, reach, std::max(1, knownF.minRange)});
+                const int minR = std::max(1, knownF.minRange);
+                const int maxR = std::max(1, knownF.maxRange);
+                const int moveB = minR > 1 ? 0 : std::max(0, fp.movement);
+                responders.push_back({ki, pos, hpF, moveB, minR, maxR});
             };
             for (const auto & actor : eval.actors)
             {
@@ -1330,7 +1600,7 @@ namespace Coordinator
                 const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
                 const int rateE = replyCaptureRate(knownE.captureRate, std::max(0, knownE.hpRounded - stepsE), false);
                 if (rateE <= 0 || rateE * 2 < capPts) continue;
-                enemyCappers.push_back({e, ep.tile, hpE, stepsE, rateE, ep.movement, ep.grid});
+                enemyCappers.push_back({e, ep.tile, hpE, stepsE, rateE, ep.movement, pawnTravelGrid(ep)});
             }
             if (enemyCappers.empty()) return {true, 0};
 
@@ -1402,7 +1672,8 @@ namespace Coordinator
                 bool canInterrupt = false;
                 for (const auto & fr : responders)
                 {
-                    if (manhattanDistance(fr.pos, prop.tile) > fr.reach) continue;
+                    if (!canUnitReachAttack(fr.ki, fr.pos, prop.tile, fr.moveBudget, fr.strikeRange, fr.maxRange))
+                        continue;
                     const double baseDmg = maxWeaponBaseDamage(fr.ki, strongestThreat->ki, fr.strikeRange);
                     if (baseDmg <= 0.0) continue;
                     const double hit = engineShotDamage(terrainReducedDamage(
@@ -1461,11 +1732,17 @@ namespace Coordinator
         std::vector<TilePoint> m_enemyPositions;
         std::vector<TilePoint> m_unownedProperties;
         std::vector<TilePoint> m_unownedNeutralProperties;
+        std::vector<TilePoint> m_unownedFactories;
         std::vector<TilePoint> m_deliverableNeutralProperties;
         std::vector<TilePoint> m_enemyFactories;
         std::vector<TilePoint> m_friendlyRepairSites;
         std::vector<OwnCapturableProperty> m_ownCapturableProperties;
-        std::map<int, std::vector<std::int32_t>> m_enemyPathDistByGrid;
+        std::map<std::tuple<int, int, int>, std::vector<std::int32_t>> m_enemyPathDistByProfile;
+        std::map<int, std::vector<std::int32_t>> m_repairPathDistByGrid;
+        std::map<int, std::vector<std::int32_t>> m_unownedPropPathDistByGrid;
+        std::map<int, std::vector<std::int32_t>> m_unownedFactoryPathDistByGrid;
+        mutable std::map<std::tuple<int, int, int, bool>, std::vector<std::int32_t>> m_tilePathDistCache;
+        mutable std::map<std::tuple<int, int, int, int, int>, std::vector<std::int32_t>> m_indirectTilePathCache;
         std::map<std::pair<ContinuationKey, std::vector<std::uint8_t>>, MilliFunds> m_seqStockCache;
         int m_evals{0};
         int m_pruned{0};

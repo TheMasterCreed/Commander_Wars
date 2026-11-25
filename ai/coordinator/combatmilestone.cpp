@@ -7171,7 +7171,7 @@ namespace Coordinator
                             local->containFrom=INVALID_TILE;
                             local->workLeft=&finalWork;
                             // Replay directly without Counterpoint buyer preview, which rejects newly captured factories.
-                            const auto finalTeam=evaluateReplyPassPlan(problem,search.bestTeam,actingBoard,{});
+                            const auto finalTeam=evaluateReplyPassPlan(problem,search.bestTeam,actingBoard,{},search.bestFireOrders);
                             const bool teamOk=finalTeam.valued() && finalTeam.replay.valid() && finalTeam.replay.complete();
                             const auto mismatch=std::mismatch(search.bestTeam.begin(),search.bestTeam.end(),effectiveChoices.begin());
                             const int changedSlot=mismatch.first==search.bestTeam.end()?NO_REPLY_PASS_ACTOR:static_cast<int>(mismatch.first-search.bestTeam.begin());
@@ -7189,7 +7189,9 @@ namespace Coordinator
                                 const QJsonObject boundaryReceipt{{"purchaseBoundary",QJsonObject{
                                     {"openAffordableSites",available},{"spendableFunds",qint64(purchaseWindow.treasury)},
                                     {"affordableBuildSlots",count}}}};
-                                const auto physicalTeam=bindPhysicalTeam(finalTeam,{},boundaryReceipt);
+                                const CombatFireOrder primaryFireOrder = search.bestFireOrders.empty()
+                                    ? CombatFireOrder{} : search.bestFireOrders.front();
+                                const auto physicalTeam=bindPhysicalTeam(finalTeam,primaryFireOrder,boundaryReceipt);
                                 assignment=std::move(nextAssignment);
                                 QJsonArray chosen;for(int c:search.bestTeam)chosen.append(c);
                                 unifiedReceipt["status"]="OPEN_TACTICAL_REFINEMENT";
