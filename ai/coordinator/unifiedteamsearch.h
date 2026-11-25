@@ -16,7 +16,6 @@ namespace Coordinator
     inline constexpr int UNIFIED_EVALS_PER_ACTOR = 60;
     inline constexpr int UNIFIED_PAIR_PASS_EVAL_RESERVE = 300;
     inline constexpr std::int64_t UNIFIED_PAIR_PASS_WORK_RESERVE = 40'000'000;
-    inline constexpr int UNIFIED_DAMAGED_CAPPER_HP = 5;
     inline constexpr std::size_t UNIFIED_MAX_FIRE_CANDIDATES = 8;
     inline constexpr std::size_t UNIFIED_MAX_POSITIONAL_CANDIDATES = 8;
     inline constexpr std::size_t UNIFIED_TIGHT_FIRE_CANDIDATES = 4;
@@ -266,9 +265,7 @@ namespace Coordinator
                     member.knowledgeUnitIndex < static_cast<int>(knowledge.units().size());
                 const bool hasProgress = hasKnown &&
                     knowledge.units()[static_cast<std::size_t>(member.knowledgeUnitIndex)].capturePoints > 0;
-                const bool damagedOnProp = hasProgress &&
-                    knowledge.units()[static_cast<std::size_t>(member.knowledgeUnitIndex)].hpRounded < UNIFIED_DAMAGED_CAPPER_HP;
-                if (damagedOnProp || hasProgress) return 0;
+                if (hasProgress) return 0;
                 return 2;
             }
             const bool exposedNow = curOpt >= 0 && curOpt < static_cast<int>(member.candidates.size()) &&
@@ -344,10 +341,13 @@ namespace Coordinator
                 addOpt(fires[i]);
 
             const int ki = member.knowledgeUnitIndex;
-            const bool heavilyDamagedCapper = member.stockRow != NO_STOCK_ROW && ki >= 0 &&
-                ki < static_cast<int>(knowledge.units().size()) &&
-                knowledge.units()[static_cast<std::size_t>(ki)].hpRounded <= UNIFIED_CRIPPLED_UNIT_HP &&
-                !friendlyRepairSites.empty();
+            const int capPts = field.capturePointsToCapture();
+            const int fullCapTurns = (capPts + UNIT_HP_STEPS - 1) / UNIT_HP_STEPS;
+            const bool hasKnownCapper = member.stockRow != NO_STOCK_ROW && ki >= 0 &&
+                ki < static_cast<int>(knowledge.units().size());
+            const int capRate = hasKnownCapper ? knowledge.units()[static_cast<std::size_t>(ki)].captureRate : 0;
+            const bool heavilyDamagedCapper = hasKnownCapper && !friendlyRepairSites.empty() &&
+                (capRate <= 0 || (capPts + capRate - 1) / capRate > fullCapTurns + 1);
             const std::span<const TilePoint> goals = member.stockRow == NO_STOCK_ROW
                 ? std::span<const TilePoint>(enemyPositions)
                 : (heavilyDamagedCapper
@@ -542,13 +542,18 @@ namespace Coordinator
                         continue;
                     partnerOpts.push_back(optB);
                 }
-                const auto isSafeB = [&](int optB) {
-                    return isSafeCand(actorB.candidates[static_cast<std::size_t>(optB)]);
+                const auto partnerRankB = [&](int optB) {
+                    const auto & cb = actorB.candidates[static_cast<std::size_t>(optB)];
+                    const int safe = isSafeCand(cb) ? 1 : 0;
+                    const int offFactory =
+                        std::ranges::find(friendlyFactories, cb.destination) == friendlyFactories.end() ? 1 : 0;
+                    return std::pair{safe, offFactory};
                 };
                 std::stable_sort(partnerOpts.begin(), partnerOpts.end(), [&](int a, int b) {
-                    return isSafeB(a) > isSafeB(b);
+                    return partnerRankB(a) > partnerRankB(b);
                 });
                 std::size_t triedB = 0;
+                bool improvedPair = false;
                 for (const int optB : partnerOpts)
                 {
                     if (triedB >= UNIFIED_VACATE_PARTNER_LIMIT ||
@@ -566,10 +571,11 @@ namespace Coordinator
                         out.bestTeam = std::move(trial);
                         out.bestScore = score;
                         bestEconEval = std::move(econEval);
-                        ++out.pairImprovements;
-                        break;
+                        improvedPair = true;
                     }
                 }
+                if (improvedPair)
+                    ++out.pairImprovements;
             }
         }
 
@@ -717,6 +723,7 @@ namespace Coordinator
                 ReplyPassEvaluation econEval;
                 const auto score = evaluator.evaluate(trial, nullptr, &econEval);
                 if (score.valid && score.worstHqRank >= out.bestScore.worstHqRank &&
+                    score.hqCaptureStartSafe >= out.bestScore.hqCaptureStartSafe &&
                     score.worstEconomicValue >= out.bestScore.worstEconomicValue)
                 {
                     out.bestTeam = std::move(trial);

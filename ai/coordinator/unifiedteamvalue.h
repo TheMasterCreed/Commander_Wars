@@ -17,35 +17,21 @@
 
 namespace Coordinator
 {
+    // Temporary production placeholders until Unified Production replaces them with exact build valuation.
     inline constexpr MilliFunds UNIFIED_FACTORY_SLOT_VALUE = 1'500'000;
+    inline constexpr std::int32_t UNIFIED_FACTORY_COUNTER_REACH = 6;
+    inline constexpr MilliFunds UNIFIED_FACTORY_COUNTER_COST = 16'000'000;
+    inline constexpr double UNIFIED_FACTORY_COUNTER_BASE_DAMAGE = 55.0;
+    inline constexpr double UNIFIED_FACTORY_COUNTER_RETURN_DAMAGE = 35.0;
+
+    // Exact game rules and search work budgets.
     inline constexpr MilliFunds UNIFIED_NEUTRAL_PROPERTY_INCOME = 1'000'000;
     inline constexpr std::int64_t UNIFIED_SEARCH_WORK_BUDGET = 240'000'000;
     inline constexpr std::int64_t UNIFIED_SEARCH_WORK_PER_ACTOR = 15'000'000;
     inline constexpr std::int64_t UNIFIED_FINAL_REPLAY_WORK_FLOOR = 2'000'000;
     inline constexpr std::int32_t UNIFIED_INFANTRY_BASE_MOVE = 3;
     inline constexpr std::int32_t UNIFIED_STOCK_TUNE_ROUNDS = 40;
-    inline constexpr std::int64_t UNIFIED_STAGING_ENEMY_WEIGHT = 100;
-    inline constexpr std::int64_t UNIFIED_STAGING_PROPERTY_WEIGHT = 40;
-    inline constexpr std::int64_t UNIFIED_STAGING_ARMOR_SUPPORT_WEIGHT = 30;
-    inline constexpr std::int64_t UNIFIED_STAGING_CLUMP_PENALTY = 15;
-    inline constexpr std::int64_t UNIFIED_STAGING_THREAT_BONUS = 250;
-    inline constexpr std::int64_t UNIFIED_STAGING_CAPTURE_BONUS = 200;
-    inline constexpr std::int64_t UNIFIED_STAGING_REPAIR_BONUS = 180;
-    inline constexpr MilliFunds UNIFIED_OWN_HQ_UNDEFENDED_RISK = 100'000'000;
     inline constexpr std::int32_t UNIFIED_TRAP_FOLLOWUP_TURNS = 2;
-    inline constexpr std::int32_t UNIFIED_ENEMY_FACTORY_GUARD_RADIUS = 4;
-    inline constexpr std::int32_t UNIFIED_FACTORY_COUNTER_REACH = 6;
-    inline constexpr MilliFunds UNIFIED_FACTORY_COUNTER_COST = 16'000'000;
-    inline constexpr double UNIFIED_FACTORY_COUNTER_BASE_DAMAGE = 55.0;
-    inline constexpr double UNIFIED_FACTORY_COUNTER_RETURN_DAMAGE = 35.0;
-    inline constexpr MilliFunds UNIFIED_BOXIN_MIN_ARMOR_COST = 7'000'000;
-    inline constexpr double UNIFIED_TRAP_MIN_BASE_DAMAGE = 1.0;
-    inline constexpr std::int32_t UNIFIED_CRIPPLED_UNIT_HP = 6;
-    inline constexpr double UNIFIED_CRIPPLED_DEFENDER_HP = 4.0;
-    inline constexpr double UNIFIED_COVER_MIN_DAMAGE = 30.0;
-    inline constexpr std::int32_t UNIFIED_VIABLE_ENEMY_CAPPER_HP = 7;
-    inline constexpr std::int32_t UNIFIED_STAGING_DESTROYED_FLAG = 32;
-    inline constexpr std::int32_t UNIFIED_STAGING_CAPTURE_FLAG = 1;
 
     struct UnifiedTeamScore
     {
@@ -53,8 +39,13 @@ namespace Coordinator
         std::tuple<TerminalClass, int, int, MilliFunds> worstHqRank{
             TerminalClass::ForcedLoss, std::numeric_limits<int>::min(),
             std::numeric_limits<int>::min(), std::numeric_limits<MilliFunds>::min()};
+        bool hqCaptureStartSafe{false};
         MilliFunds worstEconomicValue{std::numeric_limits<MilliFunds>::min()};
+        std::int32_t activeCaptures{std::numeric_limits<std::int32_t>::min()};
+        std::int32_t unitsRepairing{std::numeric_limits<std::int32_t>::min()};
+        std::int32_t combatUnitsInThreatRange{std::numeric_limits<std::int32_t>::min()};
         std::int64_t stagingScore{std::numeric_limits<std::int64_t>::min()};
+        std::int32_t negativeClumpPairs{std::numeric_limits<std::int32_t>::min()};
         std::int64_t terrainCoverScore{std::numeric_limits<std::int64_t>::min()};
         MilliFunds realizedMaterial{0};
         MilliFunds postReplyStock{0};
@@ -65,19 +56,24 @@ namespace Coordinator
         TacticalReply bindingPolicy{TacticalReply::Economic};
         int bindingTargetUnit{NO_UNIT};
 
+        auto rankingKey() const
+        {
+            return std::tie(worstHqRank, hqCaptureStartSafe, worstEconomicValue,
+                            activeCaptures, unitsRepairing, combatUnitsInThreatRange,
+                            stagingScore, negativeClumpPairs, terrainCoverScore);
+        }
+
         bool strictlyBetterThan(const UnifiedTeamScore & other) const
         {
             if (!valid) return false;
             if (!other.valid) return true;
-            return std::tie(worstHqRank, worstEconomicValue, stagingScore, terrainCoverScore) >
-                   std::tie(other.worstHqRank, other.worstEconomicValue, other.stagingScore, other.terrainCoverScore);
+            return rankingKey() > other.rankingKey();
         }
 
         bool notBetterThan(const UnifiedTeamScore & floor) const
         {
             if (!valid || !floor.valid) return false;
-            return std::tie(worstHqRank, worstEconomicValue, stagingScore, terrainCoverScore) <=
-                   std::tie(floor.worstHqRank, floor.worstEconomicValue, floor.stagingScore, floor.terrainCoverScore);
+            return rankingKey() <= floor.rankingKey();
         }
     };
 
@@ -225,7 +221,7 @@ namespace Coordinator
                     const TilePoint tile = m_stockContext.nodeTile(n);
                     if (tile == INVALID_TILE) continue;
                     const bool nearEnemyFactory = std::ranges::any_of(m_enemyFactories, [&](TilePoint f) {
-                        return manhattanDistance(f, tile) <= UNIFIED_ENEMY_FACTORY_GUARD_RADIUS;
+                        return manhattanDistance(f, tile) <= UNIFIED_INFANTRY_BASE_MOVE + 1;
                     });
                     if (!nearEnemyFactory && !m_stockContext.enemyClaimsNeutralBeforeUs(n))
                         m_deliverableNeutralProperties.push_back(tile);
@@ -259,7 +255,17 @@ namespace Coordinator
             return minDist;
         }
 
-        std::pair<std::int64_t, std::int64_t> stagingAndCover(std::span<const int> choices) const
+        struct TieBreakerScores
+        {
+            std::int32_t activeCaptures{0};
+            std::int32_t unitsRepairing{0};
+            std::int32_t combatUnitsInThreatRange{0};
+            std::int64_t stagingScore{0};
+            std::int32_t negativeClumpPairs{0};
+            std::int64_t terrainCoverScore{0};
+        };
+
+        TieBreakerScores computeTieBreakers(std::span<const int> choices) const
         {
             std::vector<TilePoint> claimedProperties;
             std::vector<TilePoint> friendlyArmorPositions;
@@ -309,8 +315,9 @@ namespace Coordinator
                     assignedNeutralBySlot.emplace(nonCapturingCappers[static_cast<std::size_t>(bestIdx)].first, neutral);
                 }
             }
-            std::int64_t total = 0;
-            std::int64_t terrainCover = 0;
+            TieBreakerScores out;
+            const int capPts = m_stockField.capturePointsToCapture();
+            const int fullCapTurns = (capPts + UNIT_HP_STEPS - 1) / UNIT_HP_STEPS;
             for (const auto & member : m_problem.actors())
             {
                 const int slot = member.canonicalSlot;
@@ -338,79 +345,75 @@ namespace Coordinator
                 int stars = 0;
                 if (m_local.defense && ki >= 0 && ki < static_cast<int>(m_local.units.size()))
                     stars = m_local.defense(ki, dest).stars;
-                terrainCover += static_cast<std::int64_t>(stars);
+                out.terrainCoverScore += static_cast<std::int64_t>(stars);
                 if (member.stockRow == NO_STOCK_ROW)
                 {
                     const auto & unit = m_knowledge.units()[static_cast<std::size_t>(ki)];
-                    const int pathDist = std::min(m_maxDist * 2, enemyPathDistance(ki, dest));
+                    const int pathDist = !m_enemyPositions.empty()
+                        ? std::min(m_maxDist * 2, enemyPathDistance(ki, dest))
+                        : minPropDist;
                     const int nextTurnThreatReach = unit.movementPoints + std::max(1, unit.maxRange);
-                    const std::int64_t threatBonus =
-                        (!m_enemyPositions.empty() && pathDist <= nextTurnThreatReach)
-                            ? UNIFIED_STAGING_THREAT_BONUS : 0;
-                    total += static_cast<std::int64_t>(m_maxDist * 2 - pathDist) * UNIFIED_STAGING_ENEMY_WEIGHT;
-                    total += static_cast<std::int64_t>(m_maxDist - minPropDist) * UNIFIED_STAGING_PROPERTY_WEIGHT;
-                    total += threatBonus;
+                    if (!m_enemyPositions.empty() && pathDist <= nextTurnThreatReach)
+                        ++out.combatUnitsInThreatRange;
+                    out.stagingScore -= static_cast<std::int64_t>(pathDist);
                 }
                 else
                 {
-                    const bool damaged = ki >= 0 && ki < static_cast<int>(m_knowledge.units().size()) &&
+                    const bool hasKnown = ki >= 0 && ki < static_cast<int>(m_knowledge.units().size());
+                    const bool damaged = hasKnown &&
                         m_knowledge.units()[static_cast<std::size_t>(ki)].hpRounded < UNIT_HP_STEPS;
-                    const bool heavilyDamaged = ki >= 0 && ki < static_cast<int>(m_knowledge.units().size()) &&
-                        m_knowledge.units()[static_cast<std::size_t>(ki)].hpRounded <= UNIFIED_CRIPPLED_UNIT_HP;
+                    const int capRate = hasKnown ? m_knowledge.units()[static_cast<std::size_t>(ki)].captureRate : 0;
+                    const bool heavilyDamaged = hasKnown &&
+                        (capRate <= 0 || (capPts + capRate - 1) / capRate > fullCapTurns + 1);
                     const auto assignedIt = assignedNeutralBySlot.find(slot);
                     const bool isSurplusCapper = !cand.capture.has_value() && assignedIt == assignedNeutralBySlot.end();
-                    if (heavilyDamaged && !cand.capture.has_value() && !m_friendlyRepairSites.empty())
+                    if (cand.capture.has_value())
+                    {
+                        ++out.activeCaptures;
+                    }
+                    else if (heavilyDamaged && !m_friendlyRepairSites.empty())
                     {
                         int minRepairDist = m_maxDist;
                         for (const TilePoint r : m_friendlyRepairSites)
                             minRepairDist = std::min(minRepairDist, manhattanDistance(dest, r));
-                        total += static_cast<std::int64_t>(m_maxDist - minRepairDist) * UNIFIED_STAGING_PROPERTY_WEIGHT;
+                        out.stagingScore -= static_cast<std::int64_t>(minRepairDist);
                     }
                     else if (assignedIt != assignedNeutralBySlot.end())
                     {
-                        const int neutralDist = manhattanDistance(dest, assignedIt->second);
-                        total += static_cast<std::int64_t>(m_maxDist - neutralDist) * UNIFIED_STAGING_PROPERTY_WEIGHT;
+                        out.stagingScore -= static_cast<std::int64_t>(manhattanDistance(dest, assignedIt->second));
                     }
                     else if (isSurplusCapper && !friendlyArmorPositions.empty())
                     {
                         int minArmorDist = m_maxDist;
                         for (const TilePoint a : friendlyArmorPositions)
                             minArmorDist = std::min(minArmorDist, manhattanDistance(dest, a));
-                        const int effectiveArmorDist = std::max(2, minArmorDist);
-                        total += static_cast<std::int64_t>(m_maxDist - effectiveArmorDist) *
-                            UNIFIED_STAGING_ARMOR_SUPPORT_WEIGHT;
-                        total += static_cast<std::int64_t>(m_maxDist - minPropDist) *
-                            (UNIFIED_STAGING_PROPERTY_WEIGHT / 2);
+                        out.stagingScore -= static_cast<std::int64_t>(std::max(2, minArmorDist) + minPropDist);
                     }
                     else
                     {
-                        total += static_cast<std::int64_t>(m_maxDist - minPropDist) * UNIFIED_STAGING_PROPERTY_WEIGHT;
+                        out.stagingScore -= static_cast<std::int64_t>(minPropDist);
                     }
                     if (isSurplusCapper)
                     {
-                        int adjacentPeers = 0;
                         for (const auto & [peerSlot, peerPos] : nonCapturingCappers)
                         {
-                            if (peerSlot != slot && manhattanDistance(dest, peerPos) == 1)
-                                ++adjacentPeers;
+                            if (peerSlot > slot && manhattanDistance(dest, peerPos) == 1)
+                                --out.negativeClumpPairs;
                         }
-                        total -= static_cast<std::int64_t>(adjacentPeers) * UNIFIED_STAGING_CLUMP_PENALTY;
                     }
-                    if (cand.capture.has_value())
-                        total += UNIFIED_STAGING_CAPTURE_BONUS;
                     if (damaged &&
                         std::ranges::find(m_friendlyRepairSites, dest) != m_friendlyRepairSites.end())
-                        total += UNIFIED_STAGING_REPAIR_BONUS;
+                        ++out.unitsRepairing;
                 }
             }
-            return {total, terrainCover};
+            return out;
         }
 
         UnifiedTeamScore evaluate(std::span<const int> choices, const UnifiedTeamScore * pruneFloor = nullptr,
                                   ReplyPassEvaluation * economicOut = nullptr)
         {
             UnifiedTeamScore summary;
-            const auto [staging, terrainCover] = stagingAndCover(choices);
+            const TieBreakerScores ties = computeTieBreakers(choices);
             const auto priorPolicy = m_local.policy;
             const int priorTarget = m_local.replyTarget;
             const int priorShooter = m_local.containShooter;
@@ -467,7 +470,7 @@ namespace Coordinator
 
                 const MilliFunds postStock = cachedPostReplyStock(eval);
                 const MilliFunds denial = computeEnemyDenial(eval);
-                const MilliFunds ownRisk = computeOwnPropertyCaptureRisk(eval);
+                const auto [hqCaptureStartSafe, ownRisk] = computeOwnPropertyCaptureRisk(eval);
                 const int buildSlots = m_buildSlotsFn(eval);
                 const MilliFunds factoryVal = static_cast<MilliFunds>(buildSlots) * UNIFIED_FACTORY_SLOT_VALUE;
 
@@ -481,9 +484,14 @@ namespace Coordinator
                 UnifiedTeamScore point;
                 point.valid = true;
                 point.worstHqRank = *hqRank;
+                point.hqCaptureStartSafe = hqCaptureStartSafe;
                 point.worstEconomicValue = econTotal;
-                point.stagingScore = staging;
-                point.terrainCoverScore = terrainCover;
+                point.activeCaptures = ties.activeCaptures;
+                point.unitsRepairing = ties.unitsRepairing;
+                point.combatUnitsInThreatRange = ties.combatUnitsInThreatRange;
+                point.stagingScore = ties.stagingScore;
+                point.negativeClumpPairs = ties.negativeClumpPairs;
+                point.terrainCoverScore = ties.terrainCoverScore;
                 point.realizedMaterial = realized;
                 point.postReplyStock = postStock;
                 point.enemyDenial = denial;
@@ -528,6 +536,7 @@ namespace Coordinator
                 double hp{0.0};
                 int reach{0};
                 int strikeRange{1};
+                MilliFunds cost{0};
             };
             std::vector<FriendlyCover> coverUnits;
             for (const auto & actor : eval.actors)
@@ -549,7 +558,7 @@ namespace Coordinator
                         if (const auto it = eval.realAfterReply.find(ki); it != eval.realAfterReply.end())
                             hpF = it->second;
                         if (reach > 0 && hpF > 0.0)
-                            coverUnits.push_back({ki, cand.destination, hpF, reach, std::max(1, knownF.minRange)});
+                            coverUnits.push_back({ki, cand.destination, hpF, reach, std::max(1, knownF.minRange), fp.replacementCost});
                     }
                     continue;
                 }
@@ -577,6 +586,7 @@ namespace Coordinator
                 double hp{0.0};
                 int reach{0};
                 int strikeRange{1};
+                MilliFunds cost{0};
             };
             std::vector<Defender> defenders;
             std::vector<std::int32_t> killedInF0;
@@ -595,14 +605,13 @@ namespace Coordinator
                     killedInF0.push_back(e);
                     continue;
                 }
-                // Keep pre-E0 position and full initial HP unless critically crippled in F0 to avoid lure/chip cliffs.
-                const double effectiveHp = hpOwn <= UNIFIED_CRIPPLED_DEFENDER_HP ? hpOwn : initialHp;
                 const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
                 const bool indirect = knownE.minRange > 1;
                 const int maxRange = std::max(1, knownE.maxRange);
                 const int reach = indirect ? maxRange : (std::max(0, ep.movement) + maxRange);
                 if (reach <= 0) continue;
-                defenders.push_back({e, ep.tile, effectiveHp, reach, std::max(1, knownE.minRange)});
+                // Keep pre-E0 position and initial HP for surviving defenders to avoid E0 lure and chip cliffs.
+                defenders.push_back({e, ep.tile, initialHp, reach, std::max(1, knownE.minRange), ep.replacementCost});
             }
             for (std::size_t n = 0; n < nodeCount; ++n)
             {
@@ -610,7 +619,7 @@ namespace Coordinator
                 const TilePoint tile = m_stockContext.nodeTile(n);
                 if (tile == INVALID_TILE) continue;
                 const bool nearEnemyFactory = std::ranges::any_of(m_enemyFactories, [&](TilePoint f) {
-                    return manhattanDistance(f, tile) <= UNIFIED_ENEMY_FACTORY_GUARD_RADIUS;
+                    return manhattanDistance(f, tile) <= UNIFIED_INFANTRY_BASE_MOVE + 1;
                 });
                 const OwnerSign owner = m_stockContext.nodeOwner(n);
                 if (owner == OwnerSign::Neutral)
@@ -632,13 +641,35 @@ namespace Coordinator
                     if (manhattanDistance(d.pos, tile) > d.reach) continue;
                     const bool coveredByFriendlyArmor = std::ranges::any_of(coverUnits, [&](const FriendlyCover & fc) {
                         if (manhattanDistance(fc.pos, tile) > fc.reach) return false;
-                        const double scaledDmg =
-                            maxWeaponBaseDamage(fc.ki, d.ki, fc.strikeRange) * (fc.hp / static_cast<double>(UNIT_HP_STEPS));
-                        return scaledDmg >= UNIFIED_COVER_MIN_DAMAGE;
+                        const double coverBase = maxWeaponBaseDamage(fc.ki, d.ki, fc.strikeRange);
+                        if (coverBase <= 0.0) return false;
+                        const TerrainDefenseRule dDef = m_local.defense
+                            ? m_local.defense(d.ki, d.pos) : TerrainDefenseRule{};
+                        const double rawHit = terrainReducedDamage(dDef, coverBase, fc.hp, ceilHpSteps(d.hp));
+                        const double hit = engineShotDamage(rawHit);
+                        if (hit <= 0.0) return false;
+                        const double afterD = engineHpAfterReply(d.hp, hit);
+                        if (afterD <= 0.0) return true;
+                        const MilliFunds capLoss = combatCapitalLoss(d.cost, d.hp, afterD);
+                        MilliFunds counterLoss = 0;
+                        if (fc.strikeRange == 1)
+                        {
+                            const double cBase = maxWeaponBaseDamage(d.ki, fc.ki, 1);
+                            if (cBase > 0.0)
+                            {
+                                const TerrainDefenseRule fDef = m_local.defense
+                                    ? m_local.defense(fc.ki, fc.pos) : TerrainDefenseRule{};
+                                const double rawC = sameActionCounterDamage(
+                                    fDef, cBase, d.hp, rawHit, ceilHpSteps(fc.hp));
+                                const double afterF = engineHpAfterReply(fc.hp, engineShotDamage(rawC));
+                                counterLoss = combatCapitalLoss(fc.cost, fc.hp, afterF);
+                            }
+                        }
+                        return (d.cost == 0 && fc.cost == 0) || capLoss > counterLoss;
                     });
                     if (coveredByFriendlyArmor) continue;
                     const double baseDmg = maxWeaponBaseDamage(d.ki, m_sampleCapperKi, d.strikeRange);
-                    if (baseDmg < UNIFIED_TRAP_MIN_BASE_DAMAGE) continue;
+                    if (baseDmg <= 0.0) continue;
                     const double hit1 = engineShotDamage(terrainReducedDamage(defRule, baseDmg, d.hp, UNIT_HP_STEPS));
                     const double hp1 = engineHpAfterReply(static_cast<double>(UNIT_HP_STEPS), hit1);
                     const int s1 = ceilHpSteps(hp1);
@@ -772,10 +803,10 @@ namespace Coordinator
                 const int initialSteps = knownF.hpRounded;
                 if (actor.stepsAfterReply < initialSteps)
                 {
-                    if (member.stockRow != NO_STOCK_ROW && actor.stepsAfterReply > UNIFIED_CRIPPLED_UNIT_HP) continue;
+                    if (member.stockRow != NO_STOCK_ROW && cand.capture.has_value()) continue;
                     victims.push_back({ki, cand.destination, hp, actor.stepsAfterReply, true});
                 }
-                else if (member.stockRow == NO_STOCK_ROW && fp.replacementCost >= UNIFIED_BOXIN_MIN_ARMOR_COST)
+                else if (member.stockRow == NO_STOCK_ROW)
                 {
                     const bool nearEnemyFactory = std::ranges::any_of(m_enemyFactories, [&](TilePoint f) {
                         return manhattanDistance(f, cand.destination) <= fp.movement + UNIFIED_FACTORY_COUNTER_REACH;
@@ -921,7 +952,7 @@ namespace Coordinator
                         const int reach = v.damaged ? th.damagedReach : th.oneTurnReach;
                         if (manhattanDistance(th.pos, q) > reach) continue;
                         const double baseDmg = maxWeaponBaseDamage(th.ki, v.ki, th.strikeRange);
-                        if (baseDmg < UNIFIED_TRAP_MIN_BASE_DAMAGE) continue;
+                        if (baseDmg <= 0.0) continue;
                         if (!th.capper) hasCombatUnitThreat = true;
                         const double cBase = th.strikeRange == 1 ? maxWeaponBaseDamage(v.ki, th.ki, 1) : 0.0;
                         shotsAtQ.push_back({baseDmg, th.hp, cBase, th.strikeRange, th.cost, th.ki});
@@ -954,7 +985,7 @@ namespace Coordinator
                         const double afterU = engineHpAfterReply(remHp, hit);
                         const MilliFunds capLoss = combatCapitalLoss(pawn.replacementCost, remHp, afterU);
                         MilliFunds counterLoss = 0;
-                        if (sp.strikeRange == 1 && afterU > 0.0 && sp.counterBase >= UNIFIED_TRAP_MIN_BASE_DAMAGE)
+                        if (sp.strikeRange == 1 && afterU > 0.0 && sp.counterBase > 0.0)
                         {
                             const TerrainDefenseRule eDef = (sp.attackerKi != NO_UNIT && m_local.defense)
                                 ? m_local.defense(sp.attackerKi, q) : TerrainDefenseRule{};
@@ -1057,9 +1088,10 @@ namespace Coordinator
                         targetKi < static_cast<int>(m_knowledge.units().size());
                     const bool capturing = hasKnown &&
                         m_knowledge.units()[static_cast<std::size_t>(targetKi)].capturePoints > 0;
+                    const int rateE = hasKnown
+                        ? m_knowledge.units()[static_cast<std::size_t>(targetKi)].captureRate : 0;
                     const bool viableCapper = hasKnown &&
-                        (capturing ||
-                         m_knowledge.units()[static_cast<std::size_t>(targetKi)].hpRounded >= UNIFIED_VIABLE_ENEMY_CAPPER_HP);
+                        (capturing || (rateE > 0 && (capPts + rateE - 1) / rateE <= horizon));
                     if (viableCapper)
                     {
                         killedEnemies.push_back(targetKi);
@@ -1093,6 +1125,58 @@ namespace Coordinator
             }
             MilliFunds total = std::max(killedStockLoss, killedInterruptFloor);
             RelativeStockDetail::checkedAdd(total, woundedInterruptCredit);
+            // Credit exact expansion/capture turns lost when an enemy capper spends E0 shooting instead of capturing.
+            std::vector<std::uint8_t> replyShooterSeen(m_local.units.size(), 0);
+            for (const ReplyPassShot & shot : eval.shots)
+            {
+                const int e = shot.shooterIndex;
+                if (e < 0 || e >= static_cast<int>(m_local.units.size()) ||
+                    e >= static_cast<int>(m_knowledge.units().size()) ||
+                    replyShooterSeen[static_cast<std::size_t>(e)] != 0)
+                    continue;
+                replyShooterSeen[static_cast<std::size_t>(e)] = 1;
+                const auto & ep = m_local.units[static_cast<std::size_t>(e)];
+                if (!ep.present || !ep.enemy || !ep.capper) continue;
+                const auto & knownE = m_knowledge.units()[static_cast<std::size_t>(e)];
+                if (knownE.captureRate <= 0) continue;
+                if (knownE.capturePoints > 0)
+                {
+                    const auto abandoned = openRefinementCaptureInterruptCredit(
+                        m_knowledge, m_stockField, m_properties, e, 0.0);
+                    RelativeStockDetail::checkedAdd(total, boundedKillInterruptCredit(e, abandoned));
+                }
+                else if (!m_unownedNeutralProperties.empty() &&
+                         (capPts + knownE.captureRate - 1) / knownE.captureRate <= horizon)
+                {
+                    int lostTurns = 1;
+                    if (const auto it = eval.enemyReplyHp.find(e); it != eval.enemyReplyHp.end())
+                    {
+                        const int afterSteps = ceilHpSteps(static_cast<double>(it->second));
+                        const int beforeRate = knownE.captureRate;
+                        const int afterRate = replyCaptureRate(
+                            beforeRate, std::max(0, knownE.hpRounded - afterSteps), afterSteps <= 0);
+                        const int beforeCapTurns = (capPts + beforeRate - 1) / beforeRate;
+                        if (afterRate <= 0)
+                            lostTurns = horizon;
+                        else
+                        {
+                            const int afterCapTurns = (capPts + afterRate - 1) / afterRate;
+                            lostTurns += std::max(0, afterCapTurns - beforeCapTurns);
+                        }
+                    }
+                    int maxDelay = horizon;
+                    if (!m_enemyFactories.empty())
+                    {
+                        const int moveE = std::max(1, knownE.movementPoints);
+                        int minDist = m_maxDist;
+                        for (const TilePoint f : m_enemyFactories)
+                            minDist = std::min(minDist, manhattanDistance({knownE.x, knownE.y}, f));
+                        maxDelay = std::min(horizon, 1 + (minDist + moveE - 1) / moveE);
+                    }
+                    RelativeStockDetail::checkedAdd(
+                        total, static_cast<MilliFunds>(std::min(maxDelay, lostTurns)) * UNIFIED_NEUTRAL_PROPERTY_INCOME);
+                }
+            }
             return total;
         }
 
@@ -1154,15 +1238,15 @@ namespace Coordinator
             }
         }
 
-        // Prices uncontested E0 capture starts on own properties when no surviving F1 responder can stop E1 completion.
-        MilliFunds computeOwnPropertyCaptureRisk(const ReplyPassEvaluation & eval) const
+        // Flags uninterruptible HQ capture starts and prices exact income swings on other own properties.
+        std::pair<bool, MilliFunds> computeOwnPropertyCaptureRisk(const ReplyPassEvaluation & eval) const
         {
             if (m_ownCapturableProperties.empty() || m_local.width <= 0 || m_local.height <= 0 ||
                 (!m_local.weapon && !m_local.weaponSlots))
-                return 0;
+                return {true, 0};
             const std::int32_t capPts = m_stockField.capturePointsToCapture();
             const std::int32_t horizon = m_stockField.horizonTurns();
-            if (horizon <= 1) return 0;
+            if (horizon <= 1) return {true, 0};
 
             struct FriendlyResponder
             {
@@ -1248,7 +1332,7 @@ namespace Coordinator
                 if (rateE <= 0 || rateE * 2 < capPts) continue;
                 enemyCappers.push_back({e, ep.tile, hpE, stepsE, rateE, ep.movement, ep.grid});
             }
-            if (enemyCappers.empty()) return 0;
+            if (enemyCappers.empty()) return {true, 0};
 
             const auto isFriendlyZoc = [&](TilePoint t) {
                 return std::ranges::any_of(friendlyOccupied, [&](TilePoint f) {
@@ -1299,6 +1383,7 @@ namespace Coordinator
                 return false;
             };
 
+            bool hqCaptureStartSafe = true;
             MilliFunds totalRisk = 0;
             for (const auto & prop : m_ownCapturableProperties)
             {
@@ -1319,7 +1404,7 @@ namespace Coordinator
                 {
                     if (manhattanDistance(fr.pos, prop.tile) > fr.reach) continue;
                     const double baseDmg = maxWeaponBaseDamage(fr.ki, strongestThreat->ki, fr.strikeRange);
-                    if (baseDmg < UNIFIED_TRAP_MIN_BASE_DAMAGE) continue;
+                    if (baseDmg <= 0.0) continue;
                     const double hit = engineShotDamage(terrainReducedDamage(
                         defRule, baseDmg, fr.hp, strongestThreat->steps));
                     if (hit <= 0.0) continue;
@@ -1335,15 +1420,20 @@ namespace Coordinator
                 }
                 if (!canInterrupt)
                 {
-                    const MilliFunds swing = incomeSwing(
-                        prop.income, std::max(1, horizon - 1), OwnerSign::Ours, OwnerSign::Enemy);
-                    const MilliFunds loss = prop.isHq
-                        ? UNIFIED_OWN_HQ_UNDEFENDED_RISK
-                        : (swing < 0 ? -swing : swing);
-                    RelativeStockDetail::checkedAdd(totalRisk, loss);
+                    if (prop.isHq)
+                    {
+                        hqCaptureStartSafe = false;
+                    }
+                    else
+                    {
+                        const MilliFunds swing = incomeSwing(
+                            prop.income, std::max(1, horizon - 1), OwnerSign::Ours, OwnerSign::Enemy);
+                        const MilliFunds loss = swing < 0 ? -swing : swing;
+                        RelativeStockDetail::checkedAdd(totalRisk, loss);
+                    }
                 }
             }
-            return totalRisk;
+            return {hqCaptureStartSafe, totalRisk};
         }
 
         struct OwnCapturableProperty

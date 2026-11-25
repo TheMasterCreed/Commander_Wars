@@ -7115,6 +7115,7 @@ namespace Coordinator
                             return QJsonObject{
                                 {"valid",s.valid},
                                 {"terminalClass",int(std::get<0>(s.worstHqRank))},
+                                {"hqCaptureStartSafe",s.hqCaptureStartSafe},
                                 {"worstEconomicValue",qint64(s.worstEconomicValue)},
                                 {"stagingScore",qint64(s.stagingScore)},
                                 {"realizedMaterial",qint64(s.realizedMaterial)},
