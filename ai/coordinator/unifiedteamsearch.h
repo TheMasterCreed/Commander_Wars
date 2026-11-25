@@ -311,6 +311,15 @@ namespace Coordinator
             addOpt(findInPlaceWaitCandidate(member));
             std::vector<int> fires;
             std::vector<int> positionals;
+            std::vector<TilePoint> capturableDestinations;
+            if (member.stockRow != NO_STOCK_ROW)
+            {
+                for (const auto & c : member.candidates)
+                {
+                    if (c.plannable && c.capture.has_value())
+                        capturableDestinations.push_back(c.destination);
+                }
+            }
             for (int opt = 0; opt < static_cast<int>(member.candidates.size()); ++opt)
             {
                 if (opt == currentOpt || seen[static_cast<std::size_t>(opt)]) continue;
@@ -321,7 +330,7 @@ namespace Coordinator
                     addOpt(opt);
                 else if (c.targetUnitId != NO_UNIT)
                     fires.push_back(opt);
-                else
+                else if (std::ranges::find(capturableDestinations, c.destination) == capturableDestinations.end())
                     positionals.push_back(opt);
             }
             std::stable_sort(fires.begin(), fires.end(), [&](int a, int b) {
@@ -351,7 +360,11 @@ namespace Coordinator
                 const int offFactory =
                     std::ranges::find(friendlyFactories, c.destination) == friendlyFactories.end() ? 1 : 0;
                 int minDist = 0;
-                if (!goals.empty())
+                if (member.stockRow == NO_STOCK_ROW && !enemyPositions.empty())
+                {
+                    minDist = evaluator.enemyPathDistance(ki, c.destination);
+                }
+                else if (!goals.empty())
                 {
                     minDist = std::numeric_limits<int>::max();
                     for (const TilePoint g : goals)
@@ -413,26 +426,31 @@ namespace Coordinator
                 ? (maxPositional - 1) : maxPositional;
             for (std::size_t i = 0; i < positionals.size() && i < safeKeep; ++i)
                 addOpt(positionals[i]);
-            if (member.stockRow == NO_STOCK_ROW && maxPositional > 1)
+            if (maxPositional > 1 && !enemyPositions.empty())
             {
-                // Keep one forward exposed tile so screening/blocking moves remain available for combat units.
+                // Keep one forward exposed tile so armor screening and infantry meat-shielding remain searchable.
                 int bestForwardExposed = NO_CANDIDATE;
                 int bestForwardDist = std::numeric_limits<int>::max();
-                for (const int opt : positionals)
+                const bool allowExposedCapper = member.stockRow != NO_STOCK_ROW && !heavilyDamagedCapper;
+                if (member.stockRow == NO_STOCK_ROW || allowExposedCapper)
                 {
-                    if (seen[static_cast<std::size_t>(opt)] || isSafeCand(member.candidates[static_cast<std::size_t>(opt)]))
-                        continue;
-                    int d = std::numeric_limits<int>::max();
-                    for (const TilePoint e : enemyPositions)
-                        d = std::min(d, manhattanDistance(member.candidates[static_cast<std::size_t>(opt)].destination, e));
-                    if (d < bestForwardDist)
+                    for (const int opt : positionals)
                     {
-                        bestForwardDist = d;
-                        bestForwardExposed = opt;
+                        if (seen[static_cast<std::size_t>(opt)] || isSafeCand(member.candidates[static_cast<std::size_t>(opt)]))
+                            continue;
+                        const TilePoint dest = member.candidates[static_cast<std::size_t>(opt)].destination;
+                        int d = std::numeric_limits<int>::max();
+                        for (const TilePoint e : enemyPositions)
+                            d = std::min(d, manhattanDistance(dest, e));
+                        if (d < bestForwardDist)
+                        {
+                            bestForwardDist = d;
+                            bestForwardExposed = opt;
+                        }
                     }
+                    if (bestForwardExposed != NO_CANDIDATE)
+                        addOpt(bestForwardExposed);
                 }
-                if (bestForwardExposed != NO_CANDIDATE)
-                    addOpt(bestForwardExposed);
             }
             return picked;
         };
@@ -619,6 +637,93 @@ namespace Coordinator
                         }
                     }
                 }
+            }
+        }
+
+        // Fire-handoff pair pass: let a stronger finisher replace a shooter holding target damage capacity.
+        if (evaluator.evalCount() < maxEvals && work >= replayTariff)
+        {
+            for (const int slotA : order)
+            {
+                if (evaluator.evalCount() >= maxEvals || work < replayTariff) break;
+                const auto & actorA = problem.actors()[static_cast<std::size_t>(slotA)];
+                const int curA = out.bestTeam[static_cast<std::size_t>(slotA)];
+                if (actorA.candidates[static_cast<std::size_t>(curA)].targetUnitId != NO_UNIT) continue;
+                for (int optA = 0; optA < static_cast<int>(actorA.candidates.size()); ++optA)
+                {
+                    if (evaluator.evalCount() >= maxEvals || work < replayTariff) break;
+                    const auto & candA = actorA.candidates[static_cast<std::size_t>(optA)];
+                    if (!candA.plannable || candA.targetUnitId == NO_UNIT) continue;
+                    const int blocker = occupantSlotAt(candA.destination, slotA);
+                    if (blocker >= 0) continue;
+                    int weakestShooterSlot = -1;
+                    std::int32_t weakestDmg = std::numeric_limits<std::int32_t>::max();
+                    for (const int slotB : order)
+                    {
+                        if (slotB == slotA) continue;
+                        const auto & actorB = problem.actors()[static_cast<std::size_t>(slotB)];
+                        const auto & candB = actorB.candidates[static_cast<std::size_t>(out.bestTeam[static_cast<std::size_t>(slotB)])];
+                        if (candB.targetUnitId != candA.targetUnitId) continue;
+                        const auto * compB = singleComponentOf(candB.source.bundle);
+                        const std::int32_t dmgB = (compB && compB->kind == ComponentKind::Fire)
+                            ? compB->fire.damageSteps : 0;
+                        if (dmgB < weakestDmg)
+                        {
+                            weakestDmg = dmgB;
+                            weakestShooterSlot = slotB;
+                        }
+                    }
+                    if (weakestShooterSlot < 0) continue;
+                    const auto & actorB = problem.actors()[static_cast<std::size_t>(weakestShooterSlot)];
+                    const int waitB = findInPlaceWaitCandidate(actorB);
+                    if (waitB == NO_CANDIDATE ||
+                        openRefinementDestinationTaken(problem, out.bestTeam, weakestShooterSlot,
+                                                       actorB.candidates[static_cast<std::size_t>(waitB)].destination))
+                        continue;
+                    std::vector<int> trial = out.bestTeam;
+                    trial[static_cast<std::size_t>(slotA)] = optA;
+                    trial[static_cast<std::size_t>(weakestShooterSlot)] = waitB;
+                    if (!allowedByPrior(trial)) continue;
+                    ReplyPassEvaluation econEval;
+                    const auto score = evaluator.evaluate(trial, &out.bestScore, &econEval);
+                    if (score.strictlyBetterThan(out.bestScore))
+                    {
+                        out.bestTeam = std::move(trial);
+                        out.bestScore = score;
+                        bestEconEval = std::move(econEval);
+                        ++out.pairImprovements;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Capture-over-wait dominance: never idle on an unowned capturable tile when capturing on it is legal.
+        for (const int slot : order)
+        {
+            if (work < replayTariff) break;
+            const auto & member = problem.actors()[static_cast<std::size_t>(slot)];
+            if (member.stockRow == NO_STOCK_ROW) continue;
+            const int curOpt = out.bestTeam[static_cast<std::size_t>(slot)];
+            const auto & curCand = member.candidates[static_cast<std::size_t>(curOpt)];
+            if (curCand.capture.has_value() || curCand.targetUnitId != NO_UNIT) continue;
+            for (int opt = 0; opt < static_cast<int>(member.candidates.size()); ++opt)
+            {
+                const auto & c = member.candidates[static_cast<std::size_t>(opt)];
+                if (!c.plannable || !c.capture.has_value() || c.destination != curCand.destination) continue;
+                std::vector<int> trial = out.bestTeam;
+                trial[static_cast<std::size_t>(slot)] = opt;
+                if (!allowedByPrior(trial)) break;
+                ReplyPassEvaluation econEval;
+                const auto score = evaluator.evaluate(trial, nullptr, &econEval);
+                if (score.valid && score.worstHqRank >= out.bestScore.worstHqRank &&
+                    score.worstEconomicValue >= out.bestScore.worstEconomicValue)
+                {
+                    out.bestTeam = std::move(trial);
+                    out.bestScore = score;
+                    bestEconEval = std::move(econEval);
+                }
+                break;
             }
         }
 

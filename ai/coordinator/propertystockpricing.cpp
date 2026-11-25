@@ -1356,7 +1356,7 @@ namespace Coordinator
     }
 
     ReplyStockFloor ReplyStockContext::floor(const ContinuationKey & key, const ReplyStockFloor * reference,
-                                             std::span<const std::uint8_t> blockedNodes)
+                                             std::span<const std::uint8_t> blockedNodes, bool claimPartialCaptures)
     {
         ReplyStockFloor result;
         const std::int64_t workBefore = work();
@@ -1365,7 +1365,7 @@ namespace Coordinator
         result.status = m_priceVersion == 0 ? ReplyStockStatus::NoPrices : extend(key, result.pricing);
         if (result.status == ReplyStockStatus::Valid)
         {
-            result.status = composeFloor(key, reference, result, blockedNodes);
+            result.status = composeFloor(key, reference, result, blockedNodes, claimPartialCaptures);
         }
         if (result.status != ReplyStockStatus::Valid)
         {
@@ -1528,7 +1528,8 @@ namespace Coordinator
     }
 
     ReplyStockStatus ReplyStockContext::composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
-                                                     ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes)
+                                                     ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes,
+                                                     bool claimPartialCaptures)
     {
         ReplyStockCeiling priced;
         priced.counters = result.pricing;
@@ -1612,11 +1613,46 @@ namespace Coordinator
             chosen[slot] = std::move(witness);
             return true;
         };
+        std::vector<std::int32_t> partialCaptureNode(rowCount, NO_SEQUENTIAL_NODE);
+        std::vector<std::int32_t> partialOwner(nodeCount, NO_STOCK_ROW);
         if (reference != nullptr && reference->status == ReplyStockStatus::Valid &&
             JointPlanStockValuer::validDiagnosticKey(*m_field, reference->key))
         {
             const std::vector<const CanonicalPlanActionKey*> referenceVariants =
                 rowVariants(reference->key, rowCount);
+            // A changed row executing a surviving partial capture owns its target node ahead of stale reference rows.
+            for (std::size_t slot = 0; claimPartialCaptures && slot < rowCount; ++slot)
+            {
+                if (variants[slot] == nullptr || sameVariant(variants[slot], referenceVariants[slot]) ||
+                    !variants[slot]->captures() || variants[slot]->destroyed())
+                {
+                    continue;
+                }
+                const auto found = m_actions.find(*variants[slot]);
+                if (found == m_actions.end() || found->second.capturedNode != NO_SEQUENTIAL_NODE)
+                {
+                    continue;
+                }
+                const std::int32_t colSlot = m_field->columnSlotAt({variants[slot]->x(), variants[slot]->y()});
+                if (colSlot == NO_STOCK_COLUMN)
+                {
+                    continue;
+                }
+                for (std::size_t n = 0; n < m_nodeSlots.size(); ++n)
+                {
+                    if (m_nodeSlots[n] == colSlot)
+                    {
+                        const auto node = static_cast<std::int32_t>(n);
+                        if (freeNode(node) && instance.rows[slot].ownedTurn[n] != NO_CAPTURE_TURNS &&
+                            instance.rows[slot].weight[n] > 0 && partialOwner[n] == NO_STOCK_ROW)
+                        {
+                            partialCaptureNode[slot] = node;
+                            partialOwner[n] = static_cast<std::int32_t>(slot);
+                        }
+                        break;
+                    }
+                }
+            }
             std::int32_t previousRow = NO_STOCK_ROW;
             for (const SequentialRowWitness & source : reference->witness)
             {
@@ -1639,7 +1675,10 @@ namespace Coordinator
                     {
                         return ReplyStockStatus::LimitReached;
                     }
-                    if (!freeNode(step.node))
+                    const std::int32_t claimedBy =
+                        step.node >= 0 && static_cast<std::size_t>(step.node) < nodeCount
+                            ? partialOwner[static_cast<std::size_t>(step.node)] : NO_STOCK_ROW;
+                    if (!freeNode(step.node) || (claimedBy != NO_STOCK_ROW && claimedBy != source.row))
                     {
                         break;
                     }
@@ -1663,8 +1702,23 @@ namespace Coordinator
         {
             const auto slot = static_cast<std::size_t>(source->row);
             std::vector<std::int32_t> nodes;
+            if (partialCaptureNode[slot] != NO_SEQUENTIAL_NODE)
+            {
+                nodes.push_back(partialCaptureNode[slot]);
+            }
             for (const SequentialWitnessStep & step : source->steps)
             {
+                if (step.node == partialCaptureNode[slot])
+                {
+                    continue;
+                }
+                const std::int32_t claimedBy =
+                    step.node >= 0 && static_cast<std::size_t>(step.node) < nodeCount
+                        ? partialOwner[static_cast<std::size_t>(step.node)] : NO_STOCK_ROW;
+                if (claimedBy != NO_STOCK_ROW && claimedBy != source->row)
+                {
+                    continue;
+                }
                 nodes.push_back(step.node);
             }
             std::vector<SequentialDetail::WitnessStep> steps;
@@ -1673,6 +1727,29 @@ namespace Coordinator
                 return ReplyStockStatus::LimitReached;
             }
             keepChain(slot, steps, counters.adaptedRows);
+        }
+        for (std::size_t slot = 0; slot < rowCount; ++slot)
+        {
+            if (chosen[slot] || partialCaptureNode[slot] == NO_SEQUENTIAL_NODE)
+            {
+                continue;
+            }
+            std::vector<std::int32_t> nodes{partialCaptureNode[slot]};
+            const std::optional<PricedRow> & pricedRow =
+                variants[slot] == nullptr ? m_pricedDayRows[slot] : m_actions.at(*variants[slot]).priced;
+            for (const std::int32_t node : pricedRow->chain)
+            {
+                if (node != partialCaptureNode[slot])
+                {
+                    nodes.push_back(node);
+                }
+            }
+            std::vector<SequentialDetail::WitnessStep> steps;
+            if (!walk(nodes, instance.rows[slot], BlockedNode::Skip, steps))
+            {
+                return ReplyStockStatus::LimitReached;
+            }
+            keepChain(slot, steps, counters.prefixRows);
         }
         for (std::size_t slot = 0; slot < rowCount; ++slot)
         {

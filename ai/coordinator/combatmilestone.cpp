@@ -7120,6 +7120,7 @@ namespace Coordinator
                                 {"realizedMaterial",qint64(s.realizedMaterial)},
                                 {"postReplyStock",qint64(s.postReplyStock)},
                                 {"enemyDenial",qint64(s.enemyDenial)},
+                                {"ownCaptureRisk",qint64(s.ownCaptureRisk)},
                                 {"factoryValue",qint64(s.factoryValue)},
                                 {"affordableBuildSlots",s.affordableBuildSlots},
                                 {"bindingPolicy",int(s.bindingPolicy)},

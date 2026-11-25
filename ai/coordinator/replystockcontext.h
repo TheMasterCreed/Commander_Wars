@@ -192,7 +192,7 @@ namespace Coordinator
         ReplyStockCeiling ceiling(const ContinuationKey & key);
         ReplyStockOwned owned(const ContinuationKey & key);
         ReplyStockFloor floor(const ContinuationKey & key, const ReplyStockFloor * reference = nullptr,
-                              std::span<const std::uint8_t> blockedNodes = {});
+                              std::span<const std::uint8_t> blockedNodes = {}, bool claimPartialCaptures = false);
         // Needs no prices: a witness's value depends only on the key's rows.
         ReplyStockFloor replayWitness(const ContinuationKey & key, std::span<const SequentialRowWitness> witness);
         ReplyStockTune tune(const ContinuationKey & key, std::int32_t rounds,
@@ -280,7 +280,8 @@ namespace Coordinator
                                      std::span<const std::uint8_t> blockedNodes = {}) const;
         ReplyStockStatus composeCeiling(const ContinuationKey & key, ReplyStockCeiling & result);
         ReplyStockStatus composeFloor(const ContinuationKey & key, const ReplyStockFloor * reference,
-                                      ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes = {});
+                                      ReplyStockFloor & result, std::span<const std::uint8_t> blockedNodes = {},
+                                      bool claimPartialCaptures = false);
         ReplyStockStatus tuneKey(const ContinuationKey & key, std::int32_t rounds, const ReplyStockFloor * reference,
                                  ReplyStockTune & result);
         std::optional<MasterPlanPricingModel> forcedModel(const ContinuationKey & key,
