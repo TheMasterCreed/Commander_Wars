@@ -84,6 +84,10 @@ void VeryEasyAI::process()
         m_IslandMaps.clear();
     }
     rebuildIsland(pUnits);
+    // Deferred post-animation kill callbacks inside threadProcessEvents can remove units from the map.
+    pUnits = m_pPlayer->getSpUnits();
+    pUnits->sortAiPriority();
+    pEnemyUnits = m_pPlayer->getSpEnemyUnits();
 
     // make the ai do stuff
     if (useCOPower(pUnits, pEnemyUnits))

@@ -2597,14 +2597,24 @@ void Player::deserializer(QDataStream& pStream, bool fast)
     {
         qint32 typeInt = 0;
         pStream >> typeInt;
-        const auto type = static_cast<GameEnums::AiTypes>(typeInt);
-        if (pStream.status() != QDataStream::Ok ||
-            !GameManager::getInstance()->isKnownAiType(type))
+        if (pStream.status() != QDataStream::Ok)
         {
-            pStream.setStatus(QDataStream::ReadCorruptData);
             return;
         }
-        m_controlType = type;
+        const auto type = static_cast<GameEnums::AiTypes>(typeInt);
+        if (GameManager::getInstance()->isKnownAiType(type))
+        {
+            m_controlType = type;
+        }
+        else if (m_pBaseGameInput.get() != nullptr)
+        {
+            // Legacy maps may store uninitialized controlType bytes; recover from the loaded AI input.
+            m_controlType = m_pBaseGameInput->getAiType();
+        }
+        else
+        {
+            m_controlType = GameEnums::AiTypes_Human;
+        }
     }
     else
     {

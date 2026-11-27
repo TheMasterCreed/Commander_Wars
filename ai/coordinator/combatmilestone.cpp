@@ -39,6 +39,7 @@
 #include "ai/coordinator/stockescape.h"
 #include "ai/coordinator/capturefinishtrade.h"
 #include "ai/coordinator/opentacticalrefinement.h"
+#include "ai/coordinator/unifiedproductionlive.h"
 #include "ai/coordinator/unifiedteamsearch.h"
 #include "ai/coordinator/factoryprogramhearing.h"
 #include "ai/coordinator/factoryopeningsecurity.h"
@@ -71,6 +72,7 @@
 #include "game/player.h"
 #include "ai/coordinator/replyfactsbuilder.h"
 #include "ai/coordinator/isolatedpayday.h"
+#include "resource_management/weaponmanager.h"
 
 namespace Coordinator
 {
@@ -83,6 +85,7 @@ namespace Coordinator
             return CombatMode::Recorded;
         return CombatMode::Off;
     }
+
 } // namespace Coordinator
 
 namespace
@@ -95,14 +98,32 @@ namespace
     }
 
     std::shared_ptr<CombatTerrain> combatTerrain(GameMap &map, const BattlefieldKnowledge &knowledge,
-                                                 MobilityFieldCache &mobility,std::int64_t &work)
+                                                 MobilityFieldCache &mobility,std::int64_t &work,
+                                                 std::optional<quint32> turnLuckNonce = std::nullopt)
     {
         auto terrain = std::make_shared<CombatTerrain>();
         terrain->movementCache = std::make_shared<CombatMovementCache>();
-        terrain->canRepairOnTerrain=[&map,&knowledge](int i,TilePoint tile){
-            if(i<0||i>=static_cast<int>(knowledge.units().size())||!map.onMap(tile.x,tile.y))return false;
-            const auto &u=knowledge.units()[i];auto *source=map.getTerrain(u.x,u.y)->getUnit();auto *site=map.getTerrain(tile.x,tile.y)->getBuilding();
-            return source && site && site->canRepair(source,true) && source->canBeRepaired(QPoint(tile.x,tile.y));
+        auto repairCache = std::make_shared<std::vector<std::int8_t>>(
+            static_cast<std::size_t>(knowledge.units().size()) * static_cast<std::size_t>(knowledge.width()) *
+                static_cast<std::size_t>(knowledge.height()),
+            std::int8_t{-1});
+        terrain->canRepairOnTerrain = [&map, &knowledge, repairCache, w = knowledge.width(), h = knowledge.height()](int i, TilePoint tile) {
+            if (i < 0 || i >= static_cast<int>(knowledge.units().size()) || tile.x < 0 || tile.x >= w ||
+                tile.y < 0 || tile.y >= h || !map.onMap(tile.x, tile.y))
+                return false;
+            const std::size_t key =
+                (static_cast<std::size_t>(i) * static_cast<std::size_t>(h) + static_cast<std::size_t>(tile.y)) *
+                    static_cast<std::size_t>(w) +
+                static_cast<std::size_t>(tile.x);
+            std::int8_t & cached = (*repairCache)[key];
+            if (cached >= 0)
+                return cached != 0;
+            const auto & u = knowledge.units()[i];
+            auto * source = map.getTerrain(u.x, u.y)->getUnit();
+            auto * site = map.getTerrain(tile.x, tile.y)->getBuilding();
+            const bool ok = source && site && site->canRepair(source, true) && source->canBeRepaired(QPoint(tile.x, tile.y));
+            cached = ok ? 1 : 0;
+            return ok;
         };
         terrain->width = knowledge.width();
         terrain->height = knowledge.height();
@@ -158,7 +179,7 @@ namespace
                     pawn.availableShots = std::min(pawn.availableShots, live->getAmmo2());
             }
             const bool canRefreshWeapon = unit.ownerId == knowledge.observerId() && unit.hasMoved && pawn.hasNativeWeapon;
-            if (pawn.present && (unit.canCapture || unit.canFire || canRefreshWeapon))
+            if (pawn.present && (unit.movementPoints > 0 || unit.canCapture || unit.canFire || canRefreshWeapon))
             {
                 auto [entry, fresh] = profiles.try_emplace({unit.ownerId, unit.unitId}, terrain->grids.size());
                 if (fresh)
@@ -172,8 +193,13 @@ namespace
             const auto &u = knowledge.units()[i];
             return map.getTerrain(u.x, u.y)->getUnit();
         };
-        terrain->ownFire = [live, &knowledge, oracle = DamageOracle(map)](int a, TilePoint from, int b, double actorHp,
+        DamageOracle ownFireOracle(map);
+        if (turnLuckNonce.has_value())
+            ownFireOracle.setLuckPeek(*turnLuckNonce, knowledge.observerId());
+        terrain->ownFire = [live, &knowledge, oracle = std::move(ownFireOracle)](int a, TilePoint from, int b, double actorHp,
                                                                           double targetHp, std::array<int,2> targetAmmo) mutable {
+            if (isTerrainTargetId(b))
+                return OwnFireReport{};
             const auto &victim = knowledge.units()[b];
             return oracle.estimateAtHp(a, *live(a), from, b, *live(b), {victim.x, victim.y}, actorHp, targetHp, targetAmmo);
         };
@@ -224,6 +250,60 @@ namespace
             return defenseGrid->lookup(i, at);
         };
         terrain->defense = std::move(stockDefense);
+        for (int y = 0; y < terrain->height; ++y)
+        {
+            for (int x = 0; x < terrain->width; ++x)
+            {
+                Terrain * pT = map.getTerrain(x, y);
+                if (pT == nullptr || pT->getHp() <= 0 || pT->getBuilding() != nullptr)
+                    continue;
+                BreakableTerrainTile bt;
+                bt.tile = {x, y};
+                const double realHp = std::min<double>(
+                    UNIT_HP_STEPS,
+                    static_cast<double>(pT->getHp()) / TERRAIN_HP_PER_STEP);
+                bt.hpSteps = std::max<std::int32_t>(1, ceilHpSteps(realHp));
+                bt.opensPlasma = (pT->getID() == QLatin1String("METEOR"));
+                bt.openedTiles.push_back(bt.tile);
+                if (bt.opensPlasma)
+                {
+                    std::set<std::pair<int, int>> visited{{x, y}};
+                    std::queue<TilePoint> q;
+                    q.push(bt.tile);
+                    while (!q.empty())
+                    {
+                        const TilePoint cur = q.front();
+                        q.pop();
+                        for (const EntryDirection dir : ENTRY_DIRECTIONS)
+                        {
+                            const StepVector step = entryStep(dir);
+                            const int nx = cur.x + step.dx;
+                            const int ny = cur.y + step.dy;
+                            if (!map.onMap(nx, ny) || visited.contains({nx, ny}))
+                                continue;
+                            Terrain * pN = map.getTerrain(nx, ny);
+                            if (pN != nullptr && pN->getID() == QLatin1String("PLASMA"))
+                            {
+                                visited.emplace(nx, ny);
+                                bt.openedTiles.push_back(TilePoint{nx, ny});
+                                q.push(TilePoint{nx, ny});
+                            }
+                        }
+                    }
+                }
+                terrain->breakableTerrains.push_back(std::move(bt));
+            }
+        }
+        terrain->envWeapon = [live, &map, &knowledge](int actorKi, TilePoint targetTile) -> double {
+            if (actorKi < 0 || actorKi >= static_cast<int>(knowledge.units().size()) ||
+                !map.onMap(targetTile.x, targetTile.y))
+                return 0.0;
+            Unit * pU = live(actorKi);
+            Terrain * pT = map.getTerrain(targetTile.x, targetTile.y);
+            if (pU == nullptr || pT == nullptr || pT->getHp() <= 0)
+                return 0.0;
+            return static_cast<double>(pU->getEnvironmentDamage(pT->getID()));
+        };
         return terrain;
     }
 
@@ -355,6 +435,9 @@ namespace
             const auto &candidate = problem.actors()[actor.actorSlot].candidates[actor.candidateIndex];
             const auto *component = singleComponentOf(candidate.source.bundle);
             if (component && component->kind == ComponentKind::Fire &&
+                !isTerrainTargetId(component->fire.targetUnitId) &&
+                component->fire.targetUnitId >= 0 &&
+                component->fire.targetUnitId < static_cast<int>(knowledge.units().size()) &&
                 knowledge.units().at(component->fire.targetUnitId).canCapture)
                 effects.emplace_back(component->fire.targetUnitId, -1, -1, actor.grantedDamage, 0);
         }
@@ -781,6 +864,199 @@ namespace
         receipt["hqSecurity"] = security;
         receipt["terminalClass"] = static_cast<int>(terminal);
         return CombatRank{terminal, security, 0, terminal == TerminalClass::Unresolved ? funds : 0};
+    }
+
+    inline std::optional<CombatRank> unifiedHqRank(
+        GameMap & map, const HeadquartersWatch & watch, const CombatTerrain & terrain,
+        const BattlefieldKnowledge & knowledge, const MasterAssignmentProblem & problem,
+        const PropertyStockField & field, const ReplyPassEvaluation & eval)
+    {
+        TerminalClass terminal = TerminalClass::Unresolved;
+        int guard = NO_UNIT;
+        const auto ownHQ = openingHeadquartersCapture(watch, problem, field, eval);
+        const bool gainedHQ = ownHQ.gained;
+        if (ownHQ.won)
+            terminal = TerminalClass::ForcedWin;
+        std::vector<TilePoint> blockers;
+        blockers.reserve(eval.combatLocations.size());
+        for (int i = 0; i < static_cast<int>(eval.combatLocations.size()); ++i)
+        {
+            const auto tileAt = eval.combatLocations[static_cast<std::size_t>(i)];
+            if (tileAt == INVALID_TILE || terrain.units[static_cast<std::size_t>(i)].enemy)
+                continue;
+            if (tileAt == watch.home)
+                guard = i;
+            else
+                blockers.push_back(tileAt);
+        }
+        bool approaching = false;
+        bool canEnterBeforeReturn = false;
+        std::vector<std::uint8_t> spentEnemyActions(terrain.units.size(), 0);
+        if (eval.openingRecruitFight && eval.openingRecruitFight->shooter >= 0 &&
+            eval.openingRecruitFight->shooter < static_cast<int>(spentEnemyActions.size()))
+            spentEnemyActions[static_cast<std::size_t>(eval.openingRecruitFight->shooter)] = 1;
+        for (const auto & shot : eval.shots)
+        {
+            if (shot.shooterIndex >= 0 && shot.shooterIndex < static_cast<int>(spentEnemyActions.size()))
+                spentEnemyActions[static_cast<std::size_t>(shot.shooterIndex)] = 1;
+        }
+        for (const auto & order : eval.encirclement.blockOrders)
+        {
+            if (order.unitIndex >= 0 && order.unitIndex < static_cast<int>(spentEnemyActions.size()))
+                spentEnemyActions[static_cast<std::size_t>(order.unitIndex)] = 1;
+        }
+        if (eval.enemyWaiting >= 0 && eval.enemyWaiting < static_cast<int>(spentEnemyActions.size()))
+            spentEnemyActions[static_cast<std::size_t>(eval.enemyWaiting)] = 1;
+
+        std::optional<std::vector<TilePoint>> beforeCache;
+        ActivationField reach;
+        const std::vector<TilePoint> homeTargets{watch.home};
+        for (const int i : watch.approaching)
+        {
+            const auto & pawn = terrain.units[static_cast<std::size_t>(i)];
+            const auto & unit = knowledge.units()[static_cast<std::size_t>(i)];
+            const auto it = eval.enemyAfterOwn.find(i);
+            const int hp = it == eval.enemyAfterOwn.end() ? unit.hpRounded : it->second;
+            if (hp <= 0)
+                continue;
+            const bool standing = pawn.tile == watch.home;
+            const int rate = replyCaptureRate(unit.captureRate, unit.hpRounded - hp, false);
+            if (standing && !ownHQ.won &&
+                openingHqFinish(hp, rate, unit.capturePoints, field.capturePointsToCapture(),
+                                gainedHQ, watch.standingTerrain, false) == OpeningHqFinish::Unverified)
+            {
+                constexpr int HQ_CAPTURE_LOSS_SECURITY = -3;
+                return CombatRank{TerminalClass::ForcedLoss, HQ_CAPTURE_LOSS_SECURITY, 0, 0};
+            }
+            if (!terrain.pay(2LL * terrain.width * terrain.height))
+                return {};
+            const auto & grid = terrain.grids[static_cast<std::size_t>(pawn.grid)];
+            const auto position = eval.combatLocations[static_cast<std::size_t>(i)];
+            const bool used = spentEnemyActions[static_cast<std::size_t>(i)] != 0;
+            reach.build(pawn.ignoresCollision ? grid : grid.withBlockedTiles(blockers),
+                        position == INVALID_TILE ? pawn.tile : position, pawn.movement, used ? 1 : 2,
+                        homeTargets);
+            const int arrival = reach.activations(watch.home.x, watch.home.y);
+            if (arrival > 0 && position != INVALID_TILE)
+            {
+                approaching = true;
+                canEnterBeforeReturn |= !used && arrival == 1;
+            }
+            if (!standing && !ownHQ.won && guard == NO_UNIT &&
+                openingHqFinish(hp, rate, 0, field.capturePointsToCapture(), gainedHQ, {}, false) ==
+                    OpeningHqFinish::Unverified)
+            {
+                if (!beforeCache)
+                {
+                    beforeCache.emplace();
+                    std::vector<std::uint8_t> actorSeen(terrain.units.size(), 0);
+                    for (const auto & a : eval.actors)
+                    {
+                        const int ki = problem.actors()[static_cast<std::size_t>(a.actorSlot)].knowledgeUnitIndex;
+                        if (ki >= 0 && ki < static_cast<int>(actorSeen.size()))
+                            actorSeen[static_cast<std::size_t>(ki)] = 1;
+                        if (a.stepsAfterOwnActions > 0)
+                            beforeCache->push_back(eval.replay.plan.action(a.actionIndex).destination);
+                    }
+                    for (int k = 0; k < static_cast<int>(terrain.units.size()); ++k)
+                    {
+                        if (terrain.units[static_cast<std::size_t>(k)].present &&
+                            !terrain.units[static_cast<std::size_t>(k)].enemy &&
+                            actorSeen[static_cast<std::size_t>(k)] == 0)
+                            beforeCache->push_back(terrain.units[static_cast<std::size_t>(k)].tile);
+                    }
+                }
+                if (std::ranges::find(*beforeCache, watch.home) == beforeCache->end())
+                {
+                    if (!terrain.pay(2LL * terrain.width * terrain.height))
+                        return {};
+                    reach.build(pawn.ignoresCollision ? grid : grid.withBlockedTiles(*beforeCache),
+                                pawn.tile, pawn.movement, 1, homeTargets);
+                    if (reach.activations(watch.home.x, watch.home.y) == 1)
+                    {
+                        constexpr int HQ_CAPTURE_LOSS_SECURITY = -3;
+                        return CombatRank{TerminalClass::ForcedLoss, HQ_CAPTURE_LOSS_SECURITY, 0, 0};
+                    }
+                }
+            }
+        }
+        const bool needsCover = approaching && !gainedHQ;
+        const int security = !needsCover || guard != NO_UNIT ? 0 : canEnterBeforeReturn ? -2 : -1;
+        CombatRank rank{terminal, security, 0, 0};
+        GameRules * rules = map.getGameRules();
+        if (rules != nullptr && rules->getVictoryRule(QStringLiteral("VICTORYRULE_NOUNITS")) != nullptr &&
+            std::get<0>(rank) == TerminalClass::Unresolved)
+        {
+            int enemyInitial = 0;
+            int enemyAlive = 0;
+            int ownInitial = 0;
+            int ownAlive = 0;
+            std::vector<std::uint8_t> seenActor(terrain.units.size(), 0);
+            for (const auto & actor : eval.actors)
+            {
+                const int ki = problem.actors()[static_cast<std::size_t>(actor.actorSlot)].knowledgeUnitIndex;
+                if (ki >= 0 && ki < static_cast<int>(seenActor.size()))
+                {
+                    seenActor[static_cast<std::size_t>(ki)] = 1;
+                    ++ownInitial;
+                    if (actor.stepsAfterReply > 0)
+                        ++ownAlive;
+                }
+            }
+            for (int ki = 0; ki < static_cast<int>(terrain.units.size()); ++ki)
+            {
+                const auto & p = terrain.units[static_cast<std::size_t>(ki)];
+                if (!p.present) continue;
+                if (p.enemy)
+                {
+                    ++enemyInitial;
+                    int remSteps = ki < static_cast<int>(knowledge.units().size())
+                        ? knowledge.units()[static_cast<std::size_t>(ki)].hpRounded
+                        : ceilHpSteps(p.realHp >= 0.0 ? p.realHp : UNIT_HP_STEPS);
+                    if (const auto itR = eval.enemyReplyHp.find(ki); itR != eval.enemyReplyHp.end())
+                        remSteps = itR->second;
+                    else if (const auto itO = eval.enemyAfterOwn.find(ki); itO != eval.enemyAfterOwn.end())
+                        remSteps = itO->second;
+                    if (remSteps > 0)
+                        ++enemyAlive;
+                }
+                else if (seenActor[static_cast<std::size_t>(ki)] == 0 &&
+                         ki < static_cast<int>(knowledge.units().size()) &&
+                         knowledge.units()[static_cast<std::size_t>(ki)].hpRounded > 0)
+                {
+                    ++ownInitial;
+                    if (const auto itOwn = eval.realAfterReply.find(ki); itOwn != eval.realAfterReply.end())
+                    {
+                        if (ceilHpSteps(itOwn->second) > 0)
+                            ++ownAlive;
+                    }
+                    else
+                    {
+                        ++ownAlive;
+                    }
+                }
+            }
+            if (enemyInitial > 0 && enemyAlive == 0)
+                std::get<0>(rank) = TerminalClass::ForcedWin;
+            else if (ownInitial > 0 && ownAlive == 0)
+                std::get<0>(rank) = TerminalClass::ForcedLoss;
+        }
+        return rank;
+    }
+
+    inline QJsonObject unifiedScoreToJson(const UnifiedTeamScore & s)
+    {
+        return QJsonObject{
+            {"valid", s.valid},
+            {"terminalClass", int(std::get<0>(s.worstHqRank))},
+            {"worstEconomicValue", qint64(s.worstEconomicValue)},
+            {"geodesicProgress", qint64(s.geodesicProgress)},
+            {"realizedMaterial", qint64(s.realizedMaterial)},
+            {"postReplyStock", qint64(s.postReplyStock)},
+            {"forwardCoverage", qint64(s.forwardCoverage)},
+            {"enemyDenial", qint64(s.enemyDenial)},
+            {"ownCaptureRisk", qint64(s.ownCaptureRisk)},
+            {"factoryValue", qint64(s.factoryValue)}};
     }
 
     struct Trial
@@ -1248,6 +1524,9 @@ namespace
                 const bool screens =
                     std::find(firingTiles.begin(), firingTiles.end(), c.destination) != firingTiles.end();
                 const bool interrupts = priceOpponent && component && component->kind == ComponentKind::Fire &&
+                                        !isTerrainTargetId(component->fire.targetUnitId) &&
+                                        component->fire.targetUnitId >= 0 &&
+                                        component->fire.targetUnitId < static_cast<int>(knowledge.units().size()) &&
                                         knowledge.units().at(component->fire.targetUnitId).capturePoints > 0 &&
                                         knowledge.units().at(component->fire.targetUnitId).canCapture;
                 const auto selected = actor.candidates[current].destination;
@@ -1924,10 +2203,274 @@ namespace
     }
 #endif
 
+    QJsonObject buildPhysicalTeamJson(const DecisionTraceIdentity &identity, const MasterAssignmentProblem &problem,
+                                      int horizonTurns, const ReplyPassEvaluation &team, CombatFireOrder fire,
+                                      const QJsonObject &receipt)
+    {
+        QJsonArray orders, execution;
+        for (const auto &a : team.actors)
+        {
+            const auto &candidate = problem.actors()[a.actorSlot].candidates[a.candidateIndex];
+            const auto &action = team.replay.plan.action(a.actionIndex);
+            QJsonArray path;
+            for (const auto &at : action.path)
+                path.append(tile(at));
+            QJsonObject shot;
+            if (a.ownShot.target != NO_UNIT)
+                shot = {{"actorHp", a.ownShot.attackerAfter}, {"targetHp", a.ownShot.targetAfter}};
+            orders.append(QJsonObject{{"combatAfter", shot}, {"slot", a.actorSlot}, {"unit", a.engineUnitId},
+                {"candidate", a.candidateIndex}, {"kind", int(candidate.actionKind)}, {"action", action.actionId},
+                {"from", tile(candidate.origin)}, {"to", tile(action.destination)}, {"target", tile(action.target)},
+                {"targetUnit", action.targetUnitId}, {"path", path}, {"actionIndex", a.actionIndex}});
+        }
+        for (int i : team.replay.ordering.order)
+            execution.append(i);
+        return QJsonObject{{"day", identity.day}, {"player", identity.playerId},
+            {"planSequence", static_cast<qint64>(identity.planSequence)}, {"horizon", horizonTurns},
+            {"orders", orders}, {"executionOrder", execution}, {"fireOrder", QJsonArray{fire.first, fire.second}},
+            {"purchaseBoundary", receipt.value("purchaseBoundary")}};
+    }
+
 } // namespace
 
 namespace Coordinator
 {
+    namespace
+    {
+        std::int64_t unifiedDynamicWorkBudget(std::size_t actorCount, std::int64_t replayTariff,
+                                              std::int64_t allowance)
+        {
+            const std::size_t pivot = static_cast<std::size_t>(UNIFIED_DIMINISHING_ACTOR_PIVOT);
+            if (actorCount > pivot)
+            {
+                const std::int64_t cliffEvalWork =
+                    replayTariff * static_cast<std::int64_t>(UNIFIED_LARGE_ARMY_MAX_EVALS);
+                return std::max<std::int64_t>(UNIFIED_SEARCH_WORK_BUDGET, cliffEvalWork);
+            }
+            const std::int64_t scaled = static_cast<std::int64_t>(actorCount) * UNIFIED_SEARCH_WORK_PER_ACTOR;
+            const std::int64_t actorScaledWork = std::max<std::int64_t>(UNIFIED_SEARCH_WORK_BUDGET, scaled);
+            const std::int64_t evalScaledWork =
+                replayTariff * static_cast<std::int64_t>(unifiedDynamicEvalBudget(static_cast<int>(actorCount)));
+            return std::max({std::max<std::int64_t>(allowance, 0), actorScaledWork, evalScaledWork});
+        }
+    }
+
+    QJsonObject planUnifiedTurn(const DecisionTraceIdentity &identity, GameMap &map,
+                                const BattlefieldKnowledge &knowledge, MobilityFieldCache &mobility,
+                                const MasterPlanHandoff &handoff, const ReplyBoard &initialBoard,
+                                const PropertyStockField &field, AssignmentResult &assignment,
+                                std::span<const PropertyFacts> properties,
+                                std::int64_t allowance,
+                                ReplyFactsBuilder *replyFacts,
+                                std::optional<quint32> turnLuckNonce)
+    {
+        QJsonObject result{{"schema", 1},
+                           {"day", identity.day},
+                           {"player", identity.playerId},
+                           {"planSequence", static_cast<qint64>(identity.planSequence)},
+                           {"horizon", identity.horizonTurns},
+                           {"acting", true},
+                           {"status", "NO_HANDOFF"},
+                           {"installed", false},
+                           {"planSource", "open_tactical"}};
+        const auto & problem = handoff.problem;
+        if (problem.actors().empty())
+        {
+            result["status"] = "EMPTY_TEAM";
+            return result;
+        }
+        std::int64_t geometry = std::max<std::int64_t>(UNIFIED_SEARCH_WORK_BUDGET, allowance);
+        auto terrain = combatTerrain(map, knowledge, mobility, geometry, turnLuckNonce);
+        if (!terrain)
+        {
+            result["status"] = "TERRAIN_UNAVAILABLE";
+            return result;
+        }
+        auto local = std::make_shared<CombatTerrain>(*terrain);
+        local->policy = TacticalReply::Economic;
+        local->replyTarget = NO_UNIT;
+        local->openingRecruitTarget = nullptr;
+        local->orderedOpening = nullptr;
+        local->friendlyBirthSites.clear();
+        local->containFrom = INVALID_TILE;
+        local->containShooter = NO_UNIT;
+        const auto hq = headquartersWatch(map, knowledge, *local);
+        local->guardedHQ = hq.home;
+        local->workLeft = &geometry;
+        if (replyFacts != nullptr)
+        {
+            for (int i = 0; i < static_cast<int>(knowledge.units().size()); ++i)
+            {
+                const auto & known = knowledge.units()[static_cast<std::size_t>(i)];
+                if (knowledge.relation(known.ownerId) != Relation::Own ||
+                    known.carrier != KnownUnit::NO_CARRIER || known.hpRounded <= 0)
+                    continue;
+                if (std::ranges::any_of(problem.actors(), [&](const MasterActor & m) {
+                        return m.knowledgeUnitIndex == i;
+                    }))
+                    continue;
+                const auto & pawn = local->units[static_cast<std::size_t>(i)];
+                Unit * live = pawn.present && map.getTerrain(known.x, known.y) != nullptr
+                    ? map.getTerrain(known.x, known.y)->getUnit() : nullptr;
+                if (live == nullptr || live->getUniqueID() != pawn.engineUnitId)
+                    continue;
+                const auto facts = replyFacts->factsFor(i, *live, pawn.tile);
+                if (!facts || !facts->tile || facts->tile->shooters.size() != facts->shots.size())
+                    continue;
+                MilliFunds observedCost = pawn.replacementCost;
+                for (qint32 c = 0; c < live->getLoadedUnitCount(); ++c)
+                {
+                    if (const Unit * cargo = live->getLoadedUnit(c))
+                    {
+                        observedCost += (toMilliFunds(std::max<qint32>(0, cargo->getUnitCosts())) *
+                                         std::max<qint32>(1, cargo->getHpRounded())) / UNIT_HP_STEPS;
+                    }
+                }
+                local->observedDefenders.push_back(
+                    {i, pawn.engineUnitId, pawn.tile, observedCost, facts, field.ourRowOf(i)});
+            }
+        }
+        ReplyBoard actingBoard = initialBoard;
+        actingBoard.combat = local;
+
+        PurchaseWindow purchaseWindow;
+        std::optional<UnifiedProductionModel> prodModel;
+        if (Player * pObserver = map.getPlayer(knowledge.observerId()))
+        {
+            const int limit = map.getGameRules() != nullptr ? map.getGameRules()->getUnitLimit() : 0;
+            purchaseWindow.unitSlots = limit > 0
+                ? std::max(0, limit - pObserver->getUnitCount())
+                : std::numeric_limits<int>::max();
+            purchaseWindow.treasury = toMilliFunds(std::max<qint32>(0, pObserver->getFunds()));
+            DamageOracle prodOracle(map);
+            prodModel = buildLiveUnifiedProductionModel(
+                map, *pObserver, knowledge, mobility, prodOracle, properties, field);
+            if (prodModel && prodModel->valid())
+            {
+                for (const auto & site : prodModel->input().sites)
+                {
+                    if (site.owner != OwnerSign::Ours)
+                        continue;
+                    MilliFunds minCost = std::numeric_limits<MilliFunds>::max();
+                    for (const int tIdx : site.buildableTemplateIndices)
+                    {
+                        if (tIdx >= 0 && tIdx < static_cast<int>(prodModel->input().templates.size()))
+                            minCost = std::min(minCost, prodModel->input().templates[static_cast<std::size_t>(tIdx)].cost);
+                    }
+                    if (minCost < std::numeric_limits<MilliFunds>::max() && minCost > 0 && minCost <= purchaseWindow.treasury)
+                        purchaseWindow.sitesByCost.emplace_back(minCost, Cell{site.tile.x, site.tile.y});
+                }
+                std::sort(purchaseWindow.sitesByCost.begin(), purchaseWindow.sitesByCost.end());
+            }
+        }
+
+        const std::int64_t replayTariff = std::max<std::int64_t>(
+            1, static_cast<std::int64_t>(problem.actors().size()) * 16 +
+                   static_cast<std::int64_t>(local->units.size()) * 8);
+        std::int64_t unifiedWork = unifiedDynamicWorkBudget(problem.actors().size(), replayTariff, allowance);
+        std::int64_t refWork = std::max(unifiedWork, replayTariff * 2 + UNIFIED_FINAL_REPLAY_WORK_FLOOR);
+        local->workLeft = &refWork;
+        const auto sourceReference = evaluateReplyPassPlan(problem, handoff.choices, actingBoard);
+        if (!sourceReference.valued())
+        {
+            result["status"] = "REFERENCE_UNAVAILABLE";
+            return result;
+        }
+        const std::int64_t unifiedWorkStart = unifiedWork;
+        local->workLeft = &unifiedWork;
+        const auto hqRankFor = [&](const ReplyPassEvaluation & eval) -> std::optional<CombatRank> {
+            return unifiedHqRank(map, hq, *local, knowledge, problem, field, eval);
+        };
+        const auto buildSlotsFor = [&](const ReplyPassEvaluation & eval) {
+            const auto at = purchaseBoundary(problem, *local, eval, purchaseWindow.unitSlots);
+            return purchaseWindow.affordable([&](Cell c) { return at.occupied.contains(c); }, at.available);
+        };
+        const auto allowAll = [&](const std::vector<int> &) { return true; };
+        const auto stockProposed = handoff.stockProposal
+            ? std::span<const int>(handoff.stockProposal->choices)
+            : std::span<const int>{};
+        const auto search = optimizeUnifiedTeam(
+            problem, knowledge, field, properties, *local, actingBoard,
+            handoff.choices, stockProposed, replayTariff, unifiedWork,
+            hqRankFor, buildSlotsFor, allowAll, prodModel ? &*prodModel : nullptr);
+        const auto scoreJson = [](const UnifiedTeamScore & s) {
+            return unifiedScoreToJson(s);
+        };
+        QJsonObject unifiedReceipt{
+            {"mode", "UNIFIED_VALUE_OVER_TIME"},
+            {"winningSeed", search.winningSeed},
+            {"sweeps", search.sweeps},
+            {"evals", search.evals},
+            {"pruned", search.pruned},
+            {"pairImprovements", search.pairImprovements},
+            {"workUsed", qint64(unifiedWorkStart - unifiedWork)},
+            {"baseline", scoreJson(search.baselineScore)},
+            {"selected", scoreJson(search.bestScore)}};
+        if (!search.bestScore.valid)
+        {
+            unifiedReceipt["status"] = "UNIFIED_NO_VALID_PLAN";
+            result["openTacticalHearing"] = unifiedReceipt;
+            result["status"] = "UNIFIED_NO_VALID_PLAN";
+            return result;
+        }
+        std::int64_t finalWork = std::max(allowance, replayTariff + UNIFIED_FINAL_REPLAY_WORK_FLOOR);
+        local->policy = TacticalReply::Economic;
+        local->replyTarget = NO_UNIT;
+        local->containShooter = NO_UNIT;
+        local->containFrom = INVALID_TILE;
+        local->workLeft = &finalWork;
+        const auto mapAtStart = map.getMapHash();
+        const auto finalTeam = evaluateReplyPassPlan(
+            problem, search.bestTeam, actingBoard, {}, search.bestFireOrders);
+        const bool teamOk = finalTeam.valued() && finalTeam.replay.valid() && finalTeam.replay.complete();
+        const auto mismatch = std::mismatch(search.bestTeam.begin(), search.bestTeam.end(), handoff.choices.begin());
+        const int changedSlot = mismatch.first == search.bestTeam.end()
+            ? NO_REPLY_PASS_ACTOR
+            : static_cast<int>(mismatch.first - search.bestTeam.begin());
+        auto nextAssignment = assignment;
+        const bool mapOk = map.getMapHash() == mapAtStart;
+        if (teamOk && mapOk && publish(handoff, finalTeam, changedSlot, sourceReference, nextAssignment))
+        {
+            const auto at = purchaseBoundary(problem, *local, finalTeam, purchaseWindow.unitSlots);
+            const auto count = purchaseWindow.affordable(
+                [&](Cell c) { return at.occupied.contains(c); }, at.available);
+            QJsonArray available;
+            for (const auto & [cost, site] : purchaseWindow.sitesByCost)
+                if (cost <= purchaseWindow.treasury && !at.occupied.contains(site))
+                    available.append(QJsonArray{site.first, site.second});
+            if (count == 0)
+                available = {};
+            const QJsonObject boundaryReceipt{{"purchaseBoundary", QJsonObject{
+                {"openAffordableSites", available},
+                {"spendableFunds", qint64(purchaseWindow.treasury)},
+                {"affordableBuildSlots", count}}}};
+            const CombatFireOrder primaryFireOrder = search.bestFireOrders.empty()
+                ? CombatFireOrder{}
+                : search.bestFireOrders.front();
+            const auto physicalTeam = buildPhysicalTeamJson(
+                identity, problem, field.horizonTurns(), finalTeam, primaryFireOrder, boundaryReceipt);
+            assignment = std::move(nextAssignment);
+            QJsonArray chosen;
+            for (int c : search.bestTeam)
+                chosen.append(c);
+            unifiedReceipt["status"] = "OPEN_TACTICAL_REFINEMENT";
+            unifiedReceipt["selectedPhysicalTeam"] = physicalTeam;
+            result["openTacticalHearing"] = unifiedReceipt;
+            result["installed"] = true;
+            result["status"] = "OPEN_TACTICAL_REFINEMENT";
+            result["choices"] = chosen;
+            result["executionOrder"] = physicalTeam["executionOrder"];
+            return result;
+        }
+        unifiedReceipt["status"] = "PUBLICATION_REFUSED";
+        unifiedReceipt["refusalReason"] = !teamOk ? "NO_FINAL_TEAM"
+            : !mapOk ? "MAP_CHANGED"
+            : "PUBLISH_FAILED";
+        result["openTacticalHearing"] = unifiedReceipt;
+        result["status"] = "PUBLICATION_REFUSED";
+        return result;
+    }
+
     QJsonObject compareCombatPlans(CombatMode mode, const DecisionTraceIdentity &identity, GameMap &map,
                                    const BattlefieldKnowledge &knowledge, MobilityFieldCache &mobility,
                                    const MasterPlanHandoff *handoff, const ReplyBoard *initialBoard,
@@ -1952,7 +2495,99 @@ namespace Coordinator
         }
         if (map.getPlayerCount() != 2)
         {
-            result["status"] = "MULTIPLAYER_SIDES";
+            if (mode != CombatMode::Acting || !progressInput || handoff->problem.actors().empty() ||
+                map.getGameRules()->getFogMode() != GameEnums::Fog_Off)
+            {
+                result["status"] = "MULTIPLAYER_SIDES";
+                return result;
+            }
+            std::int64_t geometry = allowance / 2;
+            auto terrain = combatTerrain(map, knowledge, mobility, geometry);
+            if (!terrain)
+            {
+                result["status"] = "MULTIPLAYER_SIDES";
+                return result;
+            }
+            std::int64_t work = std::max<std::int64_t>(allowance, UNIFIED_SEARCH_WORK_BUDGET);
+            terrain->workLeft = &work;
+            const auto hq = headquartersWatch(map, knowledge, *terrain);
+            terrain->guardedHQ = hq.home;
+            ReplyBoard actingBoard = *initialBoard;
+            actingBoard.combat = terrain;
+            const auto & problem = handoff->problem;
+            const auto & sourceChoices = handoff->choices;
+            const auto sourceReference = evaluateReplyPassPlan(problem, sourceChoices, actingBoard);
+            const std::int64_t replayTariff = std::max<std::int64_t>(
+                1, static_cast<std::int64_t>(problem.actors().size()) * 16 +
+                       static_cast<std::int64_t>(terrain->units.size()) * 8);
+            const auto hqRankFor = [&](const ReplyPassEvaluation & eval) -> std::optional<CombatRank> {
+                return unifiedHqRank(map, hq, *terrain, knowledge, problem, field, eval);
+            };
+            const auto buildSlotsFor = [&](const ReplyPassEvaluation &) { return 0; };
+            const auto allowAll = [&](const std::vector<int> &) { return true; };
+            std::optional<UnifiedProductionModel> prodModel;
+            if (Player * pObserver = map.getPlayer(knowledge.observerId()))
+            {
+                DamageOracle prodOracle(map);
+                prodModel = buildLiveUnifiedProductionModel(
+                    map, *pObserver, knowledge, mobility, prodOracle, progressSites, field);
+            }
+            std::int64_t unifiedWork = unifiedDynamicWorkBudget(problem.actors().size(), replayTariff, 0);
+            const std::int64_t unifiedWorkStart = unifiedWork;
+            const auto stockProposed = handoff->stockProposal
+                ? std::span<const int>(handoff->stockProposal->choices)
+                : std::span<const int>{};
+            const auto search = optimizeUnifiedTeam(
+                problem, knowledge, field, progressSites, *terrain, actingBoard,
+                sourceChoices, stockProposed, replayTariff, unifiedWork,
+                hqRankFor, buildSlotsFor, allowAll, prodModel ? &*prodModel : nullptr);
+            const auto scoreJson = [](const UnifiedTeamScore & s) {
+                return unifiedScoreToJson(s);
+            };
+            QJsonObject unifiedReceipt{
+                {"mode", "UNIFIED_VALUE_OVER_TIME_MULTIPLAYER"},
+                {"winningSeed", search.winningSeed},
+                {"sweeps", search.sweeps},
+                {"evals", search.evals},
+                {"pruned", search.pruned},
+                {"pairImprovements", search.pairImprovements},
+                {"workUsed", qint64(unifiedWorkStart - unifiedWork)},
+                {"baseline", scoreJson(search.baselineScore)},
+                {"selected", scoreJson(search.bestScore)}};
+            if (search.improved)
+            {
+                std::int64_t finalWork = std::max(work, replayTariff + UNIFIED_FINAL_REPLAY_WORK_FLOOR);
+                terrain->policy = TacticalReply::Economic;
+                terrain->replyTarget = NO_UNIT;
+                terrain->containShooter = NO_UNIT;
+                terrain->containFrom = INVALID_TILE;
+                terrain->workLeft = &finalWork;
+                const auto finalTeam = evaluateReplyPassPlan(problem, search.bestTeam, actingBoard, {}, search.bestFireOrders);
+                const bool teamOk = finalTeam.valued() && finalTeam.replay.valid() && finalTeam.replay.complete();
+                const auto mismatch = std::mismatch(search.bestTeam.begin(), search.bestTeam.end(), sourceChoices.begin());
+                const int changedSlot = mismatch.first == search.bestTeam.end()
+                    ? NO_REPLY_PASS_ACTOR : static_cast<int>(mismatch.first - search.bestTeam.begin());
+                auto nextAssignment = assignment;
+                if (teamOk && publish(*handoff, finalTeam, changedSlot, sourceReference, nextAssignment))
+                {
+                    assignment = std::move(nextAssignment);
+                    QJsonArray chosen;
+                    for (int c : search.bestTeam) chosen.append(c);
+                    unifiedReceipt["status"] = "OPEN_TACTICAL_REFINEMENT";
+                    result["openTacticalHearing"] = unifiedReceipt;
+                    result["installed"] = true;
+                    result["status"] = "OPEN_TACTICAL_REFINEMENT";
+                    result["choices"] = chosen;
+                    return result;
+                }
+                unifiedReceipt["status"] = "PUBLICATION_REFUSED";
+                result["openTacticalHearing"] = unifiedReceipt;
+                result["status"] = "MULTIPLAYER_PUBLICATION_REFUSED";
+                return result;
+            }
+            unifiedReceipt["status"] = "UNIFIED_RETAINED";
+            result["openTacticalHearing"] = unifiedReceipt;
+            result["status"] = "UNIFIED_MULTIPLAYER_RETAINED";
             return result;
         }
         if (map.getGameRules()->getFogMode() != GameEnums::Fog_Off)
@@ -1991,8 +2626,11 @@ namespace Coordinator
         QJsonArray observedDefenders;
         for(int i=0;i<int(knowledge.units().size());++i){
             const auto &known=knowledge.units()[i];const auto relation=knowledge.relation(known.ownerId);
-            if((relation!=Relation::Own && relation!=Relation::Allied) || (relation==Relation::Own && !known.hasMoved) ||
+            if((relation!=Relation::Own && relation!=Relation::Allied) ||
                known.carrier!=KnownUnit::NO_CARRIER || known.hpRounded<=0)continue;
+            if(relation==Relation::Own && std::ranges::any_of(handoff->problem.actors(),[&](const MasterActor &m){
+                return m.knowledgeUnitIndex==i;
+            }))continue;
             const auto &pawn=terrain->units[i];
             auto *live=pawn.present?map.getTerrain(known.x,known.y)->getUnit():nullptr;
             const auto open=[&](const QString &reason){
@@ -2007,10 +2645,17 @@ namespace Coordinator
             const auto facts=replyFacts->factsFor(i,*live,pawn.tile);
             if(!facts || !facts->tile || facts->tile->shooters.size()!=facts->shots.size())return open("OBSERVED_TARGET_WEAPONS_UNAVAILABLE");
             const bool exposed=std::any_of(facts->shots.begin(),facts->shots.end(),[](const auto &v){return v.rawBase>=0 || v.withAmmo>=0;});
-            if(exposed && (relation!=Relation::Own || live->getLoadedUnitCount()>0 || live->isStatusStealthed()))
+            if(exposed && relation!=Relation::Own)
                 return open("ALLIED_CARGO_OR_STEALTH_TARGET_CONSEQUENCE_UNPRICED");
             if(relation==Relation::Own){
-                terrain->observedDefenders.push_back({i,pawn.engineUnitId,pawn.tile,pawn.replacementCost,facts,field.ourRowOf(i)});
+                MilliFunds observedCost=pawn.replacementCost;
+                for(qint32 c=0;c<live->getLoadedUnitCount();++c){
+                    if(const Unit *cargo=live->getLoadedUnit(c)){
+                        observedCost+=(toMilliFunds(std::max<qint32>(0,cargo->getUnitCosts()))*
+                                       std::max<qint32>(1,cargo->getHpRounded()))/UNIT_HP_STEPS;
+                    }
+                }
+                terrain->observedDefenders.push_back({i,pawn.engineUnitId,pawn.tile,observedCost,facts,field.ourRowOf(i)});
                 observedDefenders.append(QJsonObject{{"unit",pawn.engineUnitId},{"tile",tile(pawn.tile)},{"hp",facts->actorRealHp},
                     {"fuel",known.fuel},{"ammo",QJsonArray{known.ammo1,known.ammo2}},{"possibleShooters",int(facts->tile->shooters.size())}});
             }
@@ -2169,6 +2814,139 @@ namespace Coordinator
             result["status"] = "REFERENCE_UNAVAILABLE";
             return result;
         }
+        if (mode == CombatMode::Acting && progressInput != nullptr && !problem.actors().empty() &&
+            qgetenv("COW_AI_ARENA_TEST") != "1" && qgetenv("COW_COMBAT_EXECUTE_FIXED_ORDERS") != "1" &&
+            qgetenv("COW_COORDINATED_LEGACY_TRIALS") != "1")
+        {
+            if (actingBuyer != nullptr)
+                actingBuyer->openCounterpointTurnStream();
+            const std::int64_t replayTariff = std::max<std::int64_t>(
+                1, static_cast<std::int64_t>(problem.actors().size()) * 16 +
+                       static_cast<std::int64_t>(terrain->units.size()) * 8);
+            auto local = std::make_shared<CombatTerrain>(*terrain);
+            local->policy = TacticalReply::Economic;
+            local->replyTarget = NO_UNIT;
+            local->openingRecruitTarget = nullptr;
+            local->orderedOpening = nullptr;
+            local->friendlyBirthSites.clear();
+            local->containFrom = INVALID_TILE;
+            local->containShooter = NO_UNIT;
+            ReplyBoard actingBoard = board;
+            actingBoard.combat = local;
+            std::int64_t unifiedWork = unifiedDynamicWorkBudget(problem.actors().size(), replayTariff, allowance);
+            const std::int64_t unifiedWorkStart = unifiedWork;
+            local->workLeft = &unifiedWork;
+            const auto hqRankFor = [&](const ReplyPassEvaluation &eval) -> std::optional<CombatRank> {
+                return unifiedHqRank(map, hq, *local, knowledge, problem, field, eval);
+            };
+            const auto buildSlotsFor = [&](const ReplyPassEvaluation &eval) {
+                const auto at = purchaseBoundary(problem, *local, eval, purchaseWindow.unitSlots);
+                return purchaseWindow.affordable([&](Cell c) { return at.occupied.contains(c); }, at.available);
+            };
+            const auto allowAll = [&](const std::vector<int> &) { return true; };
+            const auto stockProposed = handoff->stockProposal
+                ? std::span<const int>(handoff->stockProposal->choices)
+                : std::span<const int>{};
+            std::optional<UnifiedProductionModel> prodModel;
+            if (Player * pObserver = map.getPlayer(knowledge.observerId()))
+            {
+                DamageOracle prodOracle(map);
+                prodModel = buildLiveUnifiedProductionModel(
+                    map, *pObserver, knowledge, mobility, prodOracle, progressSites, field);
+            }
+            const auto search = optimizeUnifiedTeam(
+                problem, knowledge, field, progressSites, *local, actingBoard,
+                effectiveChoices, stockProposed, replayTariff, unifiedWork,
+                hqRankFor, buildSlotsFor, allowAll, prodModel ? &*prodModel : nullptr);
+            const auto scoreJson = [](const UnifiedTeamScore &s) {
+                return unifiedScoreToJson(s);
+            };
+            QJsonObject unifiedReceipt{
+                {"mode", "UNIFIED_VALUE_OVER_TIME"},
+                {"winningSeed", search.winningSeed},
+                {"sweeps", search.sweeps},
+                {"evals", search.evals},
+                {"pruned", search.pruned},
+                {"pairImprovements", search.pairImprovements},
+                {"workUsed", qint64(unifiedWorkStart - unifiedWork)},
+                {"baseline", scoreJson(search.baselineScore)},
+                {"selected", scoreJson(search.bestScore)}};
+            if (search.improved)
+            {
+                std::int64_t finalWork = std::max(allowance, replayTariff + UNIFIED_FINAL_REPLAY_WORK_FLOOR);
+                local->policy = TacticalReply::Economic;
+                local->replyTarget = NO_UNIT;
+                local->containShooter = NO_UNIT;
+                local->containFrom = INVALID_TILE;
+                local->workLeft = &finalWork;
+                const auto mapAtStart = map.getMapHash();
+                const auto finalTeam = evaluateReplyPassPlan(
+                    problem, search.bestTeam, actingBoard, {}, search.bestFireOrders);
+                const bool teamOk = finalTeam.valued() && finalTeam.replay.valid() && finalTeam.replay.complete();
+                const auto mismatch = std::mismatch(
+                    search.bestTeam.begin(), search.bestTeam.end(), effectiveChoices.begin());
+                const int changedSlot = mismatch.first == search.bestTeam.end()
+                    ? NO_REPLY_PASS_ACTOR
+                    : static_cast<int>(mismatch.first - search.bestTeam.begin());
+                auto nextAssignment = assignment;
+                const bool mapOk = map.getMapHash() == mapAtStart;
+                if (teamOk && mapOk && publish(*handoff, finalTeam, changedSlot, sourceReference, nextAssignment))
+                {
+                    const auto at = purchaseBoundary(problem, *local, finalTeam, purchaseWindow.unitSlots);
+                    const auto count = purchaseWindow.affordable(
+                        [&](Cell c) { return at.occupied.contains(c); }, at.available);
+                    QJsonArray available;
+                    for (const auto & [cost, site] : purchaseWindow.sitesByCost)
+                        if (cost <= purchaseWindow.treasury && !at.occupied.contains(site))
+                            available.append(QJsonArray{site.first, site.second});
+                    if (count == 0)
+                        available = {};
+                    const QJsonObject boundaryReceipt{{"purchaseBoundary", QJsonObject{
+                        {"openAffordableSites", available},
+                        {"spendableFunds", qint64(purchaseWindow.treasury)},
+                        {"affordableBuildSlots", count}}}};
+                    const CombatFireOrder primaryFireOrder = search.bestFireOrders.empty()
+                        ? CombatFireOrder{}
+                        : search.bestFireOrders.front();
+                    const auto physicalTeam = buildPhysicalTeamJson(
+                        identity, problem, field.horizonTurns(), finalTeam, primaryFireOrder, boundaryReceipt);
+                    assignment = std::move(nextAssignment);
+                    QJsonArray chosen;
+                    for (int c : search.bestTeam)
+                        chosen.append(c);
+                    unifiedReceipt["status"] = "OPEN_TACTICAL_REFINEMENT";
+                    unifiedReceipt["selectedPhysicalTeam"] = physicalTeam;
+                    result["openTacticalHearing"] = unifiedReceipt;
+                    result["installed"] = true;
+                    result["status"] = "OPEN_TACTICAL_REFINEMENT";
+                    result["economicComparisonStatus"] = "UNRESOLVED";
+                    result["selectedTrial"] = -1;
+                    result["selectedChanges"] = changedFromSource(search.bestTeam);
+                    result["choices"] = chosen;
+                    result["executionOrder"] = physicalTeam["executionOrder"];
+                    storeEconomicOrders(QJsonObject{}, finalTeam);
+                    return result;
+                }
+                unifiedReceipt["status"] = "PUBLICATION_REFUSED";
+                unifiedReceipt["refusalReason"] = !teamOk ? "NO_FINAL_TEAM"
+                    : !mapOk ? "MAP_CHANGED"
+                    : "PUBLISH_FAILED";
+                result["openTacticalHearing"] = unifiedReceipt;
+                if (repair.evaluation)
+                    retainEffectiveReference();
+                else
+                    storeEconomicOrders(QJsonObject{}, reference);
+                return result;
+            }
+            unifiedReceipt["status"] = "UNIFIED_RETAINED";
+            result["openTacticalHearing"] = unifiedReceipt;
+            result["status"] = "UNIFIED_RETAINED";
+            if (repair.evaluation)
+                retainEffectiveReference();
+            else
+                storeEconomicOrders(QJsonObject{}, reference);
+            return result;
+        }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         const auto forcedStart = allowance - allowance / 2 + geometry;
         if (auto branch = runArenaBranch(mode, identity, *handoff, board, sourceReference, candidates, assignment, result))
@@ -2203,7 +2981,8 @@ namespace Coordinator
         const bool factoryProgrammeSurface=mode==CombatMode::Acting && actingBuyer && progressInput && priceOpponent &&
             FactoryPrograms::hasFactoryProgrammeProposal(problem,*terrain,knowledge,progressSites,factorySurfaceLeft);
         result["factoryProgramSurfaceWork"]=qint64(factorySurfaceOffer-factorySurfaceLeft);
-        if (!factoryProgrammeSurface && !handoff->stockProposal && !repair.evaluation && candidates.empty() && !sharedTarget && !closingActors && (!priceOpponent || hq.standing == NO_UNIT))
+        if (!factoryProgrammeSurface && !handoff->stockProposal && !repair.evaluation && candidates.empty() && !sharedTarget && !closingActors && (!priceOpponent || hq.standing == NO_UNIT) &&
+            !(mode == CombatMode::Acting && progressInput && !problem.actors().empty()))
         {
             result["status"] = "NO_CONTACT_TRIAL";
             return result;
@@ -4261,25 +5040,7 @@ namespace Coordinator
                 result["sharedOpeningServiceWork"]=meter;
             };
             const auto bindPhysicalTeam=[&](const ReplyPassEvaluation &team,CombatFireOrder fire,const QJsonObject &receipt){
-                QJsonArray orders,execution;
-                for(const auto &a:team.actors)
-                {
-                    const auto &candidate=problem.actors()[a.actorSlot].candidates[a.candidateIndex];
-                    const auto &action=team.replay.plan.action(a.actionIndex);
-                    QJsonArray path;
-                    for(const auto &at:action.path)path.append(tile(at));
-                    QJsonObject shot;
-                    if(a.ownShot.target!=NO_UNIT)
-                        shot={{"actorHp",a.ownShot.attackerAfter},{"targetHp",a.ownShot.targetAfter}};
-                    orders.append(QJsonObject{{"combatAfter",shot},{"slot",a.actorSlot},{"unit",a.engineUnitId},{"candidate",a.candidateIndex},
-                        {"kind",int(candidate.actionKind)},{"action",action.actionId},{"from",tile(candidate.origin)},
-                        {"to",tile(action.destination)},{"target",tile(action.target)},{"targetUnit",action.targetUnitId},
-                        {"path",path},{"actionIndex",a.actionIndex}});
-                }
-                for(int i:team.replay.ordering.order)execution.append(i);
-                return QJsonObject{{"day",identity.day},{"player",identity.playerId},{"planSequence",static_cast<qint64>(identity.planSequence)},
-                    {"horizon",field.horizonTurns()},{"orders",orders},{"executionOrder",execution},
-                    {"fireOrder",QJsonArray{fire.first,fire.second}},{"purchaseBoundary",receipt.value("purchaseBoundary")}};
+                return buildPhysicalTeamJson(identity,problem,field.horizonTurns(),team,fire,receipt);
             };
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
             // A private saved-game comparison can execute one authenticated team order on its
@@ -7094,9 +7855,8 @@ namespace Coordinator
                             if(selected.size()==int(teamBeforeRefinement.size()))
                                 for(int i=0;i<selected.size();++i)teamBeforeRefinement[i]=selected[i].toInt();
                         }
-                        const auto hqRankFor=[&](const ReplyPassEvaluation &eval){
-                            QJsonObject hqObj;std::vector<int> guards;bool cover=false;
-                            return headquartersRank(hq,*local,knowledge,problem,field,eval,0,hqObj,guards,cover);
+                        const auto hqRankFor=[&](const ReplyPassEvaluation &eval) -> std::optional<CombatRank>{
+                            return unifiedHqRank(map, hq, *local, knowledge, problem, field, eval);
                         };
                         const auto buildSlotsFor=[&](const ReplyPassEvaluation &eval){
                             const auto at=purchaseBoundary(problem,*local,eval,purchaseWindow.unitSlots);
@@ -7112,35 +7872,25 @@ namespace Coordinator
                                 prev["openingLossProof"].toObject().isEmpty();
                         };
                         const auto scoreJson=[](const UnifiedTeamScore &s){
-                            return QJsonObject{
-                                {"valid",s.valid},
-                                {"terminalClass",int(std::get<0>(s.worstHqRank))},
-                                {"hqCaptureStartSafe",s.hqCaptureStartSafe},
-                                {"worstEconomicValue",qint64(s.worstEconomicValue)},
-                                {"stagingScore",qint64(s.stagingScore)},
-                                {"realizedMaterial",qint64(s.realizedMaterial)},
-                                {"postReplyStock",qint64(s.postReplyStock)},
-                                {"enemyDenial",qint64(s.enemyDenial)},
-                                {"ownCaptureRisk",qint64(s.ownCaptureRisk)},
-                                {"factoryValue",qint64(s.factoryValue)},
-                                {"affordableBuildSlots",s.affordableBuildSlots},
-                                {"bindingPolicy",int(s.bindingPolicy)},
-                                {"bindingTargetUnit",s.bindingTargetUnit}};
+                            return unifiedScoreToJson(s);
                         };
-                        // Scale work budget with live actor count so 50v50 turns always complete Sweep 1 + pair passes.
-                        const std::int64_t actorScaledWork=std::max<std::int64_t>(
-                            UNIFIED_SEARCH_WORK_BUDGET,
-                            static_cast<std::int64_t>(problem.actors().size())*UNIFIED_SEARCH_WORK_PER_ACTOR);
-                        const std::int64_t unifiedWorkStart=std::max<std::int64_t>(
-                            std::max<std::int64_t>(0,work-UNIFIED_FINAL_REPLAY_WORK_FLOOR),
-                            std::max(actorScaledWork,replayTariff*UNIFIED_SEARCH_MAX_EVALS));
+                        // Scale work budget dynamically with live actor count (diminished past 50 units).
+                        const std::int64_t unifiedWorkStart=unifiedDynamicWorkBudget(
+                            problem.actors().size(),replayTariff,work-UNIFIED_FINAL_REPLAY_WORK_FLOOR);
                         std::int64_t unifiedWork=unifiedWorkStart;
                         const auto stockProposed=handoff->stockProposal
                             ? std::span<const int>(handoff->stockProposal->choices)
                             : std::span<const int>{};
+                        std::optional<UnifiedProductionModel> prodModel;
+                        if (Player * pObserver = map.getPlayer(knowledge.observerId()))
+                        {
+                            DamageOracle prodOracle(map);
+                            prodModel = buildLiveUnifiedProductionModel(
+                                map, *pObserver, knowledge, mobility, prodOracle, progressSites, field);
+                        }
                         const auto search=optimizeUnifiedTeam(problem,knowledge,field,progressSites,*local,actingBoard,
                             teamBeforeRefinement,stockProposed,replayTariff,unifiedWork,
-                            hqRankFor,buildSlotsFor,allowedByPrior);
+                            hqRankFor,buildSlotsFor,allowedByPrior,prodModel ? &*prodModel : nullptr);
                         QJsonObject unifiedReceipt{
                             {"mode","UNIFIED_VALUE_OVER_TIME"},
                             {"winningSeed",search.winningSeed},
@@ -7432,4 +8182,5 @@ namespace Coordinator
         result["verificationStockWork"] = static_cast<qint64>(allowance / 6 - verifyBudget);
         return result;
     }
+
 } // namespace Coordinator

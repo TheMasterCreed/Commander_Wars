@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ai/coordinator/ownfirereport.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -37,12 +39,16 @@ namespace Coordinator
     struct FireFacts
     {
         std::int32_t targetUnitId{NO_UNIT};
+        TilePoint targetTile{INVALID_TILE};
         MilliFunds targetReplacementCost{0};
         std::int32_t targetHpSteps{0};
         std::int32_t damageSteps{0};
         std::int32_t counterSteps{0};
         MilliFunds targetBestShotBefore{0};
         MilliFunds targetBestShotAfter{0};
+        double targetRealHp{-1};
+        std::array<int, 2> targetAmmo{-1, -1};
+        OwnFireReport isolated;
     };
 
     struct CaptureFacts
@@ -126,6 +132,10 @@ namespace Coordinator
         std::int32_t horizonTurns{DEFAULT_ECONOMIC_RELEVANCE_HORIZON};
     };
 
+    constexpr std::int32_t MAP_HORIZON_CAPPER_SPEED = 3;
+    constexpr std::int32_t MAP_HORIZON_CAPTURE_TURNS = 2;
+    constexpr std::int32_t MAX_MAP_REACH_HORIZON = 40;
+
     constexpr std::int32_t resolveHorizon(std::int32_t remainingTurnLimit)
     {
         if (remainingTurnLimit >= 0)
@@ -133,6 +143,35 @@ namespace Coordinator
             return remainingTurnLimit;
         }
         return DEFAULT_ECONOMIC_RELEVANCE_HORIZON;
+    }
+
+    // Scales reachability horizon with map span while keeping <= 24x24 maps at H = 10.
+    constexpr std::int32_t resolveMapHorizon(std::int32_t mapWidth, std::int32_t mapHeight,
+                                             std::int32_t remainingTurnLimit)
+    {
+        const std::int32_t clampedW = mapWidth > 0 ? mapWidth : 0;
+        const std::int32_t clampedH = mapHeight > 0 ? mapHeight : 0;
+        const std::int32_t halfSpan = (clampedW + clampedH) / 2;
+        const std::int32_t transitTurns =
+            (halfSpan + MAP_HORIZON_CAPPER_SPEED - 1) / MAP_HORIZON_CAPPER_SPEED + MAP_HORIZON_CAPTURE_TURNS;
+        const std::int32_t reach = transitTurns < DEFAULT_ECONOMIC_RELEVANCE_HORIZON
+            ? DEFAULT_ECONOMIC_RELEVANCE_HORIZON
+            : (transitTurns > MAX_MAP_REACH_HORIZON ? MAX_MAP_REACH_HORIZON : transitTurns);
+        if (remainingTurnLimit >= 0)
+        {
+            return remainingTurnLimit < reach ? remainingTurnLimit : reach;
+        }
+        return reach;
+    }
+
+    // Anchors property payback to P = 10 turns when H_map > 10 while keeping strict urgency across [0, H_map).
+    constexpr MilliFunds scalePaybackToRelevanceHorizon(MilliFunds rawStream, std::int32_t horizonTurns)
+    {
+        if (horizonTurns <= DEFAULT_ECONOMIC_RELEVANCE_HORIZON)
+        {
+            return rawStream;
+        }
+        return (rawStream * DEFAULT_ECONOMIC_RELEVANCE_HORIZON) / horizonTurns;
     }
 
     // best single shot is the one bundle lower bound until the assignment supplies D_enemy deltas
@@ -388,7 +427,10 @@ namespace Coordinator
         }
         result.continuation.repositioning = actorShotAtDestination - bestShot(position.actorNextShotsAtOrigin);
         // an enemy gain at the destination lowers our value
-        result.continuation.exposure = -(enemyShotAtDestination - bestShot(position.enemyShotsOnActorAtOrigin));
+        // Exposure describes the change in danger to a living unit. A unit already
+        // lost to its own attack cannot earn a second credit for avoiding a later hit.
+        if (remainingActorHpSteps > 0)
+            result.continuation.exposure = bestShot(position.enemyShotsOnActorAtOrigin) - enemyShotAtDestination;
         result.valid = true;
         return result;
     }

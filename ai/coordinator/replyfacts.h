@@ -51,6 +51,8 @@ namespace Coordinator
         double counterRawBase{NO_COUNTER};
     };
 
+    struct SurvivorWeaponFacts;
+
     // shots run parallel to tile->shooters.
     struct ReplyFacts
     {
@@ -58,7 +60,21 @@ namespace Coordinator
         TerrainDefenseRule terrain;
         double actorRealHp{0};
         std::vector<ReplyShotBase> shots;
+        std::shared_ptr<const SurvivorWeaponFacts> survivorWeapon;
     };
+
+    // Already-activated surface unit at the observed position. E0 can target
+    // and counter it. It supplies no F0 order, movement, or attack.
+    struct ObservedReplyDefender
+    {
+        int knowledgeIndex{NO_UNIT},engineUnitId{NO_UNIT};
+        TilePoint tile{INVALID_TILE};
+        MilliFunds cost{};
+        std::shared_ptr<const ReplyFacts> facts;
+        int stockRow{-1};
+    };
+
+    struct CombatTerrain;
 
     struct ReplyBoard
     {
@@ -66,6 +82,7 @@ namespace Coordinator
         std::int32_t height{0};
         std::vector<OccupantAt> standing;
         std::int32_t alliedOccupants{0};
+        std::shared_ptr<const CombatTerrain> combat;
     };
 
     struct ResolvedReplyShot

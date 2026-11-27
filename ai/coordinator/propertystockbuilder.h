@@ -463,6 +463,7 @@ namespace Coordinator
             std::uint64_t sessionIdentity) const;
         PropertyStockField & continuationField() const;
         void ensureOurSequentialState() const;
+        void ensureEnemySequentialState() const;
         std::int32_t ourClassIndexFor(const PropertyStockRow & row) const;
         static std::vector<std::int32_t> nodeArrivalsFor(
             PropertyStockField & field,
@@ -495,6 +496,15 @@ namespace Coordinator
         mutable std::vector<PropertyStockColumn> m_ourNodeColumns;
         mutable std::vector<SequentialClassKey> m_ourClassKeys;
         mutable std::vector<SequentialClassTable> m_ourClassTables;
+        mutable std::vector<std::int32_t> m_ourDayClassIndices;
+        mutable std::vector<SequentialRow> m_ourDayRows;
+        mutable bool m_enemyStateBuilt{false};
+        mutable const PropertyStockField* m_enemyStateSource{nullptr};
+        mutable std::vector<std::int32_t> m_enemyNodeSlots;
+        mutable std::vector<PropertyStockColumn> m_enemyNodeColumns;
+        mutable std::vector<SequentialClassKey> m_enemyClassKeys;
+        mutable std::vector<SequentialClassTable> m_enemyClassTables;
+        mutable std::vector<SequentialRow> m_enemyRows;
         mutable std::optional<MilliFunds> m_enemySequentialOptimum;
         std::optional<PlanStockAudit> m_auditOrigin;
         mutable bool m_originCached{false};

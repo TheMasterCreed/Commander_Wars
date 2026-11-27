@@ -20,6 +20,14 @@ namespace Coordinator
     constexpr std::int32_t MASTER_PLAN_POLISH_PASSES = 8;
     constexpr MilliFunds MASTER_PLAN_PRICE_LIMIT = 1'000'000'000'000'000;
 
+    // What stands on a candidate's destination: nothing that stays, a priced actor that must leave, or an unproven departure.
+    enum class MasterPlanOccupant : std::int8_t
+    {
+        None,
+        Modelled,
+        Blocked,
+    };
+
     struct MasterPlanPricingCandidate
     {
         std::int32_t candidateIndex{0};
@@ -29,7 +37,9 @@ namespace Coordinator
         std::int32_t capturedNode{NO_SEQUENTIAL_NODE};
         SequentialRow row;
         std::int32_t actionIndex{0};
-        bool follows{false};
+        MasterPlanOccupant occupant{MasterPlanOccupant::None};
+        std::int32_t occupantSlot{MASTER_PLAN_NO_ACTOR};
+        bool vacatesOrigin{false};
     };
 
     struct MasterPlanPricingActor
@@ -44,6 +54,7 @@ namespace Coordinator
         std::vector<MasterResourceUsage> occupiedResources;
         std::vector<std::int32_t> rowActors;
         MasterFutureCatalog catalog;
+        bool hasVacateRequirement{false};
     };
 
     enum class MasterPlanPricingStatus : std::int8_t
@@ -119,6 +130,8 @@ namespace Coordinator
         MilliFunds ceiling{0};
         std::optional<MilliFunds> floor;
         std::int64_t pricingWork{0};
+        // Included in pricingWork.
+        std::int64_t preparationWork{0};
         std::int64_t witnessWork{0};
         MasterPlanWitnessStats witnessStats;
 #endif

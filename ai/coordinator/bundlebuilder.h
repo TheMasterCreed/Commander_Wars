@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -235,6 +236,39 @@ namespace Coordinator
         return enginePath;
     }
 
+    struct BundleBuildCache
+    {
+        struct ReachKey
+        {
+            const MobilityCostGrid* grid{nullptr};
+            std::int32_t x{0};
+            std::int32_t y{0};
+            std::int32_t maxDistance{0};
+
+            friend constexpr auto operator<=>(const ReachKey &, const ReachKey &) = default;
+        };
+
+        struct ShotKey
+        {
+            std::int32_t unitIndex{NO_UNIT};
+            std::int32_t hpSteps{0};
+            std::int32_t excludedVictimIndex{NO_UNIT};
+
+            friend constexpr auto operator<=>(const ShotKey &, const ShotKey &) = default;
+        };
+
+        bool initialized{false};
+        qint32 mobilityEpochChanges{-1};
+        bool positionFireRangeFixed{false};
+        std::vector<std::int32_t> oursUnits;
+        std::vector<std::int32_t> theirsUnits;
+        std::vector<TilePoint> breakableTerrainTiles;
+        std::map<std::pair<qint32, QString>, const MobilityCostGrid*> mobilityGrids;
+        std::map<std::int32_t, MilliFunds> replacementCosts;
+        std::map<ReachKey, DistanceField> reachFields;
+        std::map<ShotKey, MilliFunds> targetBestShots;
+    };
+
     struct BundleBuildContext
     {
         GameMap & map;
@@ -251,6 +285,7 @@ namespace Coordinator
         ReplyFactsBuilder* pReplyFacts{nullptr};
         // Tiles of our plannable units; empty unless the Master plans, so ordinary play offers no follow move.
         std::span<const TilePoint> followTiles{};
+        BundleBuildCache* pCache{nullptr};
     };
 
     struct PlannableUnitFacts
@@ -264,10 +299,10 @@ namespace Coordinator
         bool firesOrCaptures{false};
     };
 
-    constexpr bool unitPlannable(const PlannableUnitFacts & facts)
+    constexpr bool unitPlannable(const PlannableUnitFacts & facts, bool changesHeadquartersRoute = false)
     {
         return facts.relation == Relation::Own && !facts.movedInSnapshot && facts.mapped && !facts.movedLive &&
-               facts.normalAi && facts.firesOrCaptures;
+               facts.normalAi && (facts.firesOrCaptures || changesHeadquartersRoute);
     }
 
     inline bool followTileOffered(std::span<const TilePoint> followTiles, const TilePoint & tile,
@@ -310,6 +345,13 @@ namespace Coordinator
         std::int64_t oracleHits{0};
     };
 
+    struct KillableEnemyTarget
+    {
+        std::int32_t knowledgeIndex{NO_UNIT};
+        std::int32_t engineUnitId{NO_UNIT};
+        TilePoint tile{INVALID_TILE};
+    };
+
     // nullptr when the live tile no longer answers with the unit the snapshot recorded
     Unit* liveUnitFor(GameMap & map, const KnownUnit & known);
     std::int32_t resolveRemainingTurnLimit(GameMap & map);
@@ -317,4 +359,10 @@ namespace Coordinator
     std::vector<CandidateBundle> buildCandidateBundles(const BundleBuildContext & context, std::int32_t actorUnitIndex,
                                                       BundleBuildStats & stats,
                                                       std::optional<std::size_t>* pTodayCount = nullptr);
+    void appendKillBreakthroughCandidates(const BundleBuildContext & context,
+                                          std::span<const KillableEnemyTarget> killableEnemies,
+                                          std::int32_t actorUnitIndex,
+                                          std::vector<CandidateBundle> & candidates,
+                                          std::optional<std::size_t>* pTodayCount,
+                                          BundleBuildStats & stats);
 }

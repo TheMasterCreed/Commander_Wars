@@ -7,7 +7,9 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <optional>
 #include "coreengine/fileserializable.h"
+#include <QJsonObject>
 #include "coreengine/scriptvariables.h"
 #include "coreengine/qmlvector.h"
 #include "coreengine/jsthis.h"
@@ -143,6 +145,10 @@ public:
      * @return
      */
     Q_INVOKABLE Unit* getDummyUnit(const QString & unitId);
+    void openCounterpointTurnStream();
+    void beginCounterpointOpeningPreview();
+    void endCounterpointOpeningPreview();
+    QJsonObject previewCounterpointOpening(const QJsonObject &projection);
     Q_INVOKABLE qint32 getProductionFromList(const QStringList & unitIds, QmlVectorUnit* pUnits, QmlVectorBuilding* pBuildings, qint32 minBuildMode, qint32 maxBuildMode, const QVector<bool> & enableList = QVector<bool>());
     Q_INVOKABLE void updateIslandSizeForBuildings(QmlVectorBuilding* pBuildings);
     Q_INVOKABLE qint32 getCurrentTurnProducedUnitsCounter() const;
@@ -163,7 +169,7 @@ public:
 
     Q_INVOKABLE ProductionActionData* getProductionActionData(Building* pBuilding, const QString & actionId) const;
     Q_INVOKABLE quint32 deriveCounterpointSeed(qint32 algorithmVersion, qint32 generation) const;
-    Q_INVOKABLE quint32 randomCounterpointSeed() const;
+    Q_INVOKABLE quint32 randomCounterpointSeed();
     Q_INVOKABLE qreal getCounterpointBaseDamage(const QString & attackerId, const QString & defenderId);
     Q_INVOKABLE qint32 estimateCounterpointDeploymentTurns(qint32 startX, qint32 startY,
                                                            const QString & unitId,
@@ -174,6 +180,8 @@ public:
                                                            qint32 maxExpandedNodes);
     Q_INVOKABLE bool executeCounterpointBuild(qint32 x, qint32 y, const QString & unitId, qint32 ordinal = DEFAULT_ACTION_ORDINAL, qint32 expectedCost = NO_EXPECTED_COST);
 private:
+    QString openingPreviewUnavailableReason() const;
+    std::optional<quint32> reservedCounterpointTurnSeed();
     // Game script first, owning ai second, which is the seam every scripted hook here goes through.
     QJSValue dispatchScriptFunction(const QString & function, const QJSValueList & args) const;
     Building* ownedBuildingAt(qint32 x, qint32 y) const;
@@ -208,6 +216,11 @@ private:
     spUnit m_dummy;
     // Matchup scoring asks for the same ids repeatedly and Unit construction is not cheap.
     std::map<QString, spUnit> m_counterpointUnits;
+    bool m_reservingTurnSeed{};
+    bool m_previewDummiesEnabled{};
+    std::map<QString, spUnit> m_previewDummies;
+    std::shared_ptr<SimpleProductionSystem> m_previewSystem;
+    QJSValue m_previewFacts;
     // Scripted lookups, cached for the match since action scripts cannot change mid-game.
     mutable std::map<QString, bool> m_baseProductionActions;
     qint32 m_currentTurnProducedUnitsCounter{0};

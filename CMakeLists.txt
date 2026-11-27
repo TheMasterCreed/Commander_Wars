@@ -849,6 +849,7 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/bundlebuilder.h ai/coordinator/bundlebuilder.cpp
     ai/coordinator/capturedanger.h ai/coordinator/capturedangerstream.h ai/coordinator/capturedangerdecisions.h
     ai/coordinator/capturedangerrecord.h ai/coordinator/capturedangeraudit.h ai/coordinator/capturedangeraudit.cpp
+    ai/coordinator/combatforecast.h ai/coordinator/combatmilestone.h ai/coordinator/combatmilestone.cpp
     ai/coordinator/capturedangerauditmode.h ai/coordinator/capturedangerpricing.h
     ai/coordinator/replypredictionmode.h ai/coordinator/replyfacts.h ai/coordinator/replyprediction.h
     ai/coordinator/ownactionmeasurement.h ai/coordinator/stockreplykeys.h ai/coordinator/replypassevaluation.h
@@ -2534,6 +2535,7 @@ if (BUILD_TESTING)
         set(COUNTERPOINT_GGC_MIN_EXPAND 20)
         set(COUNTERPOINT_GGC_MIN_HEAP_KB 32768)
         set_source_files_properties(
+            ai/coordinator/combatmilestone.cpp
             ai/coreai.cpp
             ai/productionSystem/simpleproductionsystem.cpp
             PROPERTIES COMPILE_OPTIONS

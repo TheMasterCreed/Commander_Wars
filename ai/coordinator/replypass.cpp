@@ -616,7 +616,7 @@ namespace Coordinator
             std::set<std::int32_t> firingShooters;
             for (const ReplyPassShot & shot : evaluation.shots)
             {
-                shotSlots.insert(evaluation.actors[shot.target].actorSlot);
+                if(shot.target<evaluation.actors.size())shotSlots.insert(evaluation.actors[shot.target].actorSlot);
                 firingShooters.insert(shot.shooterIndex);
             }
             const std::span<const MasterActor> actors = problem.actors();

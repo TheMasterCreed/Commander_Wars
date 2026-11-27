@@ -291,48 +291,48 @@ namespace Coordinator
         void augmentFrom(std::int32_t row)
         {
             ++m_augmentations;
-            std::vector<MilliFunds> reduced(static_cast<std::size_t>(m_paddedColumnCount) + 1, ASSIGNMENT_INFINITY);
-            std::vector<bool> visited(static_cast<std::size_t>(m_paddedColumnCount) + 1, false);
+            m_reduced.assign(static_cast<std::size_t>(m_paddedColumnCount) + 1, ASSIGNMENT_INFINITY);
+            m_visited.assign(static_cast<std::size_t>(m_paddedColumnCount) + 1, false);
             m_columnRow[0] = row;
             std::int32_t current = 0;
             do
             {
-                visited[static_cast<std::size_t>(current)] = true;
+                m_visited[static_cast<std::size_t>(current)] = true;
                 const std::int32_t sourceRow = m_columnRow[static_cast<std::size_t>(current)];
                 MilliFunds step = ASSIGNMENT_INFINITY;
                 std::int32_t next = 0;
                 for (std::int32_t column = 1; column <= m_paddedColumnCount; ++column)
                 {
                     const std::size_t slot = static_cast<std::size_t>(column);
-                    if (visited[slot] || !m_columnAvailable[slot])
+                    if (m_visited[slot] || !m_columnAvailable[slot])
                     {
                         continue;
                     }
                     const MilliFunds candidate = costOf(sourceRow, column) -
                                                  m_rowPotential[static_cast<std::size_t>(sourceRow)] -
                                                  m_columnPotential[slot];
-                    if (candidate < reduced[slot])
+                    if (candidate < m_reduced[slot])
                     {
-                        reduced[slot] = candidate;
+                        m_reduced[slot] = candidate;
                         m_columnPredecessor[slot] = current;
                     }
-                    if (reduced[slot] < step)
+                    if (m_reduced[slot] < step)
                     {
-                        step = reduced[slot];
+                        step = m_reduced[slot];
                         next = column;
                     }
                 }
                 for (std::int32_t column = 0; column <= m_paddedColumnCount; ++column)
                 {
                     const std::size_t slot = static_cast<std::size_t>(column);
-                    if (visited[slot])
+                    if (m_visited[slot])
                     {
                         m_rowPotential[static_cast<std::size_t>(m_columnRow[slot])] += step;
                         m_columnPotential[slot] -= step;
                     }
-                    else if (reduced[slot] != ASSIGNMENT_INFINITY)
+                    else if (m_reduced[slot] != ASSIGNMENT_INFINITY)
                     {
-                        reduced[slot] -= step;
+                        m_reduced[slot] -= step;
                     }
                 }
                 current = next;
@@ -355,6 +355,8 @@ namespace Coordinator
         std::vector<std::int32_t> m_columnRow;
         std::vector<std::int32_t> m_columnPredecessor;
         std::vector<bool> m_columnAvailable;
+        std::vector<MilliFunds> m_reduced;
+        std::vector<bool> m_visited;
         std::int64_t m_augmentations{0};
     };
 

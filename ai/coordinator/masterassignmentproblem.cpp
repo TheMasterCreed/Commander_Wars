@@ -108,18 +108,21 @@ namespace
             {
                 case ComponentKind::Fire:
                 {
-                    const KnownUnitLink target =
-                        linkOf(links, component.fire.targetUnitId);
-                    if (target.engineUnitId == NO_UNIT ||
-                        target.tile == INVALID_TILE)
+                    std::int32_t targetId = component.fire.targetUnitId;
+                    if (!isTerrainTargetId(targetId))
                     {
-                        valid = false;
-                        return {};
+                        const KnownUnitLink target = linkOf(links, targetId);
+                        if (target.engineUnitId == NO_UNIT || target.tile == INVALID_TILE)
+                        {
+                            valid = false;
+                            return {};
+                        }
+                        targetId = target.engineUnitId;
                     }
                     result.push_back(PendingResourceUsage{
                         .key = MasterResourceKey{
                             .kind = MasterResourceKind::DamageTarget,
-                            .unitId = target.engineUnitId,
+                            .unitId = targetId,
                         },
                         .demand = component.fire.damageSteps,
                         .capacity = component.fire.targetHpSteps,
@@ -385,6 +388,12 @@ namespace Coordinator
     MasterAssignmentProblem::occupancy() const
     {
         return m_occupancy;
+    }
+
+    bool MasterAssignmentProblem::canChangeCombatHelper(const MasterActor & actor) const
+    {
+        return actor.stockRow == NO_STOCK_ROW && actor.actionIndex != NO_ACTION &&
+               m_actionTemplates[static_cast<std::size_t>(actor.actionIndex)].state == PlanActionState::Pending;
     }
 
     bool MasterAssignmentProblem::canChangeActor(std::int32_t actorSlot) const
@@ -768,6 +777,9 @@ namespace Coordinator
                     input.unitLinks,
                     sourceCandidate);
                 candidate.follows = isFollowCandidate(sourceActor, candidateSlot);
+                candidate.requiredKilledEnemyIds = sourceCandidate.requiredKilledEnemyIds;
+                candidate.requiredKilledKnowledgeIndices = sourceCandidate.requiredKilledKnowledgeIndices;
+                candidate.plannedAction = action;
                 candidate.source = sourceCandidate;
 
                 const std::int32_t occupant = occupantAt(
@@ -811,13 +823,8 @@ namespace Coordinator
                         actor.incumbentCandidateIndex;
                     return result;
                 }
-                const PlannedAction expected = plannedActionFrom(
-                    input.actionIds,
-                    input.unitLinks,
-                    actor.engineUnitId,
-                    selected.source);
                 if (!sameActionExceptReplayFields(
-                        expected,
+                        selected.plannedAction,
                         incumbent.action(actor.actionIndex)))
                 {
                     result.error =
@@ -922,6 +929,16 @@ namespace Coordinator
             }
         }
 
+        problem.m_actorAtAction.assign(problem.m_actionTemplates.size(), -1);
+        for (const auto & actor : problem.m_actors)
+        {
+            if (actor.actionIndex >= 0 &&
+                static_cast<std::size_t>(actor.actionIndex) < problem.m_actorAtAction.size())
+            {
+                problem.m_actorAtAction[static_cast<std::size_t>(actor.actionIndex)] = actor.canonicalSlot;
+            }
+        }
+
         const MasterAssignmentReplayResult replay =
             replayMasterAssignment(
                 problem, problem.m_incumbentChoices);
@@ -1015,8 +1032,13 @@ namespace Coordinator
     MasterAssignmentReplayResult replayMasterAssignment(
         const MasterAssignmentProblem & problem,
         std::span<const std::int32_t> choices,
-        const ReplyPredictionSetup & prediction)
+        const ReplyPredictionSetup & prediction, bool combatHelpers)
     {
+        // A changed helper retains its original reservation priority. Untouched fixed actions stay pinned.
+        const auto changedHelper = [&](const MasterActor & actor) {
+            return combatHelpers && !problem.canChangeActor(actor.canonicalSlot) && problem.canChangeCombatHelper(actor) &&
+                   choices[static_cast<std::size_t>(actor.canonicalSlot)] != actor.incumbentCandidateIndex;
+        };
         MasterAssignmentReplayResult result;
         if (choices.size() != problem.m_actors.size())
         {
@@ -1048,7 +1070,7 @@ namespace Coordinator
                 result.candidateIndex = choice;
                 return result;
             }
-            if (!problem.canChangeActor(actor.canonicalSlot) &&
+            if (!problem.canChangeActor(actor.canonicalSlot) && !changedHelper(actor) &&
                 choice != actor.incumbentCandidateIndex)
             {
                 result.error =
@@ -1069,8 +1091,13 @@ namespace Coordinator
             const PlannedAction & actionTemplate =
                 problem.m_actionTemplates[
                     static_cast<std::size_t>(actionIndex)];
-            const MasterActor* actor = actorAtAction(
-                problem.m_actors, actionIndex);
+            const std::int32_t actorSlot =
+                static_cast<std::size_t>(actionIndex) < problem.m_actorAtAction.size()
+                    ? problem.m_actorAtAction[static_cast<std::size_t>(actionIndex)]
+                    : -1;
+            const MasterActor* actor = actorSlot >= 0
+                ? &problem.m_actors[static_cast<std::size_t>(actorSlot)]
+                : nullptr;
             PlannedAction action = actionTemplate;
             if (actor != nullptr)
             {
@@ -1087,11 +1114,7 @@ namespace Coordinator
                     const MasterCandidate & candidate =
                         actor->candidates[static_cast<std::size_t>(
                             choice)];
-                    action = plannedActionFrom(
-                        problem.m_actionIds,
-                        problem.m_unitLinks,
-                        actor->engineUnitId,
-                        candidate.source);
+                    action = candidate.plannedAction;
                     action.state = incumbentTuple || !problem.canChangeActor(actor->canonicalSlot)
                         ? actionTemplate.state : PlanActionState::Pending;
                 }
@@ -1112,8 +1135,7 @@ namespace Coordinator
             if (actor.actionIndex == NO_ACTION && choices[slot] != NO_CANDIDATE)
             {
                 const auto & candidate = actor.candidates[static_cast<std::size_t>(choices[slot])];
-                const auto index = result.plan.addAction(plannedActionFrom(
-                    problem.m_actionIds, problem.m_unitLinks, actor.engineUnitId, candidate.source));
+                const auto index = result.plan.addAction(candidate.plannedAction);
                 if (index == NO_ACTION)
                 {
                     result.error = MasterAssignmentReplayError::InvalidAction;
@@ -1133,7 +1155,7 @@ namespace Coordinator
             {
                 return 0;
             }
-            return incumbentTuple || !problem.canChangeActor(actor.canonicalSlot)
+            return incumbentTuple || (!problem.canChangeActor(actor.canonicalSlot) && !changedHelper(actor))
                 ? actor.incumbentDamageSteps : component->fire.damageSteps;
         };
         std::vector<const MasterActor*> claimOrder;
@@ -1199,7 +1221,7 @@ namespace Coordinator
                 });
             for (const MasterActor* actor : claimOrder)
             {
-                if (problem.canChangeActor(actor->canonicalSlot))
+                if (problem.canChangeActor(actor->canonicalSlot) || changedHelper(*actor))
                 {
                     continue;
                 }
@@ -1243,6 +1265,23 @@ namespace Coordinator
             {
                 continue;
             }
+            if (combatHelpers && !incumbentTuple && edge.kind == PlanEdgeKind::CombinedFire)
+            {
+                const auto & from = result.plan.action(edge.from);
+                const auto & to = result.plan.action(edge.to);
+                if (!isLiveState(from.state) || !isLiveState(to.state) ||
+                    from.targetUnitId == NO_UNIT || from.targetUnitId != to.targetUnitId)
+                {
+                    continue;
+                }
+                if (!result.plan.addEdge(edge.from, edge.to, edge.kind))
+                {
+                    result.error = MasterAssignmentReplayError::InvalidAction;
+                    result.actionIndex = edge.from;
+                    return result;
+                }
+                continue;
+            }
             const auto & from = result.plan.action(edge.from);
             const auto & to = result.plan.action(edge.to);
             if (isLiveState(to.state) && !isLiveState(from.state))
@@ -1283,17 +1322,17 @@ namespace Coordinator
                 return result;
             }
         }
-        TurnPlan derived = result.plan;
-        const auto conflicts = derived.rebuildVacateEdges(problem.m_occupancy);
-        if (!conflicts.empty())
-        {
-            result.error =
-                MasterAssignmentReplayError::VacateConflict;
-            result.actionIndex = conflicts.front().moverAction;
-            return result;
-        }
         if (incumbentTuple)
         {
+            TurnPlan derived = result.plan;
+            const auto conflicts = derived.rebuildVacateEdges(problem.m_occupancy);
+            if (!conflicts.empty())
+            {
+                result.error =
+                    MasterAssignmentReplayError::VacateConflict;
+                result.actionIndex = conflicts.front().moverAction;
+                return result;
+            }
             const auto liveVacates = [](const TurnPlan & plan)
             {
                 std::vector<std::pair<std::int32_t, std::int32_t>> edges;
@@ -1317,11 +1356,61 @@ namespace Coordinator
         }
         else
         {
-            result.plan = std::move(derived);
+            const auto conflicts = result.plan.rebuildVacateEdges(problem.m_occupancy);
+            if (!conflicts.empty())
+            {
+                result.error =
+                    MasterAssignmentReplayError::VacateConflict;
+                result.actionIndex = conflicts.front().moverAction;
+                return result;
+            }
+        }
+        for (const MasterActor & actor : problem.m_actors)
+        {
+            const std::int32_t choice = choices[static_cast<std::size_t>(actor.canonicalSlot)];
+            if (choice == NO_CANDIDATE)
+            {
+                continue;
+            }
+            const auto actionIndex = result.actionIndices[static_cast<std::size_t>(actor.canonicalSlot)];
+            if (actionIndex == NO_ACTION || !isLiveState(result.plan.action(actionIndex).state))
+            {
+                continue;
+            }
+            const MasterCandidate & cand = actor.candidates[static_cast<std::size_t>(choice)];
+            for (const std::int32_t reqEnemyId : cand.requiredKilledEnemyIds)
+            {
+                const auto killers = result.plan.lethalContributorsOn(reqEnemyId);
+                if (killers.empty())
+                {
+                    result.error = MasterAssignmentReplayError::DependencyRejected;
+                    result.actorSlot = actor.canonicalSlot;
+                    result.actionIndex = actionIndex;
+                    return result;
+                }
+                for (const std::int32_t killerAction : killers)
+                {
+                    if (killerAction == actionIndex)
+                    {
+                        result.error = MasterAssignmentReplayError::DependencyRejected;
+                        result.actorSlot = actor.canonicalSlot;
+                        result.actionIndex = actionIndex;
+                        return result;
+                    }
+                    if (!result.plan.hasEdge(killerAction, actionIndex) &&
+                        !result.plan.addEdge(killerAction, actionIndex, PlanEdgeKind::Wallbreak))
+                    {
+                        result.error = MasterAssignmentReplayError::InvalidAction;
+                        result.actorSlot = actor.canonicalSlot;
+                        result.actionIndex = actionIndex;
+                        return result;
+                    }
+                }
+            }
         }
         for (const auto & actor : problem.m_actors)
         {
-            if (problem.canChangeActor(actor.canonicalSlot) || actor.actionIndex == NO_ACTION)
+            if (problem.canChangeActor(actor.canonicalSlot) || changedHelper(actor) || actor.actionIndex == NO_ACTION)
             {
                 continue;
             }

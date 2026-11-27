@@ -150,6 +150,8 @@ namespace
         QJsonObject noValue;
         for (std::size_t reason = 0; reason < counters.noValue.size(); ++reason)
         {
+            // MovementLimit belongs to the separate combat replay. Keep the legacy record stable.
+            if (reason == static_cast<std::size_t>(ReplyPassNoValue::MovementLimit)) continue;
             noValue.insert(QLatin1String(REPLY_PASS_NO_VALUE_NAMES[reason]),
                            static_cast<qint64>(counters.noValue[reason]));
         }

@@ -31,28 +31,28 @@ public:
      * @brief hide for debugging purpose
      */
     Q_INVOKABLE void hide();
-    /**
-     * @brief sameIsland
-     * @param x1
-     * @param y1
-     * @param x2
-     * @param y2
-     * @return
-     */
     Q_INVOKABLE inline bool sameIsland(qint32 x1, qint32 y1,
                            qint32 x2, qint32 y2) const
     {
+        if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0 ||
+            x1 >= static_cast<qint32>(m_Islands.size()) ||
+            x2 >= static_cast<qint32>(m_Islands.size()) ||
+            y1 >= static_cast<qint32>(m_Islands[x1].size()) ||
+            y2 >= static_cast<qint32>(m_Islands[x2].size()))
+        {
+            return false;
+        }
         return (m_Islands[x1][y1] > UNKNOWN &&
                 m_Islands[x1][y1] == m_Islands[x2][y2]);
     }
-    /**
-     * @brief getIsland
-     * @param x
-     * @param y
-     * @return the island for this point -1 means not reachable
-     */
     Q_INVOKABLE inline qint32 getIsland(qint32 x, qint32 y) const
     {
+        if (x < 0 || y < 0 ||
+            x >= static_cast<qint32>(m_Islands.size()) ||
+            y >= static_cast<qint32>(m_Islands[x].size()))
+        {
+            return UNKNOWN;
+        }
         return m_Islands[x][y];
     }
     /**

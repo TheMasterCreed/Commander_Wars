@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ai/coordinator/realcombatcapital.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -326,7 +328,7 @@ namespace Coordinator
 
     // weapon.js calculateDamage term for term in its own operation order, so the truncated shot matches the engine's.
     constexpr double terrainReducedDamage(const TerrainDefenseRule & rule, double baseDamage,
-                                          std::int32_t shooterHpSteps, std::int32_t defenderHpSteps)
+                                          double offensiveHp, std::int32_t defenderHpSteps)
     {
         if (baseDamage <= 0)
         {
@@ -339,7 +341,7 @@ namespace Coordinator
             offense += defense;
             defense = MIN_DEFENSE;
         }
-        const double hpFactor = static_cast<double>(shooterHpSteps) / UNIT_HP_STEPS;
+        const double hpFactor = offensiveHp / UNIT_HP_STEPS;
         switch (rule.formula)
         {
             case CaptureDamageFormula::AdvanceWars4:
@@ -351,6 +353,16 @@ namespace Coordinator
         const double classic = (CLASSIC_DEFENSE_CEILING - defense) / NEUTRAL_DEFENSE;
         return std::max(hpFactor * (baseDamage * offense) / NEUTRAL_DEFENSE * classic + rule.luck * hpFactor * classic,
                         0.0);
+    }
+
+    // ACTION_FIRE.calcDefenderDamage uses virtual HP minus the untruncated
+    // incoming percentage before either result is written to the game action.
+    // Only a new primary action rounds its shooter HP up to a whole step.
+    inline double sameActionCounterDamage(const TerrainDefenseRule &cover,double base,double hpBeforeHit,
+                                          double rawPrimary,int primaryShooterHpSteps)
+    {
+        const auto remaining=hpBeforeHit-rawPrimary/FastBattleEstimate::HP_SCALE;
+        return remaining>0 ? terrainReducedDamage(cover,base,remaining,primaryShooterHpSteps) : 0.;
     }
 
     // ACTION_FIRE passes each shot through writeDataInt32, which drops the fraction.
@@ -783,6 +795,9 @@ namespace Coordinator
         std::int32_t hpStepsBefore{0};
         std::int32_t hpStepsAfter{0};
         MilliFunds counterCost{0};
+        TilePoint firingTile{INVALID_TILE};
+        double realBefore{}, realAfter{};
+        MilliFunds targetCapital{};
     };
 
     // outcomes[target].fired lists that target's shots in firing order; chosen[shooter] is its target or none.
@@ -811,16 +826,30 @@ namespace Coordinator
     }
 
     // P1: each shooter acts once over the whole plan, on the positive pair of largest net, priced with P's facts.
-    template <typename CanFire, typename DamageAt, typename CounterCostAt, typename CaptureCostAt>
-    OneActionReply oneActionReply(std::span<const OneActionTarget> targets, std::span<const std::int32_t> shooterIndices,
-                                  CanFire && canFire, DamageAt && damageAt, CounterCostAt && counterCostAt,
-                                  CaptureCostAt && captureCostAt)
+    struct IgnoreReplyShot
+    {
+        void operator()(const OneActionShot &) const {}
+    };
+
+    struct EqualReplyPriority
+    {
+        int operator()(std::size_t, std::size_t) const
+        {
+            return 0;
+        }
+    };
+    template <typename CanFire, typename DamageAt, typename CounterCostAt, typename CaptureCostAt,
+              typename OnShot = IgnoreReplyShot, typename PriorityAt = EqualReplyPriority>
+    OneActionReply oneActionReply(std::span<const OneActionTarget> targets,
+                                  std::span<const std::int32_t> shooterIndices, CanFire &&canFire, DamageAt &&damageAt,
+                                  CounterCostAt &&counterCostAt, CaptureCostAt &&captureCostAt, OnShot onShot = {},
+                                  PriorityAt priorityAt = {}, bool useRealCapital = false)
     {
         OneActionReply result;
         result.chosen.assign(shooterIndices.size(), NO_ONE_ACTION_TARGET);
         std::vector<double> hp;
         hp.reserve(targets.size());
-        for (const OneActionTarget & target : targets)
+        for (const OneActionTarget &target : targets)
         {
             hp.push_back(std::max(target.hp, 0.0));
         }
@@ -829,6 +858,7 @@ namespace Coordinator
         {
             std::optional<OneActionShot> best;
             double bestDamage = 0;
+            int bestPriority = 0;
             for (std::size_t shooter = 0; shooter < shooterIndices.size(); ++shooter)
             {
                 if (result.chosen[shooter] != NO_ONE_ACTION_TARGET)
@@ -844,18 +874,30 @@ namespace Coordinator
                     }
                     ++result.pairsExamined;
                     const double damage = static_cast<double>(damageAt(shooter, target, hpSteps));
-                    const std::int32_t hpStepsAfter = ceilHpSteps(engineHpAfterReply(hp[target], engineShotDamage(damage)));
+                    const double remaining = engineHpAfterReply(hp[target], engineShotDamage(damage));
+                    const std::int32_t hpStepsAfter = ceilHpSteps(remaining);
                     const MilliFunds counter = counterCostAt(shooter, target, hpStepsAfter);
-                    const MilliFunds net = bookDamage(targets[target].cost, hpSteps - hpStepsAfter) - counter -
-                                           captureCostAt(shooter, target);
-                    if (net <= 0 ||
-                        (best && !oneActionShotBeats(net, shooterIndices[shooter], targets[target].unitId, best->net,
-                                                     shooterIndices[best->shooter], targets[best->target].unitId)))
+                    const MilliFunds capital = useRealCapital ? combatCapitalLoss(targets[target].cost, hp[target], remaining)
+                                                             : bookDamage(targets[target].cost, hpSteps - hpStepsAfter);
+                    const MilliFunds net = capital - counter - captureCostAt(shooter, target);
+                    const int priority = priorityAt(shooter, target);
+                    if ((priority > 0 && engineShotDamage(damage) <= 0) || (net <= 0 && priority <= 0) ||
+                        (best && (priority < bestPriority ||
+                                  (priority == bestPriority &&
+                                   !oneActionShotBeats(net, shooterIndices[shooter], targets[target].unitId, best->net,
+                                                       shooterIndices[best->shooter], targets[best->target].unitId)))))
                     {
                         continue;
                     }
-                    best = OneActionShot{shooter, target, net, hpSteps, hpStepsAfter, counter};
+                    best = OneActionShot{shooter, target, net, hpSteps, hpStepsAfter, counter, INVALID_TILE};
+                    if (useRealCapital)
+                    {
+                        best->realBefore = hp[target];
+                        best->realAfter = remaining;
+                        best->targetCapital = capital;
+                    }
                     bestDamage = damage;
+                    bestPriority = priority;
                 }
             }
             if (!best)
@@ -864,7 +906,8 @@ namespace Coordinator
             }
             result.chosen[best->shooter] = best->target;
             result.shots.push_back(*best);
-            ReplyOutcome & outcome = result.outcomes[best->target];
+            onShot(*best);
+            ReplyOutcome &outcome = result.outcomes[best->target];
             outcome.fired.push_back(false);
             CaptureDangerDetail::fireShot(bestDamage, hp[best->target], outcome.reply, outcome.fired,
                                           outcome.fired.size() - 1);

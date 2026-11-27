@@ -122,6 +122,8 @@ public:
 
     virtual void resetToTurnStart() override;
     virtual void onGameStart() override;
+protected:
+    virtual bool useBuildingActions(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits);
 public slots:
     virtual void process() override;
 public:
@@ -369,8 +371,8 @@ protected:
      * @param pUnits
      * @return
      */
-    bool buildUnits(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits,
-                    spQmlVectorUnit & pEnemyUnits, spQmlVectorBuilding & pEnemyBuildings);
+    virtual bool buildUnits(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits,
+                            spQmlVectorUnit & pEnemyUnits, spQmlVectorBuilding & pEnemyBuildings);
     /**
      * @brief getEnemyDamageCounts
      * @param pUnits

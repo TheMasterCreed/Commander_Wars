@@ -1,6 +1,7 @@
 #ifndef UNITPATHFINDINGSYSTEM_H
 #define UNITPATHFINDINGSYSTEM_H
 
+#include <QSet>
 #include "coreengine/pathfindingsystem.h"
 
 #include "game/unit.h"
@@ -118,6 +119,7 @@ public:
      * @param ignoreEnemies
      */
     void setIgnoreEnemies(CollisionIgnore ignoreEnemies);
+    void setIgnoredEnemyUnits(const QSet<qint32> & unitIds);
     /**
      * @brief getUseBasecosts
      * @return
@@ -150,6 +152,7 @@ protected:
     bool m_supportsShortCuts{true};
     bool m_useBasecosts{false};
     CollisionIgnore m_ignoreEnemies{CollisionIgnore::Off};
+    QSet<qint32> m_ignoredEnemyUnitIds;
     QMap<QString, qint32> m_costInfo;
     GameMap* m_pMap{nullptr};
 };

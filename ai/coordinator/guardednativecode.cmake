@@ -48,6 +48,7 @@ set(guarded_code_declarations
     "BattleAnimation|resources/scripts/general/battleanimation.js|BATTLEANIMATION|97F4511FB26906F1C6A58F06777CD018E8E9DBA47CBF237FC569401648AA76B8|10108|None"
     "InfantryBattleAnimation|resources/scripts/battleanimations/BATTLEANIMATION_INFANTRY.js|BATTLEANIMATION_INFANTRY|CA8AA2E0B3F6CFD2A357625A8953A1074E2D6A9827EC316E406611E722701C79|11588|BattleAnimation"
     "SniperBattleAnimation|resources/scripts/battleanimations/BATTLEANIMATION_SNIPER.js|BATTLEANIMATION_SNIPER|662AA2B62FD20E88703A9625B7B311C3EB6FAFFC63996068CE8523CBC2AD323A|3646|BattleAnimation"
+    "MoveMech|resources/scripts/movementtables/move_mech.js|MOVE_MECH|D3B7BBE60F213399A50F182F0C4C3F585E15576A9C9D63869AC66CB8A0B6E0EC|4766|MovementTable"
 )
 set(guarded_code_code "#pragma once\nconstexpr std::array CODE_ASSETS{\n")
 foreach(guarded_code_entry IN LISTS guarded_code_declarations)

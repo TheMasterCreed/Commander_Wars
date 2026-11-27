@@ -5,6 +5,8 @@
 #include <QPoint>
 
 #include "ai/coordinator/bundlebuilder.h"
+#include "ai/coordinator/damageoracle.h"
+#include "coreengine/globalutils.h"
 #include "coreengine/memorymanagement.h"
 #include "game/gamemap.h"
 #include "game/player.h"
@@ -53,7 +55,7 @@ Coordinator::EngineActionBuildResult reject(Coordinator::EngineActionFailure fai
 }
 
 Coordinator::EngineActionBuildResult Coordinator::buildEngineAction(
-    GameMap & map, Player & player, const PlannedAction & planned)
+    GameMap & map, Player & player, const PlannedAction & planned, std::optional<quint32> turnLuckNonce)
 {
     if (planned.actionId.isEmpty() || planned.path.empty())
     {
@@ -84,9 +86,34 @@ Coordinator::EngineActionBuildResult Coordinator::buildEngineAction(
     {
         return EngineActionBuildResult{std::move(pAction), EngineActionFailure::None};
     }
-    if (liveUnitIdAt(map, planned.target) != planned.targetUnitId)
+    if (Coordinator::isTerrainTargetId(planned.targetUnitId))
+    {
+        if (!map.onMap(planned.target.x, planned.target.y))
+        {
+            return reject(EngineActionFailure::TargetUnavailable);
+        }
+        Terrain* pTargetTerrain = map.getTerrain(planned.target.x, planned.target.y);
+        if (pTargetTerrain == nullptr || pTargetTerrain->getHp() <= 0 || pTargetTerrain->getUnit() != nullptr)
+        {
+            return reject(EngineActionFailure::TargetUnavailable);
+        }
+    }
+    else if (liveUnitIdAt(map, planned.target) != planned.targetUnitId)
     {
         return reject(EngineActionFailure::TargetUnavailable);
+    }
+    std::optional<GlobalUtils::ScopedDeterministicSeed> rngScope;
+    if (turnLuckNonce.has_value() && !Coordinator::isTerrainTargetId(planned.targetUnitId))
+    {
+        if (Terrain * pTargetTerrain = map.getTerrain(planned.target.x, planned.target.y);
+            pTargetTerrain != nullptr && pTargetTerrain->getUnit() != nullptr)
+        {
+            const quint32 shotSeed = Coordinator::computePeekedShotSeed(
+                *turnLuckNonce, pUnit->getUniqueID(), planned.destination, planned.target,
+                pUnit->getHp(), pTargetTerrain->getUnit()->getHp());
+            pAction->setSeed(shotSeed);
+            rngScope.emplace(shotSeed);
+        }
     }
     pAction->writeDataInt32(planned.target.x);
     pAction->writeDataInt32(planned.target.y);

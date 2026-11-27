@@ -180,7 +180,7 @@ namespace Coordinator
     }
 
     // useTerrainDefense and getBaseDefense only read scripts; CO terrain modifiers are left out on purpose.
-    TerrainDefenseRule ReplyFactsBuilder::terrainRule(Unit & actor, const TilePoint & tile) const
+    TerrainDefenseRule projectedTerrainRule(GameMap &m_map, Unit &actor, const TilePoint &tile)
     {
         TerrainDefenseRule rule;
         rule.luck = REPLY_TERRAIN_LUCK;
@@ -213,7 +213,7 @@ namespace Coordinator
         const auto started = Clock::now();
         auto facts = std::make_shared<ReplyFacts>();
         facts->tile = cachedTileFacts(destination);
-        facts->terrain = terrainRule(actor, destination);
+        facts->terrain = projectedTerrainRule(m_map,actor, destination);
         facts->actorRealHp = actor.getHp();
         const KnownUnit & actorUnit = known(actorIndex);
         facts->shots.reserve(facts->tile->shooters.size());

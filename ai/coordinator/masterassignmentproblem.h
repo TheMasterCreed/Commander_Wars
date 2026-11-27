@@ -109,6 +109,9 @@ namespace Coordinator
         bool plannable{false};
         // Moves onto a tile one of our units leaves, behind every candidate the constructor sees.
         bool follows{false};
+        std::vector<std::int32_t> requiredKilledEnemyIds;
+        std::vector<std::int32_t> requiredKilledKnowledgeIndices;
+        PlannedAction plannedAction;
         CandidateBundle source;
     };
 
@@ -187,6 +190,7 @@ namespace Coordinator
         std::span<const MasterFixedResourceUsage> fixedResourceUsage() const;
         bool incompatible(MasterCandidateRef left, MasterCandidateRef right) const;
         bool canChangeActor(std::int32_t actorSlot) const;
+        bool canChangeCombatHelper(const MasterActor & actor) const;
         std::span<const OccupancyEntry> occupancy() const;
         std::span<const PlannedAction> actionTemplates() const;
         std::span<const PlanEdge> incumbentEdges() const;
@@ -206,7 +210,7 @@ namespace Coordinator
         friend struct MasterAssignmentReplayResult replayMasterAssignment(
             const MasterAssignmentProblem &,
             std::span<const std::int32_t>,
-            const ReplyPredictionSetup &);
+            const ReplyPredictionSetup &, bool);
 
         explicit MasterAssignmentProblem(std::uint64_t sessionIdentity);
 
@@ -218,6 +222,7 @@ namespace Coordinator
         std::vector<MasterFixedResourceUsage> m_fixedResourceUsage;
         std::vector<OccupancyEntry> m_occupancy;
         std::vector<PlannedAction> m_actionTemplates;
+        std::vector<std::int32_t> m_actorAtAction;
         std::vector<PlanEdge> m_incumbentEdges;
         std::vector<std::int32_t> m_incumbentChoices;
         std::vector<std::int32_t> m_incumbentExecutionOrder;
@@ -344,7 +349,7 @@ namespace Coordinator
     MasterAssignmentReplayResult replayMasterAssignment(
         const MasterAssignmentProblem & problem,
         std::span<const std::int32_t> choices,
-        const ReplyPredictionSetup & prediction);
+        const ReplyPredictionSetup & prediction, bool combatHelpers = false);
 
     std::optional<MilliFunds> checkedAssignmentEconomicTotal(const AssignmentResult & assignment);
 

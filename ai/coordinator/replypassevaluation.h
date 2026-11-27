@@ -362,6 +362,21 @@ namespace Coordinator
         return replay.complete();
     }
 
+    inline void removeIncomingCombinedFireConflict(MasterAssignmentReplayResult & replay, CombatFireOrder order)
+    {
+        if (order == CombatFireOrder{})
+            return;
+        int first = NO_ACTION, second = NO_ACTION;
+        for (int index : replay.ordering.order)
+        {
+            const auto & action = replay.plan.action(index);
+            if (action.unitId == order.first) first = index;
+            if (action.unitId == order.second) second = index;
+        }
+        if (first != NO_ACTION && second != NO_ACTION && first != second)
+            replay.plan.removeCombinedFireEdgesBetween(first, second);
+    }
+
     inline void installCombatFireOrders(MasterAssignmentReplayResult &replay, std::span<const CombatFireOrder> orders)
     {
         for (const CombatFireOrder order : orders)
@@ -379,6 +394,7 @@ namespace Coordinator
                                                      std::span<const CombatFireOrder> extraFireOrders = {})
     {
         using namespace ReplyPassEvaluationDetail;
+        pumpUiEventsIfDue();
         ReplyPassEvaluation result;
         result.replay = replayMasterAssignment(problem, choices, ReplyPredictionSetup{}, board.combat != nullptr);
         const MasterAssignmentReplayResult & replay = result.replay;
@@ -389,6 +405,12 @@ namespace Coordinator
         if (!replay.complete())
         {
             return refuse(result, ReplyPassNoValue::ReplayIncomplete);
+        }
+        if (board.combat != nullptr)
+        {
+            removeIncomingCombinedFireConflict(result.replay, fireOrder);
+            for (const CombatFireOrder extraOrder : extraFireOrders)
+                removeIncomingCombinedFireConflict(result.replay, extraOrder);
         }
         if (!installCombatFireOrder(result.replay, fireOrder))
             return refuse(result, ReplyPassNoValue::ReplayInvalid);
@@ -435,6 +457,22 @@ namespace Coordinator
             const bool named = resolved.failedAction < result.actors.size();
             return refuse(result, noValueOf(resolved.own.status),
                           named ? result.actors[resolved.failedAction].actorSlot : NO_REPLY_PASS_ACTOR);
+        }
+        if (board.combat != nullptr)
+        {
+            for (const auto & entry : result.actors)
+            {
+                const auto & cand = problem.actors()[static_cast<std::size_t>(entry.actorSlot)]
+                                        .candidates[static_cast<std::size_t>(entry.candidateIndex)];
+                for (const std::int32_t reqKi : cand.requiredKilledKnowledgeIndices)
+                {
+                    const auto it = resolved.own.chain.chain.find(reqKi);
+                    if (it == resolved.own.chain.chain.end() || it->second.after > 0)
+                    {
+                        return refuse(result, ReplyPassNoValue::ReplayInvalid, entry.actorSlot);
+                    }
+                }
+            }
         }
         if (const std::optional<std::size_t> overflow = oneActionOverflowTarget(resolved))
         {

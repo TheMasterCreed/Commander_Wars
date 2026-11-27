@@ -236,6 +236,7 @@ namespace Coordinator
         MilliFunds ceiling{0};
         std::optional<MilliFunds> floor;
         std::int64_t pricingWork{0};
+        std::int64_t preparationWork{0};
         std::int64_t witnessWork{0};
         MasterPlanWitnessStats witnessStats;
     };

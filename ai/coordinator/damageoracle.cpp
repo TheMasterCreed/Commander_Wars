@@ -1,15 +1,20 @@
 #include "ai/coordinator/damageoracle.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
+#include <optional>
 
 #include <QPoint>
 #include <QRectF>
 
 #include "ai/coreai.h"
+#include "coreengine/globalutils.h"
 
 #include "game/GameEnums.h"
 #include "game/unit.h"
+#include "game/player.h"
+#include "game/scopedcombatunitstate.h"
 #include "game/weaponrangecheck.h"
 
 #include "resource_management/weaponmanager.h"
@@ -43,21 +48,68 @@ namespace Coordinator
             ++m_hitCount;
             return known->second;
         }
+        const auto usePeek = m_luckPeekEnabled && attacker.getOwner() != nullptr &&
+                             attacker.getOwner()->getPlayerID() == m_ownPlayerId;
+        const GameEnums::LuckDamageMode luckMode =
+            usePeek ? GameEnums::LuckDamageMode_On : GameEnums::LuckDamageMode_Average;
+        std::optional<GlobalUtils::ScopedDeterministicSeed> rngScope;
+        if (usePeek)
+        {
+            const quint32 shotSeed = computePeekedShotSeed(
+                m_turnLuckNonce, attacker.getUniqueID(), attackerTile, defenderTile,
+                attacker.getHp(), defender.getHp());
+            rngScope.emplace(shotSeed);
+        }
         const QRectF report = CoreAI::calcVirtuelUnitDamage(m_pMap,
                                                             &attacker, NO_TAKEN_DAMAGE, QPoint(attackerTile.x, attackerTile.y),
-                                                            GameEnums::LuckDamageMode_Average,
+                                                            luckMode,
                                                             &defender, NO_TAKEN_DAMAGE, QPoint(defenderTile.x, defenderTile.y),
-                                                            GameEnums::LuckDamageMode_Average,
+                                                            luckMode,
                                                             IGNORE_OUT_OF_VISION_RANGE, FAST_INACCURATE_DAMAGE);
         DamageEstimate result;
         result.possible = report.x() >= 0;
         if (result.possible)
         {
             result.reportedDamage = report.x();
+            result.report = {report.x(), report.width(), static_cast<int>(report.y()), static_cast<int>(report.height())};
             result.damageSteps = damageStepsFrom(defender.getHp(), report.x());
             result.counterSteps = damageStepsFrom(attacker.getHp(), report.width());
         }
         m_estimates.emplace(key, result);
+        return result;
+    }
+
+    OwnFireReport DamageOracle::estimateAtHp(int actorIndex, Unit &actor, TilePoint from, int targetIndex,
+                                              Unit &target, TilePoint to, double actorHp, double targetHp,
+                                              std::array<int, 2> targetAmmo)
+    {
+        if (!std::isfinite(actorHp) || !std::isfinite(targetHp) || actorHp <= 0 || actorHp > Unit::MAX_UNIT_HP ||
+            targetHp <= 0 || targetHp > Unit::MAX_UNIT_HP)
+            return {};
+        const std::array<int, 2> actorAmmo{actor.getAmmo1(), actor.getAmmo2()};
+        const auto key = std::tuple{Key{actorIndex, targetIndex, from.x, from.y, to.x, to.y},
+                                    actorHp, targetHp, actorAmmo, targetAmmo};
+        const auto found = m_projected.find(key);
+        if (found != m_projected.end())
+            return found->second;
+        ScopedCombatUnitState attacker(actor, actorHp, actorAmmo);
+        ScopedCombatUnitState defender(target, targetHp, targetAmmo);
+        const auto usePeek = m_luckPeekEnabled && actor.getOwner() != nullptr &&
+                             actor.getOwner()->getPlayerID() == m_ownPlayerId;
+        const GameEnums::LuckDamageMode luckMode =
+            usePeek ? GameEnums::LuckDamageMode_On : GameEnums::LuckDamageMode_Average;
+        std::optional<GlobalUtils::ScopedDeterministicSeed> rngScope;
+        if (usePeek)
+        {
+            const quint32 shotSeed = computePeekedShotSeed(
+                m_turnLuckNonce, actor.getUniqueID(), from, to, actorHp, targetHp);
+            rngScope.emplace(shotSeed);
+        }
+        const auto native = CoreAI::calcVirtuelUnitDamage(m_pMap, &actor, NO_TAKEN_DAMAGE, QPoint(from.x, from.y),
+            luckMode, &target, NO_TAKEN_DAMAGE, QPoint(to.x, to.y),
+            luckMode, IGNORE_OUT_OF_VISION_RANGE, FAST_INACCURATE_DAMAGE);
+        OwnFireReport result{native.x(), native.width(), static_cast<int>(native.y()), static_cast<int>(native.height())};
+        m_projected.emplace(key, result);
         return result;
     }
 
@@ -111,9 +163,32 @@ namespace Coordinator
                         slotBaseDamage(second, defender, distance, minRange, maxRange));
     }
 
+    void DamageOracle::setLuckPeek(quint32 turnNonce, qint32 ownPlayerId)
+    {
+        if (m_luckPeekEnabled && m_turnLuckNonce == turnNonce && m_ownPlayerId == ownPlayerId)
+            return;
+        m_luckPeekEnabled = true;
+        m_turnLuckNonce = turnNonce;
+        m_ownPlayerId = ownPlayerId;
+        m_estimates.clear();
+        m_projected.clear();
+    }
+
+    void DamageOracle::clearLuckPeek()
+    {
+        if (!m_luckPeekEnabled)
+            return;
+        m_luckPeekEnabled = false;
+        m_turnLuckNonce = 0;
+        m_ownPlayerId = NO_OWNER;
+        m_estimates.clear();
+        m_projected.clear();
+    }
+
     void DamageOracle::clear()
     {
         m_estimates.clear();
+        m_projected.clear();
         m_weaponBaseDamage.clear();
         m_callCount = 0;
         m_hitCount = 0;

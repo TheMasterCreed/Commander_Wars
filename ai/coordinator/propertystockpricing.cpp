@@ -562,6 +562,120 @@ namespace Coordinator
         return solver.optimum();
     }
 
+    std::int32_t PropertyStockField::enemyRowOf(std::int32_t knowledgeIndex) const
+    {
+        for (std::size_t row = 0; row < m_theirs.rows.size(); ++row)
+        {
+            if (m_theirs.rows[row].knowledgeIndex == knowledgeIndex)
+            {
+                return static_cast<std::int32_t>(row);
+            }
+        }
+        return NO_STOCK_ROW;
+    }
+
+    MilliFunds PropertyStockField::enemyOptimumWithout(std::int32_t removedRow)
+    {
+        if (removedRow == NO_STOCK_ROW)
+        {
+            return m_enemyOptimum;
+        }
+        const auto known = m_enemyOptimaWithoutRow.find(removedRow);
+        if (known != m_enemyOptimaWithoutRow.end())
+        {
+            return known->second;
+        }
+        const AssignmentSubInstance sub = subInstanceWithout(m_theirs, removedRow, NO_STOCK_COLUMN);
+        AssignmentSolver solver;
+        solver.solve(sub.rowCount, sub.columnCount, sub.weights);
+        const MilliFunds optimum = solver.optimum();
+        m_enemyOptimaWithoutRow.emplace(removedRow, optimum);
+        return optimum;
+    }
+
+    JointStockDecomposition PropertyStockField::jointStockDecomposition(
+        std::span<const PlanRowAction> actions)
+    {
+        JointActionFacts facts = jointActionFacts(actions);
+        JointStockDecomposition result;
+        result.ownedBaseline = m_ownedBaseline;
+        for (const std::int32_t column : facts.capturedColumns)
+        {
+            result.ownershipFlipSwingTotal += ownershipFlipSwing(
+                m_ours.columns[static_cast<std::size_t>(column)],
+                m_horizonTurns);
+        }
+        result.ourOpenOptimum = ourOpenOptimum(facts);
+        result.jointEnemyOptimum = m_enemyOptimum;
+        result.stockAbsolute =
+            result.ownedBaseline +
+            result.ownershipFlipSwingTotal +
+            result.ourOpenOptimum -
+            result.jointEnemyOptimum;
+        result.capturedColumns =
+            std::move(facts.capturedColumns);
+        return result;
+    }
+
+    MilliFunds PropertyStockField::jointStock(
+        std::span<const PlanRowAction> actions)
+    {
+        return jointStockDecomposition(actions).stockAbsolute;
+    }
+
+    MilliFunds PropertyStockField::enemyStockLoss(std::span<const std::int32_t> removedEnemyKnowledgeIndices)
+    {
+        if (removedEnemyKnowledgeIndices.empty() || m_theirs.rows.empty() || m_theirs.columns.empty())
+        {
+            return 0;
+        }
+        std::vector<std::int32_t> removedRows;
+        removedRows.reserve(removedEnemyKnowledgeIndices.size());
+        for (const std::int32_t knowledgeIndex : removedEnemyKnowledgeIndices)
+        {
+            const std::int32_t row = enemyRowOf(knowledgeIndex);
+            if (row != NO_STOCK_ROW &&
+                std::find(removedRows.begin(), removedRows.end(), row) == removedRows.end())
+            {
+                removedRows.push_back(row);
+            }
+        }
+        if (removedRows.empty())
+        {
+            return 0;
+        }
+        if (removedRows.size() == 1)
+        {
+            const MilliFunds after = enemyOptimumWithout(removedRows.front());
+            return m_enemyOptimum > after ? m_enemyOptimum - after : 0;
+        }
+        const std::size_t colCount = m_theirs.columns.size();
+        const std::size_t rowCount = m_theirs.rows.size();
+        std::vector<MilliFunds> subWeights;
+        std::size_t keptRows = 0;
+        subWeights.reserve((rowCount - removedRows.size()) * colCount);
+        for (std::size_t r = 0; r < rowCount; ++r)
+        {
+            if (std::find(removedRows.begin(), removedRows.end(), static_cast<std::int32_t>(r)) != removedRows.end())
+            {
+                continue;
+            }
+            const std::size_t rowOffset = r * colCount;
+            subWeights.insert(subWeights.end(),
+                              m_theirs.weights.begin() + static_cast<std::ptrdiff_t>(rowOffset),
+                              m_theirs.weights.begin() + static_cast<std::ptrdiff_t>(rowOffset + colCount));
+            ++keptRows;
+        }
+        if (keptRows == 0)
+        {
+            return m_enemyOptimum > 0 ? m_enemyOptimum : 0;
+        }
+        AssignmentSolver solver;
+        solver.solve(keptRows, colCount, subWeights);
+        const MilliFunds after = solver.optimum();
+        return m_enemyOptimum > after ? m_enemyOptimum - after : 0;
+    }
+
     std::vector<PlanRowAction> JointPlanStockValuer::planActions(
         const ContinuationKey & key)
     {
@@ -2235,7 +2349,9 @@ namespace Coordinator
         {
             return false;
         }
-        std::int32_t minEnemyTurn = std::numeric_limits<std::int32_t>::max();
+        // Assign each living enemy capper to at most one neutral property rather than masking every reachable city.
+        std::vector<std::tuple<std::int32_t, std::size_t, std::size_t>> claims;
+        claims.reserve(rowCount * colCount);
         for (std::size_t r = 0; r < rowCount; ++r)
         {
             const PropertyStockRow & eRow = m_field->m_theirs.rows[r];
@@ -2243,21 +2359,36 @@ namespace Coordinator
             {
                 continue;
             }
-            const std::int32_t arrival = m_field->m_enemyArrivals[r * colCount + static_cast<std::size_t>(slot)];
-            if (arrival == UNREACHABLE)
+            for (std::size_t c = 0; c < colCount; ++c)
+            {
+                const std::int32_t arrival = m_field->m_enemyArrivals[r * colCount + c];
+                if (arrival == UNREACHABLE)
+                {
+                    continue;
+                }
+                const std::int32_t carried = m_field->carriedFor(eRow, static_cast<std::int32_t>(c));
+                const RawOwnership owned = rawOwnedTurns(arrival, carried, eRow.captureRate,
+                                                         m_field->m_capturePointsToCapture);
+                if (owned.status == RawOwnershipStatus::Owned)
+                {
+                    claims.emplace_back(owned.turns, r, c);
+                }
+            }
+        }
+        std::sort(claims.begin(), claims.end());
+        std::vector<bool> enemyUsed(rowCount, false);
+        std::vector<std::int32_t> claimedEnemyTurn(colCount, std::numeric_limits<std::int32_t>::max());
+        for (const auto & [turns, r, c] : claims)
+        {
+            if (enemyUsed[r] || claimedEnemyTurn[c] < std::numeric_limits<std::int32_t>::max())
             {
                 continue;
             }
-            const std::int32_t carried = m_field->carriedFor(eRow, slot);
-            const RawOwnership owned = rawOwnedTurns(arrival, carried, eRow.captureRate,
-                                                     m_field->m_capturePointsToCapture);
-            if (owned.status == RawOwnershipStatus::Owned && owned.turns < minEnemyTurn)
-            {
-                minEnemyTurn = owned.turns;
-            }
+            enemyUsed[r] = true;
+            claimedEnemyTurn[c] = turns;
         }
-        // Enemy completes capture strictly before our fastest capper can even begin its final turn.
-        return minEnemyTurn < std::numeric_limits<std::int32_t>::max() && minEnemyTurn + 1 < minOurTurn;
+        const std::int32_t enemyTurn = claimedEnemyTurn[static_cast<std::size_t>(slot)];
+        return enemyTurn < std::numeric_limits<std::int32_t>::max() && enemyTurn < minOurTurn;
     }
 
     MilliFunds ReplyStockContext::futureFactorySpawnGain(const ContinuationKey & key, const ReplyStockFloor & floor,
@@ -2278,18 +2409,10 @@ namespace Coordinator
         const auto isBlocked = [&](std::size_t n) {
             return n < blockedNodes.size() && blockedNodes[n] != 0;
         };
-        std::vector<std::int32_t> neutralFactories;
-        std::vector<std::int32_t> enemyFactories;
+        std::vector<std::int32_t> capturableFactories;
         for (const PropertyFacts & prop : properties)
         {
-            if (!prop.visible || !prop.capturable || !prop.canProduce || prop.ownerId == observerId)
-            {
-                continue;
-            }
-            const bool buildsCapper = prop.productionList.isEmpty() ||
-                prop.productionList.contains(QStringLiteral("INFANTRY"), Qt::CaseInsensitive) ||
-                prop.productionList.contains(QStringLiteral("MECH"), Qt::CaseInsensitive);
-            if (!buildsCapper)
+            if (!prop.capturable || !prop.canProduce || prop.ownerId == observerId || !prop.canProduceCapper)
             {
                 continue;
             }
@@ -2302,22 +2425,16 @@ namespace Coordinator
             {
                 if (m_nodeSlots[node] == slot)
                 {
-                    if (m_nodeColumns[node].ownerBefore == OwnerSign::Neutral)
+                    if ((m_nodeColumns[node].ownerBefore == OwnerSign::Neutral && !isBlocked(node)) ||
+                        m_nodeColumns[node].ownerBefore == OwnerSign::Enemy)
                     {
-                        if (!isBlocked(node))
-                        {
-                            neutralFactories.push_back(static_cast<std::int32_t>(node));
-                        }
-                    }
-                    else
-                    {
-                        enemyFactories.push_back(static_cast<std::int32_t>(node));
+                        capturableFactories.push_back(static_cast<std::int32_t>(node));
                     }
                     break;
                 }
             }
         }
-        if (neutralFactories.empty() && enemyFactories.empty())
+        if (capturableFactories.empty())
         {
             return 0;
         }
@@ -2394,7 +2511,7 @@ namespace Coordinator
             }
         }
         std::vector<std::pair<std::int32_t, std::int32_t>> activeFactories;
-        for (const std::int32_t fNode : neutralFactories)
+        for (const std::int32_t fNode : capturableFactories)
         {
             std::int32_t tc = claimedTurn[static_cast<std::size_t>(fNode)];
             for (std::size_t r = 0; r < instance.rows.size(); ++r)
@@ -2413,25 +2530,9 @@ namespace Coordinator
                     tc = direct;
                 }
             }
-            if (tc < horizon - 2)
+            if (tc < horizon - 1)
             {
                 activeFactories.emplace_back(tc, fNode);
-            }
-        }
-        std::vector<bool> capturedOnF0(nodeCount, false);
-        for (const CanonicalPlanActionKey & action : key)
-        {
-            const auto it = m_actions.find(action);
-            if (it != m_actions.end() && it->second.capturedNode != NO_SEQUENTIAL_NODE)
-            {
-                capturedOnF0[static_cast<std::size_t>(it->second.capturedNode)] = true;
-            }
-        }
-        for (const std::int32_t fNode : enemyFactories)
-        {
-            if (capturedOnF0[static_cast<std::size_t>(fNode)])
-            {
-                activeFactories.emplace_back(0, fNode);
             }
         }
         if (activeFactories.empty())
@@ -2442,15 +2543,11 @@ namespace Coordinator
         MilliFunds totalGain = 0;
         for (const auto & [tc, fNode] : activeFactories)
         {
-            for (std::int32_t spawn = 1; spawn <= MAX_FACTORY_SPAWN_CAPPERS; ++spawn)
+            for (std::int32_t buildTurn = tc + 1; buildTurn < horizon - 1; ++buildTurn)
             {
-                const std::int32_t buildTurn = tc + spawn;
-                if (buildTurn >= horizon - 1)
-                {
-                    break;
-                }
                 std::int32_t curNode = fNode;
                 std::int32_t curTurn = buildTurn;
+                bool expanded = false;
                 for (;;)
                 {
                     std::int32_t bestNode = NO_SEQUENTIAL_NODE;
@@ -2460,7 +2557,7 @@ namespace Coordinator
                     {
                         const std::int32_t pNode = static_cast<std::int32_t>(p);
                         if (pNode == curNode || pNode == fNode || isBlocked(p) ||
-                            m_nodeColumns[p].ownerBefore != OwnerSign::Neutral)
+                            m_nodeColumns[p].ownerBefore == OwnerSign::Ours)
                         {
                             continue;
                         }
@@ -2485,6 +2582,7 @@ namespace Coordinator
                     {
                         break;
                     }
+                    expanded = true;
                     if (!RelativeStockDetail::checkedAdd(totalGain, bestGain))
                     {
                         return totalGain;
@@ -2492,6 +2590,10 @@ namespace Coordinator
                     claimedTurn[static_cast<std::size_t>(bestNode)] = bestTurn;
                     curNode = bestNode;
                     curTurn = bestTurn;
+                }
+                if (!expanded)
+                {
+                    break;
                 }
             }
         }

@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "ai/coordinator/coordinatorcommon.h"
+
 namespace Coordinator
 {
     enum class RefinementWork : std::int8_t
@@ -123,6 +125,7 @@ namespace Coordinator
 
         GrantId draw(std::int64_t states, RefinementWork work)
         {
+            pumpUiEventsIfDue();
             if (!canReserve(states, work, true))
             {
                 return NO_GRANT;
@@ -135,6 +138,7 @@ namespace Coordinator
 
         bool consume(std::int64_t states, RefinementWork work)
         {
+            pumpUiEventsIfDue();
             if (!canReserve(states, work, false))
             {
                 return false;
@@ -170,6 +174,17 @@ namespace Coordinator
         std::int64_t balance() const
         {
             return m_balance;
+        }
+
+        std::int64_t available() const
+        {
+            if (!m_workLimit)
+            {
+                return m_balance;
+            }
+            const std::int64_t limitRemaining = std::max<std::int64_t>(
+                m_workLimit->second - (m_stats.granted - m_workLimit->first), 0);
+            return std::min(m_balance, limitRemaining);
         }
 
         bool exhausted() const

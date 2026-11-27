@@ -78,6 +78,15 @@ namespace Coordinator
         std::vector<ResolvedReplyShot> shots;
     };
 
+    struct OwnShotOutcome
+    {
+        int target{NO_UNIT};
+        double attackerBefore{}, attackerAfter{}, targetBefore{}, targetAfter{};
+        OwnFireReport report;
+        MilliFunds targetCapital{}, counterCapital{}, targetCost{}, actorCost{};
+        bool operator==(const OwnShotOutcome &) const = default;
+    };
+
     // Every vector runs parallel to the execution-ordered actions it measured.
     struct OwnActionMeasurement
     {
@@ -86,6 +95,9 @@ namespace Coordinator
         PlanChainRun chain;
         std::vector<double> hpAfterActions;
         std::vector<MeasuredCounter> counters;
+        std::vector<OwnShotOutcome> ownShots;
+        std::map<int,double> targetRealAfter;
+        std::map<int,std::array<int, 2>> targetAmmoAfter;
         std::int32_t certainCounterUnits{0};
         std::int32_t scaledCounterUnits{0};
         std::int32_t scaledCounterSurvivalDifferences{0};
@@ -160,6 +172,82 @@ namespace Coordinator
                 ++result.certainCounterUnits;
             }
             result.hpAfterActions[index] = targets[index].target.hp;
+        }
+        return result;
+    }
+
+    // Combat candidates retain the uncapped native report for their first hit. A
+    // subsequent hit is quoted at the target's remaining real HP and ammunition.
+    inline OwnActionMeasurement measureCombatOwnActions(std::span<const PlanChainEntry> ordered,
+                                                         std::span<ReplyTargetFacts> targets, const OwnFireAt &fireAt)
+    {
+        OwnActionMeasurement result;
+        result.status = StockQuoteStatus::Available;
+        result.ownStatus.assign(ordered.size(), StockQuoteStatus::Available);
+        result.ownShots.resize(ordered.size());
+        result.counters.resize(ordered.size());
+        for (std::size_t i = 0; i < ordered.size(); ++i)
+        {
+            const auto &entry = ordered[i];
+            const auto &bundle = *entry.pBundle;
+            auto &actorHp = targets[i].target.hp;
+            const bool alive = targetsAliveIn(fireTargetsOf(bundle), result.chain.chain);
+            result.chain.targetsAlive.push_back(alive);
+            if (!alive)
+            {
+                result.ownStatus[i] = result.status = StockQuoteStatus::TargetAlreadyGone;
+                return result;
+            }
+            const auto *part = bundle.components.size() == 1 ? &bundle.components.front() : nullptr;
+            if (!part || part->kind != ComponentKind::Fire)
+            {
+                const auto outcome = hpAfterActionOn(bundle, entry.actorHpSteps, result.chain.chain);
+                actorHp = realHpAfterAction(actorHp, outcome);
+                result.chain.outcomes.push_back(outcome);
+                result.hpAfterActions.push_back(actorHp);
+                continue;
+            }
+            const FireFacts &fire = part->fire;
+            if (!std::isfinite(fire.targetRealHp) || fire.targetRealHp <= 0 || fire.targetRealHp > UNIT_HP_STEPS ||
+                ceilHpSteps(fire.targetRealHp) != fire.targetHpSteps)
+            {
+                result.ownStatus[i] = result.status = StockQuoteStatus::MissingActionFacts;
+                return result;
+            }
+            auto &hp = result.targetRealAfter.try_emplace(fire.targetUnitId, fire.targetRealHp).first->second;
+            auto &ammo = result.targetAmmoAfter.try_emplace(fire.targetUnitId, fire.targetAmmo).first->second;
+            const bool terrainTarget = isTerrainTargetId(fire.targetUnitId);
+            const bool changed = !terrainTarget && (hp != fire.targetRealHp || ammo != fire.targetAmmo);
+            OwnFireReport quote = changed ? fireAt(bundle.unitId, bundle.destination, fire.targetUnitId, actorHp, hp, ammo)
+                                          : fire.isolated;
+            if (terrainTarget && entry.actorHpSteps > 0 && ceilHpSteps(actorHp) != entry.actorHpSteps && quote.damage > 0)
+                quote.damage = quote.damage * (static_cast<double>(ceilHpSteps(actorHp)) / static_cast<double>(entry.actorHpSteps));
+            if (!std::isfinite(quote.damage) || quote.damage < 0 || !std::isfinite(quote.counter))
+            {
+                result.ownStatus[i] = result.status = StockQuoteStatus::UnusablePlanChain;
+                return result;
+            }
+            auto &shot = result.ownShots[i];
+            shot = {fire.targetUnitId, actorHp, engineHpAfterReply(actorHp, engineShotDamage(quote.counter)), hp,
+                    engineHpAfterReply(hp, engineShotDamage(quote.damage)), quote};
+            if (quote.counter >= 0 && quote.counterWeapon >= 0 && quote.counterWeapon < 2 && ammo[quote.counterWeapon] > 0)
+                --ammo[quote.counterWeapon];
+            hp = shot.targetAfter;
+            actorHp = shot.attackerAfter;
+            const int actorSteps = ceilHpSteps(actorHp), targetSteps = ceilHpSteps(hp);
+            result.chain.chain[fire.targetUnitId] = {fire.targetHpSteps, targetSteps};
+            result.chain.outcomes.push_back({.hpSteps = actorSteps, .counterApplied = quote.counter > 0,
+                                             .victimIndex = fire.targetUnitId, .victimHpSteps = targetSteps});
+            result.counters[i] = {.isolatedSteps = fire.counterSteps, .steps = entry.actorHpSteps - actorSteps,
+                                  .counterScaled = changed, .hpAfter = actorHp};
+            result.hpAfterActions.push_back(actorHp);
+            if (changed)
+            {
+                ++result.scaledCounterUnits;
+                result.scaledCounterSurvivalDifferences += (actorSteps <= 0) != (fire.counterSteps >= entry.actorHpSteps);
+            }
+            else
+                ++result.certainCounterUnits;
         }
         return result;
     }

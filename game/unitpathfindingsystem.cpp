@@ -76,6 +76,7 @@ qint32 UnitPathFindingSystem::getCosts(qint32 index, qint32 x, qint32 y, qint32 
                         (!pUnit->isStealthed(m_pPlayer)))
                     {
                         if (!m_pUnit->getIgnoreUnitCollision() &&
+                            !m_ignoredEnemyUnitIds.contains(pUnit->getUniqueID()) &&
                             (m_ignoreEnemies == CollisionIgnore::Off ||
                              (m_ignoreEnemies == CollisionIgnore::OnlyNotMovedEnemies && !pUnit->getHasMoved())))
                         {
@@ -340,6 +341,11 @@ UnitPathFindingSystem::CollisionIgnore UnitPathFindingSystem::getIgnoreEnemies()
 void UnitPathFindingSystem::setIgnoreEnemies(CollisionIgnore ignoreEnemies)
 {
     m_ignoreEnemies = ignoreEnemies;
+}
+
+void UnitPathFindingSystem::setIgnoredEnemyUnits(const QSet<qint32> & unitIds)
+{
+    m_ignoredEnemyUnitIds = unitIds;
 }
 
 void UnitPathFindingSystem::setMovepoints(const qint32 &movepoints)

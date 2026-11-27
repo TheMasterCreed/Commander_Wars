@@ -23,6 +23,8 @@ namespace Coordinator
         std::vector<MilliFunds> actorNextShotsAtDestination;
         std::vector<MilliFunds> enemyShotsOnActorAtOrigin;
         std::vector<MilliFunds> enemyShotsOnActorAtDestination;
+        std::vector<std::int32_t> requiredKilledEnemyIds;
+        std::vector<std::int32_t> requiredKilledKnowledgeIndices;
         BundleValuation valuation;
         // Null unless reply prediction is recorded; nothing prices it.
         std::shared_ptr<const ReplyFacts> replyFacts;

@@ -107,6 +107,7 @@ namespace
             .ammo2 = unit.getAmmo2(),
             .fuel = unit.getFuel(),
             .hasMoved = unit.getHasMoved(),
+            .ignoresUnitCollision = unit.getIgnoreUnitCollision(),
             .carrier = carrier,
             .unitValue = unit.getCoUnitValue(),
             .hasWeapons = unit.hasWeapons(),
@@ -224,15 +225,6 @@ namespace Coordinator
     GameEnums::VisionType BattlefieldKnowledge::visionType(qint32 x, qint32 y) const
     {
         return onMap(x, y) ? m_visionType[tileIndex(x, y)] : GameEnums::VisionType_Shrouded;
-    }
-
-    Relation BattlefieldKnowledge::relation(qint32 ownerId) const
-    {
-        if (ownerId < 0 || ownerId >= static_cast<qint32>(m_relations.size()))
-        {
-            return Relation::Neutral;
-        }
-        return m_relations[static_cast<std::size_t>(ownerId)];
     }
 
     bool BattlefieldKnowledge::onMap(qint32 x, qint32 y) const

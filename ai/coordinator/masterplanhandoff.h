@@ -25,10 +25,17 @@ namespace Coordinator
         "NOT_REQUESTED", "NO_PROBLEM", "SELECTION_MISMATCH", "REPLAY_FAILED", "PLAN_MISMATCH", "READY",
     };
 
+    struct MasterOrderProposal
+    {
+        std::vector<std::int32_t> choices;
+        std::vector<std::int32_t> executionOrder;
+    };
+
     struct MasterPlanHandoff
     {
         MasterAssignmentProblem problem;
         std::vector<std::int32_t> choices;
+        std::optional<MasterOrderProposal> stockProposal{};
     };
 
     struct MasterPlanHandoffResult

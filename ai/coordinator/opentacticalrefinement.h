@@ -68,7 +68,7 @@ namespace Coordinator
         MilliFunds net = 0;
         for (const auto & actor : eval.actors)
         {
-            if (actor.ownShot.target == NO_UNIT) continue;
+            if (actor.ownShot.target == NO_UNIT || isTerrainTargetId(actor.ownShot.target)) continue;
             MilliFunds targetGain = actor.ownShot.targetCapital;
             if (actor.ownShot.targetAfter > 0.0 &&
                 actor.ownShot.target >= 0 && actor.ownShot.target < static_cast<int>(local.units.size()))

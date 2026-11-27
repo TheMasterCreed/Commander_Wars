@@ -19,6 +19,7 @@
 #include "game/building.h"
 #include "game/player.h"
 #include "game/unit.h"
+#include "game/scopedcombatunitstate.h"
 #include "game/weaponrangecheck.h"
 #include "game/gameanimation/gameanimation.h"
 
@@ -903,7 +904,7 @@ qint32 Unit::getCoUnitValue()
 
 qint32 Unit::getUnitValue()
 {
-    return static_cast<qint32>(getCosts() * m_hp / Unit::MAX_UNIT_HP);
+    return static_cast<qint32>(getCosts() * getHp() / Unit::MAX_UNIT_HP);
 }
 
 bool Unit::canBeRepaired(QPoint position)
@@ -2223,12 +2224,14 @@ void Unit::setMaxAmmo2(const qint32 value)
 
 qint32 Unit::getAmmo2() const
 {
+    if (const auto *state = ScopedCombatUnitState::forUnit(this))
+        return state->ammo[1];
     return m_ammo2;
 }
 
 bool Unit::hasAmmo2() const
 {
-    return WeaponRangeCheck::hasAmmo(m_ammo2, m_maxAmmo2);
+    return WeaponRangeCheck::hasAmmo(getAmmo2(), m_maxAmmo2);
 }
 
 QString Unit::getWeapon2ID() const
@@ -2304,6 +2307,8 @@ void Unit::setWeapon1ID(const QString & value)
 
 qint32 Unit::getAmmo1() const
 {
+    if (const auto *state = ScopedCombatUnitState::forUnit(this))
+        return state->ammo[0];
     return m_ammo1;
 }
 
@@ -2343,7 +2348,7 @@ void Unit::setAmmo1(const qint32 value)
 
 bool Unit::hasAmmo1() const
 {
-    return WeaponRangeCheck::hasAmmo(m_ammo1, m_maxAmmo1);
+    return WeaponRangeCheck::hasAmmo(getAmmo1(), m_maxAmmo1);
 }
 
 void Unit::reduceAmmo1(qint32 value)
@@ -2356,12 +2361,14 @@ void Unit::reduceAmmo1(qint32 value)
 
 qreal Unit::getHp() const
 {
+    if (const auto *state = ScopedCombatUnitState::forUnit(this))
+        return state->hp;
     return m_hp;
 }
 
 qint32 Unit::getHpRounded() const
 {
-    return GlobalUtils::roundUp(m_hp);
+    return GlobalUtils::roundUp(getHp());
 }
 
 void Unit::setHp(const qreal value, bool updateVisuals)
@@ -2379,22 +2386,25 @@ void Unit::setHp(const qreal value, bool updateVisuals)
 
 void Unit::setVirtualHpValue(const qreal value)
 {
-    m_virtualHp = PrecisionGrid::floor(value, FLOAT_PRECISION);
+    const auto hp = PrecisionGrid::floor(value, FLOAT_PRECISION);
+    if (auto *state = ScopedCombatUnitState::forUnit(this))
+        state->virtualHp = hp;
+    else
+        m_virtualHp = hp;
 }
 
 
 qreal Unit::getVirtualHpValue() const
 {
+    if (const auto *state = ScopedCombatUnitState::forUnit(this))
+        return state->virtualHp;
     return m_virtualHp;
 }
 
 qreal Unit::getVirtualHp() const
 {
-    if (m_virtualHp > 0.0)
-    {
-        return m_virtualHp;
-    }
-    return m_hp;
+    const auto hp = getVirtualHpValue();
+    return hp > 0 ? hp : getHp();
 }
 
 bool Unit::getHpHidden(Player* pPlayer)

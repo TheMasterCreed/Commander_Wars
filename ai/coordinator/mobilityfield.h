@@ -117,8 +117,22 @@ namespace Coordinator
         {
             if (onGrid(x, y))
             {
-                m_costs[index(x, y, direction)] = value;
+                std::int32_t & slot = m_costs[index(x, y, direction)];
+                if (slot == 0 && value != 0)
+                {
+                    --m_zeroCostCount;
+                }
+                else if (slot != 0 && value == 0)
+                {
+                    ++m_zeroCostCount;
+                }
+                slot = value;
             }
+        }
+
+        bool hasZeroCost() const
+        {
+            return m_zeroCostCount > 0;
         }
 
         void setTileCost(std::int32_t x, std::int32_t y, std::int32_t value)
@@ -127,6 +141,16 @@ namespace Coordinator
             {
                 setCost(x, y, direction, value);
             }
+        }
+
+        MobilityCostGrid withBlockedTiles(const std::vector<TilePoint> & tiles) const
+        {
+            MobilityCostGrid grid = *this;
+            for (const TilePoint & tile : tiles)
+            {
+                grid.setTileCost(tile.x, tile.y, IMPASSABLE_COST);
+            }
+            return grid;
         }
 
         friend bool operator==(const MobilityCostGrid &, const MobilityCostGrid &) = default;
@@ -141,7 +165,10 @@ namespace Coordinator
         std::int32_t m_width{0};
         std::int32_t m_height{0};
         std::vector<std::int32_t> m_costs;
+        std::int32_t m_zeroCostCount{0};
     };
+
+    constexpr std::int32_t UNBOUNDED_DISTANCE = -1;
 
     enum class FieldExpansion
     {
@@ -152,9 +179,26 @@ namespace Coordinator
     class DistanceField
     {
     public:
-        static DistanceField build(const MobilityCostGrid & grid, const std::vector<TilePoint> & sources, FieldExpansion expansion)
+        static DistanceField build(const MobilityCostGrid & grid, const std::vector<TilePoint> & sources,
+                                   FieldExpansion expansion, std::int32_t maxDistance = UNBOUNDED_DISTANCE)
         {
             DistanceField field(grid.width(), grid.height());
+            const bool bounded = maxDistance != UNBOUNDED_DISTANCE;
+            if (bounded && maxDistance < 0)
+            {
+                return field;
+            }
+            if (bounded && maxDistance == 0 && !grid.hasZeroCost())
+            {
+                for (const TilePoint & source : sources)
+                {
+                    if (grid.onGrid(source.x, source.y))
+                    {
+                        field.m_distances[field.index(source.x, source.y)] = 0;
+                    }
+                }
+                return field;
+            }
             std::vector<bool> settledTiles(field.m_distances.size(), false);
             std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapOrder> open;
             std::int64_t sequence = 0;
@@ -199,6 +243,10 @@ namespace Coordinator
                         continue;
                     }
                     const std::int32_t candidate = current.distance + cost;
+                    if (bounded && candidate > maxDistance)
+                    {
+                        continue;
+                    }
                     const std::int32_t known = field.m_distances[neighbourIndex];
                     if (known == UNREACHABLE || candidate < known)
                     {
@@ -352,14 +400,14 @@ namespace Coordinator
                     {
                         continue;
                     }
-                    TileState & neighbour = freshState(index(neighbourX, neighbourY));
-                    if (neighbour.settled)
-                    {
-                        continue;
-                    }
                     const std::int32_t cost = grid.cost(neighbourX, neighbourY, direction);
                     // A tile costing more than a whole allowance is never enterable, at any turn count.
                     if (cost < 0 || cost > movementPoints)
+                    {
+                        continue;
+                    }
+                    TileState & neighbour = freshState(index(neighbourX, neighbourY));
+                    if (neighbour.settled)
                     {
                         continue;
                     }

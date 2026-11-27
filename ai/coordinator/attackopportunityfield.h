@@ -149,11 +149,12 @@ namespace Coordinator
 
         static DistanceField buildReach(const AttackerSpec & spec, const MobilityCostGrid & blockedGrid, bool usable)
         {
-            if (usable)
+            if (!usable)
             {
-                return DistanceField::build(*spec.grid, {{spec.x, spec.y}}, FieldExpansion::FromSources);
+                return DistanceField::build(blockedGrid, {}, FieldExpansion::FromSources, 0);
             }
-            return DistanceField::build(blockedGrid, {}, FieldExpansion::FromSources);
+            const std::int32_t limit = spec.canMoveAndFire ? std::max(spec.movementPoints, 0) : 0;
+            return DistanceField::build(*spec.grid, {{spec.x, spec.y}}, FieldExpansion::FromSources, limit);
         }
 
         SlotData buildSlot(const AttackerSpec & spec, const MobilityCostGrid & blockedGrid) const
@@ -166,42 +167,44 @@ namespace Coordinator
             {
                 return slot;
             }
-            markOrigins(spec, slot);
-            markTargets(spec, slot);
+            std::vector<TilePoint> markedOrigins;
+            markOrigins(spec, slot, markedOrigins);
+            markTargets(spec, markedOrigins, slot);
             return slot;
         }
 
-        void markOrigins(const AttackerSpec & spec, SlotData & slot) const
+        void markOrigins(const AttackerSpec & spec, SlotData & slot, std::vector<TilePoint> & markedOrigins) const
         {
             // Firing without moving is always legal, even with a negative allowance.
             slot.origins[index(spec.x, spec.y)] = true;
-            if (!spec.canMoveAndFire)
+            markedOrigins.push_back(TilePoint{spec.x, spec.y});
+            if (!spec.canMoveAndFire || spec.movementPoints <= 0)
             {
                 return;
             }
-            for (std::int32_t y = 0; y < m_height; ++y)
+            const bool manhattanBounded = !spec.grid->hasZeroCost();
+            const std::int32_t minY = manhattanBounded ? std::max<std::int32_t>(0, spec.y - spec.movementPoints) : 0;
+            const std::int32_t maxY = manhattanBounded ? std::min<std::int32_t>(m_height - 1, spec.y + spec.movementPoints) : m_height - 1;
+            const std::int32_t minX = manhattanBounded ? std::max<std::int32_t>(0, spec.x - spec.movementPoints) : 0;
+            const std::int32_t maxX = manhattanBounded ? std::min<std::int32_t>(m_width - 1, spec.x + spec.movementPoints) : m_width - 1;
+            for (std::int32_t y = minY; y <= maxY; ++y)
             {
-                for (std::int32_t x = 0; x < m_width; ++x)
+                for (std::int32_t x = minX; x <= maxX; ++x)
                 {
-                    if (slot.reach.reachable(x, y, spec.movementPoints))
+                    if ((x != spec.x || y != spec.y) && slot.reach.reachable(x, y, spec.movementPoints))
                     {
                         slot.origins[index(x, y)] = true;
+                        markedOrigins.push_back(TilePoint{x, y});
                     }
                 }
             }
         }
 
-        void markTargets(const AttackerSpec & spec, SlotData & slot) const
+        void markTargets(const AttackerSpec & spec, const std::vector<TilePoint> & markedOrigins, SlotData & slot) const
         {
-            for (std::int32_t originY = 0; originY < m_height; ++originY)
+            for (const TilePoint & origin : markedOrigins)
             {
-                for (std::int32_t originX = 0; originX < m_width; ++originX)
-                {
-                    if (slot.origins[index(originX, originY)])
-                    {
-                        markRing(spec, originX, originY, slot);
-                    }
-                }
+                markRing(spec, origin.x, origin.y, slot);
             }
         }
 

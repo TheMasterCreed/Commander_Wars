@@ -183,6 +183,7 @@ namespace
             }
             while (!m_frontier.empty() || hasRefinement())
             {
+                pumpUiEventsIfDue();
                 if (m_evaluator.hasGuardedStock() && m_result.improvement)
                 {
                     break;
@@ -475,7 +476,8 @@ namespace
                                .witnessBuildWork = m_options.schedule.planPricingWitnessWork},
                     .status = priced.status, .rounds = priced.rounds, .stoppedOnTarget = priced.stoppedOnTarget,
                     .ceiling = priced.ceiling, .floor = priced.floor, .pricingWork = priced.pricingWork,
-                    .witnessWork = priced.witnessWork, .witnessStats = priced.witnessStats};
+                    .preparationWork = priced.preparationWork, .witnessWork = priced.witnessWork,
+                    .witnessStats = priced.witnessStats};
         }
 #endif
 
@@ -941,19 +943,34 @@ namespace
             std::vector<std::uint64_t> owners(m_problem.resources().size(), 0);
             std::vector<std::vector<bool>> uses(m_problem.actors().size(),
                                               std::vector<bool>(m_problem.resources().size(), false));
+            m_isExclusiveResource.assign(m_problem.resources().size(), false);
+            for (std::size_t resource = 0; resource < m_problem.resources().size(); ++resource)
+            {
+                const auto kind = m_problem.resources()[resource].kind;
+                m_isExclusiveResource[resource] = kind == MasterResourceKind::Destination ||
+                    kind == MasterResourceKind::Capture || kind == MasterResourceKind::Service;
+            }
+            m_candidateExclusiveResources.assign(m_problem.actors().size(), {});
             for (const auto & actor : m_problem.actors())
             {
                 const auto slot = static_cast<std::size_t>(actor.canonicalSlot);
-                for (const auto & candidate : actor.candidates)
+                m_candidateExclusiveResources[slot].resize(actor.candidates.size());
+                for (std::size_t choice = 0; choice < actor.candidates.size(); ++choice)
                 {
+                    const auto & candidate = actor.candidates[choice];
                     if (!chargeMasterWork(m_ledger, candidate.resources.size() + 1, 1,
                                           RefinementWork::MasterPreparation))
                     {
                         return false;
                     }
+                    auto & exclusiveList = m_candidateExclusiveResources[slot][choice];
                     for (const auto & resource : candidate.resources)
                     {
                         const auto index = static_cast<std::size_t>(resource.resourceIndex);
+                        if (m_isExclusiveResource[index])
+                        {
+                            exclusiveList.push_back(resource.resourceIndex);
+                        }
                         if (m_problem.resources()[index].kind != MasterResourceKind::DamageTarget &&
                             !uses[slot][index])
                         {
@@ -1013,6 +1030,51 @@ namespace
             return true;
         }
 
+        std::optional<bool> compatibleInBranch(const MasterAssignmentState & state, std::size_t actor,
+                                               std::int32_t choice, std::size_t sumAssignedResourcesPlus1)
+        {
+            const auto & candidate = m_problem.actors()[actor].candidates[static_cast<std::size_t>(choice)];
+            const std::size_t actorCount = state.choices.size();
+            if (!candidate.plannable)
+            {
+                const auto baseWork = masterWorkProduct(actorCount, 1);
+                if (baseWork && *baseWork <= m_ledger.available())
+                {
+                    m_ledger.consume(*baseWork, RefinementWork::MasterExpansion);
+                    return true;
+                }
+                return compatible(state, actor, choice, m_ledger);
+            }
+            const bool selfAssigned = state.choices[actor] == choice;
+            const std::uint32_t selfCount = selfAssigned ? 1u : 0u;
+            for (const std::int32_t resIndex : m_candidateExclusiveResources[actor][static_cast<std::size_t>(choice)])
+            {
+                if (m_exclusiveCounts[static_cast<std::size_t>(resIndex)] > selfCount)
+                {
+                    return compatible(state, actor, choice, m_ledger);
+                }
+            }
+            std::size_t otherSum = sumAssignedResourcesPlus1;
+            if (state.choices[actor] >= 0)
+            {
+                const auto & selfCandidate =
+                    m_problem.actors()[actor].candidates[static_cast<std::size_t>(state.choices[actor])];
+                if (selfCandidate.plannable)
+                {
+                    otherSum -= selfCandidate.resources.size() + 1;
+                }
+            }
+            const auto pairWork = masterWorkProduct(candidate.resources.size() + 1, otherSum);
+            auto totalWork = masterWorkProduct(actorCount, 1);
+            if (pairWork && totalWork && RelativeStockDetail::checkedAdd(*totalWork, *pairWork) &&
+                *totalWork <= m_ledger.available())
+            {
+                m_ledger.consume(*totalWork, RefinementWork::MasterExpansion);
+                return true;
+            }
+            return compatible(state, actor, choice, m_ledger);
+        }
+
         NodeStatus chooseBranch(SearchNode & node)
         {
             MasterProfileScope timing(m_options.profile, MasterPhase::Expansion);
@@ -1020,6 +1082,27 @@ namespace
                                   RefinementWork::MasterExpansion))
             {
                 return NodeStatus::Interrupted;
+            }
+            m_exclusiveCounts.assign(m_isExclusiveResource.size(), 0);
+            std::size_t sumAssignedResourcesPlus1 = 0;
+            for (std::size_t other = 0; other < node.state.choices.size(); ++other)
+            {
+                const auto selected = node.state.choices[other];
+                if (selected < 0)
+                {
+                    continue;
+                }
+                const auto & otherCandidate = m_problem.actors()[other].candidates[static_cast<std::size_t>(selected)];
+                if (!otherCandidate.plannable)
+                {
+                    continue;
+                }
+                sumAssignedResourcesPlus1 += otherCandidate.resources.size() + 1;
+                for (const std::int32_t resIndex :
+                     m_candidateExclusiveResources[other][static_cast<std::size_t>(selected)])
+                {
+                    ++m_exclusiveCounts[static_cast<std::size_t>(resIndex)];
+                }
             }
             node.canonicalChoices.reserve(node.state.choices.size());
             for (std::size_t actor = 0; actor < node.state.choices.size(); ++actor)
@@ -1029,7 +1112,7 @@ namespace
                     m_problem.actors()[actor].candidates[static_cast<std::size_t>(selected)].identity.canonicalOrderKey());
                 if (selected >= 0)
                 {
-                    const auto legal = compatible(node.state, actor, selected, m_ledger);
+                    const auto legal = compatibleInBranch(node.state, actor, selected, sumAssignedResourcesPlus1);
                     if (!legal)
                     {
                         return NodeStatus::Interrupted;
@@ -1046,7 +1129,7 @@ namespace
                 std::vector<std::int32_t> domain;
                 for (const auto choice : m_problem.actors()[actor].canonicalCandidates)
                 {
-                    const auto legal = compatible(node.state, actor, choice, m_ledger);
+                    const auto legal = compatibleInBranch(node.state, actor, choice, sumAssignedResourcesPlus1);
                     if (!legal)
                     {
                         return NodeStatus::Interrupted;
@@ -2419,6 +2502,9 @@ namespace
         std::vector<DeferredLeaf> m_leaves;
         std::map<std::vector<std::int32_t>, std::shared_ptr<MasterAssignmentEvaluation>> m_evaluations;
         std::vector<std::uint64_t> m_conflictDegree;
+        std::vector<bool> m_isExclusiveResource;
+        std::vector<std::vector<std::vector<std::int32_t>>> m_candidateExclusiveResources;
+        std::vector<std::uint32_t> m_exclusiveCounts;
         std::optional<MilliFunds> m_rootUpper;
         std::optional<MilliFunds> m_incumbentUpper;
         std::uint64_t m_nodesSinceRefinement{0};

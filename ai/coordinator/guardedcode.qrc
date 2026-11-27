@@ -49,5 +49,6 @@
         <file alias="battleanimation.js">../../resources/scripts/general/battleanimation.js</file>
         <file alias="BATTLEANIMATION_INFANTRY.js">../../resources/scripts/battleanimations/BATTLEANIMATION_INFANTRY.js</file>
         <file alias="BATTLEANIMATION_SNIPER.js">../../resources/scripts/battleanimations/BATTLEANIMATION_SNIPER.js</file>
+        <file alias="move_mech.js">../../resources/scripts/movementtables/move_mech.js</file>
     </qresource>
 </RCC>

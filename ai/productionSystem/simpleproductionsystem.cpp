@@ -8,6 +8,13 @@
 #include "resource_management/unitspritemanager.h"
 
 #include <QCryptographicHash>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QRandomGenerator>
+#include <QScopeGuard>
+#include <QScopedValueRollback>
+#include "ai/productionSystem/counterpointopeningpreview.h"
+#include "ai/productionSystem/counterpointfutureboard.h"
 
 #include <algorithm>
 #include <limits>
@@ -23,6 +30,7 @@ constexpr qint32 COUNTERPOINT_SEED_HALF_MAX =
     static_cast<qint32>(std::numeric_limits<quint16>::max());
 const QString BASE_PRODUCTION_MENU_FUNCTION = QStringLiteral("getStepData");
 const QString CUSTOM_PRODUCTION_MENU_FUNCTION = QStringLiteral("getProductionMenuData");
+const QString COUNTERPOINT_TURN_SEED = QStringLiteral("COORDINATED_COUNTERPOINT_TURN_SEED");
 const QString COUNTERPOINT_SEED_NAMESPACE = QStringLiteral("counterpoint-production");
 const QString PREPARE_PRODUCTION_FUNCTION = QStringLiteral("prepareProduction");
 const QString BASE_PRODUCTION_ACTION_FUNCTION = QStringLiteral("getIsBaseProductionAction");
@@ -281,13 +289,29 @@ quint32 SimpleProductionSystem::deriveCounterpointSeed(qint32 algorithmVersion, 
     return seed;
 }
 
-quint32 SimpleProductionSystem::randomCounterpointSeed() const
+std::optional<quint32> SimpleProductionSystem::reservedCounterpointTurnSeed()
 {
+    if (!m_owner || !m_owner->getMap() || !m_owner->getPlayer()) return {};
+    auto *variable = m_Variables.getVariable(COUNTERPOINT_TURN_SEED);
+    if (!variable) return {};
+    const auto values = variable->readDataListString();
+    if (values.size() != 3 || values[0] != QString::number(m_owner->getPlayer()->getPlayerID()) ||
+        values[1] != QString::number(m_owner->getMap()->getCurrentDay())) return {};
+    bool valid = false;
+    const auto seed = values[2].toUInt(&valid);
+    return valid ? std::optional<quint32>(seed) : std::nullopt;
+}
+
+quint32 SimpleProductionSystem::randomCounterpointSeed()
+{
+    // Native action seeds also use the global generator. The early reservation
+    // draws from the OS. At the actual purchase boundary, keep both legacy draws.
+    if (m_reservingTurnSeed) return QRandomGenerator::system()->generate();
     const auto high = static_cast<quint32>(
         GlobalUtils::randIntBase(0, COUNTERPOINT_SEED_HALF_MAX));
     const auto low = static_cast<quint32>(
         GlobalUtils::randIntBase(0, COUNTERPOINT_SEED_HALF_MAX));
-    return (high << COUNTERPOINT_SEED_HALF_BITS) | low;
+    return reservedCounterpointTurnSeed().value_or((high << COUNTERPOINT_SEED_HALF_BITS) | low);
 }
 
 spUnit SimpleProductionSystem::getCounterpointUnit(const QString & unitId)
@@ -1489,8 +1513,154 @@ void SimpleProductionSystem::deserializeObject(QDataStream& pStream)
     }
 }
 
+
+QString SimpleProductionSystem::openingPreviewUnavailableReason() const
+{
+    if (!m_owner || !m_enabled || !m_init || !m_owner->getMap())
+        return QStringLiteral("production preview unavailable");
+    auto *map = m_owner->getMap();
+    if (map->getGameRules()->getAiBehaviorMode() != GameEnums::AiBehavior_Counterpoint ||
+        map->getGameRules()->getFogMode() != GameEnums::Fog_Off)
+        return QStringLiteral("ordinary visible Counterpoint play required");
+    auto *engine = Interpreter::getInstance();
+    for (const auto &fn : {QStringLiteral("prepareProduction"), QStringLiteral("onNewBuildQueue"),
+                           QStringLiteral("buildUnitSimpleProductionSystem")})
+        if (engine->exists(GameScript::m_scriptName, fn))
+            return QStringLiteral("map-script production override");
+    if (!engine->exists(QStringLiteral("COORDINATED_COUNTERPOINT_OPENING"), QStringLiteral("preview")) &&
+        !engine->loadScript(QString::fromUtf8(COUNTERPOINT_OPENING_SCRIPT), QStringLiteral("embedded/coordinated-counterpoint-opening.js")))
+        return QStringLiteral("opening preview adapter unavailable");
+    return {};
+}
+
+void SimpleProductionSystem::openCounterpointTurnStream()
+{
+    if (!m_owner || !m_owner->getPlayer() || !m_owner->getMap() ||
+        m_owner->getMap()->getCurrentPlayer() != m_owner->getPlayer() ||
+        m_owner->getPlayer()->getBaseGameInput() != m_owner ||
+        !openingPreviewUnavailableReason().isEmpty() || reservedCounterpointTurnSeed())
+        return;
+    auto *map = m_owner->getMap();
+    const QScopedValueRollback reserving(m_reservingTurnSeed, true);
+    const auto seed = Interpreter::getInstance()->doFunction(QStringLiteral("COORDINATED_COUNTERPOINT_OPENING"), QStringLiteral("newTurnSeed"),
+        {m_jsThis, JsThis::getJsThis(m_owner), GameMap::getMapJsThis(map)});
+    if (seed.isNumber())
+    {
+        // Counterpoint cannot serialize an unprepared queue until its dynamic baseline
+        // exists. Save just the genuine seed; preparing the queue still belongs to the buyer.
+        m_Variables.createVariable(COUNTERPOINT_TURN_SEED)->writeDataListString({
+            QString::number(m_owner->getPlayer()->getPlayerID()), QString::number(map->getCurrentDay()),
+            QString::number(seed.toUInt())});
+    }
+}
+
+void SimpleProductionSystem::beginCounterpointOpeningPreview()
+{
+    endCounterpointOpeningPreview();
+    m_previewSystem=std::make_shared<SimpleProductionSystem>(m_owner);
+    m_previewSystem->m_previewDummiesEnabled=true;
+    m_previewFacts=Interpreter::getInstance()->newObject();
+}
+
+void SimpleProductionSystem::endCounterpointOpeningPreview()
+{
+    m_previewFacts=QJSValue{};
+    m_previewSystem.reset();
+}
+
+QJsonObject SimpleProductionSystem::previewCounterpointOpening(const QJsonObject &projection)
+{
+    const auto unsupported=[](const QString &reason) {
+        return QJsonObject{{"supported",false},{"reason",reason},{"orders",QJsonArray{}}};
+    };
+    if (!m_previewSystem) return unsupported(QStringLiteral("production preview unavailable"));
+    const QString reason = openingPreviewUnavailableReason();
+    if (!reason.isEmpty()) return unsupported(reason);
+    auto *map=m_owner->getMap();
+    auto *engine=Interpreter::getInstance();
+    QJsonObject input=projection;
+    const bool chained=input["includeContinuationState"].toBool();
+    const bool future=input.contains("futureDay");
+    if(future && !chained) return unsupported(QStringLiteral("future quote requires a bound preceding purchase phase"));
+    CounterpointFutureBoard nextBoard;
+    if(chained)
+    {
+        const auto problem=nextBoard.collect(*map,*m_owner->getPlayer(),input);
+        if(!problem.isEmpty()) return unsupported(problem);
+    }
+    if (const auto seed = reservedCounterpointTurnSeed())
+        input.insert("reservedTurnSeed", static_cast<qint64>(*seed));
+    else
+        input.remove("reservedTurnSeed");
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    if (qgetenv("COW_AI_ARENA_TEST")=="1") input.insert("privateReplay",true);
+#endif
+    const auto variable=m_Variables.getVariable(QStringLiteral("COUNTERPOINT_STATE"));
+    input.insert("persistedState",variable ? QJsonArray::fromStringList(variable->readDataListString()) : QJsonArray{});
+    if(future)
+    {
+        input.remove("reservedTurnSeed");
+        input["persistedState"]=input.value("previousBuyerState");
+    }
+    // The stock island geometry is lazily appended by getIslandIndex/createIslandMap.
+    // Share the existing immutable maps and restore the live vector on every exit.
+    const auto islands=m_owner->m_IslandMaps;
+    const auto restore=qScopeGuard([&]{m_owner->m_IslandMaps=islands;});
+    const auto value=engine->doFunction(QStringLiteral("COORDINATED_COUNTERPOINT_OPENING"),QStringLiteral("preview"),
+        {JsThis::getJsThis(m_previewSystem.get()),JsThis::getJsThis(m_owner),GameMap::getMapJsThis(map),
+         QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact)),chained ? engine->newObject() : m_previewFacts,
+         nextBoard.cards});
+    if (!value.isObject() || value.isError()) return unsupported(QStringLiteral("ordinary projection failed"));
+    if (!chained && value.property("supported").toBool() && !m_previewFacts.property("components").isObject())
+    {
+        // Prewarm only once, after the original policy has finished. Asking
+        // through the interpreter uses the native non-event-pumping island query.
+        const auto units=m_owner->getPlayer()->getSpUnits();
+        std::map<QString,std::map<QString,spUnit>> profiles;
+        for (const auto &unit:units->getVector())
+            profiles[unit->getMovementType()].try_emplace(unit->getUnitID(),unit);
+        auto cells=[&](const IslandMap &island){
+            std::vector<int> ids;
+            ids.reserve(map->getMapWidth()*map->getMapHeight());
+            for (int y=0;y<map->getMapHeight();++y)
+                for (int x=0;x<map->getMapWidth();++x) ids.push_back(island.getIsland(x,y));
+            return ids;
+        };
+        auto tables=engine->newObject();
+        for (const auto &[movement,types]:profiles)
+        {
+            auto initial=std::find_if(islands.begin(),islands.end(),
+                [&](const auto &item){return item->getMovementType()==movement;});
+            std::vector<int> ids;
+            if (initial!=islands.end()) ids=cells(**initial);
+            else for (const auto &entry:types)
+            {
+                m_owner->m_IslandMaps=islands;
+                const auto index=engine->doFunction(QStringLiteral("COORDINATED_COUNTERPOINT_OPENING"),QStringLiteral("islandIndex"),
+                    {JsThis::getJsThis(m_owner),JsThis::getJsThis(entry.second.get())});
+                if (!index.isNumber() || index.toInt()<0 || index.toInt()>=static_cast<int>(m_owner->m_IslandMaps.size()))
+                {ids.clear();break;}
+                auto fresh=cells(*m_owner->m_IslandMaps[index.toInt()]);
+                // Differing mod-defined partitions under one movement name
+                // require exact source squares in the equivalence key.
+                if (!ids.empty() && fresh!=ids) {ids.clear();break;}
+                ids=std::move(fresh);
+            }
+            if (!ids.empty()) tables.setProperty(movement,engine->arraytoJSValue(ids));
+        }
+        m_previewFacts.setProperty(QStringLiteral("components"),tables);
+    }
+    return QJsonObject::fromVariantMap(value.toVariant().toMap());
+}
+
 Unit* SimpleProductionSystem::getDummyUnit(const QString & unitId)
 {
+    if (m_previewDummiesEnabled)
+    {
+        auto [it,fresh]=m_previewDummies.try_emplace(unitId);
+        if (fresh) it->second=MemoryManagement::create<Unit>(unitId,m_owner->getPlayer(),false,nullptr);
+        return it->second.get();
+    }
     m_dummy = MemoryManagement::create<Unit>(unitId, m_owner->getPlayer(), false, nullptr);
     return m_dummy.get();
 }

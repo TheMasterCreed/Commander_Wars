@@ -1,5 +1,11 @@
 #include "ai/coordinator/mobilityfieldcache.h"
 
+#include <map>
+#include <tuple>
+
+#include <QSet>
+
+#include "coreengine/interpreter.h"
 #include "coreengine/memorymanagement.h"
 
 #include "game/building.h"
@@ -10,20 +16,164 @@
 #include "game/terrain.h"
 #include "game/unit.h"
 
+#include "resource_management/movementtablemanager.h"
+
 namespace
 {
+    constexpr qint32 NO_BUILDING_ALLY = -1;
+
     qint32 normalizeCost(qint32 cost)
     {
         return cost < 0 ? Coordinator::IMPASSABLE_COST : cost;
     }
 
-    // Terrain scripts receive the from tile, so every entry direction is probed even for origin independent movement tables.
+    bool mapHasAnyCo(GameMap & map)
+    {
+        const qint32 playerCount = map.getPlayerCount();
+        for (qint32 player = 0; player < playerCount; ++player)
+        {
+            Player* pPlayer = map.getPlayer(player);
+            if (pPlayer == nullptr)
+            {
+                continue;
+            }
+            for (qint32 slot = 0; slot < Coordinator::MobilityEpoch::CO_SLOT_COUNT; ++slot)
+            {
+                if (pPlayer->getCO(static_cast<quint8>(slot)) != nullptr)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool mapHasTerrainMovementModifier(GameMap & map)
+    {
+        Interpreter* pInterpreter = Interpreter::getInstance();
+        if (pInterpreter == nullptr)
+        {
+            return true;
+        }
+        static const QString MODIFIER_FUNCTION = QStringLiteral("getMovementcostModifier");
+        QSet<QString> checked;
+        const qint32 width = map.getMapWidth();
+        const qint32 height = map.getMapHeight();
+        for (qint32 y = 0; y < height; ++y)
+        {
+            for (qint32 x = 0; x < width; ++x)
+            {
+                Terrain* pTerrain = map.getTerrain(x, y);
+                if (pTerrain == nullptr)
+                {
+                    continue;
+                }
+                const QString terrainId = pTerrain->getTerrainID();
+                if (checked.contains(terrainId))
+                {
+                    continue;
+                }
+                checked.insert(terrainId);
+                if (pInterpreter->exists(terrainId, MODIFIER_FUNCTION))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    struct TileCostKey
+    {
+        QString terrainId;
+        QString baseTerrainId;
+        QString buildingId;
+        qint32 buildingAllyState{NO_BUILDING_ALLY};
+
+        friend auto operator<=>(const TileCostKey &, const TileCostKey &) = default;
+    };
+
     Coordinator::MobilityCostGrid buildMobilityGrid(GameMap & map, Player & owner, const QString & unitId)
     {
         const qint32 width = map.getMapWidth();
         const qint32 height = map.getMapHeight();
         Coordinator::MobilityCostGrid grid(width, height);
         spUnit pUnit = MemoryManagement::create<Unit>(unitId, &owner, false, &map);
+        const bool directionIndependent =
+            MovementTableManager::getInstance()->getSupportsFastPfs(pUnit->getMovementType()) &&
+            !mapHasTerrainMovementModifier(map);
+        if (directionIndependent)
+        {
+            const bool memoizeByTileKind = !mapHasAnyCo(map);
+            std::map<TileCostKey, qint32> costByTileKind;
+            for (qint32 y = 0; y < height; ++y)
+            {
+                for (qint32 x = 0; x < width; ++x)
+                {
+                    qint32 sampleFromX = -1;
+                    qint32 sampleFromY = -1;
+                    for (const Coordinator::EntryDirection direction : Coordinator::ENTRY_DIRECTIONS)
+                    {
+                        const Coordinator::StepVector step = Coordinator::entryStep(direction);
+                        const qint32 fromX = x - step.dx;
+                        const qint32 fromY = y - step.dy;
+                        if (map.onMap(fromX, fromY))
+                        {
+                            sampleFromX = fromX;
+                            sampleFromY = fromY;
+                            break;
+                        }
+                    }
+                    if (sampleFromX < 0)
+                    {
+                        continue;
+                    }
+                    qint32 tileCost = Coordinator::IMPASSABLE_COST;
+                    if (memoizeByTileKind)
+                    {
+                        Terrain* pTerrain = map.getTerrain(x, y);
+                        Building* pBuilding = pTerrain != nullptr ? pTerrain->getBuilding() : nullptr;
+                        qint32 allyState = NO_BUILDING_ALLY;
+                        if (pBuilding != nullptr)
+                        {
+                            Player* pBuildingOwner = pBuilding->getOwner();
+                            allyState = pBuildingOwner != nullptr && owner.isAlly(pBuildingOwner) ? 1 : 0;
+                        }
+                        const TileCostKey key{
+                            pTerrain != nullptr ? pTerrain->getTerrainID() : QString(),
+                            pTerrain != nullptr ? pTerrain->getBaseTerrainID() : QString(),
+                            pBuilding != nullptr ? pBuilding->getBuildingID() : QString(),
+                            allyState,
+                        };
+                        const auto found = costByTileKind.find(key);
+                        if (found != costByTileKind.end())
+                        {
+                            tileCost = found->second;
+                        }
+                        else
+                        {
+                            tileCost = normalizeCost(pUnit->getMovementCosts(x, y, sampleFromX, sampleFromY));
+                            costByTileKind.emplace(key, tileCost);
+                        }
+                    }
+                    else
+                    {
+                        tileCost = normalizeCost(pUnit->getMovementCosts(x, y, sampleFromX, sampleFromY));
+                    }
+                    for (const Coordinator::EntryDirection direction : Coordinator::ENTRY_DIRECTIONS)
+                    {
+                        const Coordinator::StepVector step = Coordinator::entryStep(direction);
+                        const qint32 fromX = x - step.dx;
+                        const qint32 fromY = y - step.dy;
+                        if (map.onMap(fromX, fromY))
+                        {
+                            grid.setCost(x, y, direction, tileCost);
+                        }
+                    }
+                }
+            }
+            return grid;
+        }
         for (qint32 x = 0; x < width; ++x)
         {
             for (qint32 y = 0; y < height; ++y)

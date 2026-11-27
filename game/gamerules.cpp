@@ -1721,8 +1721,9 @@ void GameRules::deserializer(QDataStream& pStream, bool)
     }
     if (version <= 4)
     {        
-        qint32 startPlayer  = m_pMap->getCurrentPlayer()->getPlayerID();
-        qint32 playerCount = m_pMap->getPlayerCount();
+        Player* pCurrentPlayer = (m_pMap != nullptr) ? m_pMap->getCurrentPlayer() : nullptr;
+        qint32 startPlayer = (pCurrentPlayer != nullptr) ? pCurrentPlayer->getPlayerID() : 0;
+        qint32 playerCount = (m_pMap != nullptr) ? m_pMap->getPlayerCount() : 0;
         qint32 day = 0;
         // loop while remaining counter >= 0
         while (weatherDuration > 0)

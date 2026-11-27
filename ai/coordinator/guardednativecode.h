@@ -68,6 +68,7 @@ namespace Coordinator
         BattleAnimation,
         InfantryBattleAnimation,
         SniperBattleAnimation,
+        MoveMech,
         Count,
     };
 

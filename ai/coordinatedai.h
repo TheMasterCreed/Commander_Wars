@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -17,6 +18,7 @@
 #include "ai/coordinator/mobilityfieldcache.h"
 #include "ai/coordinator/propertyeconomics.h"
 #include "ai/coordinator/propertystockbuilder.h"
+#include "ai/coordinator/unifiedproduction.h"
 
 class CoordinatedAi;
 using spCoordinatedAi = std::shared_ptr<CoordinatedAi>;
@@ -82,7 +84,7 @@ private:
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
     void stopStockReference(const QString & reason);
 #endif
-    Unit* plannableUnit(const Coordinator::KnownUnit & known) const;
+    Unit* plannableUnit(const Coordinator::KnownUnit & known, bool changesHeadquartersRoute = false) const;
     std::vector<Coordinator::KnownUnitLink> linkKnownUnits(
         const Coordinator::BattlefieldKnowledge & knowledge) const;
     std::vector<Coordinator::CandidateBundle> candidatesFor(
@@ -95,9 +97,13 @@ private:
         Coordinator::BundleBuildStats & stats,
         Coordinator::ReplyFactsBuilder* pReplyFacts,
         std::span<const Coordinator::TilePoint> followTiles = {},
-        std::optional<std::size_t>* pTodayCount = nullptr);
+        std::optional<std::size_t>* pTodayCount = nullptr,
+        Coordinator::BundleBuildCache* pCache = nullptr);
     bool useStartOfDayCoPower();
     bool executeNextPlannedAction();
+    bool buildUnits(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits,
+                    spQmlVectorUnit & pEnemyUnits, spQmlVectorBuilding & pEnemyBuildings) override;
+    void invalidateSelectedTeam(qint32 actionIndex,qint32 unit,const QString &reason,bool &replanAllowed);
     bool performPlannedAction(qint32 actionIndex, bool & replanAllowed);
     void failPlannedAction(qint32 actionIndex);
     bool replanFailedAction(qint32 actionIndex);
@@ -106,6 +112,17 @@ private:
         const Coordinator::AssignmentInput & input);
     const Coordinator::AssignmentResult::Selection* selectionForAction(
         qint32 actionIndex) const;
+    bool useBuildingActions(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits) override;
+    bool strictCoordinatedFailureMode() const;
+    bool unifiedSpecialActionsActive() const;
+    bool tryPrePlanSpecialActions();
+    bool tryPostPlanSpecialActions();
+    bool tryExecuteUnifiedBuildingActions(bool allowFriendlySplash);
+    bool tryExecuteUnifiedSiloAction(bool allowUnmovedFriendlySplash);
+    bool tryExecuteUnifiedCoBoarding();
+    bool tryExecuteUnifiedUnitSpecialActions();
+    spGameAction maybeUpgradeMoveToJoinOrStealth(const Coordinator::PlannedAction & planned,
+                                                const spGameAction & baseAction) const;
 
     Coordinator::BattlefieldKnowledge m_dayStartKnowledge;
     Coordinator::MobilityFieldCache m_mobilityFields;
@@ -114,9 +131,34 @@ private:
     Coordinator::PropertyStockField m_propertyStock;
     Coordinator::AssignmentResult m_assignment;
     std::size_t m_executionCursor{0};
+    enum class TeamSelection { Ordinary, Ranked, FundedClear, StockProgress, FactoryProgram, OpenTactical };
+    TeamSelection m_teamSelection{TeamSelection::Ordinary};
+    struct ExpectedFireResult
+    {
+        qint32 shooter, target;
+        double shooterHp, targetHp;
+    };
+    struct ExpectedTerrainFire
+    {
+        Coordinator::TilePoint tile{Coordinator::INVALID_TILE};
+        qint32 shooter{Coordinator::NO_UNIT};
+    };
+    std::map<qint32,ExpectedFireResult> m_expectedFireResults;
+    std::optional<qint32> m_pendingExpectedFire;
+    std::optional<ExpectedTerrainFire> m_pendingTerrainFire;
     qint32 m_factLayersDay{UNBUILT_DAY};
     qint32 m_planDay{UNBUILT_DAY};
+    qint32 m_turnLuckDay{UNBUILT_DAY};
+    quint32 m_turnLuckNonce{0};
+    bool m_directUnifiedTurnActive{false};
+    bool m_planHasOmniscientPostKill{false};
     qint32 m_coPowerDay{UNBUILT_DAY};
+    qint32 m_coBoardCheckedDay{UNBUILT_DAY};
+    qint32 m_unifiedProductionDay{UNBUILT_DAY};
+    qint32 m_unifiedProductionFunds{0};
+    std::size_t m_unifiedOpenSiteCount{0};
+    std::vector<Coordinator::ProductionBuildOrder> m_unifiedBuildQueue;
+    std::size_t m_unifiedBuildCursor{0};
     std::unique_ptr<Coordinator::DecisionTrace> m_decisionTrace;
     std::uint64_t m_planSequence{0};
     std::int64_t m_factLayersNanos{0};

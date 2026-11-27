@@ -45,24 +45,35 @@ namespace
             return chargeWork(*work, category);
         }
 
-        MasterFuturePricing priceFuture(const MasterFutureCatalog & catalog, std::span<const MilliFunds> prices)
+        void priceFutureInto(const MasterFutureCatalog & catalog, std::span<const MilliFunds> prices,
+                             const MasterFuturePreparation * pPreparation, MasterFuturePricing & result)
         {
-            RefinementLedger scratch;
-            if (!scratch.open(available()))
+            if (!m_scratch.open(available()))
             {
                 m_stop = MeterStop::Total;
-                return {MasterFutureStatus::BudgetExhausted};
+                result.status = MasterFutureStatus::BudgetExhausted;
+                result.dayRows.clear();
+                result.actions.clear();
+                result.classes.clear();
+                return;
             }
-            auto pricing = priceMasterFuture(catalog, prices, scratch, RefinementWork::MasterDualOptimization);
-            if (!chargeWork(scratch.stats().granted, RefinementWork::MasterDualOptimization))
+            priceMasterFutureInto(catalog, prices, pPreparation, m_scratch, RefinementWork::MasterDualOptimization,
+                                  result);
+            if (!chargeWork(m_scratch.stats().granted, RefinementWork::MasterDualOptimization))
             {
-                pricing.status = MasterFutureStatus::BudgetExhausted;
+                result.status = MasterFutureStatus::BudgetExhausted;
             }
-            else if (scratch.lastRefusal())
+            else if (m_scratch.lastRefusal())
             {
-                refuse(scratch.lastRefusal()->requested);
+                refuse(m_scratch.lastRefusal()->requested);
             }
-            return pricing;
+        }
+
+        MasterFuturePreparation prepareFuture(const MasterFutureCatalog & catalog)
+        {
+            return scratchCharged<MasterFuturePreparation>([&](RefinementLedger & scratch) {
+                return prepareMasterFuture(catalog, scratch, RefinementWork::MasterDualOptimization);
+            });
         }
 
         void startBuild(std::int64_t cap)
@@ -89,10 +100,31 @@ namespace
             return m_stop == MeterStop::Total;
         }
 
-    private:
         std::int64_t available() const
         {
-            return m_build ? std::min(m_remaining, *m_build) : m_remaining;
+            const std::int64_t cap = m_build ? std::min(m_remaining, *m_build) : m_remaining;
+            return std::min(cap, m_ledger.available());
+        }
+
+    private:
+        template <typename Result, typename Compute>
+        Result scratchCharged(Compute compute)
+        {
+            if (!m_scratch.open(available()))
+            {
+                m_stop = MeterStop::Total;
+                return {MasterFutureStatus::BudgetExhausted};
+            }
+            Result result = compute(m_scratch);
+            if (!chargeWork(m_scratch.stats().granted, RefinementWork::MasterDualOptimization))
+            {
+                result.status = MasterFutureStatus::BudgetExhausted;
+            }
+            else if (m_scratch.lastRefusal())
+            {
+                refuse(m_scratch.lastRefusal()->requested);
+            }
+            return result;
         }
 
         void refuse(std::int64_t work)
@@ -102,7 +134,7 @@ namespace
 
         bool chargeWork(std::int64_t work, RefinementWork category)
         {
-            if (work > available())
+            if (work > (m_build ? std::min(m_remaining, *m_build) : m_remaining))
             {
                 refuse(work);
                 return false;
@@ -121,6 +153,7 @@ namespace
         }
 
         RefinementLedger & m_ledger;
+        RefinementLedger m_scratch;
         std::int64_t m_remaining{0};
         std::optional<std::int64_t> m_build;
         MeterStop m_stop{MeterStop::None};
@@ -169,49 +202,14 @@ namespace
 
     using Usage = std::map<std::int32_t, std::int64_t>;
 
-    bool fits(const MasterPlanPricingCandidate & candidate, const Usage & usage, const std::vector<bool> & used,
-              ResourcePolicy policy)
-    {
-        if (candidate.capturedNode != NO_SEQUENTIAL_NODE && used[static_cast<std::size_t>(candidate.capturedNode)])
-        {
-            return false;
-        }
-        if (policy == ResourcePolicy::Ignored)
-        {
-            return true;
-        }
-        // The witness does not yet order a follower behind its leader, so it never seats one.
-        if (candidate.follows)
-        {
-            return false;
-        }
-        for (const auto & resource : candidate.resources)
-        {
-            std::int64_t demand = 0;
-            for (const auto & other : candidate.resources)
-            {
-                if (other.resourceIndex == resource.resourceIndex)
-                {
-                    demand += other.demand;
-                }
-            }
-            const auto found = usage.find(resource.resourceIndex);
-            if ((found == usage.end() ? 0 : found->second) + demand > resource.capacity)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    MasterPlanPricingStatus unpricedStatus(const MasterFuturePricing & pricing, const WorkMeter & meter)
+    MasterPlanPricingStatus unpricedStatus(MasterFutureStatus status, const WorkMeter & meter)
     {
         if (meter.stopped())
         {
             return MasterPlanPricingStatus::LimitReached;
         }
-        return pricing.status == MasterFutureStatus::ArithmeticFailure ? MasterPlanPricingStatus::ArithmeticFailure
-                                                                       : MasterPlanPricingStatus::Unavailable;
+        return status == MasterFutureStatus::ArithmeticFailure ? MasterPlanPricingStatus::ArithmeticFailure
+                                                                : MasterPlanPricingStatus::Unavailable;
     }
 
     bool addIdleRows(const MasterPlanPricingModel & model, const MasterFuturePricing & pricing, MilliFunds & ceiling,
@@ -232,74 +230,77 @@ namespace
         return true;
     }
 
-    std::optional<std::vector<MilliFunds>> candidateValues(const MasterPlanPricingActor & actor,
-                                                           std::span<const MilliFunds> prices,
-                                                           const MasterFuturePricing & pricing)
+    void evaluateCeilingInto(const MasterPlanPricingModel & model, std::span<const MilliFunds> prices,
+                             WorkMeter & meter, const MasterFuturePreparation * pPreparation,
+                             MasterPlanCeiling & result)
     {
-        std::vector<MilliFunds> values;
-        for (const auto & candidate : actor.candidates)
-        {
-            const auto & future = pricing.actions[static_cast<std::size_t>(candidate.actionIndex)];
-            const auto value =
-                MasterPlanPricingDetail::masterPlanCandidateValue(candidate.immediateValue, candidate.capturedNode,
-                                                                  future.upper, prices);
-            if (!value)
-            {
-                return std::nullopt;
-            }
-            values.push_back(*value);
-        }
-        return values;
-    }
-
-    MasterPlanCeiling evaluateCeiling(const MasterPlanPricingModel & model, std::span<const MilliFunds> prices,
-                                      WorkMeter & meter)
-    {
-        MasterPlanCeiling result;
-        result.pricing = meter.priceFuture(model.catalog, prices);
+        result.status = MasterPlanPricingStatus::Unavailable;
+        result.ceiling = 0;
+        result.actorMaxima.clear();
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.choicePositions.clear();
+#endif
+        meter.priceFutureInto(model.catalog, prices, pPreparation, result.pricing);
         const auto & pricing = result.pricing;
         if (pricing.status != MasterFutureStatus::Valid)
         {
-            result.status = unpricedStatus(pricing, meter);
-            return result;
+            result.status = unpricedStatus(pricing.status, meter);
+            return;
         }
         if (pricing.dayRows.size() != model.rowActors.size() || pricing.actions.size() != model.catalog.actions.size())
         {
             result.status = MasterPlanPricingStatus::Invalid;
-            return result;
+            return;
         }
         MilliFunds ceiling = 0;
         result.nodeDemand.assign(prices.size(), 0);
-        if (!MasterPlanPricingDetail::addMasterPlanTerms(ceiling, prices) || !addIdleRows(model, pricing, ceiling, result.nodeDemand))
+        if (!MasterPlanPricingDetail::addMasterPlanTerms(ceiling, prices) ||
+            !addIdleRows(model, pricing, ceiling, result.nodeDemand))
         {
             result.status = MasterPlanPricingStatus::ArithmeticFailure;
-            return result;
+            return;
         }
+        result.actorMaxima.reserve(model.actors.size());
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        result.choicePositions.reserve(model.actors.size());
+#endif
         for (const auto & actor : model.actors)
         {
             if (!meter.charge(actor.candidates.size(), RefinementWork::MasterDualOptimization))
             {
                 result.status = MasterPlanPricingStatus::LimitReached;
-                return result;
+                return;
             }
             if (actor.candidates.empty())
             {
                 result.status = MasterPlanPricingStatus::Invalid;
-                return result;
+                return;
             }
-            const auto values = candidateValues(actor, prices, pricing);
-            if (!values)
+            std::size_t best = 0;
+            MilliFunds bestValue = 0;
+            for (std::size_t index = 0; index < actor.candidates.size(); ++index)
             {
-                result.status = MasterPlanPricingStatus::ArithmeticFailure;
-                return result;
+                const auto & candidate = actor.candidates[index];
+                const auto & future = pricing.actions[static_cast<std::size_t>(candidate.actionIndex)];
+                const auto value =
+                    MasterPlanPricingDetail::masterPlanCandidateValue(candidate.immediateValue, candidate.capturedNode,
+                                                                      future.upper, prices);
+                if (!value)
+                {
+                    result.status = MasterPlanPricingStatus::ArithmeticFailure;
+                    return;
+                }
+                if (index == 0 || *value > bestValue)
+                {
+                    best = index;
+                    bestValue = *value;
+                }
             }
-            const auto best =
-                static_cast<std::size_t>(std::max_element(values->begin(), values->end()) - values->begin());
             const auto & chosen = actor.candidates[best];
-            if (!RelativeStockDetail::checkedAdd(ceiling, (*values)[best]))
+            if (!RelativeStockDetail::checkedAdd(ceiling, bestValue))
             {
                 result.status = MasterPlanPricingStatus::ArithmeticFailure;
-                return result;
+                return;
             }
             countNodes(result.nodeDemand, pricing.actions[static_cast<std::size_t>(chosen.actionIndex)].nodes);
             if (chosen.capturedNode != NO_SEQUENTIAL_NODE)
@@ -309,10 +310,17 @@ namespace
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
             result.choicePositions.push_back(static_cast<std::int32_t>(best));
 #endif
-            result.actorMaxima.push_back((*values)[best]);
+            result.actorMaxima.push_back(bestValue);
         }
         result.ceiling = ceiling;
         result.status = MasterPlanPricingStatus::Valid;
+    }
+
+    MasterPlanCeiling evaluateCeiling(const MasterPlanPricingModel & model, std::span<const MilliFunds> prices,
+                                      WorkMeter & meter, const MasterFuturePreparation * pPreparation = nullptr)
+    {
+        MasterPlanCeiling result;
+        evaluateCeilingInto(model, prices, meter, pPreparation, result);
         return result;
     }
 
@@ -387,21 +395,43 @@ namespace
             {
                 m_best.objective = *threshold;
             }
-            std::vector<Branch> heads;
-            for (std::size_t head = 0; head < used.size(); ++head)
+            const std::size_t headBegin = m_branchPool.size();
+            const std::size_t nodeCount = used.size();
+            if (static_cast<std::int64_t>(nodeCount) <= m_meter.available())
             {
-                if (!charge(1))
+                for (std::size_t head = 0; head < nodeCount; ++head)
                 {
-                    return SearchStatus::Failed;
+                    // Non-positive heads cannot beat the empty itinerary, so keeping them is harmless.
+                    if (!used[head] &&
+                        !addBranch(m_branchPool, static_cast<std::int32_t>(head), row.ownedTurn[head], row.weight[head], 0))
+                    {
+                        charge(head + 1);
+                        m_branchPool.resize(headBegin);
+                        return SearchStatus::Failed;
+                    }
                 }
-                // Non-positive heads cannot beat the empty itinerary, so keeping them is harmless.
-                if (!used[head] &&
-                    !addBranch(heads, static_cast<std::int32_t>(head), row.ownedTurn[head], row.weight[head], 0))
+                charge(nodeCount);
+            }
+            else
+            {
+                for (std::size_t head = 0; head < nodeCount; ++head)
                 {
-                    return SearchStatus::Failed;
+                    if (!charge(1))
+                    {
+                        m_branchPool.resize(headBegin);
+                        return SearchStatus::Failed;
+                    }
+                    if (!used[head] &&
+                        !addBranch(m_branchPool, static_cast<std::int32_t>(head), row.ownedTurn[head], row.weight[head], 0))
+                    {
+                        m_branchPool.resize(headBegin);
+                        return SearchStatus::Failed;
+                    }
                 }
             }
-            explore(heads, 0, 0);
+            const std::size_t headEnd = m_branchPool.size();
+            explore(headBegin, headEnd, 0, 0);
+            m_branchPool.resize(headBegin);
             if (m_failed)
             {
                 return SearchStatus::Failed;
@@ -489,10 +519,11 @@ namespace
             return !pruning() || bound > m_best.objective;
         }
 
-        void explore(const std::vector<Branch> & branches, MilliFunds value, MilliFunds objective)
+        void explore(std::size_t begin, std::size_t end, MilliFunds value, MilliFunds objective)
         {
-            for (const auto & branch : branches)
+            for (std::size_t index = begin; index < end; ++index)
             {
+                const Branch branch = m_branchPool[index];
                 if (open(branch.bound))
                 {
                     visit(branch, value, objective);
@@ -531,31 +562,62 @@ namespace
             }
             if (turn != NO_CAPTURE_TURNS && open(branch.bound))
             {
-                std::vector<Branch> children;
-                for (std::int32_t next = 0; next < m_table->nodeCount() && !m_failed; ++next)
+                const std::size_t childBegin = m_branchPool.size();
+                const std::int32_t nodeCount = m_table->nodeCount();
+                if (static_cast<std::int64_t>(nodeCount) <= m_meter.available())
                 {
-                    if (!charge(1))
+                    std::int32_t checked = 0;
+                    for (std::int32_t next = 0; next < nodeCount; ++next)
                     {
-                        m_failed = true;
-                        break;
+                        checked = next + 1;
+                        if ((*m_used)[static_cast<std::size_t>(next)])
+                        {
+                            continue;
+                        }
+                        const auto nextTurn = m_table->continuationOwnedTurn(node, turn, next);
+                        if (nextTurn != NO_CAPTURE_TURNS &&
+                            !addBranch(m_branchPool, next, nextTurn,
+                                       columnStreamValue(m_catalog.columns[static_cast<std::size_t>(next)], nextTurn,
+                                                         m_catalog.horizon), objective))
+                        {
+                            m_failed = true;
+                            break;
+                        }
                     }
-                    if ((*m_used)[static_cast<std::size_t>(next)])
+                    if (checked > 0)
                     {
-                        continue;
-                    }
-                    const auto nextTurn = m_table->continuationOwnedTurn(node, turn, next);
-                    if (nextTurn != NO_CAPTURE_TURNS &&
-                        !addBranch(children, next, nextTurn,
-                                   columnStreamValue(m_catalog.columns[static_cast<std::size_t>(next)], nextTurn,
-                                                     m_catalog.horizon), objective))
-                    {
-                        m_failed = true;
+                        charge(static_cast<std::size_t>(checked));
                     }
                 }
+                else
+                {
+                    for (std::int32_t next = 0; next < nodeCount && !m_failed; ++next)
+                    {
+                        if (!charge(1))
+                        {
+                            m_failed = true;
+                            break;
+                        }
+                        if ((*m_used)[static_cast<std::size_t>(next)])
+                        {
+                            continue;
+                        }
+                        const auto nextTurn = m_table->continuationOwnedTurn(node, turn, next);
+                        if (nextTurn != NO_CAPTURE_TURNS &&
+                            !addBranch(m_branchPool, next, nextTurn,
+                                       columnStreamValue(m_catalog.columns[static_cast<std::size_t>(next)], nextTurn,
+                                                         m_catalog.horizon), objective))
+                        {
+                            m_failed = true;
+                        }
+                    }
+                }
+                const std::size_t childEnd = m_branchPool.size();
                 if (!m_failed)
                 {
-                    explore(children, value, objective);
+                    explore(childBegin, childEnd, value, objective);
                 }
+                m_branchPool.resize(childBegin);
             }
             m_steps.pop_back();
             (*m_used)[slot] = false;
@@ -573,6 +635,7 @@ namespace
         const SequentialClassTable* m_table{nullptr};
         std::vector<bool>* m_used{nullptr};
         std::vector<SequentialWitnessStep> m_steps;
+        std::vector<Branch> m_branchPool;
         Itinerary m_best;
         bool m_found{false};
         bool m_failed{false};
@@ -598,8 +661,17 @@ namespace
 
     struct Occupancy
     {
-        Usage usage;
+        std::vector<std::int64_t> usage;
         std::vector<bool> used;
+
+        std::int64_t usageOf(std::int32_t resourceIndex) const
+        {
+            if (resourceIndex < 0 || static_cast<std::size_t>(resourceIndex) >= usage.size())
+            {
+                return 0;
+            }
+            return usage[static_cast<std::size_t>(resourceIndex)];
+        }
 
         void occupy(const Seat & seat)
         {
@@ -616,7 +688,12 @@ namespace
             const auto occupied = direction > 0;
             for (const auto & resource : seat.chosen->resources)
             {
-                usage[resource.resourceIndex] += direction * resource.demand;
+                const auto index = static_cast<std::size_t>(resource.resourceIndex);
+                if (index >= usage.size())
+                {
+                    usage.resize(index + 1, 0);
+                }
+                usage[index] += direction * resource.demand;
             }
             if (seat.chosen->capturedNode != NO_SEQUENTIAL_NODE)
             {
@@ -629,13 +706,156 @@ namespace
         }
     };
 
+    Occupancy buildOccupancy(const MasterPlanPricingModel & model)
+    {
+        std::int32_t maxResource = -1;
+        for (const auto & use : model.occupiedResources)
+        {
+            maxResource = std::max(maxResource, use.resourceIndex);
+        }
+        for (const auto & actor : model.actors)
+        {
+            for (const auto & candidate : actor.candidates)
+            {
+                for (const auto & use : candidate.resources)
+                {
+                    maxResource = std::max(maxResource, use.resourceIndex);
+                }
+            }
+        }
+        Occupancy result;
+        if (maxResource >= 0)
+        {
+            result.usage.assign(static_cast<std::size_t>(maxResource) + 1, 0);
+        }
+        for (const auto & use : model.occupiedResources)
+        {
+            if (use.resourceIndex >= 0)
+            {
+                result.usage[static_cast<std::size_t>(use.resourceIndex)] += use.demand;
+            }
+        }
+        result.used.assign(model.catalog.columns.size(), false);
+        return result;
+    }
+
+    // Seats are in priority order, so a walk reaches a priced actor's seat through this map.
+    struct SeatWalk
+    {
+        const std::vector<Seat>* pSeats{nullptr};
+        std::vector<std::int32_t> seatOfSlot;
+    };
+
     struct ChoiceContext
     {
         WorkMeter & meter;
         MasterPlanWitnessStats & stats;
         ResourcePolicy policy;
         MasterPlanSearchMode mode;
+        const SeatWalk* pWalk{nullptr};
     };
+
+    std::optional<SeatWalk> seatWalk(const std::vector<Seat> & seats, std::size_t actors, WorkMeter & meter)
+    {
+        if (!meter.charge(seats.size(), RefinementWork::MasterWitness))
+        {
+            return std::nullopt;
+        }
+        SeatWalk walk{&seats, std::vector<std::int32_t>(actors, MASTER_PLAN_NO_ACTOR)};
+        for (std::size_t index = 0; index < seats.size(); ++index)
+        {
+            if (seats[index].slot != MASTER_PLAN_NO_ACTOR)
+            {
+                walk.seatOfSlot[static_cast<std::size_t>(seats[index].slot)] = static_cast<std::int32_t>(index);
+            }
+        }
+        return walk;
+    }
+
+    enum class FitOutcome : std::int8_t
+    {
+        Refused,
+        Waiting,
+        Fits,
+    };
+
+    // Every seat on the chain must leave its tile, ending at one that enters nothing we keep; empty means the work ran out.
+    std::optional<FitOutcome> walkDepartures(std::int32_t slot, const Seat & choosing, const ChoiceContext & context)
+    {
+        const auto & seats = *context.pWalk->pSeats;
+        const auto & seatOfSlot = context.pWalk->seatOfSlot;
+        for (std::size_t visit = 0; visit < seats.size(); ++visit)
+        {
+            if (!context.meter.charge(1, RefinementWork::MasterWitness))
+            {
+                return std::nullopt;
+            }
+            if (slot < 0 || static_cast<std::size_t>(slot) >= seatOfSlot.size() ||
+                seatOfSlot[static_cast<std::size_t>(slot)] == MASTER_PLAN_NO_ACTOR)
+            {
+                return FitOutcome::Refused;
+            }
+            const auto & seat = seats[static_cast<std::size_t>(seatOfSlot[static_cast<std::size_t>(slot)])];
+            if (&seat == &choosing)
+            {
+                return FitOutcome::Refused;
+            }
+            if (seat.chosen == nullptr)
+            {
+                return FitOutcome::Waiting;
+            }
+            if (!seat.chosen->vacatesOrigin || seat.chosen->occupant == MasterPlanOccupant::Blocked)
+            {
+                return FitOutcome::Refused;
+            }
+            if (seat.chosen->occupant == MasterPlanOccupant::None)
+            {
+                return FitOutcome::Fits;
+            }
+            slot = seat.chosen->occupantSlot;
+        }
+        return FitOutcome::Refused;
+    }
+
+    // Charged as one resource scan plus the walk; empty means the work ran out.
+    std::optional<FitOutcome> fits(const MasterPlanPricingCandidate & candidate, const Occupancy & occupancy,
+                                   const ChoiceContext & context, const Seat & choosing)
+    {
+        const auto resources = candidate.resources.size();
+        if (!context.meter.charge(resources * resources + 1, RefinementWork::MasterWitness))
+        {
+            return std::nullopt;
+        }
+        if (candidate.capturedNode != NO_SEQUENTIAL_NODE &&
+            occupancy.used[static_cast<std::size_t>(candidate.capturedNode)])
+        {
+            return FitOutcome::Refused;
+        }
+        if (context.policy == ResourcePolicy::Ignored)
+        {
+            return FitOutcome::Fits;
+        }
+        for (const auto & resource : candidate.resources)
+        {
+            std::int64_t demand = 0;
+            for (const auto & other : candidate.resources)
+            {
+                if (other.resourceIndex == resource.resourceIndex)
+                {
+                    demand += other.demand;
+                }
+            }
+            if (occupancy.usageOf(resource.resourceIndex) + demand > resource.capacity)
+            {
+                return FitOutcome::Refused;
+            }
+        }
+        if (candidate.occupant == MasterPlanOccupant::Modelled && context.pWalk != nullptr)
+        {
+            return walkDepartures(candidate.occupantSlot, choosing, context);
+        }
+        return candidate.occupant == MasterPlanOccupant::None ? FitOutcome::Fits : FitOutcome::Refused;
+    }
 
     const SequentialWitnessStep* headOf(const Itinerary & itinerary)
     {
@@ -698,6 +918,7 @@ namespace
     struct LaterDayScan
     {
         const Choice* pHeld{nullptr};
+        const Seat* pSeat{nullptr};
         std::optional<bool> heldFits;
         std::optional<SequentialLaterKey> runningKey;
     };
@@ -719,12 +940,12 @@ namespace
         }
         if (&running == scan.pHeld && !scan.heldFits)
         {
-            const auto resources = running.candidate->resources.size();
-            if (!context.meter.charge(resources * resources + 1, RefinementWork::MasterWitness))
+            const auto outcome = fits(*running.candidate, occupancy, context, *scan.pSeat);
+            if (!outcome)
             {
                 return std::nullopt;
             }
-            scan.heldFits = fits(*running.candidate, occupancy.usage, occupancy.used, context.policy);
+            scan.heldFits = *outcome == FitOutcome::Fits;
         }
         if (&running == scan.pHeld && !*scan.heldFits)
         {
@@ -748,21 +969,22 @@ namespace
 
     // Found means the held choice, if any, was replaced: by a higher score, or an equal one closer or positive sooner.
     SearchStatus bestChoice(const Seat & seat, Occupancy & occupancy, ItinerarySearch & search,
-                            const ChoiceContext & context, const Choice* pHeld, Choice & result)
+                            const ChoiceContext & context, const Choice* pHeld, Choice & result, bool & waited)
     {
         ++context.stats.responses;
         auto status = SearchStatus::Dominated;
         std::optional<MilliFunds> unseededBest;
-        LaterDayScan later{pHeld};
+        LaterDayScan later{pHeld, &seat};
         for (const auto * candidate : seat.options)
         {
-            const auto resources = candidate->resources.size();
-            if (!context.meter.charge(resources * resources + 1, RefinementWork::MasterWitness))
+            const auto outcome = fits(*candidate, occupancy, context, seat);
+            if (!outcome)
             {
                 return SearchStatus::Failed;
             }
-            if (!fits(*candidate, occupancy.usage, occupancy.used, context.policy))
+            if (*outcome != FitOutcome::Fits)
             {
+                waited = waited || *outcome == FitOutcome::Waiting;
                 continue;
             }
             const auto captured = static_cast<std::size_t>(candidate->capturedNode);
@@ -858,7 +1080,8 @@ namespace
         }
         const Choice held{seat.chosen, seat.itinerary, current};
         Choice best;
-        const auto status = bestChoice(seat, occupancy, search, context, &held, best);
+        auto waited = false;
+        const auto status = bestChoice(seat, occupancy, search, context, &held, best, waited);
         if (status == SearchStatus::Failed)
         {
             return PolishOutcome::Failed;
@@ -922,19 +1145,65 @@ namespace
         return seats;
     }
 
-    bool pickSeats(std::vector<Seat> & seats, Occupancy & occupancy, ItinerarySearch & search,
-                   const ChoiceContext & context)
+    enum class PickStep : std::int8_t
     {
-        for (auto & seat : seats)
+        Seated,
+        Deferred,
+        Failed,
+    };
+
+    PickStep pickSeat(Seat & seat, Occupancy & occupancy, ItinerarySearch & search, const ChoiceContext & context)
+    {
+        Choice choice;
+        auto waited = false;
+        const auto status = bestChoice(seat, occupancy, search, context, nullptr, choice, waited);
+        if (status == SearchStatus::Found)
         {
-            Choice choice;
-            if (bestChoice(seat, occupancy, search, context, nullptr, choice) != SearchStatus::Found)
-            {
-                return false;
-            }
             seat.chosen = choice.candidate;
             seat.itinerary = std::move(choice.itinerary);
             occupancy.occupy(seat);
+            return PickStep::Seated;
+        }
+        return status != SearchStatus::Failed && waited ? PickStep::Deferred : PickStep::Failed;
+    }
+
+    // A seat that can only follow a leader seated after it is retried in later sweeps, in its original order.
+    bool pickSeats(std::vector<Seat> & seats, Occupancy & occupancy, ItinerarySearch & search,
+                   const ChoiceContext & context)
+    {
+        std::vector<Seat*> deferred;
+        for (auto & seat : seats)
+        {
+            const auto step = pickSeat(seat, occupancy, search, context);
+            if (step == PickStep::Failed)
+            {
+                return false;
+            }
+            if (step == PickStep::Deferred)
+            {
+                deferred.push_back(&seat);
+            }
+        }
+        while (!deferred.empty())
+        {
+            std::vector<Seat*> waiting;
+            for (auto * pSeat : deferred)
+            {
+                const auto step = pickSeat(*pSeat, occupancy, search, context);
+                if (step == PickStep::Failed)
+                {
+                    return false;
+                }
+                if (step == PickStep::Deferred)
+                {
+                    waiting.push_back(pSeat);
+                }
+            }
+            if (waiting.size() == deferred.size())
+            {
+                return false;
+            }
+            deferred = std::move(waiting);
         }
         return true;
     }
@@ -1026,8 +1295,17 @@ namespace
         }
         const auto idle = idleCandidates(model);
         auto seats = buildSeats(model, priced, idle);
-        Occupancy occupancy{masterPlanOccupiedUsage(model), std::vector<bool>(catalog.columns.size(), false)};
-        const ChoiceContext context{meter, stats, policy, options.mode};
+        Occupancy occupancy = buildOccupancy(model);
+        std::optional<SeatWalk> walk;
+        if (model.hasVacateRequirement && policy == ResourcePolicy::Enforced)
+        {
+            walk = seatWalk(seats, model.actors.size(), meter);
+            if (!walk)
+            {
+                return {};
+            }
+        }
+        const ChoiceContext context{meter, stats, policy, options.mode, walk ? &*walk : nullptr};
         ItinerarySearch reduced(catalog, prices, priced.pricing.classes, meter, options.mode, TailSource::PricedTable,
                                 stats, stats.pickSearchWork);
         if (!pickSeats(seats, occupancy, reduced, context))
@@ -1101,8 +1379,7 @@ namespace
                 seat.chosen = findMasterPlanCandidate(actor, index);
             }
             const auto & source = start.rows[row];
-            // Held choices are kept without passing fits, so a supplied follower must be refused here.
-            if (seat.chosen == nullptr || seat.chosen->follows || source.row != seat.row ||
+            if (seat.chosen == nullptr || source.row != seat.row ||
                 !sumSteps(source.steps, seat.itinerary.value))
             {
                 return std::nullopt;
@@ -1124,6 +1401,26 @@ namespace
             return std::all_of(seat.itinerary.steps.begin(), seat.itinerary.steps.end(),
                                [&](const SequentialWitnessStep & step) { return claimSlot(used, step.node); });
         });
+    }
+
+    // Held choices are kept without passing fits, so a supplied seating must fit as a final state; empty means the work ran out.
+    std::optional<bool> admitSupplied(const std::vector<Seat> & seats, Occupancy & occupancy,
+                                      const ChoiceContext & context)
+    {
+        for (const auto & seat : seats)
+        {
+            const auto outcome = fits(*seat.chosen, occupancy, context, seat);
+            if (!outcome)
+            {
+                return std::nullopt;
+            }
+            if (*outcome != FitOutcome::Fits)
+            {
+                return false;
+            }
+            occupancy.occupy(seat);
+        }
+        return true;
     }
 
     enum class PriceStep : std::int8_t
@@ -1154,11 +1451,20 @@ namespace
 
         MasterPlanPricingResult run()
         {
+            m_preparation = m_meter.prepareFuture(m_model.catalog);
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+            m_result.preparationWork = granted(RefinementWork::MasterDualOptimization) - m_pricingStart;
+#endif
+            if (m_preparation.status != MasterFutureStatus::Valid)
+            {
+                return finish(unpricedStatus(m_preparation.status, m_meter));
+            }
             auto scale = INITIAL_SCALE;
             std::int32_t stall = 0;
             for (std::int32_t round = 0; round < m_limits.rounds; ++round)
             {
-                const auto priced = evaluateCeiling(m_model, m_prices, m_meter);
+                evaluateCeilingInto(m_model, m_prices, m_meter, &m_preparation, m_scratchCeiling);
+                const auto & priced = m_scratchCeiling;
                 if (priced.status != MasterPlanPricingStatus::Valid)
                 {
                     return finish(priced.status);
@@ -1208,7 +1514,8 @@ namespace
                     break;
                 }
             }
-            const auto priced = evaluateCeiling(m_model, m_result.prices, m_meter);
+            evaluateCeilingInto(m_model, m_result.prices, m_meter, &m_preparation, m_scratchCeiling);
+            const auto & priced = m_scratchCeiling;
             if (priced.status != MasterPlanPricingStatus::Valid)
             {
                 return finish(priced.status);
@@ -1307,6 +1614,7 @@ namespace
         const MasterPlanPricingLimits & m_limits;
         MasterPlanWitnessOptions m_options;
         WorkMeter m_meter;
+        MasterFuturePreparation m_preparation;
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         const RefinementLedger & m_ledger;
         std::int64_t m_pricingStart{0};
@@ -1314,6 +1622,7 @@ namespace
 #endif
         std::vector<MilliFunds> m_prices;
         MasterPlanPricingResult m_result;
+        MasterPlanCeiling m_scratchCeiling;
         MasterPlanWitnessStats m_stats;
         std::optional<MilliFunds> m_floor;
         std::optional<MilliFunds> m_bestCeiling;
@@ -1475,16 +1784,33 @@ namespace Coordinator
         {
             return result;
         }
+        MasterPlanWitnessStats stats;
+        WorkMeter meter(ledger, maximumWork);
         std::vector<Seat> seats;
-        Occupancy occupancy{masterPlanOccupiedUsage(model), std::vector<bool>(catalog.columns.size(), false)};
+        Occupancy occupancy = buildOccupancy(model);
         for (const auto row : rowOrder)
         {
             seats.push_back((*byRow)[static_cast<std::size_t>(row)]);
-            occupancy.occupy(seats.back());
         }
-        MasterPlanWitnessStats stats;
-        WorkMeter meter(ledger, maximumWork);
-        const ChoiceContext context{meter, stats, ResourcePolicy::Enforced, options.mode};
+        std::optional<SeatWalk> walk;
+        if (model.hasVacateRequirement)
+        {
+            walk = seatWalk(seats, model.actors.size(), meter);
+        }
+        const ChoiceContext context{meter, stats, ResourcePolicy::Enforced, options.mode, walk ? &*walk : nullptr};
+        if (!model.hasVacateRequirement)
+        {
+            for (const auto & seat : seats)
+            {
+                occupancy.occupy(seat);
+            }
+        }
+        else if (const auto admitted = walk ? admitSupplied(seats, occupancy, context) : std::nullopt;
+                 !admitted || !*admitted)
+        {
+            result.status = admitted ? MasterPlanPricingStatus::Invalid : MasterPlanPricingStatus::LimitReached;
+            return result;
+        }
         ItinerarySearch exact(catalog, {}, {}, meter, options.mode, TailSource::Unpriced, stats,
                               stats.polishSearchWork);
         if (!polishSeats(seats, occupancy, exact, context, options) || meter.stopped())

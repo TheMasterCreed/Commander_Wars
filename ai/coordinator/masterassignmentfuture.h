@@ -55,9 +55,46 @@ namespace Coordinator
         std::vector<MasterFuturePricedClass> classes;
     };
 
+    struct MasterFutureSuccessor
+    {
+        std::int32_t next{NO_SEQUENTIAL_NODE};
+        std::int32_t turn{NO_CAPTURE_TURNS};
+        std::size_t targetCell{0};
+        MilliFunds prize{0};
+    };
+
+    struct MasterFuturePreparedClass
+    {
+        // Feasible successors per cell, indexed like the priced cells; the list runs in recurrence order.
+        std::vector<std::int32_t> successorCount;
+        std::vector<MasterFutureSuccessor> successors;
+    };
+
+    // Price-independent lists of one unchanged catalog; holds indices and values only.
+    struct MasterFuturePreparation
+    {
+        MasterFutureStatus status{MasterFutureStatus::Unavailable};
+        std::int32_t nodes{0};
+        std::int32_t horizon{0};
+        std::vector<MasterFuturePreparedClass> classes;
+        std::vector<std::vector<std::int32_t>> dayRows;
+        std::vector<std::vector<std::int32_t>> actions;
+    };
+
     MasterFuturePricing priceMasterFuture(
         const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
         RefinementLedger & ledger, RefinementWork category);
+    // The preparation must come from this unchanged catalog.
+    MasterFuturePricing priceMasterFuture(
+        const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
+        const MasterFuturePreparation & preparation, RefinementLedger & ledger, RefinementWork category);
+    void priceMasterFutureInto(
+        const MasterFutureCatalog & catalog, std::span<const MilliFunds> nodePrices,
+        const MasterFuturePreparation * pPreparation, RefinementLedger & ledger, RefinementWork category,
+        MasterFuturePricing & result);
+    MasterFuturePreparation prepareMasterFuture(const MasterFutureCatalog & catalog, RefinementLedger & ledger,
+                                                RefinementWork category);
+    std::optional<std::int64_t> masterFuturePreparationWork(const MasterFutureCatalog & catalog);
 
     namespace MasterFutureDetail
     {

@@ -38,6 +38,7 @@ namespace Coordinator
         bool capturable{false};
         ObjectiveKind objective{ObjectiveKind::None};
         bool canProduce{false};
+        bool canProduceCapper{true};
         QStringList productionList;
         qint32 repairTypeMask{0};
         // Index into BattlefieldKnowledge::units().

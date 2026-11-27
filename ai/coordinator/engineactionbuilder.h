@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "ai/coordinator/turnplan.h"
 #include "game/gameaction.h"
@@ -33,5 +34,6 @@ namespace Coordinator
     };
 
     EngineActionBuildResult buildEngineAction(GameMap & map, Player & player,
-                                              const PlannedAction & planned);
+                                              const PlannedAction & planned,
+                                              std::optional<quint32> turnLuckNonce = std::nullopt);
 }

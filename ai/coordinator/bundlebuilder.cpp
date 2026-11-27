@@ -5,17 +5,21 @@
 #include <utility>
 
 #include <QPoint>
+#include <QSet>
 
 #include "ai/coordinator/mobilityfieldcache.h"
+#include "ai/coordinator/survivorshot.h"
 #include "ai/coordinator/propertystockfield.h"
 #include "ai/coordinator/decisiontrace.h"
 #include "ai/coordinator/replyfactsbuilder.h"
 #include "ai/coreai.h"
 
 #include "coreengine/gameconsole.h"
+#include "coreengine/interpreter.h"
 #include "coreengine/memorymanagement.h"
 
 #include "game/building.h"
+#include "game/co.h"
 #include "game/gameaction.h"
 #include "game/gamemap.h"
 #include "game/gamerules.h"
@@ -91,6 +95,10 @@ namespace
         std::vector<TilePoint> path;
         std::vector<QPoint> enginePath;
         qint32 costs{NO_MOVEMENT_COST};
+        Unit *vacatingUnit{nullptr};
+        Unit *clearingUnit{nullptr};
+        std::vector<std::int32_t> requiredKilledEnemyIds;
+        std::vector<std::int32_t> requiredKilledKnowledgeIndices;
     };
 
     // Nothing refuels between now and the shot, so the fuel left after moving caps next turn's reach.
@@ -103,17 +111,74 @@ namespace
         return std::min(known.movementPoints, std::max(known.fuel - spentCosts, 0));
     }
 
+    bool mapHasPositionFireRangeModifier(GameMap & map)
+    {
+        const qint32 playerCount = map.getPlayerCount();
+        for (qint32 player = 0; player < playerCount; ++player)
+        {
+            Player* pPlayer = map.getPlayer(player);
+            if (pPlayer == nullptr)
+            {
+                continue;
+            }
+            for (qint32 slot = 0; slot < Coordinator::MobilityEpoch::CO_SLOT_COUNT; ++slot)
+            {
+                if (pPlayer->getCO(static_cast<quint8>(slot)) != nullptr)
+                {
+                    return true;
+                }
+            }
+        }
+        Interpreter* pInterpreter = Interpreter::getInstance();
+        if (pInterpreter == nullptr)
+        {
+            return true;
+        }
+        static const QString FIRERANGE_FUNCTION = QStringLiteral("getFirerangeModifier");
+        QSet<QString> checked;
+        const qint32 width = map.getMapWidth();
+        const qint32 height = map.getMapHeight();
+        for (qint32 y = 0; y < height; ++y)
+        {
+            for (qint32 x = 0; x < width; ++x)
+            {
+                Terrain* pTerrain = map.getTerrain(x, y);
+                if (pTerrain == nullptr)
+                {
+                    continue;
+                }
+                const QString terrainId = pTerrain->getTerrainID();
+                if (checked.contains(terrainId))
+                {
+                    continue;
+                }
+                checked.insert(terrainId);
+                if (pInterpreter->exists(terrainId, FIRERANGE_FUNCTION))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     class CandidateBuilder
     {
     public:
         CandidateBuilder(const Coordinator::BundleBuildContext & context, Coordinator::BundleBuildStats & stats)
             : m_context(context),
-              m_stats(stats)
+              m_stats(stats),
+              m_pCache(context.pCache != nullptr ? context.pCache : &m_ownedCache)
         {
+            ensureCacheInitialized();
         }
 
         std::vector<Coordinator::CandidateBundle> build(std::int32_t actorUnitIndex,
                                                         std::optional<std::size_t> & todayCount);
+        void appendBreakthrough(std::int32_t actorUnitIndex,
+                                std::span<const Coordinator::KillableEnemyTarget> killableEnemies,
+                                std::vector<Coordinator::CandidateBundle> & result,
+                                std::optional<std::size_t> & todayCount);
 
     private:
         struct CaptureTraceFacts
@@ -124,29 +189,15 @@ namespace
             std::int32_t rate{0};
         };
 
-        struct TileKey
-        {
-            std::int32_t unitIndex{Coordinator::NO_UNIT};
-            std::int32_t x{0};
-            std::int32_t y{0};
-
-            friend constexpr auto operator<=>(const TileKey &, const TileKey &) = default;
-        };
-
-        struct ShotKey
-        {
-            std::int32_t unitIndex{Coordinator::NO_UNIT};
-            std::int32_t hpSteps{0};
-            std::int32_t excludedVictimIndex{Coordinator::NO_UNIT};
-
-            friend constexpr auto operator<=>(const ShotKey &, const ShotKey &) = default;
-        };
-
+        void ensureCacheInitialized();
+        void syncReachCacheEpoch();
+        const std::vector<std::int32_t> & sideUnits(Side side) const;
         Unit* liveUnit(std::int32_t unitIndex);
         MilliFunds replacementCost(std::int32_t unitIndex, Unit & unit);
         bool describeShooter(std::int32_t unitIndex, std::int32_t hpSteps, const TilePoint & tile, ShotSource & shooter);
-        const Coordinator::DistanceField & reachFrom(const ShotSource & shooter);
-        std::int32_t shotDistance(const ShotSource & shooter, const TilePoint & target);
+        const Coordinator::MobilityCostGrid* mobilityGridFor(std::int32_t unitIndex);
+        const Coordinator::DistanceField & reachFrom(const ShotSource & shooter,
+                                                     const Coordinator::MobilityCostGrid & grid);
         std::int32_t estimatedShotSteps(const ShotSource & shooter, Unit & victim, std::int32_t victimHpSteps,
                                         std::int32_t distance);
         std::vector<MilliFunds> nextShotSpan(const ShotSource & shooter, const VictimOverride & changed,
@@ -166,15 +217,16 @@ namespace
                                    std::vector<Coordinator::CandidateBundle> & result);
         void addCaptureCandidates(const ShotSource & actor, const std::vector<MoveOption> & options,
                                   std::vector<Coordinator::CandidateBundle> & result);
+        std::shared_ptr<const Coordinator::SurvivorWeaponFacts> survivorWeapon(int actorIndex);
+        std::shared_ptr<const Coordinator::SurvivorWeaponFacts> m_survivorWeapon;
         const Coordinator::PropertyFacts* propertyAt(const TilePoint & tile) const;
         Coordinator::CandidateBundle makeCandidate(const ShotSource & actor, const MoveOption & option,
                                                    std::int32_t actorHpStepsAfter, const VictimOverride & damaged);
 
         const Coordinator::BundleBuildContext & m_context;
         Coordinator::BundleBuildStats & m_stats;
-        std::map<std::int32_t, MilliFunds> m_replacementCosts;
-        std::map<TileKey, Coordinator::DistanceField> m_reachFields;
-        std::map<ShotKey, MilliFunds> m_targetBestShots;
+        Coordinator::BundleBuildCache m_ownedCache;
+        Coordinator::BundleBuildCache* m_pCache{nullptr};
         std::vector<MilliFunds> m_actorShotsAtOrigin;
         std::vector<MilliFunds> m_enemyShotsAtOrigin;
         std::int32_t m_generationIndex{0};
@@ -182,6 +234,73 @@ namespace
         Unit* m_pActor{nullptr};
         bool m_actorOnActiveFriendlyProduction{false};
     };
+
+    void CandidateBuilder::ensureCacheInitialized()
+    {
+        syncReachCacheEpoch();
+        if (m_pCache->initialized)
+        {
+            return;
+        }
+        const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
+        for (std::size_t i = 0; i < units.size(); ++i)
+        {
+            const Coordinator::KnownUnit & unit = units[i];
+            if (unit.carrier != Coordinator::KnownUnit::NO_CARRIER)
+            {
+                continue;
+            }
+            const Side side = Coordinator::sideOf(m_context.knowledge.relation(unit.ownerId));
+            if (side == Side::Ours)
+            {
+                m_pCache->oursUnits.push_back(static_cast<std::int32_t>(i));
+            }
+            else if (side == Side::Theirs)
+            {
+                m_pCache->theirsUnits.push_back(static_cast<std::int32_t>(i));
+            }
+        }
+        m_pCache->breakableTerrainTiles.clear();
+        for (std::int32_t y = 0; y < m_context.knowledge.height(); ++y)
+        {
+            for (std::int32_t x = 0; x < m_context.knowledge.width(); ++x)
+            {
+                Terrain * pTerrain = m_context.map.getTerrain(x, y);
+                if (pTerrain != nullptr && pTerrain->getHp() > 0 &&
+                    pTerrain->getUnit() == nullptr && pTerrain->getBuilding() == nullptr)
+                {
+                    m_pCache->breakableTerrainTiles.push_back(TilePoint{x, y});
+                }
+            }
+        }
+        m_pCache->positionFireRangeFixed = !mapHasPositionFireRangeModifier(m_context.map);
+        m_pCache->initialized = true;
+    }
+
+    void CandidateBuilder::syncReachCacheEpoch()
+    {
+        const qint32 epochChanges = m_context.mobility.epochChangeCount();
+        if (m_pCache->mobilityEpochChanges != epochChanges)
+        {
+            m_pCache->mobilityGrids.clear();
+            m_pCache->reachFields.clear();
+            m_pCache->mobilityEpochChanges = epochChanges;
+        }
+    }
+
+    const std::vector<std::int32_t> & CandidateBuilder::sideUnits(Side side) const
+    {
+        static const std::vector<std::int32_t> EMPTY;
+        if (side == Side::Ours)
+        {
+            return m_pCache->oursUnits;
+        }
+        if (side == Side::Theirs)
+        {
+            return m_pCache->theirsUnits;
+        }
+        return EMPTY;
+    }
 
     Unit* CandidateBuilder::liveUnit(std::int32_t unitIndex)
     {
@@ -195,13 +314,13 @@ namespace
 
     MilliFunds CandidateBuilder::replacementCost(std::int32_t unitIndex, Unit & unit)
     {
-        const auto known = m_replacementCosts.find(unitIndex);
-        if (known != m_replacementCosts.end())
+        const auto known = m_pCache->replacementCosts.find(unitIndex);
+        if (known != m_pCache->replacementCosts.end())
         {
             return known->second;
         }
         const MilliFunds cost = Coordinator::toMilliFunds(unit.getUnitCosts());
-        m_replacementCosts.emplace(unitIndex, cost);
+        m_pCache->replacementCosts.emplace(unitIndex, cost);
         return cost;
     }
 
@@ -231,40 +350,42 @@ namespace
         return true;
     }
 
-    const Coordinator::DistanceField & CandidateBuilder::reachFrom(const ShotSource & shooter)
+    const Coordinator::MobilityCostGrid* CandidateBuilder::mobilityGridFor(std::int32_t unitIndex)
     {
-        const TileKey key{shooter.unitIndex, shooter.tile.x, shooter.tile.y};
-        const auto known = m_reachFields.find(key);
-        if (known != m_reachFields.end())
+        const Coordinator::KnownUnit & unit = m_context.knowledge.units()[static_cast<std::size_t>(unitIndex)];
+        const std::pair<qint32, QString> key{unit.ownerId, unit.unitId};
+        const auto cached = m_pCache->mobilityGrids.find(key);
+        if (cached != m_pCache->mobilityGrids.end())
         {
-            return known->second;
+            return cached->second;
         }
-        ++m_stats.distanceFieldBuilds;
-        const Coordinator::KnownUnit & unit = m_context.knowledge.units()[static_cast<std::size_t>(shooter.unitIndex)];
         Player* pOwner = m_context.map.getPlayer(unit.ownerId);
         if (pOwner == nullptr)
         {
             AI_CONSOLE_PRINT("Coordinator::buildCandidateBundles() no owner " + QString::number(unit.ownerId),
                              GameConsole::eERROR);
-            const Coordinator::MobilityCostGrid blocked(m_context.knowledge.width(), m_context.knowledge.height());
-            return m_reachFields
-                .emplace(key, Coordinator::DistanceField::build(blocked, {}, Coordinator::FieldExpansion::FromSources))
-                .first->second;
+            return nullptr;
         }
         const Coordinator::MobilityCostGrid & grid = m_context.mobility.grid(m_context.map, *pOwner, unit.unitId);
-        Coordinator::DistanceField field = Coordinator::DistanceField::build(grid, {shooter.tile},
-                                                                             Coordinator::FieldExpansion::FromSources);
-        return m_reachFields.emplace(key, std::move(field)).first->second;
+        syncReachCacheEpoch();
+        m_pCache->mobilityGrids.emplace(key, &grid);
+        return &grid;
     }
 
-    std::int32_t CandidateBuilder::shotDistance(const ShotSource & shooter, const TilePoint & target)
+    const Coordinator::DistanceField & CandidateBuilder::reachFrom(const ShotSource & shooter,
+                                                                   const Coordinator::MobilityCostGrid & grid)
     {
-        if (!shooter.canMoveAndFire)
+        const std::int32_t maxDistance = std::max(shooter.movementPoints, 0);
+        const Coordinator::BundleBuildCache::ReachKey key{&grid, shooter.tile.x, shooter.tile.y, maxDistance};
+        const auto known = m_pCache->reachFields.find(key);
+        if (known != m_pCache->reachFields.end())
         {
-            return Coordinator::stationaryShotDistance(shooter.tile, target, shooter.minRange, shooter.maxRange);
+            return known->second;
         }
-        return Coordinator::movedShotDistance(reachFrom(shooter), shooter.movementPoints, shooter.minRange,
-                                              shooter.maxRange, target);
+        ++m_stats.distanceFieldBuilds;
+        Coordinator::DistanceField field = Coordinator::DistanceField::build(
+            grid, {shooter.tile}, Coordinator::FieldExpansion::FromSources, maxDistance);
+        return m_pCache->reachFields.emplace(key, std::move(field)).first->second;
     }
 
     std::int32_t CandidateBuilder::estimatedShotSteps(const ShotSource & shooter, Unit & victim,
@@ -284,22 +405,27 @@ namespace
             return span;
         }
         const Side victimSide = Coordinator::opposingSide(shooter.side);
-        const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
-        for (std::size_t i = 0; i < units.size(); ++i)
+        const std::vector<std::int32_t> & targets = sideUnits(victimSide);
+        if (targets.empty())
         {
-            const Coordinator::KnownUnit & victim = units[i];
+            return span;
+        }
+        const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
+        const Coordinator::MobilityCostGrid* pGrid = nullptr;
+        bool gridResolved = false;
+        const Coordinator::DistanceField* pReach = nullptr;
+        const std::int32_t maxReachDistance =
+            std::max(shooter.movementPoints, 0) + std::max(shooter.maxRange, 0);
+        for (const std::int32_t targetIndex : targets)
+        {
             // The attacker's own safety is already the exposure term, so its shot is not priced here too.
-            if (static_cast<std::int32_t>(i) == excludedVictimIndex)
+            if (targetIndex == excludedVictimIndex)
             {
                 continue;
             }
-            if (victim.carrier != Coordinator::KnownUnit::NO_CARRIER ||
-                Coordinator::sideOf(m_context.knowledge.relation(victim.ownerId)) != victimSide)
-            {
-                continue;
-            }
+            const Coordinator::KnownUnit & victim = units[static_cast<std::size_t>(targetIndex)];
             std::int32_t victimHpSteps = victim.hpRounded;
-            if (static_cast<std::int32_t>(i) == changed.unitIndex)
+            if (targetIndex == changed.unitIndex)
             {
                 victimHpSteps = changed.hpSteps;
             }
@@ -307,12 +433,41 @@ namespace
             {
                 continue;
             }
-            const std::int32_t distance = shotDistance(shooter, TilePoint{victim.x, victim.y});
+            const TilePoint victimTile{victim.x, victim.y};
+            std::int32_t distance = NO_SHOT_DISTANCE;
+            if (!shooter.canMoveAndFire)
+            {
+                distance = Coordinator::stationaryShotDistance(shooter.tile, victimTile, shooter.minRange,
+                                                               shooter.maxRange);
+            }
+            else
+            {
+                if (!gridResolved)
+                {
+                    pGrid = mobilityGridFor(shooter.unitIndex);
+                    gridResolved = true;
+                }
+                if (pGrid == nullptr)
+                {
+                    continue;
+                }
+                if (!pGrid->hasZeroCost() &&
+                    Coordinator::manhattanDistance(shooter.tile, victimTile) > maxReachDistance)
+                {
+                    continue;
+                }
+                if (pReach == nullptr)
+                {
+                    pReach = &reachFrom(shooter, *pGrid);
+                }
+                distance = Coordinator::movedShotDistance(*pReach, shooter.movementPoints, shooter.minRange,
+                                                          shooter.maxRange, victimTile);
+            }
             if (distance == NO_SHOT_DISTANCE)
             {
                 continue;
             }
-            Unit* pVictim = liveUnit(static_cast<std::int32_t>(i));
+            Unit* pVictim = liveUnit(targetIndex);
             if (pVictim == nullptr)
             {
                 ++m_stats.missingUnits;
@@ -323,7 +478,7 @@ namespace
             {
                 continue;
             }
-            span.push_back(Coordinator::bookDamage(replacementCost(static_cast<std::int32_t>(i), *pVictim), steps));
+            span.push_back(Coordinator::bookDamage(replacementCost(targetIndex, *pVictim), steps));
         }
         return span;
     }
@@ -363,9 +518,9 @@ namespace
         {
             return 0;
         }
-        const ShotKey key{targetUnitIndex, hpSteps, excludedVictimIndex};
-        const auto known = m_targetBestShots.find(key);
-        if (known != m_targetBestShots.end())
+        const Coordinator::BundleBuildCache::ShotKey key{targetUnitIndex, hpSteps, excludedVictimIndex};
+        const auto known = m_pCache->targetBestShots.find(key);
+        if (known != m_pCache->targetBestShots.end())
         {
             return known->second;
         }
@@ -376,7 +531,7 @@ namespace
         {
             best = Coordinator::bestShot(nextShotSpan(shooter, VictimOverride{}, excludedVictimIndex));
         }
-        m_targetBestShots.emplace(key, best);
+        m_pCache->targetBestShots.emplace(key, best);
         return best;
     }
 
@@ -417,6 +572,7 @@ namespace
             option.path = Coordinator::pathFromEngineOrder(option.enginePath);
             if (follows)
             {
+                option.vacatingUnit = pTerrain->getUnit();
                 followOptions.push_back(std::move(option));
             }
             else
@@ -441,6 +597,8 @@ namespace
         candidate.vacatesActiveFriendlyProduction =
             m_actorOnActiveFriendlyProduction &&
             option.destination != actor.tile;
+        candidate.requiredKilledEnemyIds = option.requiredKilledEnemyIds;
+        candidate.requiredKilledKnowledgeIndices = option.requiredKilledKnowledgeIndices;
         candidate.actor = Coordinator::ActorFacts{
             .replacementCost = replacementCost(actor.unitIndex, *actor.pUnit),
             .hpSteps = actor.hpSteps,
@@ -458,6 +616,43 @@ namespace
             candidate.enemyShotsOnActorAtDestination = enemyShotSpan(moved, damaged);
         }
         return candidate;
+    }
+
+    // Isolated lethal counters can disappear when an earlier ally weakens the target.
+    // Keep one weapon table and mobility grid per such actor, shared by all its fire orders.
+    std::shared_ptr<const Coordinator::SurvivorWeaponFacts> CandidateBuilder::survivorWeapon(int actorIndex)
+    {
+        if (m_survivorWeapon)
+            return m_survivorWeapon;
+        const auto &knowledge = m_context.knowledge;
+        const auto &actor = knowledge.units().at(actorIndex);
+        auto facts = std::make_shared<Coordinator::SurvivorWeaponFacts>();
+        facts->movement = actor.movementPoints;
+        facts->fuel = actor.fuel;
+        facts->ammo = {m_pActor->getMaxAmmo1() < 0 ? -1 : actor.ammo1,
+                       m_pActor->getMaxAmmo2() < 0 ? -1 : actor.ammo2};
+        facts->ignoresCollision = actor.ignoresUnitCollision;
+        if (actor.canMoveAndFire)
+            facts->grid = m_context.mobility.grid(m_context.map, m_context.player, actor.unitId);
+        const int range = std::min<int>(actor.maxRange, knowledge.width() + knowledge.height() - 2);
+        for (int i = 0; i < static_cast<int>(knowledge.units().size()); ++i)
+        {
+            const auto &enemy = knowledge.units()[i];
+            if (enemy.carrier != Coordinator::KnownUnit::NO_CARRIER || knowledge.relation(enemy.ownerId) != Coordinator::Relation::Enemy)
+                continue;
+            auto *victim = liveUnit(i);
+            if (!victim)
+                continue;
+            Coordinator::SurvivorTarget target{i, {enemy.x, enemy.y}, enemy.hpRounded, replacementCost(i, *victim)};
+            for (int d = 0; d <= range; ++d)
+                target.baseByRange.push_back({m_context.oracle.bestSlotDamage(*m_pActor, *victim, d, actor.minRange,
+                                                                              actor.maxRange, true, false),
+                                              m_context.oracle.bestSlotDamage(*m_pActor, *victim, d, actor.minRange,
+                                                                              actor.maxRange, false, true)});
+            facts->targets.push_back(std::move(target));
+        }
+        m_survivorWeapon = std::move(facts);
+        return m_survivorWeapon;
     }
 
     void CandidateBuilder::addCandidate(
@@ -490,9 +685,16 @@ namespace
                 if (pComponent->kind == Coordinator::ComponentKind::Fire)
                 {
                     targetUnit = pComponent->fire.targetUnitId;
-                    if (targetUnit >= 0 &&
-                        targetUnit < static_cast<std::int32_t>(
-                                         m_context.knowledge.units().size()))
+                    if (Coordinator::isTerrainTargetId(targetUnit))
+                    {
+                        target = pComponent->fire.targetTile != Coordinator::INVALID_TILE
+                            ? pComponent->fire.targetTile
+                            : Coordinator::decodeTerrainTargetTile(targetUnit);
+                        targetEngineUnit = targetUnit;
+                    }
+                    else if (targetUnit >= 0 &&
+                             targetUnit < static_cast<std::int32_t>(
+                                              m_context.knowledge.units().size()))
                     {
                         const Coordinator::KnownUnit & known =
                             m_context.knowledge.units()[static_cast<std::size_t>(
@@ -597,6 +799,12 @@ namespace
         {
             candidate.replyFacts =
                 m_context.pReplyFacts->factsFor(candidate.bundle.unitId, *m_pActor, candidate.bundle.destination);
+            if (Coordinator::hpAfterAction(candidate.bundle, candidate.actor.hpSteps).hpSteps <= 0)
+            {
+                auto conditional = std::make_shared<Coordinator::ReplyFacts>(*candidate.replyFacts);
+                conditional->survivorWeapon = survivorWeapon(candidate.bundle.unitId);
+                candidate.replyFacts = std::move(conditional);
+            }
             m_context.pReplyFacts->countCandidate();
         }
         result.push_back(std::move(candidate));
@@ -607,6 +815,14 @@ namespace
     {
         for (const MoveOption & option : options)
         {
+            if (option.clearingUnit != nullptr)
+            {
+                spGameAction pAction = MemoryManagement::create<GameAction>(CoreAI::ACTION_WAIT, &m_context.map);
+                pAction->setTarget(QPoint(actor.tile.x, actor.tile.y));
+                pAction->setMovepath(option.enginePath, option.costs);
+                if (!pAction->canBePerformedAfterClearing(CoreAI::ACTION_WAIT, m_context.player, *option.clearingUnit))
+                    continue;
+            }
             addCandidate(makeCandidate(actor, option, actor.hpSteps, VictimOverride{}), result);
         }
     }
@@ -615,10 +831,51 @@ namespace
     void CandidateBuilder::addFireCandidatesFrom(const ShotSource & actor, const MoveOption & option,
                                                  std::vector<Coordinator::CandidateBundle> & result)
     {
+        if (!actor.pUnit->hasWeapons())
+        {
+            return;
+        }
+        if (m_pCache->positionFireRangeFixed)
+        {
+            const std::vector<std::int32_t> & targets = sideUnits(Coordinator::opposingSide(actor.side));
+            const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
+            const std::int32_t maxBound = std::max(actor.maxRange, 1);
+            bool anyInRange = false;
+            for (const std::int32_t targetIndex : targets)
+            {
+                const Coordinator::KnownUnit & victim = units[static_cast<std::size_t>(targetIndex)];
+                if (victim.hpRounded > 0 &&
+                    Coordinator::manhattanDistance(option.destination, TilePoint{victim.x, victim.y}) <= maxBound)
+                {
+                    anyInRange = true;
+                    break;
+                }
+            }
+            if (!anyInRange)
+            {
+                for (const TilePoint terrainTile : m_pCache->breakableTerrainTiles)
+                {
+                    if (Coordinator::manhattanDistance(option.destination, terrainTile) <= maxBound)
+                    {
+                        anyInRange = true;
+                        break;
+                    }
+                }
+            }
+            if (!anyInRange)
+            {
+                return;
+            }
+        }
         spGameAction pAction = MemoryManagement::create<GameAction>(CoreAI::ACTION_FIRE, &m_context.map);
         pAction->setTarget(QPoint(actor.tile.x, actor.tile.y));
         pAction->setMovepath(option.enginePath, option.costs);
-        if (!pAction->canBePerformed(CoreAI::ACTION_FIRE, EMPTY_FIELD_ACTION, &m_context.player))
+        const bool eligible = option.clearingUnit
+            ? pAction->canBePerformedAfterClearing(CoreAI::ACTION_FIRE, m_context.player, *option.clearingUnit)
+            : (option.vacatingUnit
+                ? pAction->canBePerformedAfterVacating(CoreAI::ACTION_FIRE, m_context.player, *option.vacatingUnit)
+                : pAction->canBePerformed(CoreAI::ACTION_FIRE, EMPTY_FIELD_ACTION, &m_context.player));
+        if (!eligible)
         {
             return;
         }
@@ -631,17 +888,72 @@ namespace
         for (const QPoint & target : targets)
         {
             const Coordinator::KnownUnit* pKnownTarget = m_context.knowledge.unitAt(target.x(), target.y());
-            if (pKnownTarget == nullptr ||
-                Coordinator::sideOf(m_context.knowledge.relation(pKnownTarget->ownerId)) !=
-                    Coordinator::opposingSide(actor.side))
+            if (pKnownTarget == nullptr)
+            {
+                Terrain * pTargetTerrain = m_context.map.getTerrain(target.x(), target.y());
+                if (pTargetTerrain == nullptr || pTargetTerrain->getHp() <= 0 ||
+                    pTargetTerrain->getUnit() != nullptr || pTargetTerrain->getBuilding() != nullptr)
+                {
+                    continue;
+                }
+                const QRectF envReport = Interpreter::getInstance()->doFunction(
+                    CoreAI::ACTION_FIRE,
+                    QStringLiteral("calcBattleDamage"),
+                    QJSValueList({
+                        GameMap::getMapJsThis(&m_context.map),
+                        JsThis::getJsThis(pAction.get()),
+                        QJSValue(target.x()),
+                        QJSValue(target.y()),
+                        QJSValue(static_cast<qint32>(GameEnums::LuckDamageMode_Average)),
+                    })).toVariant().toRectF();
+                if (envReport.x() <= 0.0)
+                {
+                    continue;
+                }
+                const TilePoint targetTile{target.x(), target.y()};
+                const double terrainRealHp = std::min<double>(
+                    Coordinator::UNIT_HP_STEPS,
+                    static_cast<double>(pTargetTerrain->getHp()) / Coordinator::TERRAIN_HP_PER_STEP);
+                const std::int32_t targetHpSteps = Coordinator::ceilHpSteps(terrainRealHp);
+                const std::int32_t dmgSteps = Coordinator::damageStepsFrom(terrainRealHp, envReport.x());
+                if (targetHpSteps <= 0 || dmgSteps <= 0)
+                {
+                    continue;
+                }
+                const Coordinator::FireFacts fire{
+                    .targetUnitId = Coordinator::encodeTerrainTargetId(targetTile),
+                    .targetTile = targetTile,
+                    .targetReplacementCost = 0,
+                    .targetHpSteps = targetHpSteps,
+                    .damageSteps = dmgSteps,
+                    .counterSteps = 0,
+                    .targetBestShotBefore = 0,
+                    .targetBestShotAfter = 0,
+                    .targetRealHp = terrainRealHp,
+                    .targetAmmo = {-1, -1},
+                    .isolated = Coordinator::OwnFireReport{envReport.x(), -1.0, static_cast<int>(envReport.y()), -1},
+                };
+                Coordinator::CandidateBundle candidate = makeCandidate(actor, option, actor.hpSteps, VictimOverride{});
+                candidate.bundle.components.push_back(Coordinator::fireComponent(fire));
+                addCandidate(std::move(candidate), result);
+                continue;
+            }
+            if (Coordinator::sideOf(m_context.knowledge.relation(pKnownTarget->ownerId)) !=
+                Coordinator::opposingSide(actor.side))
             {
                 continue;
             }
             const std::int32_t targetIndex = static_cast<std::int32_t>(pKnownTarget - m_context.knowledge.units().data());
-            Unit* pTarget = liveUnit(targetIndex);
-            if (pTarget == nullptr)
+            if (std::ranges::find(option.requiredKilledKnowledgeIndices, targetIndex) !=
+                option.requiredKilledKnowledgeIndices.end())
             {
-                ++m_stats.missingUnits;
+                continue;
+            }
+            Unit* pTarget = liveUnit(targetIndex);
+            if (pTarget == nullptr || pTarget == option.clearingUnit)
+            {
+                if (pTarget == nullptr)
+                    ++m_stats.missingUnits;
                 continue;
             }
             const Coordinator::DamageEstimate estimate =
@@ -667,6 +979,10 @@ namespace
                 .counterSteps = estimate.counterSteps,
                 .targetBestShotBefore = targetBestShot(targetIndex, targetHpSteps, actor.unitIndex),
                 .targetBestShotAfter = targetBestShot(targetIndex, targetHpStepsAfter, actor.unitIndex),
+                .targetRealHp = pTarget->getHp(),
+                .targetAmmo = {pTarget->getMaxAmmo1() < 0 ? -1 : pTarget->getAmmo1(),
+                               pTarget->getMaxAmmo2() < 0 ? -1 : pTarget->getAmmo2()},
+                .isolated = estimate.report,
             };
             Coordinator::CandidateBundle candidate = makeCandidate(actor, option, actor.hpSteps - taken,
                                                                    VictimOverride{targetIndex, targetHpStepsAfter});
@@ -715,7 +1031,12 @@ namespace
             spGameAction pAction = MemoryManagement::create<GameAction>(CoreAI::ACTION_CAPTURE, &m_context.map);
             pAction->setTarget(QPoint(actor.tile.x, actor.tile.y));
             pAction->setMovepath(option.enginePath, option.costs);
-            if (!pAction->canBePerformed(CoreAI::ACTION_CAPTURE, EMPTY_FIELD_ACTION, &m_context.player))
+            const bool eligible = option.clearingUnit
+                ? pAction->canBePerformedAfterClearing(CoreAI::ACTION_CAPTURE, m_context.player, *option.clearingUnit)
+                : (option.vacatingUnit
+                    ? pAction->canBePerformedAfterVacating(CoreAI::ACTION_CAPTURE, m_context.player, *option.vacatingUnit)
+                    : pAction->canBePerformed(CoreAI::ACTION_CAPTURE, EMPTY_FIELD_ACTION, &m_context.player));
+            if (!eligible)
             {
                 continue;
             }
@@ -796,14 +1117,146 @@ namespace
                 addFireCandidates(actor, options, candidates);
                 addCaptureCandidates(actor, options, candidates);
             },
-            // Fire and capture need an empty endpoint, so onto an occupied tile only a positional move exists.
+            // The master enforces the prior occupant's departure and the engine revalidates the order live.
             [&](std::vector<Coordinator::CandidateBundle> & candidates)
             {
                 addPositionalCandidates(actor, followOptions, candidates);
+                addFireCandidates(actor, followOptions, candidates);
+                addCaptureCandidates(actor, followOptions, candidates);
             });
         m_stats.oracleCalls += m_context.oracle.callCount() - oracleCallsBefore;
         m_stats.oracleHits += m_context.oracle.hitCount() - oracleHitsBefore;
         return result;
+    }
+
+    void CandidateBuilder::appendBreakthrough(std::int32_t actorUnitIndex,
+                                              std::span<const Coordinator::KillableEnemyTarget> killableEnemies,
+                                              std::vector<Coordinator::CandidateBundle> & result,
+                                              std::optional<std::size_t> & todayCount)
+    {
+        if (killableEnemies.empty())
+            return;
+        m_generationIndex = 0;
+        for (const Coordinator::CandidateBundle & existing : result)
+        {
+            if (existing.generationIndex >= m_generationIndex)
+                m_generationIndex = existing.generationIndex + 1;
+        }
+        const std::vector<Coordinator::KnownUnit> & units = m_context.knowledge.units();
+        if (actorUnitIndex < 0 || actorUnitIndex >= static_cast<std::int32_t>(units.size()))
+            return;
+        const Coordinator::KnownUnit & known = units[static_cast<std::size_t>(actorUnitIndex)];
+        if (known.hasMoved || known.movementPoints <= 0 || known.ignoresUnitCollision ||
+            m_context.knowledge.relation(known.ownerId) != Coordinator::Relation::Own)
+            return;
+        ShotSource actor;
+        if (!describeShooter(actorUnitIndex, known.hpRounded, TilePoint{known.x, known.y}, actor))
+            return;
+        const Coordinator::MobilityCostGrid* pGrid = mobilityGridFor(actorUnitIndex);
+        if (pGrid == nullptr)
+            return;
+        const Coordinator::DistanceField & reach = reachFrom(actor, *pGrid);
+        std::map<std::pair<std::int32_t, std::int32_t>, Coordinator::KillableEnemyTarget> killableByTile;
+        QSet<qint32> ignoredIds;
+        bool anyKillableReachable = false;
+        for (const auto & k : killableEnemies)
+        {
+            if (k.engineUnitId == Coordinator::NO_UNIT || k.knowledgeIndex < 0)
+                continue;
+            killableByTile.emplace(std::pair{k.tile.x, k.tile.y}, k);
+            ignoredIds.insert(k.engineUnitId);
+            if (!anyKillableReachable && reach.reachable(k.tile.x, k.tile.y, actor.movementPoints))
+                anyKillableReachable = true;
+        }
+        if (!anyKillableReachable || ignoredIds.isEmpty())
+            return;
+
+        m_actorEngineUnitId = actor.pUnit->getUniqueID();
+        m_pActor = actor.pUnit;
+        const Coordinator::PropertyFacts* pOriginProperty = propertyAt(actor.tile);
+        m_actorOnActiveFriendlyProduction =
+            pOriginProperty != nullptr && pOriginProperty->canProduce &&
+            m_context.knowledge.relation(pOriginProperty->ownerId) == Coordinator::Relation::Own;
+        m_actorShotsAtOrigin = nextShotSpan(actor, VictimOverride{}, Coordinator::NO_UNIT);
+        m_enemyShotsAtOrigin = enemyShotSpan(actor, VictimOverride{});
+
+        UnitPathFindingSystem pfs(&m_context.map, actor.pUnit, &m_context.player);
+        pfs.setIgnoredEnemyUnits(ignoredIds);
+        pfs.explore();
+        std::vector<MoveOption> breakthroughOptions;
+        for (const QPoint & node : pfs.getAllNodePointsFast(actor.movementPoints + NODE_COST_BOUND_MARGIN))
+        {
+            const TilePoint destination{node.x(), node.y()};
+            if (destination == actor.tile)
+                continue;
+            Terrain* pTerrain = m_context.map.getTerrain(destination.x, destination.y);
+            if (pTerrain == nullptr)
+                continue;
+            const std::vector<QPoint> enginePath = pfs.getPathFast(destination.x, destination.y);
+            if (enginePath.empty())
+                continue;
+            const std::vector<TilePoint> path = Coordinator::pathFromEngineOrder(enginePath);
+            std::vector<std::int32_t> reqIds;
+            std::vector<std::int32_t> reqKis;
+            for (std::size_t pi = 1; pi < path.size(); ++pi)
+            {
+                if (const auto ktIt = killableByTile.find(std::pair{path[pi].x, path[pi].y});
+                    ktIt != killableByTile.end())
+                {
+                    if (std::ranges::find(reqIds, ktIt->second.engineUnitId) == reqIds.end())
+                    {
+                        reqIds.push_back(ktIt->second.engineUnitId);
+                        reqKis.push_back(ktIt->second.knowledgeIndex);
+                    }
+                }
+            }
+            if (reqIds.empty())
+                continue;
+
+            Unit* pOcc = pTerrain->getUnit();
+            Unit* clearingUnit = nullptr;
+            Unit* vacatingUnit = nullptr;
+            if (pOcc != nullptr)
+            {
+                if (killableByTile.contains(std::pair{destination.x, destination.y}))
+                    clearingUnit = pOcc;
+                else if (pOcc != actor.pUnit && Coordinator::followTileOffered(m_context.followTiles, destination, actor.tile))
+                    vacatingUnit = pOcc;
+                else
+                    continue;
+            }
+            MoveOption option;
+            option.destination = destination;
+            option.path = path;
+            option.enginePath = enginePath;
+            option.costs = pfs.getCosts(option.enginePath);
+            option.vacatingUnit = vacatingUnit;
+            option.clearingUnit = clearingUnit;
+            option.requiredKilledEnemyIds = std::move(reqIds);
+            option.requiredKilledKnowledgeIndices = std::move(reqKis);
+            breakthroughOptions.push_back(std::move(option));
+        }
+        if (breakthroughOptions.empty())
+            return;
+
+        std::vector<MoveOption> directBreakthrough;
+        std::vector<MoveOption> followBreakthrough;
+        for (auto & opt : breakthroughOptions)
+        {
+            if (opt.vacatingUnit != nullptr)
+                followBreakthrough.push_back(std::move(opt));
+            else
+                directBreakthrough.push_back(std::move(opt));
+        }
+        const std::size_t baseCount = result.size();
+        addPositionalCandidates(actor, directBreakthrough, result);
+        addFireCandidates(actor, directBreakthrough, result);
+        addCaptureCandidates(actor, directBreakthrough, result);
+        addPositionalCandidates(actor, followBreakthrough, result);
+        addFireCandidates(actor, followBreakthrough, result);
+        addCaptureCandidates(actor, followBreakthrough, result);
+        if (result.size() > baseCount && !todayCount.has_value())
+            todayCount = baseCount;
     }
 }
 
@@ -851,7 +1304,8 @@ namespace Coordinator
 
     ValuationContext makeValuationContext(GameMap & map)
     {
-        return ValuationContext{resolveHorizon(resolveRemainingTurnLimit(map))};
+        return ValuationContext{resolveMapHorizon(
+            map.getMapWidth(), map.getMapHeight(), resolveRemainingTurnLimit(map))};
     }
 
     std::vector<CandidateBundle> buildCandidateBundles(const BundleBuildContext & context, std::int32_t actorUnitIndex,
@@ -866,5 +1320,21 @@ namespace Coordinator
             *pTodayCount = todayCount;
         }
         return candidates;
+    }
+
+    void appendKillBreakthroughCandidates(const BundleBuildContext & context,
+                                          std::span<const KillableEnemyTarget> killableEnemies,
+                                          std::int32_t actorUnitIndex,
+                                          std::vector<CandidateBundle> & candidates,
+                                          std::optional<std::size_t>* pTodayCount,
+                                          BundleBuildStats & stats)
+    {
+        if (killableEnemies.empty())
+            return;
+        CandidateBuilder builder(context, stats);
+        std::optional<std::size_t> todayCount = pTodayCount != nullptr ? *pTodayCount : std::nullopt;
+        builder.appendBreakthrough(actorUnitIndex, killableEnemies, candidates, todayCount);
+        if (pTodayCount != nullptr)
+            *pTodayCount = todayCount;
     }
 }

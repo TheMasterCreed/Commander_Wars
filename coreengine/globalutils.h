@@ -29,6 +29,32 @@ public:
     static void setup();
     static bool getUseSeed();
     static void setUseSeed(bool useSeed);
+    struct RngStateSnapshot
+    {
+        bool useSeed{false};
+        quint32 seed{0};
+        QRandomGenerator generator;
+    };
+    static RngStateSnapshot captureRngState();
+    static void restoreRngState(const RngStateSnapshot & state);
+    static void applyDeterministicSeedSilent(quint32 seed);
+    class ScopedDeterministicSeed final
+    {
+    public:
+        explicit ScopedDeterministicSeed(quint32 seed)
+            : m_saved(GlobalUtils::captureRngState())
+        {
+            GlobalUtils::applyDeterministicSeedSilent(seed);
+        }
+        ~ScopedDeterministicSeed()
+        {
+            GlobalUtils::restoreRngState(m_saved);
+        }
+        ScopedDeterministicSeed(const ScopedDeterministicSeed &) = delete;
+        ScopedDeterministicSeed & operator=(const ScopedDeterministicSeed &) = delete;
+    private:
+        RngStateSnapshot m_saved;
+    };
     static qint32 randIntBase(qint32 low, qint32 high);
     static float randFloatBase(float low, float high);
     static qreal randDoubleBase(qreal low, qreal high);

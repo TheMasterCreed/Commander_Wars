@@ -1,4 +1,11 @@
 #include <QFile>
+#ifdef COW_ACTION_SEED_TESTING
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include "ai/coordinator/masterassignmentshadow.h"
+#include "game/gameaction.h"
+#endif
 
 #include "3rd_party/oxygine-framework/oxygine/actor/Stage.h"
 
@@ -332,6 +339,32 @@ void Mainwindow::lastSaveGame()
     loadGame(Settings::getInstance()->getLastSaveGame());
 }
 
+#ifdef COW_ACTION_SEED_TESTING
+namespace
+{
+bool pinPrivateReplaySeed(const QFileInfo & save)
+{
+    bool validSeed = false;
+    const quint32 seed = qgetenv("COW_ARENA_REPLAY_ACTION_SEED").toUInt(&validSeed);
+    if (!validSeed || qgetenv("COW_AI_ARENA_TEST") != "1" || GameAction::getActionSeedsPinned())
+        return false;
+    auto * app = Mainapp::getInstance();
+    const QString active = Settings::getInstance()->getUserPath();
+    QString requested;
+    if (!app->getNoUi() || !app->getParser().getUserPath(requested) ||
+        !Coordinator::isolatedMasterTrialPath(QCoreApplication::applicationDirPath(), requested, active) ||
+        save.fileName() != QStringLiteral("checkpoint.sav") || save.isSymLink() ||
+        save.canonicalPath() != QFileInfo(active).canonicalFilePath())
+        return false;
+    GlobalUtils::seed(seed);
+    GlobalUtils::setUseSeed(true);
+    GameAction::pinActionSeeds(seed);
+    CONSOLE_PRINT("Private native replay action seed " + QString::number(seed), GameConsole::eDEBUG);
+    return true;
+}
+}
+#endif
+
 void Mainwindow::loadGame(QString filename)
 {
     if (filename.endsWith(".sav"))
@@ -339,7 +372,17 @@ void Mainwindow::loadGame(QString filename)
         QFile file(filename);
         if (file.exists())
         {
+#ifdef COW_ACTION_SEED_TESTING
+            const bool privateSeed = pinPrivateReplaySeed(QFileInfo(file));
+#endif
             spGameMenue pMenu = MemoryManagement::create<GameMenue>(filename, true);
+#ifdef COW_ACTION_SEED_TESTING
+            if (privateSeed)
+                QObject::connect(pMenu.get(), &QObject::destroyed, [] {
+                    GameAction::unpinActionSeeds();
+                    GlobalUtils::setUseSeed(false);
+                });
+#endif
             oxygine::Stage::getStage()->addChild(pMenu);
             Mainapp* pApp = Mainapp::getInstance();
             pApp->getAudioManager()->clearPlayList();

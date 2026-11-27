@@ -1,5 +1,6 @@
 #include "ai/coordinator/masterassignmentcontrol.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include <QDebug>
@@ -8,7 +9,13 @@
 #include <QJsonDocument>
 
 #include "ai/coordinator/bundleassignment.h"
+#include "ai/coordinator/replyfacts.h"
 #include "ai/coordinator/masterassignmentstock.h"
+#include "ai/coordinator/compatiblepacking.h"
+#include "ai/coordinator/stockpackingsibling.h"
+#include "ai/coordinator/stocktargetwitness.h"
+#include "ai/coordinator/stockprogressscope.h"
+#include <QScopeGuard>
 #include "ai/coordinator/masterassignmenttrace.h"
 #include "ai/coordinator/masterplanpricing.h"
 
@@ -336,9 +343,148 @@ namespace
         return finishAttempt(context, attempt);
     }
 
+    std::optional<SequentialInstance> stockInstance(const MasterFutureCatalog &catalog, const RelativeStockQuote &quote)
+    {
+        SequentialInstance result{catalog.horizon, catalog.columns, catalog.classes, catalog.dayRows, {}};
+        for (const auto &column : catalog.columns)
+            result.capturedNodes.push_back(std::ranges::binary_search(quote.capturedColumns, column.slot));
+        for (const auto &entry : quote.key)
+        {
+            const auto *action = findMasterFutureAction(catalog, entry);
+            if (!action || entry.row() < 0 || std::size_t(entry.row()) >= result.rows.size()) return std::nullopt;
+            result.rows[entry.row()] = action->row;
+        }
+        return result;
+    }
+
+    std::optional<std::vector<SequentialDetail::RowOption>> stockRowOptions(
+        const SequentialInstance &instance, int rowIndex, RefinementLedger &ledger)
+    {
+        const auto &row = instance.rows[rowIndex];
+        if (!ledger.consume(instance.nodeCount() + 1, RefinementWork::MasterWitness)) return std::nullopt;
+        std::vector<MilliFunds> enriched(instance.nodeCount());
+        for (int node = 0; node < instance.nodeCount(); ++node)
+        {
+            if (instance.capturedNodes[node]) continue;
+            enriched[node] = row.weight[node];
+            if (!RelativeStockDetail::checkedAdd(enriched[node],
+                SequentialDetail::continuationGain(instance, row, node))) return std::nullopt;
+        }
+        SequentialDetail::EnumerationBudget budget{0, ledger.balance()};
+        if (budget.stateCap <= 0) return std::nullopt;
+        std::int64_t routes = 0;
+        auto options = SequentialDetail::enumerateRowOptions(instance, rowIndex, enriched, budget, routes);
+        if (!ledger.consume(budget.states, RefinementWork::MasterWitness) || budget.truncated) return std::nullopt;
+        return options;
+    }
+
+    // Each neutral site can be claimed by at most one row in any complete
+    // packing. Match every old route with the same row's route on the new
+    // board, removing only the newly owned site. No match introduces a claim
+    // on a teammate's site. Consequently the largest single loss on that site
+    // bounds the entire team's loss, even if its best assignment is unknown.
+    std::optional<MilliFunds> stockRouteMargin(const MasterFutureCatalog &catalog,
+        const RelativeStockQuote &before, const RelativeStockQuote &after,
+        const RelativeStockComparison &comparison, RefinementLedger &ledger)
+    {
+        if (!catalog.complete || !comparison.valid() || !comparison.commonEnemyCancelled) return std::nullopt;
+        const auto left = stockInstance(catalog, before), right = stockInstance(catalog, after);
+        if (!left || !right) return std::nullopt;
+        int claimed = NO_SEQUENTIAL_NODE;
+        for (int n = 0; n < left->nodeCount(); ++n)
+        {
+            if (left->capturedNodes[n] == right->capturedNodes[n]) continue;
+            if (left->capturedNodes[n] || claimed != NO_SEQUENTIAL_NODE) return std::nullopt;
+            claimed = n;
+        }
+        if (claimed == NO_SEQUENTIAL_NODE) return std::nullopt;
+        MilliFunds maxLoss = 0;
+        for (std::size_t row = 0; row < left->rows.size(); ++row)
+        {
+            const auto old = stockRowOptions(*left, static_cast<int>(row), ledger);
+            const auto next = stockRowOptions(*right, static_cast<int>(row), ledger);
+            if (!old || !next) return std::nullopt;
+            std::map<std::vector<int>, MilliFunds> matched{{{}, 0}};
+            for (const auto &option : *next)
+                matched.emplace(option.nodes, option.value);
+            for (const auto &option : *old)
+            {
+                if (!ledger.consume(option.nodes.size() + 1, RefinementWork::MasterWitness)) return std::nullopt;
+                auto sites = option.nodes;
+                const bool usesSite = std::erase(sites, claimed) != 0;
+                const auto found = matched.find(sites);
+                if (found == matched.end()) return std::nullopt;
+                MilliFunds loss = option.value;
+                if (!RelativeStockDetail::checkedSubtract(loss, found->second) || (!usesSite && loss > 0))
+                    return std::nullopt;
+                if (usesSite) maxLoss = std::max(maxLoss, loss);
+            }
+        }
+        MilliFunds gain = comparison.ownedDelta;
+        if (!RelativeStockDetail::checkedAdd(gain, comparison.economicDelta) ||
+            !RelativeStockDetail::checkedSubtract(gain, maxLoss)) return std::nullopt;
+        return gain;
+    }
+
+
+    // Compare two complete teams on the stock planner's own objective. Both
+    // use the same field and fixed enemy term. The later combat comparison
+    // still owns replies, buying, and terminal outcomes.
+    std::optional<AssignmentResult> compatibleStockActions(
+        const MasterAssignmentProblem &problem, const AssignmentResult &incumbent,
+        const std::vector<std::int32_t> &proposal, MasterAssignmentEvaluation before,
+        MasterAssignmentEvaluator &evaluator, RefinementLedger &ledger)
+    {
+        auto state = std::vector<std::int32_t>(problem.incumbentChoices().begin(), problem.incumbentChoices().end());
+        if (proposal.size() != state.size()) return std::nullopt;
+        bool changed = false;
+        for (const auto &actor : problem.actors())
+        {
+            const auto slot = static_cast<std::size_t>(actor.canonicalSlot);
+            if (state[slot] == proposal[slot] || !problem.canChangeActor(actor.canonicalSlot)) continue;
+            const auto &old = actor.candidates.at(state[slot]);
+            const auto &next = actor.candidates.at(proposal[slot]);
+            const auto &facts = next.source.replyFacts;
+            if ((old.actionKind != PlanBundleKind::Wait && old.actionKind != PlanBundleKind::Move) ||
+                !next.capture || next.destination != old.destination || next.source.bundle.path != old.source.bundle.path ||
+                !facts || !facts->tile || !facts->tile->shooters.empty()) continue;
+            state[slot] = proposal[slot];
+            changed = true;
+        }
+        if (!changed) return std::nullopt;
+        const auto retained = replayMasterAssignment(problem, state, ReplyPredictionSetup{});
+        if (!retained.complete() || retained.ordering.order != incumbent.executionOrder) return std::nullopt;
+        auto after = evaluator.evaluate({problem.identity(), state});
+        if (!after.quote() || !before.quote() || !evaluator.futureCatalog()) return std::nullopt;
+        const auto comparison = evaluator.compare(before, after);
+        const auto startWork = ledger.balance();
+        const auto margin = stockRouteMargin(*evaluator.futureCatalog(), *before.quote(), *after.quote(), comparison, ledger);
+        qInfo() << "Compatible stock routes" << margin.value_or(0) << "verified" << margin.has_value()
+                << "pairedWork" << startWork - ledger.balance();
+        if (!margin || *margin <= 0) return std::nullopt;
+        auto result = incumbent;
+        for (auto &selection : result.selections)
+        {
+            const auto actors = problem.actors();
+            const auto actor = std::ranges::find(actors, selection.engineUnitId, &MasterActor::engineUnitId);
+            if (actor == actors.end()) return std::nullopt;
+            const auto slot = static_cast<std::size_t>(actor->canonicalSlot);
+            selection.seatedValue = retained.seatedValues[slot];
+            if (state[slot] == selection.candidateIndex) continue;
+            selection.actionIndex = retained.actionIndices[slot];
+            selection.candidateIndex = state[slot];
+            selection.phase = AssignmentResult::SelectionPhase::Master;
+            selection.completeValues.clear();
+        }
+        result.plan = retained.plan;
+        result.executionOrder = retained.ordering.order;
+        return result;
+    }
+
     MasterStockControlStatus attemptRelativeStock(
         ControlContext & context, const MasterAssignmentProblem & problem,
-        const AssignmentInput & input, const PropertyStockField & field)
+        const AssignmentInput & input, const PropertyStockField & field,
+        std::optional<AssignmentResult>* compatible)
     {
         auto attempt = beginAttempt(context, MasterStockAuthority::RelativeStock);
         MasterAssignmentStockContext stock;
@@ -360,6 +506,14 @@ namespace
         }
         MasterAssignmentEvaluator evaluator(problem, context.ledger, *stock.session(), stock.tariffs(), &context.profile);
         searchAndInstall(context, attempt, problem, evaluator);
+        if (compatible && *compatible && attempt.installed.proof && stock.session()->futureCatalogMatchesSolver())
+        {
+            const auto &proof = *attempt.installed.proof;
+            auto candidate = compatibleStockActions(problem, **compatible, proof.challenger.state.choices,
+                proof.incumbent, evaluator, context.ledger);
+            if (candidate && handOffMasterPlan(&problem, *candidate).handoff)
+                **compatible = std::move(*candidate);
+        }
 #ifdef COW_COORDINATED_REFINEMENT_TESTING
         attempt.witnessCharges = evaluator.witnessCharges();
 #endif
@@ -451,7 +605,8 @@ namespace
     MasterStockControlTiming controlWithCapture(
         const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
         AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
-        const DecisionTraceIdentity & identity, std::optional<MasterCaptureResult> & capture)
+        const DecisionTraceIdentity & identity, std::optional<MasterCaptureResult> & capture,
+        std::optional<AssignmentResult>* incoming)
     {
         MasterStockControlTiming measured;
         if (!config.controlsStock())
@@ -489,6 +644,7 @@ namespace
         {
             return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::ExtractionRefused);
         }
+        if (incoming) incoming->emplace(assignment);
         const auto & problem = *capture->extraction.problem;
         screen = screenCapture(problem, field, properties, ledger);
         if (screen == CaptureScreen::BudgetExhausted)
@@ -500,13 +656,148 @@ namespace
         {
             return finishControl(context, controlTiming, capture, screen, MasterStockControlStatus::Installed);
         }
-        const auto status = attemptRelativeStock(context, problem, input, field);
+        const auto status = attemptRelativeStock(context, problem, input, field, incoming);
         return finishControl(context, controlTiming, capture, screen, status);
     }
 }
 
 namespace Coordinator
 {
+    bool StockProgressPricing::prepare(const PropertyStockField &field,const AssignmentInput &input,
+                                       std::int64_t offer,std::int64_t &work)
+    {
+        if(!ledger.open(work))return false;
+        RefinementLedger::WorkLimit cap(ledger,std::min(offer,work));
+        const auto charge=qScopeGuard([&]{work-=ledger.stats().spent();});
+        return stock.prepare(field,input,ledger,nullptr,SequentialTierAuditMode::CountersOnly)==MasterStockSetupStatus::Prepared &&
+               stock.prepareOperationService()==MasterStockSetupStatus::Prepared && stock.session()->futureCatalogMatchesSolver();
+    }
+
+    QJsonObject priceStockProgress(const MasterAssignmentProblem &problem,StockProgressPricing &pricing,
+        const std::vector<int> &before,const std::vector<int> &after,StockProgressArms &arms,
+        std::int64_t allowance,std::int64_t &work)
+    {
+        auto &owner=pricing.ledger;
+        const auto offer=std::min({allowance,work,owner.balance()});
+        if(offer<=0)return {{"status","NO_STOCK_QUOTE_ALLOWANCE"}};
+        auto *session=pricing.stock.session();
+        if(!session || !session->futureCatalogMatchesSolver())return {{"status","STOCK_INPUTS_UNAVAILABLE"}};
+        const auto start=owner.stats();
+        RefinementLedger::WorkLimit cap(owner,offer);
+        const auto debit=qScopeGuard([&]{work-=owner.stats().spent()-start.spent();});
+        MasterAssignmentEvaluator evaluator(problem,owner,*session,pricing.stock.tariffs());
+        auto old=evaluator.evaluate({problem.identity(),before}),next=evaluator.evaluate({problem.identity(),after});
+        const auto relative=evaluator.compare(old,next);
+        if(!old.quote() || !next.quote() || !old.lowerReplayed || !old.upperVerified || !next.lowerReplayed || !next.upperVerified ||
+           !old.quote()->ourLowerWitnessReplays || !next.quote()->ourLowerWitnessReplays ||
+           !relative.valid() || !relative.commonEnemyCancelled || !evaluator.futureCatalog())
+            return {{"status","NO_COMMON_ENEMY_STOCK_PROOF"}};
+        std::int64_t siblingWork=0;
+        bool usedSibling=false;
+        // The relative quotes need their original ledger. The pure packing
+        // search instead sees only the actual unspent portion of this offer.
+        const auto packingBudget=std::min(owner.balance(),offer-(owner.stats().granted-start.granted));
+        if(packingBudget<0)return {{"status","NO_STOCK_QUOTE_ALLOWANCE"}};
+        RefinementLedger ledger;
+        if(!ledger.open(packingBudget))return {{"status","NO_STOCK_QUOTE_ALLOWANCE"}};
+        const auto packingGrant=owner.draw(packingBudget,RefinementWork::MasterWitness);
+        if(packingGrant==NO_GRANT)return {{"status","NO_STOCK_QUOTE_ALLOWANCE"}};
+        const auto refund=qScopeGuard([&]{owner.refund(packingGrant,ledger.balance());});
+        const auto solve=[&](const RelativeStockQuote &quote,StockProgressArmBounds &range,
+            std::span<const MilliFunds> prices,std::optional<MilliFunds> required)->std::optional<CompatiblePackingResult>{
+            const auto instance=stockInstance(*evaluator.futureCatalog(),quote);
+            if(!instance)return {};
+            std::vector<std::vector<SequentialDetail::RowOption>> menus;
+            for(int i=0;i<int(instance->rows.size());++i)
+            {
+                auto options=stockRowOptions(*instance,i,ledger);
+                if(!options)return {};
+                menus.push_back(std::move(*options));
+            }
+            std::optional<CompatiblePackingResult> constructive;
+            if(required && prices.size()==instance->capturedNodes.size()){
+                const auto start=ledger.stats().spent();
+                std::optional<StockSiblingWitness> witness;
+                {
+                    RefinementLedger::WorkLimit limit(ledger,std::min<std::int64_t>(300000,ledger.balance()/2));
+                    witness=stockSiblingWitness(*instance,menus,prices,*required,ledger);
+                    // The shortlist can finish without a witness because its
+                    // sixteen selected routes omit a necessary reallocation.
+                    // Use only unconsumed credits from the same work limit.
+                    if(!witness && ledger.balance()>0)
+                        witness=stockTargetWitness(*instance,menus,prices,*required,ledger);
+                }
+                siblingWork+=ledger.stats().spent()-start;
+                if(witness && witness->value>=*required && witness->value<=range.upper){
+                    usedSibling=true;
+                    if(range.sitePrices.empty())range.sitePrices.assign(prices.begin(),prices.end());
+                    constructive=CompatiblePackingResult{witness->value,range.upper,witness->work,std::move(witness->witness)};
+                }
+            }
+            // A successful constructive test is only a lower bound. Preserve
+            // it while independently closing the full ceiling; this team can
+            // become the incumbent on the very next physical option.
+            auto full=compatiblePackingBounds(*instance,ledger,menus,&range.sitePrices);
+            if(!full)return constructive;
+            if(constructive && constructive->lower>full->lower){
+                if(constructive->lower>full->upper)return {};
+                full->lower=constructive->lower;
+                full->witness=std::move(constructive->witness);
+            }
+            return full;
+        };
+        const auto initial=[&](const std::vector<int> &choices,const RelativeStockQuote &quote)->StockProgressArmBounds&{
+            auto &range=arms.try_emplace(choices,StockProgressArmBounds{quote.ours.lower,quote.ours.upper,0}).first->second;
+            range.lower=std::max(range.lower,quote.ours.lower);range.upper=std::min(range.upper,quote.ours.upper);
+            return range;
+        };
+        const auto refine=[&](StockProgressArmBounds &range,const RelativeStockQuote &quote,std::int64_t share,
+                              std::span<const MilliFunds> prices={},std::optional<MilliFunds> required={}) {
+            if(range.lower<range.upper && (share>range.previousAllowance || (required && !prices.empty()))){
+                RefinementLedger::WorkLimit cap(ledger,share);
+                const auto spentBefore=ledger.stats().spent();
+                if(const auto bounded=solve(quote,range,prices,required)){
+                    range.lower=std::max(range.lower,bounded->lower);range.upper=std::min(range.upper,bounded->upper);
+                }
+                range.previousAllowance=std::max(range.previousAllowance,ledger.stats().spent()-spentBefore);
+            }
+        };
+        const auto beforeKnown=arms.find(before);
+        const bool leftExact=beforeKnown!=arms.end() && beforeKnown->second.lower==beforeKnown->second.upper;
+        const auto afterKnown=arms.find(after);
+        const bool rightExact=afterKnown!=arms.end() && afterKnown->second.lower==afterKnown->second.upper;
+        auto &left=initial(before,*old.quote()),&right=initial(after,*next.quote());
+        MilliFunds margin{},ceiling{};
+        const auto compare=[&](){
+            margin=relative.ownedDelta;ceiling=relative.ownedDelta;
+            return left.lower<=left.upper && right.lower<=right.upper &&
+                RelativeStockDetail::checkedAdd(margin,relative.economicDelta) &&
+                RelativeStockDetail::checkedAdd(margin,right.lower) && RelativeStockDetail::checkedSubtract(margin,left.upper) &&
+                RelativeStockDetail::checkedAdd(ceiling,relative.economicDelta) &&
+                RelativeStockDetail::checkedAdd(ceiling,right.upper) && RelativeStockDetail::checkedSubtract(ceiling,left.lower);
+        };
+        if(!compare())return {{"status","INVALID_STOCK_BOUNDS_OR_ARITHMETIC"}};
+        if(margin<=0 && ceiling>0){
+            refine(left,*old.quote(),rightExact?ledger.balance():ledger.balance()/2);
+            if(!compare())return {{"status","INVALID_STOCK_BOUNDS_OR_ARITHMETIC"}};
+            if(margin<=0 && ceiling>0){
+                MilliFunds target=left.upper;
+                if(!RelativeStockDetail::checkedSubtract(target,relative.ownedDelta) ||
+                   !RelativeStockDetail::checkedSubtract(target,relative.economicDelta) ||
+                   !RelativeStockDetail::checkedAdd(target,1))return {{"status","INVALID_SIBLING_THRESHOLD"}};
+                refine(right,*next.quote(),ledger.balance(),left.sitePrices,target);
+            }
+            if(!compare())return {{"status","INVALID_STOCK_BOUNDS_OR_ARITHMETIC"}};
+        }
+        return {{"status",margin>0?"STRICT_STOCK_IMPROVEMENT":ceiling<=0?"NO_STRICT_STOCK_MARGIN":"STOCK_INTERVAL_OVERLAP"},
+            {"incumbentLower",qint64(left.lower)},{"incumbentUpper",qint64(left.upper)},
+            {"candidateLower",qint64(right.lower)},{"candidateUpper",qint64(right.upper)},
+            {"cachedIncumbent",leftExact},{"cachedCandidate",rightExact},{"marginUpper",qint64(ceiling)},
+            {"commonEnemyCancelled",true},{"ownedDelta",qint64(relative.ownedDelta)},{"economicDelta",qint64(relative.economicDelta)},
+            {"margin",qint64(margin)},{"siblingWitness",usedSibling},{"siblingWork",qint64(siblingWork)},
+            {"usedWork",qint64(owner.stats().spent()-start.spent()-ledger.balance())}};
+    }
+
     QString masterStockAuthorityName(MasterStockAuthority authority)
     {
         switch (authority)
@@ -546,16 +837,67 @@ namespace Coordinator
     MasterStockControlTiming controlMasterAssignment(
         const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
         AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
-        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff)
+        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff, bool requireFullComparison)
     {
         std::optional<MasterCaptureResult> capture;
-        const auto measured = controlWithCapture(config, map, input, assignment, field, properties, identity, capture);
+        std::optional<AssignmentResult> incoming;
+        const auto measured = controlWithCapture(config, map, input, assignment, field, properties, identity, capture,
+                                                 requireFullComparison && pHandoff ? &incoming : nullptr);
         // After the receipt, so the receipt and the timing are the same with and without a handoff.
         if (pHandoff != nullptr)
         {
             const auto started = std::chrono::steady_clock::now();
             const bool extracted = capture && capture->extraction.valid();
             *pHandoff = handOffMasterPlan(extracted ? &*capture->extraction.problem : nullptr, assignment);
+            // A stock improvement can remain the default for a quiet economic turn.
+            // A current firing opportunity, an exposed endpoint or a blocked purchase
+            // gives the broader comparison authority over both complete teams.
+            const auto needsTacticalComparison = [&] {
+                for (const auto &actor : input.actors)
+                {
+                    for (const auto &choice : actor.candidates)
+                    {
+                        const bool canFire = std::ranges::any_of(choice.bundle.components, [](const auto &part) {
+                            return part.kind == ComponentKind::Fire;
+                        });
+                        if (canFire ||
+                            !choice.replyFacts || !choice.replyFacts->tile ||
+                            !choice.replyFacts->tile->shooters.empty()) return true;
+                    }
+                }
+                return false;
+            };
+            const auto needsBroaderValuation = [&](const AssignmentResult &team) {
+                for (int i = 0; i < team.plan.actionCount(); ++i)
+                {
+                    const auto &action = team.plan.action(i);
+                    if (action.actionId != "ACTION_WAIT" && action.actionId != "ACTION_CAPTURE") return true;
+                    if (action.actionId == "ACTION_WAIT" && std::ranges::any_of(properties, [&](const PropertyFacts &site) {
+                        return site.ownerId == identity.playerId && site.canProduce &&
+                               site.x == action.destination.x && site.y == action.destination.y;
+                    })) return true;
+                }
+                return false;
+            };
+            if (extracted && incoming && measured.status == MasterStockControlStatus::Installed &&
+                (needsTacticalComparison() || needsBroaderValuation(assignment) || needsBroaderValuation(*incoming)))
+            {
+                // The stock proof establishes an improvement on its own terms.
+                // Preserve the actual constructor orders and submit the stock
+                // result as a candidate when a broader valuation owns the turn.
+                auto original = handOffMasterPlan(&*capture->extraction.problem, *incoming);
+                if (original.handoff)
+                {
+                    if (pHandoff->handoff && (pHandoff->handoff->choices != original.handoff->choices ||
+                                              assignment.executionOrder != incoming->executionOrder))
+                    {
+                        original.handoff->stockProposal = MasterOrderProposal{
+                            std::move(pHandoff->handoff->choices), assignment.executionOrder};
+                    }
+                    assignment = std::move(*incoming);
+                    *pHandoff = std::move(original);
+                }
+            }
             pHandoff->nanos = nanosSince(started);
         }
         return measured;

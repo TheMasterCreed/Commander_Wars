@@ -19,6 +19,7 @@ class Unit;
 
 namespace Coordinator
 {
+    TerrainDefenseRule projectedTerrainRule(GameMap &map, Unit &actor, const TilePoint &tile);
     bool ownBuildingAt(GameMap & map, const TilePoint & tile, std::int32_t ownerId);
     ReplyBoard replyBoardOf(const BattlefieldKnowledge & knowledge);
 
@@ -65,7 +66,7 @@ namespace Coordinator
         std::shared_ptr<const ReplyTileFacts> cachedTileFacts(const TilePoint & target);
         ReplyShooterFacts shooterFacts(const EnemyShot & shot, const TilePoint & target);
         void priceShooter(ReplyShooterFacts & shooter);
-        TerrainDefenseRule terrainRule(Unit & actor, const TilePoint & tile) const;
+
 
         GameMap & m_map;
         const BattlefieldKnowledge & m_knowledge;

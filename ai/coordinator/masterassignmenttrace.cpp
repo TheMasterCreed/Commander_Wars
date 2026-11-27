@@ -1,4 +1,7 @@
 #include "ai/coordinator/masterassignmenttrace.h"
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+#include "ai/coordinator/capturedangeraudit.h"
+#endif
 #include "ai/coordinator/masterassignmentshadow.h"
 #include "ai/coordinator/masternativesource.h"
 
@@ -143,6 +146,7 @@ namespace
             {TRACE_CEILING, QString::number(tuning->ceiling)},
             {TRACE_FLOOR, Coordinator::masterValueRecord(tuning->floor)},
             {TRACE_PRICING_WORK, QString::number(tuning->pricingWork)},
+            {TRACE_PREPARATION_WORK, QString::number(tuning->preparationWork)},
             {TRACE_WITNESS_WORK, QString::number(tuning->witnessWork)},
             {TRACE_WITNESS_STATS, planWitnessStatsRecord(tuning->witnessStats)}};
     }
@@ -466,6 +470,22 @@ namespace
 
 namespace Coordinator
 {
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+    QJsonObject CaptureDangerAuditView::captureRouteFieldRecord() const
+    {
+        QJsonArray grids;
+        for (const auto & grid : propertyStock.m_grids)
+        {
+            grids.append(mobilityGridRecord(grid));
+        }
+        return {{"ourRows", stockRowsRecord(propertyStock.m_ours.rows)},
+                {"ourColumns", stockColumnsRecord(propertyStock.m_ours.columns)},
+                {"columnCapturers", masterChoicesRecord(propertyStock.m_columnCapturer)},
+                {"columnCapturePoints", masterChoicesRecord(propertyStock.m_columnCapturePoints)},
+                {"mobilityGrids", grids}, {"capturePointsToCapture", propertyStock.capturePointsToCapture()}};
+    }
+#endif
+
     MasterAssignmentSearchTrace::MasterAssignmentSearchTrace(
         const QString & path, const DecisionTraceIdentity & identity,
         const MasterAssignmentProblem & problem, const RefinementLedger & ledger, std::int64_t reservedWork,

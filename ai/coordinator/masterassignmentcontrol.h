@@ -56,5 +56,6 @@ namespace Coordinator
     MasterStockControlTiming controlMasterAssignment(
         const MasterShadowConfig & config, GameMap & map, const AssignmentInput & input,
         AssignmentResult & assignment, const PropertyStockField & field, std::span<const PropertyFacts> properties,
-        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff = nullptr);
+        const DecisionTraceIdentity & identity, MasterPlanHandoffResult* pHandoff = nullptr,
+        bool requireFullComparison = false);
 }

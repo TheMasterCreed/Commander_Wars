@@ -12,6 +12,7 @@
 #include "ai/coordinator/turnplan.h"
 
 class GameMap;
+class QJsonObject;
 
 namespace Coordinator
 {
@@ -27,6 +28,9 @@ namespace Coordinator
         const TurnPlan & plan;
         const DecisionTraceIdentity & identity;
         ReplyPredictionTelemetry reply{};
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        QJsonObject captureRouteFieldRecord() const;
+#endif
     };
 
     // Change pricing never orders a vacate, so a follower is never offered as a replacement.

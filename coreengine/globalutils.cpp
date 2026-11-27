@@ -347,6 +347,29 @@ void GlobalUtils::setUseSeed(bool useSeed)
     }
 }
 
+GlobalUtils::RngStateSnapshot GlobalUtils::captureRngState()
+{
+    return RngStateSnapshot{
+        m_pInstace->m_useSeed,
+        m_pInstace->m_seed,
+        m_pInstace->m_randGenerator,
+    };
+}
+
+void GlobalUtils::restoreRngState(const RngStateSnapshot & state)
+{
+    m_pInstace->m_useSeed = state.useSeed;
+    m_pInstace->m_seed = state.seed;
+    m_pInstace->m_randGenerator = state.generator;
+}
+
+void GlobalUtils::applyDeterministicSeedSilent(quint32 seed)
+{
+    m_pInstace->m_seed = seed;
+    m_pInstace->m_randGenerator.seed(seed);
+    m_pInstace->m_useSeed = true;
+}
+
 QStringList GlobalUtils::getFiles(const QString folder, const QStringList filter)
 {
     QStringList ret;
@@ -482,17 +505,39 @@ QString GlobalUtils::getNextAutosavePath(const QString path, const QString endin
 
 QString GlobalUtils::makePathRelative(QString file, bool full)
 {
-    QDir dir (QCoreApplication::applicationDirPath());
-    QString path = dir.absolutePath();
-    file = file.replace(path + "/", "");
-    file = file.replace(path, "");
-    QString userPath = Settings::getInstance()->getUserPath();
+    // When a profile is inside the application directory, both roots can match.
+    // Resolve against the most specific directory before looking up the virtual path.
+    const QString userPath = Settings::getInstance()->getUserPath();
+    const QString candidate = QDir::cleanPath(QDir::fromNativeSeparators(file));
+    QStringList roots{QCoreApplication::applicationDirPath()};
     if (!userPath.isEmpty())
     {
-        file = file.replace(userPath + "/", "");
-        file = file.replace(userPath, "");
+        roots.append(QDir(userPath).absolutePath());
     }
-    if (file.startsWith(oxygine::Resource::RCC_PREFIX_PATH) && full)
+    qsizetype matched = 0;
+#ifdef Q_OS_WIN
+    constexpr auto sensitivity = Qt::CaseInsensitive;
+#else
+    constexpr auto sensitivity = Qt::CaseSensitive;
+#endif
+    for (const auto & directory : roots)
+    {
+        const QString root = QDir::cleanPath(directory);
+        const QString prefix = root.endsWith('/') ? root : root + '/';
+        if (candidate.compare(root, sensitivity) == 0)
+        {
+            matched = candidate.size();
+        }
+        else if (prefix.size() > matched && candidate.startsWith(prefix, sensitivity))
+        {
+            matched = prefix.size();
+        }
+    }
+    if (matched > 0)
+    {
+        file = candidate.mid(matched);
+    }
+    if (full && file.startsWith(oxygine::Resource::RCC_PREFIX_PATH))
     {
         file.remove(0, QString(oxygine::Resource::RCC_PREFIX_PATH).length());
     }

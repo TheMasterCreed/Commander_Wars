@@ -116,7 +116,6 @@ namespace Coordinator
     };
 
     inline constexpr MilliFunds REPLY_STOCK_PARTS_PER_MILLION = 1'000'000;
-    inline constexpr std::int32_t MAX_FACTORY_SPAWN_CAPPERS = 3;
 
     // Splitting the division keeps the product from overflowing for any non-negative ceiling.
     constexpr std::optional<MilliFunds> replyStockTargetGap(MilliFunds ceiling, MilliFunds ppm)

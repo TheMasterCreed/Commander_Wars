@@ -141,6 +141,8 @@ void MapSelection::changeFolder(QString folder)
             addFiles(newFolder, searchPaths, filterList, filter);
         }
     }
+    CONSOLE_PRINT("MapSelection::changeFolder. Listed " + QString::number(m_Files.size()) +
+                  " entries in " + newFolder, GameConsole::eDEBUG);
     m_currentFolder = newFolder;
     updateSelection();
     if (m_currentIdx < m_Files.size() && m_currentIdx >= 0)

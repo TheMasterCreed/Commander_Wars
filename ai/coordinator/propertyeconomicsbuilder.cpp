@@ -133,6 +133,10 @@ namespace Coordinator
         std::vector<PropertyFacts> properties;
         properties.reserve(buildings.size());
         QHash<QString, BuildingIdFacts> knownFacts;
+        QHash<QString, bool> unitCanCaptureCache;
+        Player* pObserver = knowledge.observerId() >= 0 && knowledge.observerId() < map.getPlayerCount()
+            ? map.getPlayer(knowledge.observerId())
+            : nullptr;
         for (std::size_t i = 0; i < buildings.size(); ++i)
         {
             const KnownBuilding & known = buildings[i];
@@ -157,6 +161,7 @@ namespace Coordinator
                 .capturable = idFacts.capturable,
                 .objective = idFacts.objective,
                 .canProduce = pBuilding->isProductionBuilding(),
+                .canProduceCapper = false,
                 .repairTypeMask = idFacts.repairTypeMask,
             };
             if (facts.canProduce && facts.ownerId == NO_OWNER)
@@ -166,6 +171,23 @@ namespace Coordinator
             else if (facts.canProduce)
             {
                 facts.productionList = pBuilding->getConstructionList();
+            }
+            if (facts.canProduce && pObserver != nullptr)
+            {
+                for (const QString & unitId : facts.productionList)
+                {
+                    auto capIt = unitCanCaptureCache.constFind(unitId);
+                    if (capIt == unitCanCaptureCache.constEnd())
+                    {
+                        Unit probe(unitId, pObserver, false, &map);
+                        capIt = unitCanCaptureCache.insert(unitId, probe.canCapture());
+                    }
+                    if (capIt.value())
+                    {
+                        facts.canProduceCapper = true;
+                        break;
+                    }
+                }
             }
             addCaptureProgress(facts, knowledge);
             properties.push_back(std::move(facts));

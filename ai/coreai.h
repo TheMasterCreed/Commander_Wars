@@ -902,6 +902,7 @@ protected:
     // Named so the overloaded getBaseDamage collapses to one oracle for exchangeBaseDamage.
     static QPointF getBaseDamageAgainst(Unit* pAttacker, Unit* pDefender);
 protected:
+    friend class SimpleProductionSystem;
     std::vector<spIslandMap> m_IslandMaps;
     double m_buildingValue{1.0f};
     double m_ownUnitValue{1.0f};

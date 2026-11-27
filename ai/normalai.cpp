@@ -230,7 +230,7 @@ void NormalAi::process()
     m_missileTarget = (cost >= m_minSiloDamage);
     // Special production actions are claimed inside useBuilding, so planning has to be ready first.
     m_productionSystem.prepareProduction(pBuildings.get(), pUnits.get());
-    if (useBuilding(pBuildings, pUnits))
+    if (useBuildingActions(pBuildings, pUnits))
     {
     }
     else
@@ -282,6 +282,11 @@ void NormalAi::process()
             }
         }
     }
+}
+
+bool NormalAi::useBuildingActions(spQmlVectorBuilding & pBuildings, spQmlVectorUnit & pUnits)
+{
+    return useBuilding(pBuildings, pUnits);
 }
 
 void NormalAi::toggleAiPause()

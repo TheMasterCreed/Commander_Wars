@@ -70,7 +70,9 @@ namespace Coordinator
     }
 
     // actions arrive live and in execution order; anything the own-action measurement cannot take leaves it incomplete.
-    inline ResolvedPlanReply resolvePlanReply(std::span<const PlanReplyAction> actions, const ReplyBoard & board)
+    inline ResolvedPlanReply resolvePlanReply(std::span<const PlanReplyAction> actions, const ReplyBoard & board,
+                                               const OwnFireAt *fireAt = nullptr,
+                                               std::span<const ObservedReplyDefender> spent = {})
     {
         std::vector<PlanChainEntry> ordered;
         std::vector<ReplyTargetFacts> targets;
@@ -95,7 +97,8 @@ namespace Coordinator
             targets.push_back(ReplyTargetFacts{.target = OneActionTarget{
                 action.engineUnitId, candidate.replyFacts->actorRealHp, candidate.actor.replacementCost}});
         }
-        ResolvedPlanReply resolved{.own = measureOwnActions(ordered, targets)};
+        ResolvedPlanReply resolved{.own = fireAt && *fireAt ? measureCombatOwnActions(ordered, targets, *fireAt)
+                                                            : measureOwnActions(ordered, targets)};
         const OwnActionMeasurement & own = resolved.own;
         if (own.status != StockQuoteStatus::Available)
         {
@@ -114,6 +117,16 @@ namespace Coordinator
                 .hpStepsBefore = own.chain.outcomes[index].hpSteps,
                 .destination = candidate.bundle.destination,
             });
+        }
+        for(const auto &defender:spent){
+            const auto *facts=defender.facts.get();
+            if(!facts || !facts->tile || facts->tile->target!=defender.tile || facts->actorRealHp<=0 ||
+               facts->shots.size()!=facts->tile->shooters.size() ||
+               std::any_of(resolved.entries.begin(),resolved.entries.end(),[&](const auto &e){return e.engineUnitId==defender.engineUnitId;}))
+                return ReplyPredictionDetail::refused(StockQuoteStatus::MissingActionFacts,NO_FAILED_ACTION);
+            targets.push_back({.target={defender.engineUnitId,facts->actorRealHp,defender.cost}});
+            resolved.entries.push_back({.pFacts=facts,.engineUnitId=defender.engineUnitId,.actionIndex=NO_ACTION,
+                .hpStepsBefore=ceilHpSteps(facts->actorRealHp),.destination=defender.tile});
         }
         prepareSurvivorReplies(own.chain, planReplyOccupancy(actions, board),
             [&](std::size_t index) { return actions[index].pCandidate->bundle.unitId; },

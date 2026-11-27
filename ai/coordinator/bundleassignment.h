@@ -272,9 +272,19 @@ namespace Coordinator
         {
             case ComponentKind::Fire:
             {
-                const KnownUnitLink target = linkOf(links, pComponent->fire.targetUnitId);
-                action.targetUnitId = target.engineUnitId;
-                action.target = target.tile;
+                if (isTerrainTargetId(pComponent->fire.targetUnitId))
+                {
+                    action.targetUnitId = pComponent->fire.targetUnitId;
+                    action.target = pComponent->fire.targetTile != INVALID_TILE
+                        ? pComponent->fire.targetTile
+                        : decodeTerrainTargetTile(pComponent->fire.targetUnitId);
+                }
+                else
+                {
+                    const KnownUnitLink target = linkOf(links, pComponent->fire.targetUnitId);
+                    action.targetUnitId = target.engineUnitId;
+                    action.target = target.tile;
+                }
                 break;
             }
             case ComponentKind::Capture:
@@ -302,6 +312,11 @@ namespace Coordinator
         if (pComponent == nullptr)
         {
             return false;
+        }
+        if (isTerrainTargetId(pComponent->fire.targetUnitId))
+        {
+            return pComponent->fire.targetTile != INVALID_TILE ||
+                   decodeTerrainTargetTile(pComponent->fire.targetUnitId) != INVALID_TILE;
         }
         const KnownUnitLink target = linkOf(links, pComponent->fire.targetUnitId);
         return target.engineUnitId != NO_UNIT && target.tile != INVALID_TILE;
@@ -514,6 +529,7 @@ namespace Coordinator
         AssignmentResult::SelectionPhase phase{
             AssignmentResult::SelectionPhase::None};
         std::vector<AssignmentResult::CandidateCompleteValue> completeValues;
+        std::vector<PlannedAction> plannedActions;
         bool done{false};
 
         const CandidateBundle & candidate() const
@@ -679,8 +695,13 @@ namespace Coordinator
             return SeatOutcome{ReservationResult::Granted, 0};
         }
         const CandidateBundle & candidate = state.pActor->candidates[static_cast<std::size_t>(option)];
-        const PlannedAction action =
-            plannedActionFrom(input.actionIds, input.unitLinks, state.pActor->engineUnitId, candidate);
+        const bool hasCachedAction = static_cast<std::size_t>(option) < state.plannedActions.size();
+        const PlannedAction builtAction =
+            hasCachedAction
+                ? PlannedAction{}
+                : plannedActionFrom(input.actionIds, input.unitLinks, state.pActor->engineUnitId, candidate);
+        const PlannedAction & action =
+            hasCachedAction ? state.plannedActions[static_cast<std::size_t>(option)] : builtAction;
         ReservationResult claim = ReservationResult::Invalid;
         if (state.actionIndex == NO_ACTION)
         {
@@ -1521,6 +1542,13 @@ namespace Coordinator
                 entry.pActor = &actor;
                 entry.order = plannableCandidateOrder(input.actionIds, input.unitLinks, actor.candidates, stats);
                 entry.options = buildOptionOrder(entry);
+                entry.plannedActions.resize(actor.candidates.size());
+                for (const std::int32_t slot : entry.order)
+                {
+                    const std::size_t index = static_cast<std::size_t>(slot);
+                    entry.plannedActions[index] =
+                        plannedActionFrom(input.actionIds, input.unitLinks, actor.engineUnitId, actor.candidates[index]);
+                }
                 if (input.pTrace != nullptr)
                 {
                     entry.completeValues.resize(actor.candidates.size());
@@ -3672,18 +3700,8 @@ namespace Coordinator
             return total;
         }
 
-        static void buildSearchOptions(
-            const std::vector<ActorProgress> & actors,
-            ClusterSearch & search,
-            std::int32_t candidateCap)
+        static void recomputeSearchCeilings(const std::vector<ActorProgress> & actors, ClusterSearch & search)
         {
-            for (const std::int32_t slot : search.members)
-            {
-                const ActorProgress & state = actors[static_cast<std::size_t>(slot)];
-                search.options.push_back(cappedOptions(
-                    incumbentFirstOptions(state),
-                    candidateCap));
-            }
             search.ceilings.assign(search.members.size() + 1, 0);
             for (std::size_t depth = search.members.size(); depth > 0; --depth)
             {
@@ -3696,6 +3714,48 @@ namespace Coordinator
                 }
                 search.ceilings[depth - 1] = best + search.ceilings[depth];
             }
+        }
+
+        static void filterSearchOptionsAgainstFixedPlan(TurnPlan & plan, const AssignmentInput & input,
+                                                        std::vector<ActorProgress> & actors, ClusterSearch & search)
+        {
+            for (std::size_t depth = 0; depth < search.members.size(); ++depth)
+            {
+                ActorProgress & state = actors[static_cast<std::size_t>(search.members[depth])];
+                std::vector<std::int32_t> feasible;
+                feasible.reserve(search.options[depth].size());
+                for (const std::int32_t option : search.options[depth])
+                {
+                    if (option == NO_CANDIDATE)
+                    {
+                        feasible.push_back(option);
+                        continue;
+                    }
+                    const SeatOutcome outcome = seatOption(plan, input, state, option);
+                    if (outcome.claim == ReservationResult::Granted)
+                    {
+                        feasible.push_back(option);
+                        unseatActor(plan, state);
+                    }
+                }
+                search.options[depth] = std::move(feasible);
+            }
+            recomputeSearchCeilings(actors, search);
+        }
+
+        static void buildSearchOptions(
+            const std::vector<ActorProgress> & actors,
+            ClusterSearch & search,
+            std::int32_t candidateCap)
+        {
+            for (const std::int32_t slot : search.members)
+            {
+                const ActorProgress & state = actors[static_cast<std::size_t>(slot)];
+                search.options.push_back(cappedOptions(
+                    incumbentFirstOptions(state),
+                    candidateCap));
+            }
+            recomputeSearchCeilings(actors, search);
             search.current.assign(search.members.size(), NO_CANDIDATE);
         }
 
@@ -4244,6 +4304,13 @@ namespace Coordinator
                 }
             }
             unseatMembers(plan, actors, members);
+            filterSearchOptionsAgainstFixedPlan(plan, input, actors, search);
+            if (!liveIntervals && !search.stockLive)
+            {
+                search.bestTotal = incumbentTotal;
+                search.legacyBest = incumbentChoices;
+                search.hasBest = true;
+            }
             search.fixedEconomic =
                 seatedPlanTotal(plan, actors);
             searchCluster(plan, input, actors, search, 0, 0, stats);

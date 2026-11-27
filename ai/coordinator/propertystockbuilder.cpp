@@ -241,18 +241,6 @@ namespace Coordinator
         return NO_STOCK_ROW;
     }
 
-    std::int32_t PropertyStockField::enemyRowOf(std::int32_t knowledgeIndex) const
-    {
-        for (std::size_t row = 0; row < m_theirs.rows.size(); ++row)
-        {
-            if (m_theirs.rows[row].knowledgeIndex == knowledgeIndex)
-            {
-                return static_cast<std::int32_t>(row);
-            }
-        }
-        return NO_STOCK_ROW;
-    }
-
     const MarginalTable & PropertyStockField::marginalFor(std::int32_t row, std::int32_t excludedColumn)
     {
         const MarginalKey key{row, excludedColumn};
@@ -263,25 +251,6 @@ namespace Coordinator
         }
         MarginalTable table = buildMarginalTable(m_ours, row, excludedColumn);
         return m_marginals.emplace(key, std::move(table)).first->second;
-    }
-
-    MilliFunds PropertyStockField::enemyOptimumWithout(std::int32_t removedRow)
-    {
-        if (removedRow == NO_STOCK_ROW)
-        {
-            return m_enemyOptimum;
-        }
-        const auto known = m_enemyOptimaWithoutRow.find(removedRow);
-        if (known != m_enemyOptimaWithoutRow.end())
-        {
-            return known->second;
-        }
-        const AssignmentSubInstance sub = subInstanceWithout(m_theirs, removedRow, NO_STOCK_COLUMN);
-        AssignmentSolver solver;
-        solver.solve(sub.rowCount, sub.columnCount, sub.weights);
-        const MilliFunds optimum = solver.optimum();
-        m_enemyOptimaWithoutRow.emplace(removedRow, optimum);
-        return optimum;
     }
 
     MilliFunds PropertyStockField::ourPositionalStock(const PropertyStockActor & actor,
@@ -308,89 +277,6 @@ namespace Coordinator
         }
         return owned + ourPositionalStock(actor, outcome) -
             enemyOptimumWithout(enemyRowOf(outcome.destroyedKnowledgeIndex));
-    }
-
-    JointStockDecomposition PropertyStockField::jointStockDecomposition(
-        std::span<const PlanRowAction> actions)
-    {
-        JointActionFacts facts = jointActionFacts(actions);
-        JointStockDecomposition result;
-        result.ownedBaseline = m_ownedBaseline;
-        for (const std::int32_t column : facts.capturedColumns)
-        {
-            result.ownershipFlipSwingTotal += ownershipFlipSwing(
-                m_ours.columns[static_cast<std::size_t>(column)],
-                m_horizonTurns);
-        }
-        result.ourOpenOptimum = ourOpenOptimum(facts);
-        result.jointEnemyOptimum = m_enemyOptimum;
-        result.stockAbsolute =
-            result.ownedBaseline +
-            result.ownershipFlipSwingTotal +
-            result.ourOpenOptimum -
-            result.jointEnemyOptimum;
-        result.capturedColumns =
-            std::move(facts.capturedColumns);
-        return result;
-    }
-
-    MilliFunds PropertyStockField::jointStock(
-        std::span<const PlanRowAction> actions)
-    {
-        return jointStockDecomposition(actions).stockAbsolute;
-    }
-
-    MilliFunds PropertyStockField::enemyStockLoss(std::span<const std::int32_t> removedEnemyKnowledgeIndices)
-    {
-        if (removedEnemyKnowledgeIndices.empty() || m_theirs.rows.empty() || m_theirs.columns.empty())
-        {
-            return 0;
-        }
-        std::vector<std::int32_t> removedRows;
-        removedRows.reserve(removedEnemyKnowledgeIndices.size());
-        for (const std::int32_t knowledgeIndex : removedEnemyKnowledgeIndices)
-        {
-            const std::int32_t row = enemyRowOf(knowledgeIndex);
-            if (row != NO_STOCK_ROW &&
-                std::find(removedRows.begin(), removedRows.end(), row) == removedRows.end())
-            {
-                removedRows.push_back(row);
-            }
-        }
-        if (removedRows.empty())
-        {
-            return 0;
-        }
-        if (removedRows.size() == 1)
-        {
-            const MilliFunds after = enemyOptimumWithout(removedRows.front());
-            return m_enemyOptimum > after ? m_enemyOptimum - after : 0;
-        }
-        const std::size_t colCount = m_theirs.columns.size();
-        const std::size_t rowCount = m_theirs.rows.size();
-        std::vector<MilliFunds> subWeights;
-        std::size_t keptRows = 0;
-        subWeights.reserve((rowCount - removedRows.size()) * colCount);
-        for (std::size_t r = 0; r < rowCount; ++r)
-        {
-            if (std::find(removedRows.begin(), removedRows.end(), static_cast<std::int32_t>(r)) != removedRows.end())
-            {
-                continue;
-            }
-            const std::size_t rowOffset = r * colCount;
-            subWeights.insert(subWeights.end(),
-                              m_theirs.weights.begin() + static_cast<std::ptrdiff_t>(rowOffset),
-                              m_theirs.weights.begin() + static_cast<std::ptrdiff_t>(rowOffset + colCount));
-            ++keptRows;
-        }
-        if (keptRows == 0)
-        {
-            return m_enemyOptimum > 0 ? m_enemyOptimum : 0;
-        }
-        AssignmentSolver solver;
-        solver.solve(keptRows, colCount, subWeights);
-        const MilliFunds after = solver.optimum();
-        return m_enemyOptimum > after ? m_enemyOptimum - after : 0;
     }
 
     MilliFunds PropertyStockField::stockCeiling() const

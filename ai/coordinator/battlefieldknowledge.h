@@ -35,6 +35,7 @@ namespace Coordinator
         qint32 ammo2{0};
         qint32 fuel{0};
         bool hasMoved{false};
+        bool ignoresUnitCollision{false};
         // Transport's units() index; unitAt() skips cargo.
         qint32 carrier{NO_CARRIER};
         qint32 unitValue{0};
@@ -66,6 +67,30 @@ namespace Coordinator
         BattlefieldKnowledge() = default;
 
         static BattlefieldKnowledge capture(GameMap & map, Player & observer);
+
+        static BattlefieldKnowledge forTest(qint32 width, qint32 height, std::vector<KnownUnit> units,
+                                            qint32 observerId = 0,
+                                            std::vector<Relation> relations = {Relation::Own, Relation::Enemy})
+        {
+            BattlefieldKnowledge k;
+            k.m_observerId = observerId;
+            k.m_width = width;
+            k.m_height = height;
+            k.m_units = std::move(units);
+            k.m_relations = std::move(relations);
+            const std::size_t cells = width > 0 && height > 0
+                ? static_cast<std::size_t>(width) * static_cast<std::size_t>(height) : 0;
+            k.m_unitIndex.assign(cells, NO_UNIT);
+            k.m_visible.assign(cells, true);
+            for (std::size_t i = 0; i < k.m_units.size(); ++i)
+            {
+                const auto & u = k.m_units[i];
+                if (u.carrier == KnownUnit::NO_CARRIER && u.x >= 0 && u.x < width && u.y >= 0 && u.y < height)
+                    k.m_unitIndex[static_cast<std::size_t>(u.y) * static_cast<std::size_t>(width) +
+                                  static_cast<std::size_t>(u.x)] = static_cast<qint32>(i);
+            }
+            return k;
+        }
 
         qint32 observerId() const
         {
@@ -104,7 +129,14 @@ namespace Coordinator
         // Player::getFieldVisible semantics: true under mist and no fog.
         bool isVisible(qint32 x, qint32 y) const;
         GameEnums::VisionType visionType(qint32 x, qint32 y) const;
-        Relation relation(qint32 ownerId) const;
+        Relation relation(qint32 ownerId) const
+        {
+            if (ownerId < 0 || ownerId >= static_cast<qint32>(m_relations.size()))
+            {
+                return Relation::Neutral;
+            }
+            return m_relations[static_cast<std::size_t>(ownerId)];
+        }
 
     private:
         bool onMap(qint32 x, qint32 y) const;

@@ -11,6 +11,8 @@
 #include "game/player.h"
 #include "game/co.h"
 
+#include <QScopedValueRollback>
+
 const char* const GameAction::INPUTSTEP_FIELD = "FIELD";
 const char* const GameAction::INPUTSTEP_MENU = "MENU";
 static constexpr quint32 ACTION_SEED_BOUND = std::numeric_limits<quint32>::max();
@@ -348,6 +350,22 @@ bool GameAction::canBePerformed(const QString & actionID, bool emptyField, Playe
     return false;
 }
 
+bool GameAction::canBePerformedAfterVacating(const QString &actionID, Player &player, Unit &occupant)
+{
+    if (getMovementTarget() != &occupant || getTargetUnit() == &occupant || occupant.getOwner() != &player)
+        return false;
+    const QScopedValueRollback<Unit *> preview(m_previewVacatingUnit, &occupant);
+    return canBePerformed(actionID, false, &player);
+}
+
+bool GameAction::canBePerformedAfterClearing(const QString &actionID, Player &player, Unit &occupant)
+{
+    if (getMovementTarget() != &occupant || getTargetUnit() == &occupant || !player.isEnemyUnit(&occupant))
+        return false;
+    const QScopedValueRollback<Unit *> preview(m_previewVacatingUnit, &occupant);
+    return canBePerformed(actionID, false, &player);
+}
+
 bool GameAction::isFinalStep()
 {
     return isFinalStep(m_actionID);
@@ -526,6 +544,8 @@ Unit* GameAction::getMovementTarget()
     if (m_pMap->onMap(actionTarget.x(), actionTarget.y()))
     {
         pUnit = m_pMap->getTerrain(actionTarget.x(), actionTarget.y())->getUnit();
+        if (pUnit != nullptr && pUnit == m_previewVacatingUnit)
+            return nullptr;
         // ignore stealthed units
         if (pUnit != nullptr)
         {

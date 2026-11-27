@@ -238,6 +238,9 @@ public:
      * @return
      */
     Q_INVOKABLE bool canBePerformed(const QString & actionID, bool emptyField = false, Player* pUsingPlayer = nullptr);
+    // Preview one planned departure without modifying the game map. Execution uses normal eligibility.
+    bool canBePerformedAfterVacating(const QString &actionID, Player &player, Unit &occupant);
+    bool canBePerformedAfterClearing(const QString &actionID, Player &player, Unit &occupant);
     /**
      * @brief isFinalStep
      * @return true if we have all data to perform this action
@@ -476,6 +479,7 @@ private:
       * needed for ai simulations
       */
     Unit* m_pTargetUnit{nullptr};
+    Unit *m_previewVacatingUnit{nullptr};
     spUnit m_perfomingUnit;
     QVector<QPoint> m_MultiTurnPath;
     bool m_isLocal{false};

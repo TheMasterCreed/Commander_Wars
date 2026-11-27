@@ -3472,6 +3472,7 @@ namespace Coordinator
             case GuardedNativeCodeKind::MovementTable:
                 return authenticateMembers(engine, kind, MOVEMENT_HELPER_MEMBERS);
             case GuardedNativeCodeKind::MoveFeet:
+            case GuardedNativeCodeKind::MoveMech:
             case GuardedNativeCodeKind::MoveTireA:
             case GuardedNativeCodeKind::MoveTank:
                 return authenticateMembers(engine, kind, MOVEMENT_CALLBACK_MEMBERS);
@@ -3486,6 +3487,7 @@ namespace Coordinator
         switch (kind)
         {
             case GuardedNativeCodeKind::MoveFeet:
+            case GuardedNativeCodeKind::MoveMech:
             case GuardedNativeCodeKind::MoveTireA:
             case GuardedNativeCodeKind::MoveTank:
                 return authenticateTables(engine, kind, MOVEMENT_TABLE_MEMBERS);

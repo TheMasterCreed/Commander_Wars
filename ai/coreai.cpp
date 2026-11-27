@@ -11,6 +11,7 @@
 #include "game/player.h"
 #include "game/co.h"
 #include "game/actionperformer.h"
+#include "game/gameanimation/gameanimationfactory.h"
 
 #include "menue/basegamemenu.h"
 
@@ -355,7 +356,9 @@ void CoreAI::nextAction()
         if (m_pMenu != nullptr &&
             m_pMap != nullptr &&
             m_pPlayer == m_pMap->getCurrentPlayer() &&
-            m_pMenu->getGameStarted())
+            m_pMenu->getGameStarted() &&
+            (m_pMenu->getActionPerformer() == nullptr || !m_pMenu->getActionPerformer()->getActionRunning()) &&
+            GameAnimationFactory::getAnimationCount() == 0)
         {
             if (m_pause)
             {
@@ -2964,12 +2967,14 @@ qint32 CoreAI::getEnemyUnitCountNearOwnUnits(QmlVectorUnit * pUnits, QmlVectorUn
     qint32 count = 0;
     for (auto & pUnit : pEnemyUnits->getVector())
     {
-        if (pUnit->getHp() >= minHp &&
+        if (pUnit->onMap() &&
+            pUnit->getHp() >= minHp &&
             unitIds.contains(pUnit->getUnitID()))
         {
             for (auto & ownUnit : pUnits->getVector())
             {
-                if (GlobalUtils::getDistance(ownUnit->getPosition(), pUnit->getPosition()) <= distance)
+                if (ownUnit->onMap() &&
+                    GlobalUtils::getDistance(ownUnit->getPosition(), pUnit->getPosition()) <= distance)
                 {
                     ++count;
                     break;
@@ -2990,6 +2995,10 @@ qint32 CoreAI::getBuildingCountsOnEnemyIslands(QmlVectorUnit * pUnits, QmlVector
         bool reachable = false;
         for (auto & pUnit : pUnits->getVector())
         {
+            if (!pUnit->onMap())
+            {
+                continue;
+            }
             qint32 island = getIslandIndex(pUnit.get());
             if (onSameIsland(island, pUnit->getX(), pUnit->getY(), x, y))
             {
@@ -3125,15 +3134,15 @@ bool CoreAI::canTransportToEnemy(Unit* pUnit, Unit* pLoadedUnit, spQmlVectorUnit
     std::vector<QVector3D> targets;
     for (auto & pEnemy : pEnemyUnits->getVector())
     {
+        if (!pEnemy->onMap())
+        {
+            continue;
+        }
         qint32 x = pEnemy->Unit::getX();
         qint32 y = pEnemy->Unit::getY();
         qint32 targetIsland = m_IslandMaps[loadedUnitIslandIdx]->getIsland(x, y);
-        // check if we could reach the enemy if we would be on his island
-        // and we didn't checked this island yet -> improves the speed
-        if (targetIsland >= 0  && !GlobalUtils::contains(checkedIslands, targetIsland))
+        if (targetIsland >= 0 && !GlobalUtils::contains(checkedIslands, targetIsland))
         {
-            // could we beat his ass? -> i mean can we attack him
-            // if so this is a great island
             if (pLoadedUnit->isAttackable(pEnemy.get(), true))
             {
                 checkIslandForUnloading(pUnit, pLoadedUnit, checkedIslands, unitIslandIdx, unitIsland,

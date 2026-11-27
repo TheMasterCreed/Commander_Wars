@@ -1630,9 +1630,10 @@ namespace
                 installed.slotPartners[slot] = Coordinator::servicedPartnersOf(pCandidate->bundle);
                 continue;
             }
-            const std::int32_t target = action.targetUnitId == Coordinator::NO_UNIT
-                                            ? Coordinator::NO_UNIT
-                                            : knowledgeIndexOf(action.targetUnitId);
+            const std::int32_t target =
+                (action.targetUnitId == Coordinator::NO_UNIT || Coordinator::isTerrainTargetId(action.targetUnitId))
+                    ? Coordinator::NO_UNIT
+                    : knowledgeIndexOf(action.targetUnitId);
             if (target != Coordinator::NO_UNIT)
             {
                 installed.slotTargets[slot].insert(target);
@@ -2053,6 +2054,21 @@ namespace
             {KEY_ALLIED_OCCUPANTS, m_alliedOccupants},
             {KEY_NANOS, static_cast<qint64>(Coordinator::nanosSince(started))},
         };
+#ifdef COW_COORDINATED_REFINEMENT_TESTING
+        if (qEnvironmentVariableIntValue("COW_CAPTURE_ROUTE_AUDIT") == 1)
+        {
+            auto captureRoutes = m_view.captureRouteFieldRecord();
+            QJsonArray occupants;
+            for (const Coordinator::KnownUnit & unit : m_view.knowledge.units())
+            {
+                occupants.append(QJsonObject{{"x", unit.x}, {"y", unit.y}, {"hp", unit.hpRounded},
+                    {"cargo", unit.carrier != Coordinator::KnownUnit::NO_CARRIER}, {"ignoresCollision", unit.ignoresUnitCollision},
+                    {"friendly", sideOf(m_view.knowledge.relation(unit.ownerId)) == Coordinator::Side::Ours}});
+            }
+            captureRoutes.insert("knownUnits", occupants);
+            result.insert("captureRoutes", captureRoutes);
+        }
+#endif
         result.insert(KEY_REPLY_PRICING, replyPricingRecord());
         const MeasuredPlan measured = measuredPlan();
         result.insert(KEY_PLAN_REPLAY, planReplayRecord(measured));

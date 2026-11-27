@@ -41,6 +41,8 @@ namespace Coordinator
         Coverage,
         // the service tile is claimed before approach
         Service,
+        // two legal shots on the same unit are deliberately executed in this order
+        CombinedFire,
     };
 
     enum class ReservationResult : std::int8_t
@@ -469,6 +471,50 @@ namespace Coordinator
             return m_damageClaims[slot].plannedHpSteps >= m_damageClaims[slot].remainingHpSteps;
         }
 
+        bool hasEdge(std::int32_t fromActionIndex, std::int32_t toActionIndex) const
+        {
+            for (const PlanEdge & dependency : m_edges)
+            {
+                if (dependency.from == fromActionIndex && dependency.to == toActionIndex)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool hasEdge(std::int32_t fromActionIndex, std::int32_t toActionIndex, PlanEdgeKind kind) const
+        {
+            for (const PlanEdge & dependency : m_edges)
+            {
+                if (dependency.from == fromActionIndex && dependency.to == toActionIndex && dependency.kind == kind)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::vector<std::int32_t> lethalContributorsOn(std::int32_t targetUnitId) const
+        {
+            std::vector<std::int32_t> killers;
+            const std::size_t slot = findDamage(targetUnitId);
+            if (slot >= m_damageClaims.size() ||
+                m_damageClaims[slot].plannedHpSteps < m_damageClaims[slot].remainingHpSteps)
+            {
+                return killers;
+            }
+            for (const DamageContribution & contrib : m_damageClaims[slot].contributions)
+            {
+                if (contrib.actionIndex != NO_ACTION && contrib.hpSteps > 0 &&
+                    hasAction(contrib.actionIndex) && isLiveState(action(contrib.actionIndex).state))
+                {
+                    killers.push_back(contrib.actionIndex);
+                }
+            }
+            return killers;
+        }
+
         // false on an unknown index, self loop, or repeated pair
         bool addEdge(std::int32_t fromActionIndex, std::int32_t toActionIndex, PlanEdgeKind kind)
         {
@@ -513,6 +559,15 @@ namespace Coordinator
             std::erase_if(m_edges, [kind](const PlanEdge & edge) { return edge.kind == kind; });
         }
 
+        void removeCombinedFireEdgesBetween(std::int32_t actionA, std::int32_t actionB)
+        {
+            std::erase_if(m_edges, [actionA, actionB](const PlanEdge & edge) {
+                return edge.kind == PlanEdgeKind::CombinedFire &&
+                       ((edge.from == actionA && edge.to == actionB) ||
+                        (edge.from == actionB && edge.to == actionA));
+            });
+        }
+
         std::vector<VacateConflict> rebuildVacateEdges(std::span<const OccupancyEntry> occupancy)
         {
             clearEdgesOfKind(PlanEdgeKind::Vacate);
@@ -536,7 +591,24 @@ namespace Coordinator
                     continue;
                 }
                 const std::int32_t occupantAction = liveActionOfUnit(occupantUnit);
-                if (occupantAction == NO_ACTION || !vacatesTile(action(occupantAction), mover.destination))
+                if (occupantAction == NO_ACTION)
+                {
+                    const auto killers = lethalContributorsOn(occupantUnit);
+                    if (!killers.empty())
+                    {
+                        for (const std::int32_t killerAction : killers)
+                        {
+                            if (killerAction != index && !hasEdge(killerAction, index))
+                            {
+                                addEdge(killerAction, index, PlanEdgeKind::Wallbreak);
+                            }
+                        }
+                        continue;
+                    }
+                    conflicts.push_back(VacateConflict{index, occupantUnit, occupantAction});
+                    continue;
+                }
+                if (!vacatesTile(action(occupantAction), mover.destination))
                 {
                     conflicts.push_back(VacateConflict{index, occupantUnit, occupantAction});
                     continue;
