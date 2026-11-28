@@ -1,6 +1,7 @@
 #include "ai/coordinator/bundlebuilder.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <utility>
 
@@ -266,11 +267,14 @@ namespace
             for (std::int32_t x = 0; x < m_context.knowledge.width(); ++x)
             {
                 Terrain * pTerrain = m_context.map.getTerrain(x, y);
-                if (pTerrain != nullptr && pTerrain->getHp() > 0 &&
-                    pTerrain->getUnit() == nullptr && pTerrain->getBuilding() == nullptr)
-                {
+                if (pTerrain == nullptr || pTerrain->getUnit() != nullptr)
+                    continue;
+                Building * pBld = pTerrain->getBuilding();
+                const bool attackableBuilding = pBld != nullptr && pBld->getHp() > 0 &&
+                    (pBld->getOwner() == nullptr ||
+                     m_context.knowledge.relation(pBld->getOwner()->getPlayerID()) == Coordinator::Relation::Enemy);
+                if ((pTerrain->getHp() > 0 && pBld == nullptr) || attackableBuilding)
                     m_pCache->breakableTerrainTiles.push_back(TilePoint{x, y});
-                }
             }
         }
         m_pCache->positionFireRangeFixed = !mapHasPositionFireRangeModifier(m_context.map);
@@ -891,8 +895,16 @@ namespace
             if (pKnownTarget == nullptr)
             {
                 Terrain * pTargetTerrain = m_context.map.getTerrain(target.x(), target.y());
-                if (pTargetTerrain == nullptr || pTargetTerrain->getHp() <= 0 ||
-                    pTargetTerrain->getUnit() != nullptr || pTargetTerrain->getBuilding() != nullptr)
+                if (pTargetTerrain == nullptr || pTargetTerrain->getUnit() != nullptr)
+                {
+                    continue;
+                }
+                Building * pTargetBld = pTargetTerrain->getBuilding();
+                const bool attackableBuilding = pTargetBld != nullptr && pTargetBld->getHp() > 0 &&
+                    (pTargetBld->getOwner() == nullptr ||
+                     m_context.knowledge.relation(pTargetBld->getOwner()->getPlayerID()) == Coordinator::Relation::Enemy);
+                const qint32 targetRawHp = attackableBuilding ? pTargetBld->getHp() : pTargetTerrain->getHp();
+                if (targetRawHp <= 0 || (!attackableBuilding && pTargetBld != nullptr))
                 {
                     continue;
                 }
@@ -913,7 +925,7 @@ namespace
                 const TilePoint targetTile{target.x(), target.y()};
                 const double terrainRealHp = std::min<double>(
                     Coordinator::UNIT_HP_STEPS,
-                    static_cast<double>(pTargetTerrain->getHp()) / Coordinator::TERRAIN_HP_PER_STEP);
+                    static_cast<double>(targetRawHp) / Coordinator::TERRAIN_HP_PER_STEP);
                 const std::int32_t targetHpSteps = Coordinator::ceilHpSteps(terrainRealHp);
                 const std::int32_t dmgSteps = Coordinator::damageStepsFrom(terrainRealHp, envReport.x());
                 if (targetHpSteps <= 0 || dmgSteps <= 0)
@@ -1294,12 +1306,22 @@ namespace Coordinator
         {
             return NO_TURN_LIMIT;
         }
-        VictoryRule* pRule = pRules->getVictoryRule(TURN_LIMIT_VICTORY_RULE);
-        if (pRule == nullptr)
+        std::int32_t tightest = NO_TURN_LIMIT;
+        const std::array<QString, 3> turnRules{
+            TURN_LIMIT_VICTORY_RULE,
+            QStringLiteral("VICTORYRULE_TURNLIMIT_CAPTURE_RACE"),
+            QStringLiteral("VICTORYRULE_TURNLIMIT_SCORE_RACE"),
+        };
+        for (const QString & ruleId : turnRules)
         {
-            return NO_TURN_LIMIT;
+            VictoryRule* pRule = pRules->getVictoryRule(ruleId);
+            if (pRule == nullptr)
+                continue;
+            const std::int32_t rem = remainingTurnLimit(pRule->getRuleValue(TURN_LIMIT_RULE_ITEM), map.getCurrentDay());
+            if (rem != NO_TURN_LIMIT && (tightest == NO_TURN_LIMIT || rem < tightest))
+                tightest = rem;
         }
-        return remainingTurnLimit(pRule->getRuleValue(TURN_LIMIT_RULE_ITEM), map.getCurrentDay());
+        return tightest;
     }
 
     ValuationContext makeValuationContext(GameMap & map)

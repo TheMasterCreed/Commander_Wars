@@ -250,21 +250,126 @@ namespace
             return defenseGrid->lookup(i, at);
         };
         terrain->defense = std::move(stockDefense);
+        // Collect breakable terrain (Pipe Seams, Meteors) and attackable/weaponized buildings (Black Cannons, Lasers, Crystals, Death Rays).
+        Unit * pSampleFriendly = nullptr;
+        MilliFunds totalFriendlyCap = 0;
+        std::int32_t friendlyCapCount = 0;
+        MilliFunds totalEnemyCap = 0;
+        std::int32_t enemyCapCount = 0;
+        for (std::size_t ki = 0; ki < terrain->units.size(); ++ki)
+        {
+            const auto & p = terrain->units[ki];
+            if (!p.present || p.replacementCost <= 0) continue;
+            if (p.enemy)
+            {
+                totalEnemyCap += p.replacementCost;
+                ++enemyCapCount;
+            }
+            else
+            {
+                totalFriendlyCap += p.replacementCost;
+                ++friendlyCapCount;
+                if (pSampleFriendly == nullptr)
+                    pSampleFriendly = live(static_cast<int>(ki));
+            }
+        }
+        const MilliFunds avgFriendlyCost = friendlyCapCount > 0 ? totalFriendlyCap / friendlyCapCount : 0;
+        const MilliFunds avgEnemyCost = enemyCapCount > 0 ? totalEnemyCap / enemyCapCount : 0;
         for (int y = 0; y < terrain->height; ++y)
         {
             for (int x = 0; x < terrain->width; ++x)
             {
                 Terrain * pT = map.getTerrain(x, y);
-                if (pT == nullptr || pT->getHp() <= 0 || pT->getBuilding() != nullptr)
+                if (pT == nullptr)
+                    continue;
+                Building * pB = pT->getBuilding();
+                const bool enemyOrNeutralBld = pB != nullptr &&
+                    (pB->getOwner() == nullptr ||
+                     knowledge.relation(pB->getOwner()->getPlayerID()) == Relation::Enemy);
+                const bool breakableTerrain = pB == nullptr && pT->getHp() > 0;
+                const bool breakableBld = enemyOrNeutralBld && pB->getHp() > 0;
+                std::vector<TilePoint> hazardTiles;
+                std::int32_t hazardDmgSteps = 0;
+                bool hazardSingleTarget = true;
+                bool hazardActiveE0 = false;
+                MilliFunds directWeaponStake = 0;
+                if (enemyOrNeutralBld)
+                {
+                    spQmlVectorPoint pFields(pB->getActionTargetFields());
+                    if (pFields.get() != nullptr && pFields->size() > 0)
+                    {
+                        const QPoint offset = pB->getActionTargetOffset();
+                        for (const QPoint & pt : pFields->getVector())
+                        {
+                            const int tx = x + offset.x() + pt.x();
+                            const int ty = y + offset.y() + pt.y();
+                            if (map.onMap(tx, ty))
+                                hazardTiles.push_back(TilePoint{tx, ty});
+                        }
+                        const qreal rawDmg = pB->getDamage(pSampleFriendly);
+                        const QStringList actions = pB->getActionList();
+                        const bool isSingleCannon = actions.contains(QStringLiteral("ACTION_CANNON_FIRE"));
+                        hazardSingleTarget = isSingleCannon;
+                        const qint32 fireCd = pB->getFireCount();
+                        const bool targetsUs = pB->getOwner() != nullptr ||
+                            pB->getBuildingTargets() != GameEnums::BuildingTarget_Own;
+                        if (rawDmg > 0.0 && targetsUs)
+                        {
+                            hazardDmgSteps = std::clamp<std::int32_t>(
+                                static_cast<std::int32_t>(std::llround(rawDmg)), 1, UNIT_HP_STEPS);
+                            hazardActiveE0 = (fireCd == 0);
+                            if (breakableBld && avgFriendlyCost > 0)
+                            {
+                                const MilliFunds perShot = bookDamage(avgFriendlyCost, hazardDmgSteps);
+                                const std::int32_t aoeScale = hazardSingleTarget ? 1 : 2;
+                                const MilliFunds horizonVal = perShot * aoeScale * DEFAULT_ECONOMIC_RELEVANCE_HORIZON;
+                                directWeaponStake = totalFriendlyCap > 0
+                                    ? std::min(totalFriendlyCap, horizonVal)
+                                    : horizonVal;
+                            }
+                        }
+                        else if (rawDmg < 0.0 && breakableBld && pB->getOwner() != nullptr && avgEnemyCost > 0)
+                        {
+                            const std::int32_t healSteps = std::clamp<std::int32_t>(
+                                static_cast<std::int32_t>(std::llround(-rawDmg)), 1, UNIT_HP_STEPS);
+                            const MilliFunds perTurnHeal = bookDamage(avgEnemyCost, healSteps);
+                            directWeaponStake = std::min(
+                                totalEnemyCap > 0 ? totalEnemyCap : perTurnHeal * DEFAULT_ECONOMIC_RELEVANCE_HORIZON,
+                                perTurnHeal * DEFAULT_ECONOMIC_RELEVANCE_HORIZON);
+                        }
+                    }
+                    if (breakableBld && pB->isProductionBuilding() && pB->getOwner() != nullptr)
+                    {
+                        const MilliFunds prodStake =
+                            toMilliFunds(std::max<qint32>(0, pB->getOwner()->calcIncome())) *
+                            DEFAULT_ECONOMIC_RELEVANCE_HORIZON;
+                        directWeaponStake = std::max(directWeaponStake, prodStake);
+                    }
+                }
+                if (!breakableTerrain && !breakableBld && !(hazardActiveE0 && hazardDmgSteps > 0 && !hazardTiles.empty()))
                     continue;
                 BreakableTerrainTile bt;
                 bt.tile = {x, y};
-                const double realHp = std::min<double>(
-                    UNIT_HP_STEPS,
-                    static_cast<double>(pT->getHp()) / TERRAIN_HP_PER_STEP);
-                bt.hpSteps = std::max<std::int32_t>(1, ceilHpSteps(realHp));
-                bt.opensPlasma = (pT->getID() == QLatin1String("METEOR"));
-                bt.openedTiles.push_back(bt.tile);
+                const qint32 rawHp = breakableBld ? pB->getHp() : (breakableTerrain ? pT->getHp() : 0);
+                if (rawHp > 0)
+                {
+                    const double realHp = std::min<double>(
+                        UNIT_HP_STEPS,
+                        static_cast<double>(rawHp) / TERRAIN_HP_PER_STEP);
+                    bt.hpSteps = std::max<std::int32_t>(1, ceilHpSteps(realHp));
+                }
+                else
+                {
+                    bt.hpSteps = 0;
+                }
+                bt.opensPlasma = breakableTerrain && (pT->getID() == QLatin1String("METEOR"));
+                bt.directWeaponStake = directWeaponStake;
+                bt.hazardTiles = std::move(hazardTiles);
+                bt.hazardDamageSteps = hazardDmgSteps;
+                bt.hazardSingleTarget = hazardSingleTarget;
+                bt.hazardActiveE0 = hazardActiveE0;
+                if (breakableTerrain || breakableBld)
+                    bt.openedTiles.push_back(bt.tile);
                 if (bt.opensPlasma)
                 {
                     std::set<std::pair<int, int>> visited{{x, y}};
@@ -300,7 +405,11 @@ namespace
                 return 0.0;
             Unit * pU = live(actorKi);
             Terrain * pT = map.getTerrain(targetTile.x, targetTile.y);
-            if (pU == nullptr || pT == nullptr || pT->getHp() <= 0)
+            if (pU == nullptr || pT == nullptr)
+                return 0.0;
+            if (Building * pB = pT->getBuilding(); pB != nullptr && pB->getHp() > 0)
+                return static_cast<double>(pU->getEnvironmentDamage(pB->getBuildingID()));
+            if (pT->getHp() <= 0)
                 return 0.0;
             return static_cast<double>(pU->getEnvironmentDamage(pT->getID()));
         };
@@ -461,14 +570,115 @@ namespace
         bool ordinaryStandingCapture{};
         HeadquartersTerrainTurn standingTerrain;
         HeadquartersTurnUnits turnUnits;
-
+        bool hasNoUnitsRule{false};
+        int buildingLimit{0};
+        int ownBuildings{0};
+        int maxEnemyBuildings{0};
+        int killLimit{0};
+        int ownKills{0};
+        int maxEnemyKills{0};
+        int coUnitLimit{0};
+        int ownCoLost{0};
+        int minEnemyCoLost{0};
+        std::vector<std::uint8_t> isCoUnit;
+        bool captureRaceFinalTurn{false};
+        int captureRaceOwnBuildings{0};
+        int captureRaceMaxEnemyBuildings{0};
+        bool turnLimitLossOnFinalTurn{false};
     };
 
     HeadquartersWatch headquartersWatch(GameMap &map, const BattlefieldKnowledge &knowledge,
                                         const CombatTerrain &terrain)
     {
         HeadquartersWatch watch;
-        if (!map.getGameRules()->hasVictoryRule(QStringLiteral("VICTORYRULE_NOHQ")))
+        GameRules * rules = map.getGameRules();
+        if (rules == nullptr)
+            return watch;
+        // Snapshot all non-HQ victory rules once per turn so search evaluation stays zero-JS and symmetric.
+        Player * pObs = knowledge.observerId() >= 0 && knowledge.observerId() < map.getPlayerCount()
+            ? map.getPlayer(knowledge.observerId()) : nullptr;
+        watch.hasNoUnitsRule = rules->hasVictoryRule(QStringLiteral("VICTORYRULE_NOUNITS")) ||
+            rules->hasVictoryRule(QStringLiteral("VICTORYRULE_UNITSDOMINATION"));
+        if (VictoryRule * pBld = rules->getVictoryRule(QStringLiteral("VICTORYRULE_BUILDINGLIMIT"));
+            pBld != nullptr && pObs != nullptr)
+        {
+            watch.buildingLimit = std::max<qint32>(0, pBld->getRuleValue(0));
+            watch.ownBuildings = std::max<qint32>(0, pBld->getRuleProgress(0, pObs));
+            for (qint32 pi = 0; pi < map.getPlayerCount(); ++pi)
+            {
+                Player * pOther = map.getPlayer(pi);
+                if (pOther != nullptr && !pOther->getIsDefeated() && knowledge.relation(pi) == Relation::Enemy)
+                    watch.maxEnemyBuildings = std::max<int>(watch.maxEnemyBuildings, pBld->getRuleProgress(0, pOther));
+            }
+        }
+        if (VictoryRule * pElim = rules->getVictoryRule(QStringLiteral("VICTORYRULE_ELIMINATION"));
+            pElim != nullptr && pObs != nullptr)
+        {
+            watch.killLimit = std::max<qint32>(0, pElim->getRuleValue(0));
+            watch.ownKills = std::max<qint32>(0, pElim->getRuleProgress(0, pObs));
+            for (qint32 pi = 0; pi < map.getPlayerCount(); ++pi)
+            {
+                Player * pOther = map.getPlayer(pi);
+                if (pOther != nullptr && !pOther->getIsDefeated() && knowledge.relation(pi) == Relation::Enemy)
+                    watch.maxEnemyKills = std::max<int>(watch.maxEnemyKills, pElim->getRuleProgress(0, pOther));
+            }
+        }
+        if (VictoryRule * pCo = rules->getVictoryRule(QStringLiteral("VICTORYRULE_COUNITLOST"));
+            pCo != nullptr && pObs != nullptr)
+        {
+            watch.coUnitLimit = std::max<qint32>(0, pCo->getRuleValue(0));
+            watch.ownCoLost = std::max<qint32>(0, pCo->getRuleProgress(0, pObs));
+            bool foundEnemy = false;
+            for (qint32 pi = 0; pi < map.getPlayerCount(); ++pi)
+            {
+                Player * pOther = map.getPlayer(pi);
+                if (pOther != nullptr && !pOther->getIsDefeated() && knowledge.relation(pi) == Relation::Enemy)
+                {
+                    const int lost = std::max<int>(0, pCo->getRuleProgress(0, pOther));
+                    watch.minEnemyCoLost = foundEnemy ? std::min(watch.minEnemyCoLost, lost) : lost;
+                    foundEnemy = true;
+                }
+            }
+            watch.isCoUnit.assign(terrain.units.size(), 0);
+            for (std::size_t ki = 0; ki < terrain.units.size() && ki < knowledge.units().size(); ++ki)
+            {
+                const auto & ku = knowledge.units()[ki];
+                if (!map.onMap(ku.x, ku.y)) continue;
+                Unit * pU = map.getTerrain(ku.x, ku.y)->getUnit();
+                if (pU != nullptr && pU->getUniqueID() == terrain.units[ki].engineUnitId &&
+                    (pU->getUnitRank() == GameEnums::UnitRank_CO0 || pU->getUnitRank() == GameEnums::UnitRank_CO1))
+                    watch.isCoUnit[ki] = 1;
+            }
+        }
+        if (VictoryRule * pCapRace = rules->getVictoryRule(QStringLiteral("VICTORYRULE_TURNLIMIT_CAPTURE_RACE"));
+            pCapRace != nullptr && pObs != nullptr)
+        {
+            const qint32 turnLimit = pCapRace->getRuleValue(0);
+            if (turnLimit > 0 && map.getCurrentDay() >= turnLimit)
+            {
+                watch.captureRaceFinalTurn = true;
+                watch.captureRaceOwnBuildings = std::max<qint32>(0, pCapRace->getRuleProgress(0, pObs));
+                for (qint32 pi = 0; pi < map.getPlayerCount(); ++pi)
+                {
+                    Player * pOther = map.getPlayer(pi);
+                    if (pOther != nullptr && !pOther->getIsDefeated() && knowledge.relation(pi) == Relation::Enemy)
+                        watch.captureRaceMaxEnemyBuildings = std::max<int>(
+                            watch.captureRaceMaxEnemyBuildings, pCapRace->getRuleProgress(0, pOther));
+                }
+            }
+        }
+        if (VictoryRule * pTl = rules->getVictoryRule(QStringLiteral("VICTORYRULE_TURNLIMIT"));
+            pTl != nullptr && pObs != nullptr)
+        {
+            const qint32 turnLimit = pTl->getRuleValue(0);
+            const qint32 victoryTeam = pTl->getRuleValue(1);
+            if (turnLimit > 0 && map.getCurrentDay() >= turnLimit && pObs->getTeam() != victoryTeam - 1)
+                watch.turnLimitLossOnFinalTurn = true;
+        }
+        const bool hasHqRule = rules->hasVictoryRule(QStringLiteral("VICTORYRULE_NOHQ")) ||
+            rules->hasVictoryRule(QStringLiteral("VICTORYRULE_FIRSTHQ")) ||
+            rules->hasVictoryRule(QStringLiteral("VICTORYRULE_1NOHQ_TOWN_REPLACE"));
+        if (!hasHqRule)
             return watch;
         std::vector<TilePoint> own, enemy;
         for (const auto &b : knowledge.buildings())
@@ -983,62 +1193,111 @@ namespace
         const bool needsCover = approaching && !gainedHQ;
         const int security = !needsCover || guard != NO_UNIT ? 0 : canEnterBeforeReturn ? -2 : -1;
         CombatRank rank{terminal, security, 0, 0};
-        GameRules * rules = map.getGameRules();
-        if (rules != nullptr && rules->getVictoryRule(QStringLiteral("VICTORYRULE_NOUNITS")) != nullptr &&
-            std::get<0>(rank) == TerminalClass::Unresolved)
+        const bool needUnitTallies = watch.hasNoUnitsRule || watch.killLimit > 0 || watch.coUnitLimit > 0;
+        const bool needCaptureTallies = watch.buildingLimit > 0 || watch.captureRaceFinalTurn;
+        if (std::get<0>(rank) == TerminalClass::Unresolved && (needUnitTallies || needCaptureTallies || watch.turnLimitLossOnFinalTurn))
         {
             int enemyInitial = 0;
             int enemyAlive = 0;
             int ownInitial = 0;
             int ownAlive = 0;
-            std::vector<std::uint8_t> seenActor(terrain.units.size(), 0);
-            for (const auto & actor : eval.actors)
+            int enemyCoKilled = 0;
+            int ownCoKilled = 0;
+            int ownFinishedCaps = 0;
+            int enemyFinishableCaps = 0;
+            if (needUnitTallies)
             {
-                const int ki = problem.actors()[static_cast<std::size_t>(actor.actorSlot)].knowledgeUnitIndex;
-                if (ki >= 0 && ki < static_cast<int>(seenActor.size()))
+                std::vector<std::uint8_t> seenActor(terrain.units.size(), 0);
+                for (const auto & actor : eval.actors)
                 {
-                    seenActor[static_cast<std::size_t>(ki)] = 1;
-                    ++ownInitial;
-                    if (actor.stepsAfterReply > 0)
-                        ++ownAlive;
+                    const int ki = problem.actors()[static_cast<std::size_t>(actor.actorSlot)].knowledgeUnitIndex;
+                    if (ki >= 0 && ki < static_cast<int>(seenActor.size()))
+                    {
+                        seenActor[static_cast<std::size_t>(ki)] = 1;
+                        ++ownInitial;
+                        if (actor.stepsAfterReply > 0)
+                            ++ownAlive;
+                        else if (ki < static_cast<int>(watch.isCoUnit.size()) && watch.isCoUnit[static_cast<std::size_t>(ki)] != 0)
+                            ++ownCoKilled;
+                    }
+                }
+                for (int ki = 0; ki < static_cast<int>(terrain.units.size()); ++ki)
+                {
+                    const auto & p = terrain.units[static_cast<std::size_t>(ki)];
+                    if (!p.present) continue;
+                    if (p.enemy)
+                    {
+                        ++enemyInitial;
+                        int remSteps = ki < static_cast<int>(knowledge.units().size())
+                            ? knowledge.units()[static_cast<std::size_t>(ki)].hpRounded
+                            : ceilHpSteps(p.realHp >= 0.0 ? p.realHp : UNIT_HP_STEPS);
+                        if (const auto itR = eval.enemyReplyHp.find(ki); itR != eval.enemyReplyHp.end())
+                            remSteps = itR->second;
+                        else if (const auto itO = eval.enemyAfterOwn.find(ki); itO != eval.enemyAfterOwn.end())
+                            remSteps = itO->second;
+                        if (remSteps > 0)
+                            ++enemyAlive;
+                        else if (ki < static_cast<int>(watch.isCoUnit.size()) && watch.isCoUnit[static_cast<std::size_t>(ki)] != 0)
+                            ++enemyCoKilled;
+                    }
+                    else if (seenActor[static_cast<std::size_t>(ki)] == 0 &&
+                             ki < static_cast<int>(knowledge.units().size()) &&
+                             knowledge.units()[static_cast<std::size_t>(ki)].hpRounded > 0)
+                    {
+                        ++ownInitial;
+                        bool alive = true;
+                        if (const auto itOwn = eval.realAfterReply.find(ki); itOwn != eval.realAfterReply.end())
+                            alive = ceilHpSteps(itOwn->second) > 0;
+                        if (alive)
+                            ++ownAlive;
+                        else if (ki < static_cast<int>(watch.isCoUnit.size()) && watch.isCoUnit[static_cast<std::size_t>(ki)] != 0)
+                            ++ownCoKilled;
+                    }
                 }
             }
-            for (int ki = 0; ki < static_cast<int>(terrain.units.size()); ++ki)
+            if (needCaptureTallies)
             {
-                const auto & p = terrain.units[static_cast<std::size_t>(ki)];
-                if (!p.present) continue;
-                if (p.enemy)
+                for (const auto & actor : eval.actors)
                 {
-                    ++enemyInitial;
-                    int remSteps = ki < static_cast<int>(knowledge.units().size())
-                        ? knowledge.units()[static_cast<std::size_t>(ki)].hpRounded
-                        : ceilHpSteps(p.realHp >= 0.0 ? p.realHp : UNIT_HP_STEPS);
+                    const auto & cand = problem.actors()[static_cast<std::size_t>(actor.actorSlot)]
+                        .candidates[static_cast<std::size_t>(actor.candidateIndex)];
+                    if (cand.capture.has_value() && cand.capture->turnsUntilOwned <= 0)
+                        ++ownFinishedCaps;
+                }
+                for (int ki = 0; ki < static_cast<int>(terrain.units.size()) && ki < static_cast<int>(knowledge.units().size()); ++ki)
+                {
+                    const auto & p = terrain.units[static_cast<std::size_t>(ki)];
+                    const auto & ku = knowledge.units()[static_cast<std::size_t>(ki)];
+                    if (!p.present || !p.enemy || !ku.canCapture || ku.capturePoints <= 0) continue;
+                    if (spentEnemyActions[static_cast<std::size_t>(ki)] != 0) continue;
+                    int remSteps = ku.hpRounded;
                     if (const auto itR = eval.enemyReplyHp.find(ki); itR != eval.enemyReplyHp.end())
                         remSteps = itR->second;
                     else if (const auto itO = eval.enemyAfterOwn.find(ki); itO != eval.enemyAfterOwn.end())
                         remSteps = itO->second;
-                    if (remSteps > 0)
-                        ++enemyAlive;
-                }
-                else if (seenActor[static_cast<std::size_t>(ki)] == 0 &&
-                         ki < static_cast<int>(knowledge.units().size()) &&
-                         knowledge.units()[static_cast<std::size_t>(ki)].hpRounded > 0)
-                {
-                    ++ownInitial;
-                    if (const auto itOwn = eval.realAfterReply.find(ki); itOwn != eval.realAfterReply.end())
-                    {
-                        if (ceilHpSteps(itOwn->second) > 0)
-                            ++ownAlive;
-                    }
-                    else
-                    {
-                        ++ownAlive;
-                    }
+                    if (remSteps > 0 && ku.capturePoints + remSteps >= field.capturePointsToCapture())
+                        ++enemyFinishableCaps;
                 }
             }
-            if (enemyInitial > 0 && enemyAlive == 0)
+            const int enemyKilled = std::max(0, enemyInitial - enemyAlive);
+            const int ownKilled = std::max(0, ownInitial - ownAlive);
+            const bool wonByNoUnits = watch.hasNoUnitsRule && enemyInitial > 0 && enemyAlive == 0;
+            const bool lostByNoUnits = watch.hasNoUnitsRule && ownInitial > 0 && ownAlive == 0;
+            const bool wonByElim = watch.killLimit > 0 && (watch.ownKills + enemyKilled) >= watch.killLimit;
+            const bool lostByElim = watch.killLimit > 0 && (watch.maxEnemyKills + ownKilled) >= watch.killLimit;
+            const bool wonByCo = watch.coUnitLimit > 0 && enemyCoKilled > 0 &&
+                (watch.minEnemyCoLost + enemyCoKilled) >= watch.coUnitLimit;
+            const bool lostByCo = watch.coUnitLimit > 0 && ownCoKilled > 0 &&
+                (watch.ownCoLost + ownCoKilled) >= watch.coUnitLimit;
+            const bool wonByBld = watch.buildingLimit > 0 && (watch.ownBuildings + ownFinishedCaps) >= watch.buildingLimit;
+            const bool lostByBld = watch.buildingLimit > 0 && (watch.maxEnemyBuildings + enemyFinishableCaps) >= watch.buildingLimit;
+            const bool wonByCapRace = watch.captureRaceFinalTurn &&
+                (watch.captureRaceOwnBuildings + ownFinishedCaps) > watch.captureRaceMaxEnemyBuildings;
+            const bool lostByCapRace = watch.captureRaceFinalTurn &&
+                (watch.captureRaceOwnBuildings + ownFinishedCaps) < watch.captureRaceMaxEnemyBuildings;
+            if (wonByNoUnits || wonByElim || wonByCo || wonByBld || wonByCapRace)
                 std::get<0>(rank) = TerminalClass::ForcedWin;
-            else if (ownInitial > 0 && ownAlive == 0)
+            else if (lostByNoUnits || lostByElim || lostByCo || lostByBld || lostByCapRace || watch.turnLimitLossOnFinalTurn)
                 std::get<0>(rank) = TerminalClass::ForcedLoss;
         }
         return rank;
@@ -2302,10 +2561,11 @@ namespace Coordinator
             for (int i = 0; i < static_cast<int>(knowledge.units().size()); ++i)
             {
                 const auto & known = knowledge.units()[static_cast<std::size_t>(i)];
-                if (knowledge.relation(known.ownerId) != Relation::Own ||
+                const Relation rel = knowledge.relation(known.ownerId);
+                if ((rel != Relation::Own && rel != Relation::Allied) ||
                     known.carrier != KnownUnit::NO_CARRIER || known.hpRounded <= 0)
                     continue;
-                if (std::ranges::any_of(problem.actors(), [&](const MasterActor & m) {
+                if (rel == Relation::Own && std::ranges::any_of(problem.actors(), [&](const MasterActor & m) {
                         return m.knowledgeUnitIndex == i;
                     }))
                     continue;
@@ -2327,7 +2587,8 @@ namespace Coordinator
                     }
                 }
                 local->observedDefenders.push_back(
-                    {i, pawn.engineUnitId, pawn.tile, observedCost, facts, field.ourRowOf(i)});
+                    {i, pawn.engineUnitId, pawn.tile, observedCost, facts,
+                     rel == Relation::Own ? field.ourRowOf(i) : NO_STOCK_ROW});
             }
         }
         ReplyBoard actingBoard = initialBoard;
@@ -2644,21 +2905,19 @@ namespace Coordinator
                 return open("OBSERVED_E0_TARGET_WORK_LIMIT");
             const auto facts=replyFacts->factsFor(i,*live,pawn.tile);
             if(!facts || !facts->tile || facts->tile->shooters.size()!=facts->shots.size())return open("OBSERVED_TARGET_WEAPONS_UNAVAILABLE");
-            const bool exposed=std::any_of(facts->shots.begin(),facts->shots.end(),[](const auto &v){return v.rawBase>=0 || v.withAmmo>=0;});
-            if(exposed && relation!=Relation::Own)
-                return open("ALLIED_CARGO_OR_STEALTH_TARGET_CONSEQUENCE_UNPRICED");
-            if(relation==Relation::Own){
-                MilliFunds observedCost=pawn.replacementCost;
-                for(qint32 c=0;c<live->getLoadedUnitCount();++c){
-                    if(const Unit *cargo=live->getLoadedUnit(c)){
-                        observedCost+=(toMilliFunds(std::max<qint32>(0,cargo->getUnitCosts()))*
-                                       std::max<qint32>(1,cargo->getHpRounded()))/UNIT_HP_STEPS;
-                    }
+            MilliFunds observedCost=pawn.replacementCost;
+            for(qint32 c=0;c<live->getLoadedUnitCount();++c){
+                if(const Unit *cargo=live->getLoadedUnit(c)){
+                    observedCost+=(toMilliFunds(std::max<qint32>(0,cargo->getUnitCosts()))*
+                                   std::max<qint32>(1,cargo->getHpRounded()))/UNIT_HP_STEPS;
                 }
-                terrain->observedDefenders.push_back({i,pawn.engineUnitId,pawn.tile,observedCost,facts,field.ourRowOf(i)});
-                observedDefenders.append(QJsonObject{{"unit",pawn.engineUnitId},{"tile",tile(pawn.tile)},{"hp",facts->actorRealHp},
-                    {"fuel",known.fuel},{"ammo",QJsonArray{known.ammo1,known.ammo2}},{"possibleShooters",int(facts->tile->shooters.size())}});
             }
+            terrain->observedDefenders.push_back(
+                {i,pawn.engineUnitId,pawn.tile,observedCost,facts,
+                 relation==Relation::Own ? field.ourRowOf(i) : NO_STOCK_ROW});
+            observedDefenders.append(QJsonObject{{"unit",pawn.engineUnitId},{"tile",tile(pawn.tile)},{"hp",facts->actorRealHp},
+                {"fuel",known.fuel},{"ammo",QJsonArray{known.ammo1,known.ammo2}},{"possibleShooters",int(facts->tile->shooters.size())},
+                {"allied",relation==Relation::Allied}});
         }
         if(!observedDefenders.isEmpty())result["observedSpentE0Defenders"]=observedDefenders;
         const auto beforeWalkProfile=geometry;

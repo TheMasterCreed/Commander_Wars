@@ -2873,7 +2873,7 @@ bool CoordinatedAi::buildUnits(spQmlVectorBuilding & pBuildings, spQmlVectorUnit
             const auto liveProperties = Coordinator::buildPropertyEconomics(*m_pMap, liveKnowledge);
             Coordinator::DamageOracle liveOracle(*m_pMap);
             const auto model = Coordinator::buildLiveUnifiedProductionModel(
-                *m_pMap, *m_pPlayer, liveKnowledge, m_mobilityFields, liveOracle, liveProperties, m_propertyStock);
+                *m_pMap, *m_pPlayer, liveKnowledge, m_mobilityFields, liveOracle, liveProperties, m_propertyStock, false);
             const auto plan = model.planBuilds(openSites, Coordinator::toMilliFunds(currentFunds));
             m_unifiedBuildQueue = plan.orders;
 

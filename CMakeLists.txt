@@ -850,6 +850,10 @@ set(${PROJECT_NAME}_SRCS
     ai/coordinator/capturedanger.h ai/coordinator/capturedangerstream.h ai/coordinator/capturedangerdecisions.h
     ai/coordinator/capturedangerrecord.h ai/coordinator/capturedangeraudit.h ai/coordinator/capturedangeraudit.cpp
     ai/coordinator/combatforecast.h ai/coordinator/combatmilestone.h ai/coordinator/combatmilestone.cpp
+    ai/coordinator/unifiedproduction.h ai/coordinator/unifiedproduction.cpp
+    ai/coordinator/unifiedproductionlive.h ai/coordinator/unifiedproductionlive.cpp
+    ai/coordinator/unifiedteamvalue.h ai/coordinator/unifiedteamvalue.cpp
+    ai/coordinator/unifiedteamsearch.h ai/coordinator/unifiedteamsearch.cpp
     ai/coordinator/capturedangerauditmode.h ai/coordinator/capturedangerpricing.h
     ai/coordinator/replypredictionmode.h ai/coordinator/replyfacts.h ai/coordinator/replyprediction.h
     ai/coordinator/ownactionmeasurement.h ai/coordinator/stockreplykeys.h ai/coordinator/replypassevaluation.h
@@ -1546,6 +1550,9 @@ if (BUILD_TESTING)
         ai/coordinator/propertystockpricing.cpp
         ai/coordinator/masterassignmentfuture.cpp
         ai/coordinator/masterplanpricing.cpp
+        ai/coordinator/unifiedproduction.cpp
+        ai/coordinator/unifiedteamvalue.cpp
+        ai/coordinator/unifiedteamsearch.cpp
     )
     target_compile_definitions(CoordinatorAiReplyPassTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_include_directories(CoordinatorAiReplyPassTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1562,6 +1569,7 @@ if (BUILD_TESTING)
         ai/coordinator/propertystockpricing.cpp
         ai/coordinator/masterassignmentfuture.cpp
         ai/coordinator/masterplanpricing.cpp
+        ai/coordinator/unifiedproduction.cpp
     )
     target_compile_definitions(CoordinatorAiReplyPassRecordTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_include_directories(CoordinatorAiReplyPassRecordTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1726,6 +1734,7 @@ if (BUILD_TESTING)
         ai/coordinator/propertystockpricing.cpp
         ai/coordinator/masterassignmentfuture.cpp
         ai/coordinator/masterplanpricing.cpp
+        ai/coordinator/unifiedproduction.cpp
     )
     target_compile_definitions(CoordinatorAiPropertyStockTests PRIVATE COW_COORDINATED_REFINEMENT_TESTING)
     target_include_directories(CoordinatorAiPropertyStockTests PRIVATE

@@ -11,6 +11,7 @@
 
 #include "game/building.h"
 #include "game/gamemap.h"
+#include "game/gamerules.h"
 #include "game/player.h"
 #include "game/terrain.h"
 #include "game/unit.h"
@@ -191,6 +192,26 @@ namespace Coordinator
             }
             addCaptureProgress(facts, knowledge);
             properties.push_back(std::move(facts));
+        }
+        // On zero-production pre-deployed maps without property/score victory rules, unspendable cash cannot deploy units.
+        const bool anyProductionOnMap = std::ranges::any_of(properties, [](const PropertyFacts & prop) {
+            return prop.canProduce;
+        });
+        GameRules* pRules = map.getGameRules();
+        const bool hasPropertyVictoryRule = pRules != nullptr &&
+            (pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_BUILDINGLIMIT")) ||
+             pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_DOMINATION")) ||
+             pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_1NOHQ_TOWN_REPLACE")) ||
+             pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_TURNLIMIT_CAPTURE_RACE")) ||
+             pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_TURNLIMIT_SCORE_RACE")) ||
+             pRules->hasVictoryRule(QStringLiteral("VICTORYRULE_TURNLIMIT")));
+        if (!anyProductionOnMap && !hasPropertyVictoryRule)
+        {
+            for (PropertyFacts & prop : properties)
+            {
+                prop.baseIncome = 0;
+                prop.incomePerTurn = 0;
+            }
         }
         return properties;
     }

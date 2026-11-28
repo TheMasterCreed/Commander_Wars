@@ -110,6 +110,11 @@ namespace Coordinator
         std::int32_t hpSteps{UNIT_HP_STEPS};
         bool opensPlasma{false};
         std::vector<TilePoint> openedTiles;
+        MilliFunds directWeaponStake{0};
+        std::vector<TilePoint> hazardTiles;
+        std::int32_t hazardDamageSteps{0};
+        bool hazardSingleTarget{true};
+        bool hazardActiveE0{false};
     };
 
     struct CombatTerrain
